@@ -150,7 +150,7 @@ memtx_engine_shutdown(struct engine *engine)
 
 static int
 memtx_engine_recover_snapshot_row(struct memtx_engine *memtx,
-				  struct xrow_header *row);
+				  struct xrow_header *row, bool *not_system_space);
 
 int
 memtx_engine_recover_snapshot(struct memtx_engine *memtx,
@@ -159,8 +159,16 @@ memtx_engine_recover_snapshot(struct memtx_engine *memtx,
 	/* Process existing snapshot */
 	say_info("recovery start");
 	int64_t signature = vclock_sum(vclock);
-	const char *filename = xdir_format_filename(&memtx->snap_dir,
+	char filename[PATH_MAX];
+	const char *name = xdir_format_filename(&memtx->snap_dir,
 						    signature, NONE);
+	/*
+	 * we need to save name in local variable because
+	 * xdir_format_filename allocate memory in static buffer
+	 * which will be overwritten later
+	 */
+	strncpy(filename, name, PATH_MAX - 1);
+	filename[PATH_MAX - 1] = '\0';
 
 	say_info("recovering from `%s'", filename);
 	struct xlog_cursor cursor;
@@ -170,12 +178,13 @@ memtx_engine_recover_snapshot(struct memtx_engine *memtx,
 	int rc;
 	struct xrow_header row;
 	uint64_t row_count = 0;
+	bool not_system_space = false;
 	while ((rc = xlog_cursor_next(&cursor, &row,
 				      memtx->force_recovery)) == 0) {
 		row.lsn = signature;
-		rc = memtx_engine_recover_snapshot_row(memtx, &row);
+		rc = memtx_engine_recover_snapshot_row(memtx, &row, &not_system_space);
 		if (rc < 0) {
-			if (!memtx->force_recovery)
+			if (!memtx->force_recovery || !not_system_space)
 				break;
 			say_error("can't apply row: ");
 			diag_log();
@@ -196,8 +205,12 @@ memtx_engine_recover_snapshot(struct memtx_engine *memtx,
 	 * marker - such snapshots are very likely corrupted and
 	 * should not be trusted.
 	 */
-	if (!xlog_cursor_is_eof(&cursor))
-		panic("snapshot `%s' has no EOF marker", filename);
+	if (!xlog_cursor_is_eof(&cursor)) {
+		if (!memtx->force_recovery)
+			panic("snapshot `%s' has no EOF marker", filename);
+		else
+			say_error("snapshot `%s' has no EOF marker", filename);
+	}
 
 	return 0;
 }
@@ -216,7 +229,7 @@ memtx_engine_recover_raft(const struct xrow_header *row)
 
 static int
 memtx_engine_recover_snapshot_row(struct memtx_engine *memtx,
-				  struct xrow_header *row)
+				  struct xrow_header *row, bool *not_system_space)
 {
 	assert(row->bodycnt == 1); /* always 1 for read */
 	if (row->type != IPROTO_INSERT) {
@@ -230,6 +243,8 @@ memtx_engine_recover_snapshot_row(struct memtx_engine *memtx,
 	struct request request;
 	if (xrow_decode_dml(row, &request, dml_request_key_map(row->type)) != 0)
 		return -1;
+	if (not_system_space && request.space_id > BOX_SYSTEM_ID_MAX)
+		*not_system_space = true;
 	struct space *space = space_cache_find(request.space_id);
 	if (space == NULL)
 		return -1;
@@ -451,7 +466,7 @@ memtx_engine_bootstrap(struct engine *engine)
 	int rc;
 	struct xrow_header row;
 	while ((rc = xlog_cursor_next(&cursor, &row, true)) == 0) {
-		rc = memtx_engine_recover_snapshot_row(memtx, &row);
+		rc = memtx_engine_recover_snapshot_row(memtx, &row, NULL);
 		if (rc < 0)
 			break;
 	}
