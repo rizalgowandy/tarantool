@@ -1,15 +1,56 @@
 #include "execute.h"
 #include "lua/utils.h"
+#include "sqlInt.h"
+#include "../sql/vdbe.h"	// FIXME
+#include "../execute.h"		// FIXME
+#include "../schema.h"		// FIXME
+#include "../session.h"		// FIXME
+#include "box/sql_stmt_cache.h"
 
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
 
+/**
+ * Parse SQL to AST, return it as cdata
+ * FIXME - split to the Lua and SQL parts..
+ */
 static int
 lbox_sqlparser_parse(struct lua_State *L)
 {
-	lua_pushliteral(L, "sqlparser.parse");
+	size_t length;
+	int top = lua_gettop(L);
+
+	if (top != 1 || !lua_isstring(L, 1))
+		return luaL_error(L, "Usage: sqlparser.parse(sqlstring)");
+
+	const char *sql = lua_tolstring(L, 1, &length);
+
+	uint32_t stmt_id = sql_stmt_calculate_id(sql, length);
+	struct sql_stmt *stmt = sql_stmt_cache_find(stmt_id);
+
+	if (stmt == NULL) {
+		if (sql_stmt_compile(sql, length, NULL, &stmt, NULL) != 0)
+			return -1;
+		if (sql_stmt_cache_insert(stmt) != 0) {
+			sql_stmt_finalize(stmt);
+			goto error;
+		}
+	} else {
+		if (sql_stmt_schema_version(stmt) != box_schema_version() &&
+		    !sql_stmt_busy(stmt)) {
+			; //if (sql_reprepare(&stmt) != 0)
+			//	goto error;
+		}
+	}
+	assert(stmt != NULL);
+	/* Add id to the list of available statements in session. */
+	if (!session_check_stmt_id(current_session(), stmt_id))
+		session_add_stmt_id(current_session(), stmt_id);
+
 	return 1;
+error:
+	return luaT_push_nil_and_error(L);
 }
 
 static int
