@@ -11,6 +11,47 @@
 #include <lauxlib.h>
 #include <lualib.h>
 
+int
+sql_stmt_parse(const char *zSql, sql_stmt **ppStmt)
+{
+	struct sql *db = sql_get();
+	int rc = 0;	/* Result code */
+	Parse sParse;
+	sql_parser_create(&sParse, db, current_session()->sql_flags);
+
+	sParse.parse_only = true;	// Parse and build AST only
+
+	*ppStmt = NULL;
+	/* assert( !db->mallocFailed ); // not true with SQL_USE_ALLOCA */
+
+	sqlRunParser(&sParse, zSql);
+	assert(0 == sParse.nQueryLoop);
+
+	if (sParse.is_aborted)
+		rc = -1;
+
+	if (db->init.busy == 0) {
+		Vdbe *pVdbe = sParse.pVdbe;
+		sqlVdbeSetSql(pVdbe, zSql, (int)(sParse.zTail - zSql));
+	}
+	if (sParse.pVdbe != NULL && (rc != 0 || db->mallocFailed)) {
+		sqlVdbeFinalize(sParse.pVdbe);
+		assert(!(*ppStmt));
+	} else {
+		*ppStmt = (sql_stmt *) sParse.pVdbe;
+	}
+
+	/* Delete any TriggerPrg structures allocated while parsing this statement. */
+	while (sParse.pTriggerPrg) {
+		TriggerPrg *pT = sParse.pTriggerPrg;
+		sParse.pTriggerPrg = pT->pNext;
+		sqlDbFree(db, pT);
+	}
+
+	sql_parser_destroy(&sParse);
+	return rc;
+}
+
 /**
  * Parse SQL to AST, return it as cdata
  * FIXME - split to the Lua and SQL parts..
@@ -30,7 +71,7 @@ lbox_sqlparser_parse(struct lua_State *L)
 	struct sql_stmt *stmt = sql_stmt_cache_find(stmt_id);
 
 	if (stmt == NULL) {
-		if (sql_stmt_compile(sql, length, NULL, &stmt, NULL) != 0)
+		if (sql_stmt_parse(sql, &stmt) != 0)
 			return -1;
 		if (sql_stmt_cache_insert(stmt) != 0) {
 			sql_stmt_finalize(stmt);
