@@ -30,10 +30,8 @@ sql_stmt_parse(const char *zSql, sql_stmt **ppStmt)
 	if (sParse.is_aborted)
 		rc = -1;
 
-	if (db->init.busy == 0) {
-		Vdbe *pVdbe = sParse.pVdbe;
-		sqlVdbeSetSql(pVdbe, zSql, (int)(sParse.zTail - zSql));
-	}
+	if (db->init.busy == 0) 
+		sqlVdbeSetSql(sParse.pVdbe, zSql, (int)(sParse.zTail - zSql));
 	if (sParse.pVdbe != NULL && (rc != 0 || db->mallocFailed)) {
 		sqlVdbeFinalize(sParse.pVdbe);
 		assert(!(*ppStmt));
@@ -41,12 +39,14 @@ sql_stmt_parse(const char *zSql, sql_stmt **ppStmt)
 		*ppStmt = (sql_stmt *) sParse.pVdbe;
 	}
 
+#if 0 // FIXME
 	/* Delete any TriggerPrg structures allocated while parsing this statement. */
 	while (sParse.pTriggerPrg) {
 		TriggerPrg *pT = sParse.pTriggerPrg;
 		sParse.pTriggerPrg = pT->pNext;
 		sqlDbFree(db, pT);
 	}
+#endif
 
 	sql_parser_destroy(&sParse);
 	return rc;
