@@ -56,8 +56,18 @@ error:
 static int
 lbox_sqlparser_unparse(struct lua_State *L)
 {
-	lua_pushliteral(L, "sqlparser.unparse");
-	return 1;
+	int top = lua_gettop(L);
+
+	if (top != 1 || !lua_isnumber(L, 1)) {
+		return luaL_error(L, "Usage: sqlparser.unparse(stmt_id)");
+	}
+	lua_Integer stmt_id = lua_tonumber(L, 1);
+
+	if (stmt_id < 0)
+		return luaL_error(L, "Statement id can't be negative");
+	if (sql_unprepare((uint32_t) stmt_id) != 0)
+		return luaT_push_nil_and_error(L);
+	return 0;
 }
 
 static int
