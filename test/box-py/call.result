@@ -536,10 +536,10 @@ function f(...) return ... end
 call f({'k2': 'v2', 'k1': 'v1'})
 ---
 - {'k2': 'v2', 'k1': 'v1'}
-eval (return space:auto_increment({"transaction"}))()
+eval (return space:auto_increment({'transaction'}))()
 ---
 - [1, 'transaction']
-function f(...) return space:auto_increment({"transaction"}) end
+function f(...) return space:auto_increment({'transaction'}) end
 ---
 ...
 call f()
@@ -554,11 +554,11 @@ function f(...) return space:select{} end
 call f()
 ---
 - [[1, 'transaction'], [2, 'transaction']]
-eval (return box.begin(), space:auto_increment({"failed"}), box.rollback())()
+eval (return box.begin(), space:auto_increment({'failed'}), box.rollback())()
 ---
 - None
 - [3, 'failed']
-function f(...) return box.begin(), space:auto_increment({"failed"}), box.rollback() end
+function f(...) return box.begin(), space:auto_increment({'failed'}), box.rollback() end
 ---
 ...
 call f()
@@ -574,10 +574,10 @@ function f(...) return space:select{} end
 call f()
 ---
 - [[1, 'transaction'], [2, 'transaction']]
-eval (return require("fiber").sleep(0))()
+eval (return require('fiber').sleep(0))()
 ---
 
-function f(...) return require("fiber").sleep(0) end
+function f(...) return require('fiber').sleep(0) end
 ---
 ...
 call f()

@@ -165,7 +165,7 @@ box.space._user:select{}
   - [3, 1, 'replication', 'role', {}]
   - [31, 1, 'super', 'role', {}]
 ...
-for _, v in box.space._func:pairs{} do r = {} table.insert(r, v:update({{"=", 18, ""}, {"=", 19, ""}})) return r end
+for _, v in box.space._func:pairs{} do r = {} table.insert(r, v:update({{'=', 18, ''}, {'=', 19, ''}})) return r end
 ---
 - - [1, 1, 'box.schema.user.info', 1, 'LUA', '', 'function', [], 'any', 'none', 'none',
     false, false, true, ['LUA'], {}, '', '', '']

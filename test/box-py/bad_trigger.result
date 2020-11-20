@@ -1,8 +1,6 @@
-
  #
  # if on_connect() trigger raises an exception, the connection is dropped
  #
- 
 nosuchfunction = nil
 ---
 ...

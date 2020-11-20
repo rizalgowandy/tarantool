@@ -1,3 +1,5 @@
+from __future__ import print_function
+
 import os
 import sys
 import yaml
@@ -9,13 +11,13 @@ sys.stdout.push_filter(server.vardir, "<dir>")
 admin("space = box.schema.space.create('tweedledum')")
 admin("index = space:create_index('primary', { type = 'hash' })")
 
-print """#
-# A test case for: http://bugs.launchpad.net/bugs/686411
-# Check that 'box.snapshot()' does not overwrite a snapshot
-# file that already exists. Verify also that any other
-# error that happens when saving snapshot is propagated
-# to the caller.
-"""
+print("#")
+print("# A test case for: http://bugs.launchpad.net/bugs/686411")
+print("# Check that 'box.snapshot()' does not overwrite a snapshot")
+print("# file that already exists. Verify also that any other")
+print("# error that happens when saving snapshot is propagated")
+print("# to the caller.")
+
 admin("space:insert{1, 'first tuple'}")
 admin("box.snapshot()")
 #
@@ -38,14 +40,13 @@ os.rmdir(snapshot)
 admin("space:delete{1}")
 admin("space:delete{2}")
 
-print """#
-# A test case for http://bugs.launchpad.net/bugs/727174
-# "tarantool_box crashes when saving snapshot on SIGUSR1"
-#"""
+print("#")
+print("# A test case for http://bugs.launchpad.net/bugs/727174")
+print("# 'tarantool_box crashes when saving snapshot on SIGUSR1'")
+print("#")
 
-print """
-# Increment the lsn number, to make sure there is no such snapshot yet
-#"""
+print("# Increment the lsn number, to make sure there is no such snapshot yet")
+print("#")
 
 admin("space:insert{1, 'Test tuple'}")
 
@@ -65,9 +66,9 @@ while not os.access(snapshot, os.F_OK) and iteration < MAX_ITERATIONS:
   iteration = iteration + 1
 
 if iteration == 0 or iteration >= MAX_ITERATIONS:
-  print "Snapshot is missing."
+  print("Snapshot is missing.")
 else:
-  print "Snapshot exists."
+  print("Snapshot exists.")
 
 admin("space:drop()")
 

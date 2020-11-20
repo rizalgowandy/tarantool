@@ -1,4 +1,4 @@
-print("Hello, world")
+print('Hello, world')
 ---
 ...
 io = require('io')
@@ -17,9 +17,9 @@ require('fiber').sleep(0.01)
 ...
 Check log line (Hello):
 ---
-- "logfile contains "Hello""
+- 'logfile contains 'Hello''
 ...
 Check log line (Ehllo):
 ---
-- "logfile contains "Ehllo""
+- 'logfile contains 'Ehllo''
 ...

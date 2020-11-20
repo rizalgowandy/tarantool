@@ -1,21 +1,15 @@
 box.schema.user.grant('guest', 'read,write,execute', 'universe')
 ---
 ...
-
 #
 # iproto packages test
 #
-
-
 # Test bug #899343 (server assertion failure on incorrect packet)
-
 # send the package with invalid length
 12
 # check that is server alive
 True
-
-#  Test gh-206 "Segfault if sending IPROTO package without `KEY` field"
-
+#  Test gh-206 'Segfault if sending IPROTO package without `KEY` field'
 IPROTO_SELECT
 query {'IPROTO_CODE': 1} {'IPROTO_SPACE_ID': 280}
 True
@@ -165,10 +159,8 @@ space:drop()
 box.schema.user.revoke('guest', 'read,write,execute', 'universe')
 ---
 ...
-
 # Test bugs gh-272, gh-1654 if the packet was incorrect, respond with
 # an error code and do not close connection
-
 sync=0, Invalid MsgPack - packet header
 sync=1234, Missing mandatory field 'space id' in request
 sync=5678, Read access to space '_user' is denied for user 'guest'
