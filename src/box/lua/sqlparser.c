@@ -13,6 +13,19 @@
 #include <lauxlib.h>
 #include <lualib.h>
 
+/*
+ * Remember the SQL string for a prepared statement.
+ * Looks same as sqlVdbeSetSql but for AST, not VDBE
+ */
+static void
+sql_ast_set_sql(struct sql_parsed_ast *ast, const char *ps, int sz)
+{
+	if (ast == NULL)
+		return;
+	assert(ast->sql_query == NULL);
+	ast->sql_query = sqlDbStrNDup(sql_get(), ps, sz);
+}
+
 int
 sql_stmt_parse(const char *zSql, sql_stmt **ppStmt, struct sql_parsed_ast *ast)
 {
@@ -33,8 +46,7 @@ sql_stmt_parse(const char *zSql, sql_stmt **ppStmt, struct sql_parsed_ast *ast)
 	if (sParse.is_aborted)
 		rc = -1;
 
-	if (db->init.busy == 0) 
-		sqlVdbeSetSql(sParse.pVdbe, zSql, (int)(sParse.zTail - zSql));
+	assert(sParse.pVdbe == NULL); // FIXME
 	if (sParse.pVdbe != NULL && (rc != 0 || db->mallocFailed)) {
 		sqlVdbeFinalize(sParse.pVdbe);
 		assert(!(*ppStmt));
@@ -43,6 +55,8 @@ sql_stmt_parse(const char *zSql, sql_stmt **ppStmt, struct sql_parsed_ast *ast)
 	}
 	*ast = sParse.parsed_ast;
 	assert(ast->keep_ast == true);
+	//if (db->init.busy == 0)
+	sql_ast_set_sql(ast, zSql, (int)(sParse.zTail - zSql));
 
 #if 0 // FIXME
 	/* Delete any TriggerPrg structures allocated while parsing this statement. */
@@ -90,7 +104,7 @@ lbox_sqlparser_parse(struct lua_State *L)
 			//	goto error;
 		}
 	}
-	assert(stmt != NULL);
+	assert(ast != NULL);
 	/* Add id to the list of available statements in session. */
 	if (!session_check_stmt_id(current_session(), stmt_id))
 		session_add_stmt_id(current_session(), stmt_id);
