@@ -6,6 +6,7 @@
 #include "../execute.h"		// FIXME
 #include "../schema.h"		// FIXME
 #include "../session.h"		// FIXME
+#include "../box.h"		// FIXME
 #include "box/sql_stmt_cache.h"
 
 #include <stdlib.h>
@@ -78,6 +79,8 @@ sql_stmt_parse(const char *zSql, sql_stmt **ppStmt, struct sql_parsed_ast *ast)
 static int
 lbox_sqlparser_parse(struct lua_State *L)
 {
+	if (!box_is_configured())
+		luaL_error(L, "Please call box.cfg{} first");
 	size_t length;
 	int top = lua_gettop(L);
 
