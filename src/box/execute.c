@@ -685,8 +685,11 @@ sql_execute(struct sql_stmt *stmt, struct port *port, struct region *region)
 		rc = sql_step(stmt);
 		assert(rc != SQL_ROW && rc != 0);
 	}
-	if (rc != SQL_DONE)
+	if (rc != SQL_DONE) {
+		if (diag_is_empty(&fiber()->diag))
+			abort();
 		return -1;
+	}
 	return 0;
 }
 
@@ -737,8 +740,11 @@ sql_prepare_and_execute(const char *sql, int len, const struct sql_bind *bind,
 			struct region *region)
 {
 	struct sql_stmt *stmt;
-	if (sql_stmt_compile(sql, len, NULL, &stmt, NULL) != 0)
+	if (sql_stmt_compile(sql, len, NULL, &stmt, NULL) != 0) {
+		if (diag_is_empty(&fiber()->diag))
+			abort();
 		return -1;
+	}
 	assert(stmt != NULL);
 	enum sql_serialization_format format = sql_column_count(stmt) > 0 ?
 					   DQL_EXECUTE : DML_EXECUTE;

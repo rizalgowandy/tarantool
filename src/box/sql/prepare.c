@@ -96,8 +96,11 @@ sql_stmt_compile(const char *zSql, int nBytes, struct Vdbe *pReprepare,
 	if (pzTail) {
 		*pzTail = sParse.zTail;
 	}
-	if (sParse.is_aborted)
+	if (sParse.is_aborted) {
+		if (diag_is_empty(&fiber()->diag))
+			abort();
 		rc = -1;
+	}
 
 	if (rc == 0 && sParse.pVdbe != NULL && sParse.explain) {
 		static const char *const azColName[] = {
