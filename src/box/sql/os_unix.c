@@ -159,14 +159,17 @@ robust_open(const char *z, int f, mode_t m)
 		if (fd < 0) {
 			if (errno == EINTR)
 				continue;
+			diag_set(SystemError, strerror(errno));
 			break;
 		}
 		if (fd >= SQL_MINIMUM_FILE_DESCRIPTOR)
 			break;
 		close(fd);
 		fd = -1;
-		if (open("/dev/null", f, m) < 0)
+		if (open("/dev/null", f, m) < 0) {
+			diag_set(SystemError, strerror(errno));
 			break;
+		}
 	}
 	if (fd >= 0) {
 		if (m != 0) {
@@ -831,8 +834,10 @@ seekAndWriteFd(int fd,		/* File descriptor to write to */
 		rc = write(fd, pBuf, nBuf);
 	} while (rc < 0 && errno == EINTR);
 
-	if (rc < 0)
+	if (rc < 0) {
+		diag_set(SystemError, strerror(errno));
 		*piErrno = errno;
+	}
 	return rc;
 }
 
