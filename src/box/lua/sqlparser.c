@@ -114,9 +114,14 @@ lbox_sqlparser_parse(struct lua_State *L)
 	if (!session_check_stmt_id(current_session(), stmt_id))
 		session_add_stmt_id(current_session(), stmt_id);
 
+#if 0 
 	struct sql_parsed_ast** ppast =
 		luaL_pushcdata(L, CTID_STRUCT_SQL_PARSED_AST);
 	*ppast = ast;
+#else
+	lua_pushinteger(L, (lua_Integer)stmt_id);
+
+#endif
 
 	return 1;
 error:
