@@ -141,6 +141,13 @@ lbox_sqlparser_unparse(struct lua_State *L)
 }
 
 static int
+lbox_sqlparse_execute(struct lua_State *L)
+{
+	lua_pushliteral(L, "sqlparser.execute");
+	return 1;
+};
+
+static int
 lbox_sqlparser_serialize(struct lua_State *L)
 {
 	lua_pushliteral(L, "sqlparser.serialize");
@@ -172,6 +179,7 @@ box_lua_sqlparser_init(struct lua_State *L)
 		{ "unparse", lbox_sqlparser_unparse },
 		{ "serialize", lbox_sqlparser_serialize },
 		{ "deserialize", lbox_sqlparser_deserialize },
+		{ "execute", lbox_sqlparse_execute },
 		{ NULL, NULL },
 	};
 	luaL_register_module(L, "sqlparser", meta);
