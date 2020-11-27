@@ -103,11 +103,13 @@ lbox_sqlparser_parse(struct lua_State *L)
 			goto error;
 		}
 	} else {
+#if 0
 		if (sql_stmt_schema_version(stmt) != box_schema_version() &&
 		    !sql_stmt_busy(stmt)) {
 			; //if (sql_reprepare(&stmt) != 0)
 			//	goto error;
 		}
+#endif
 	}
 	assert(ast != NULL);
 	/* Add id to the list of available statements in session. */
@@ -148,6 +150,38 @@ lbox_sqlparser_unparse(struct lua_State *L)
 static int
 lbox_sqlparse_execute(struct lua_State *L)
 {
+	struct sql_bind *bind = NULL;
+	int bind_count = 0;
+	size_t length;
+	struct port port;
+	int top = lua_gettop(L);
+
+#if 0
+	if (top == 2) {
+		if (! lua_istable(L, 2))
+			return luaL_error(L, "Second argument must be a table");
+		bind_count = lua_sql_bind_list_decode(L, &bind, 2);
+		if (bind_count < 0)
+			return luaT_push_nil_and_error(L);
+	}
+
+#endif
+	// FIXME - assuming we are receiving a single 
+	// argument of a prepared AST handle
+	assert(top == 1);
+	assert(lua_type(L, 1) == LUA_TNUMBER);
+	lua_Integer query_id = lua_tointeger(L, 1);
+#if 0
+	if (!session_check_stmt_id(current_session(), stmt_id)) {
+		diag_set(ClientError, ER_WRONG_QUERY_ID, stmt_id);
+		return -1;
+	}
+#endif
+
+	struct stmt_cache_entry *entry = stmt_cache_find_entry(query_id);
+	assert(entry != NULL);
+
+
 	lua_pushliteral(L, "sqlparser.execute");
 	return 1;
 };
