@@ -862,6 +862,7 @@ int sqlVdbeExec(Vdbe *p)
 	}
 #endif
 	for(pOp=&aOp[p->pc]; 1; pOp++) {
+		p->pOp = pOp;
 		/* Errors are detected by individual opcodes, with an immediate
 		 * jumps to abort_due_to_error.
 		 */
@@ -5364,6 +5365,12 @@ abort_due_to_error:
 
 	/* This is the only way out of this procedure. */
 vdbe_return:
+	if (p->is_aborted) {
+		if (diag_is_empty(&fiber()->diag)) {
+			assert(0);
+			abort();
+		}
+	}
 	testcase( nVmStep>0);
 	p->aCounter[SQL_STMTSTATUS_VM_STEP] += (int)nVmStep;
 	assert(rc == 0 || rc == -1 || rc == SQL_ROW || rc == SQL_DONE);

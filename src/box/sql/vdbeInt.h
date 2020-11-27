@@ -411,6 +411,7 @@ struct Vdbe {
 	 */
 
 	Op *aOp;		/* Space to hold the virtual machine's program */
+	Op *pOp;
 	Mem *aMem;		/* The memory locations */
 	Mem **apArg;		/* Arguments to currently executing user function */
 	/** SQL metadata for DML/DQL queries. */
