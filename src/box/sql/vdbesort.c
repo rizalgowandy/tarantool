@@ -1041,6 +1041,7 @@ vdbeSorterOpenTempFile(sql * db,	/* Database handle doing sort */
 			vdbeSorterExtendFile(db, *ppFd, nExtend);
 		}
 	}
+	assert(rc == 0 || !diag_is_empty(&fiber()->diag));
 	return rc;
 }
 
@@ -1254,6 +1255,7 @@ vdbePmaWriterFinish(PmaWriter * p, i64 * piEof)
 	sql_free(p->aBuffer);
 	rc = p->eFWErr;
 	memset(p, 0, sizeof(PmaWriter));
+	assert(rc == 0 || !diag_is_empty(&fiber()->diag));
 	return rc;
 }
 
@@ -1341,6 +1343,7 @@ vdbeSorterListToPMA(SortSubtask * pTask, SorterList * pList)
 
 	assert(rc != 0 || pList->pList == NULL);
 	assert(rc != 0 || pTask->file.iEof == iSz);
+	assert(rc == 0 || !diag_is_empty(&fiber()->diag));
 	return rc;
 }
 
@@ -1546,6 +1549,7 @@ sqlVdbeSorterWrite(const VdbeCursor * pCsr,	/* Sorter cursor */
 	pNew->nVal = pVal->n;
 	pSorter->list.pList = pNew;
 
+	assert(rc == 0 || !diag_is_empty(&fiber()->diag));
 	return rc;
 }
 
