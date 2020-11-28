@@ -159,14 +159,17 @@ robust_open(const char *z, int f, mode_t m)
 		if (fd < 0) {
 			if (errno == EINTR)
 				continue;
+			diag_set(SystemError, "os(4): %s", strerror(errno));
 			break;
 		}
 		if (fd >= SQL_MINIMUM_FILE_DESCRIPTOR)
 			break;
 		close(fd);
 		fd = -1;
-		if (open("/dev/null", f, m) < 0)
+		if (open("/dev/null", f, m) < 0) {
+			diag_set(SystemError, "os(5): %s", strerror(errno));
 			break;
+		}
 	}
 	if (fd >= 0) {
 		if (m != 0) {
@@ -396,6 +399,7 @@ findInodeInfo(unixFile * pFile,	/* Unix file with file desc used in the key */
 	rc = fstat(fd, &statbuf);
 	if (rc != 0) {
 		storeLastErrno(pFile, errno);
+		diag_set(SystemError, "os(1): %s", strerror(errno));
 		return -1;
 	}
 
@@ -831,8 +835,10 @@ seekAndWriteFd(int fd,		/* File descriptor to write to */
 		rc = write(fd, pBuf, nBuf);
 	} while (rc < 0 && errno == EINTR);
 
-	if (rc < 0)
+	if (rc < 0) {
+		diag_set(SystemError, "os(3): %s", strerror(errno));
 		*piErrno = errno;
+	}
 	return rc;
 }
 
@@ -874,6 +880,7 @@ unixWrite(sql_file * id, const void *pBuf, int amt, sql_int64 offset)
 			return -1;
 		} else {
 			storeLastErrno(pFile, 0);	/* not a system error */
+			diag_set(SystemError, "os(2): %s", strerror(errno));
 			return -1;
 		}
 	}
@@ -1449,6 +1456,7 @@ unixTempFileDir(void)
 			break;
 		zDir = azDirs[i++];
 	}
+	diag_set(ClientError, ER_SQL_EXECUTE, "no temporary directory");
 	return 0;
 }
 
@@ -1480,8 +1488,11 @@ unixGetTempname(int nBuf, char *zBuf)
 		sql_snprintf(nBuf, zBuf,
 				 "%s/" SQL_TEMP_FILE_PREFIX "%llx%c", zDir,
 				 r, 0);
-		if (zBuf[nBuf - 2] != 0 || (iLimit++) > 10)
+		if (zBuf[nBuf - 2] != 0 || (iLimit++) > 10) {
+			diag_set(ClientError, ER_SQL_EXECUTE,
+				 "buffer overflow");
 			return -1;
+		}
 	} while (access(zBuf, 0) == 0);
 	return 0;
 }
@@ -1559,6 +1570,7 @@ getFileMode(const char *zFile,	/* File name */
 		*pGid = sStat.st_gid;
 	} else {
 		rc = -1;
+		diag_set(ClientError, ER_SQL_EXECUTE, "wrong file mode");
 	}
 	return rc;
 }
