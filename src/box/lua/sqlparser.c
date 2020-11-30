@@ -148,15 +148,52 @@ lbox_sqlparser_unparse(struct lua_State *L)
 }
 
 static int
+sql_ast_generate_vdbe(struct lua_State *L, struct stmt_cache_entry *entry)
+{
+	struct sql_parsed_ast * ast = entry->ast;
+	if (entry->ast == NULL)	// there is no AST generation yet
+		return 0;
+
+	// assumption is that we have not yet completed
+	// bytecode generation for parsed AST
+	assert(entry->stmt == NULL);
+	struct sql *db = sql_get();
+
+	Parse sParse = {0};
+	sql_parser_create(&sParse, db, current_session()->sql_flags);
+	sParse.parse_only = false;
+
+	// we already parsed AST, thus not calling sqlRunParser
+
+	switch (ast->ast_type) {
+		case AST_TYPE_SELECT:
+		{
+			Select *p = ast->select;
+			SelectDest dest = {SRT_Output, 0, 0, 0, 0, 0, 0};
+
+			sqlSelect(&sParse, p, &dest);
+			sql_select_delete(sParse.db, p);
+			break;
+		}
+
+		default:	// FIXME
+		{
+			assert(0);
+		}
+	}
+	return 1;
+}
+
+static int
 lbox_sqlparser_execute(struct lua_State *L)
 {
+#if 0
 	struct sql_bind *bind = NULL;
 	int bind_count = 0;
 	size_t length;
 	struct port port;
 	int top = lua_gettop(L);
 
-#if 0
 	if (top == 2) {
 		if (! lua_istable(L, 2))
 			return luaL_error(L, "Second argument must be a table");
@@ -181,8 +218,9 @@ lbox_sqlparser_execute(struct lua_State *L)
 	struct stmt_cache_entry *entry = stmt_cache_find_entry(query_id);
 	assert(entry != NULL);
 
+	int rc = sql_ast_generate_vdbe(L, entry);
 
-	lua_pushliteral(L, "sqlparser.execute");
+	luaL_pushint64(L, rc);
 	return 1;
 };
 
