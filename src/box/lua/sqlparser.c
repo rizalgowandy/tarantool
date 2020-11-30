@@ -150,13 +150,15 @@ lbox_sqlparser_unparse(struct lua_State *L)
 static int
 sql_ast_generate_vdbe(struct lua_State *L, struct stmt_cache_entry *entry)
 {
+	(void)L;
 	struct sql_parsed_ast * ast = entry->ast;
 	if (entry->ast == NULL)	// there is no AST generation yet
 		return 0;
 
 	// assumption is that we have not yet completed
 	// bytecode generation for parsed AST
-	assert(entry->stmt == NULL);
+	struct sql_stmt *stmt = entry->stmt;
+	assert(stmt == NULL);
 	struct sql *db = sql_get();
 
 	Parse sParse = {0};
@@ -166,7 +168,7 @@ sql_ast_generate_vdbe(struct lua_State *L, struct stmt_cache_entry *entry)
 	// we already parsed AST, thus not calling sqlRunParser
 
 	switch (ast->ast_type) {
-		case AST_TYPE_SELECT:
+		case AST_TYPE_EXPR: // SELECT
 		{
 			Select *p = ast->select;
 			SelectDest dest = {SRT_Output, 0, 0, 0, 0, 0, 0};
@@ -174,6 +176,23 @@ sql_ast_generate_vdbe(struct lua_State *L, struct stmt_cache_entry *entry)
 			sqlSelect(&sParse, p, &dest);
 			sql_select_delete(sParse.db, p);
 			break;
+		}
+
+		case AST_TYPE_SELECT: // CREATEE VIEW
+		{
+#if 0
+			struct create_view_def *view_def;
+			struct Token *name;
+			struct Token *create;
+			struct ExprList *aliases;
+			struct Select *select = ast->select;;
+			bool if_not_exists;
+			create_view_def_init(&sParse.create_view_def, name, create, aliases, select, if_not_exists);
+			sParse.initiateTTrans = true;
+			sql_create_view(&sParse);
+#endif
+			break;
+
 		}
 
 		default:	// FIXME
@@ -187,12 +206,12 @@ sql_ast_generate_vdbe(struct lua_State *L, struct stmt_cache_entry *entry)
 static int
 lbox_sqlparser_execute(struct lua_State *L)
 {
+	int top = lua_gettop(L);
 #if 0
 	struct sql_bind *bind = NULL;
 	int bind_count = 0;
 	size_t length;
 	struct port port;
-	int top = lua_gettop(L);
 
 	if (top == 2) {
 		if (! lua_istable(L, 2))
@@ -203,9 +222,9 @@ lbox_sqlparser_execute(struct lua_State *L)
 	}
 
 #endif
+	assert(top == 1);
 	// FIXME - assuming we are receiving a single 
 	// argument of a prepared AST handle
-	assert(top == 1);
 	assert(lua_type(L, 1) == LUA_TNUMBER);
 	lua_Integer query_id = lua_tointeger(L, 1);
 #if 0
