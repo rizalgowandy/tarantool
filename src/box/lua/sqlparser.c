@@ -3,6 +3,7 @@
 #include "lua/utils.h"
 #include "sqlInt.h"
 #include "../sql/vdbe.h"	// FIXME
+#include "../sql/vdbeInt.h"	// FIXME
 #include "../execute.h"		// FIXME
 #include "../schema.h"		// FIXME
 #include "../session.h"		// FIXME
@@ -165,41 +166,35 @@ sql_ast_generate_vdbe(struct lua_State *L, struct stmt_cache_entry *entry)
 	sql_parser_create(&sParse, db, current_session()->sql_flags);
 	sParse.parse_only = false;
 
+	struct Vdbe *v = sqlGetVdbe(&sParse);
+	if (v == NULL) {
+		sql_parser_destroy(&sParse);
+		diag_set(OutOfMemory, sizeof(struct Vdbe), "sqlGetVdbe",
+			 "sqlparser");
+		return NULL;
+	}
+
 	// we already parsed AST, thus not calling sqlRunParser
 
 	switch (ast->ast_type) {
-		case AST_TYPE_EXPR: // SELECT
+		case AST_TYPE_SELECT: 	// SELECT
 		{
 			Select *p = ast->select;
-			SelectDest dest = {SRT_Output, 0, 0, 0, 0, 0, 0};
+			SelectDest dest = {SRT_Output, NULL, 0, 0, 0, 0, NULL};
 
 			sqlSelect(&sParse, p, &dest);
 			sql_select_delete(sParse.db, p);
 			break;
 		}
 
-		case AST_TYPE_SELECT: // CREATEE VIEW
-		{
-#if 0
-			struct create_view_def *view_def;
-			struct Token *name;
-			struct Token *create;
-			struct ExprList *aliases;
-			struct Select *select = ast->select;;
-			bool if_not_exists;
-			create_view_def_init(&sParse.create_view_def, name, create, aliases, select, if_not_exists);
-			sParse.initiateTTrans = true;
-			sql_create_view(&sParse);
-#endif
-			break;
-
-		}
-
-		default:	// FIXME
+		default:		// FIXME
 		{
 			assert(0);
 		}
 	}
+	sql_finish_coding(&sParse);
+	sql_parser_destroy(&sParse);
+
 	stmt = (struct sql_stmt*)sParse.pVdbe;
 	return stmt;
 }
@@ -248,9 +243,13 @@ lbox_sqlparser_execute(struct lua_State *L)
 			sql_column_count(stmt) > 0 ? DQL_EXECUTE : DML_EXECUTE;
 
 		port_sql_create(&port, stmt, format, true);
-		if (sql_execute(stmt, &port, region) != 0)
+		if (sql_execute(stmt, &port, region) != 0) {
+			port_destroy(&port);
+			sql_stmt_reset(stmt);
 			return luaT_push_nil_and_error(L);
+		}
 	}
+	sql_stmt_reset(stmt);
 	port_dump_lua(&port, L, false);
 	port_destroy(&port);
 
