@@ -147,13 +147,13 @@ lbox_sqlparser_unparse(struct lua_State *L)
 	return 0;
 }
 
-static int
+static struct sql_stmt*
 sql_ast_generate_vdbe(struct lua_State *L, struct stmt_cache_entry *entry)
 {
 	(void)L;
 	struct sql_parsed_ast * ast = entry->ast;
 	if (entry->ast == NULL)	// there is no AST generation yet
-		return 0;
+		return NULL;
 
 	// assumption is that we have not yet completed
 	// bytecode generation for parsed AST
@@ -200,7 +200,8 @@ sql_ast_generate_vdbe(struct lua_State *L, struct stmt_cache_entry *entry)
 			assert(0);
 		}
 	}
-	return 1;
+	stmt = (struct sql_stmt*)sParse.pVdbe;
+	return stmt;
 }
 
 static int
@@ -237,9 +238,22 @@ lbox_sqlparser_execute(struct lua_State *L)
 	struct stmt_cache_entry *entry = stmt_cache_find_entry(query_id);
 	assert(entry != NULL);
 
-	int rc = sql_ast_generate_vdbe(L, entry);
+	// 2. generate 
+	struct sql_stmt *stmt = NULL;
+	struct port port;
+	struct region *region = &fiber()->gc;
 
-	luaL_pushint64(L, rc);
+	if ((stmt = sql_ast_generate_vdbe(L, entry))) {
+		enum sql_serialization_format format = 
+			sql_column_count(stmt) > 0 ? DQL_EXECUTE : DML_EXECUTE;
+
+		port_sql_create(&port, stmt, format, true);
+		if (sql_execute(stmt, &port, region) != 0)
+			return luaT_push_nil_and_error(L);
+	}
+	port_dump_lua(&port, L, false);
+	port_destroy(&port);
+
 	return 1;
 };
 
