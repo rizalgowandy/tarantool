@@ -45,7 +45,6 @@
 #include "sio.h"
 #include "evio.h"
 #include "coio.h"
-#include "scoped_guard.h"
 #include "memory.h"
 #include "random.h"
 
@@ -63,6 +62,8 @@
 #include "execute.h"
 #include "errinj.h"
 #include "tt_static.h"
+#include "assoc.h"
+#include "txn.h"
 
 enum {
 	IPROTO_SALT_SIZE = 32,
@@ -175,6 +176,8 @@ iproto_reset_input(struct ibuf *ibuf)
 
 /* {{{ iproto_msg - declaration */
 
+struct remote_txn;
+
 /**
  * A single msg from io thread. All requests
  * from all connections are queued into a single queue
@@ -232,6 +235,12 @@ struct iproto_msg
 	 * and the connection must be closed.
 	 */
 	bool close_connection;
+	/** Member of remote_txn->messages. */
+	struct rlist next_in_tx;
+	/**
+	 * NULL or transaction node from iproto_connection hash.
+	 */
+	struct remote_txn *txnode;
 };
 
 static struct mempool iproto_msg_pool;
@@ -534,6 +543,33 @@ struct iproto_connection
 	} tx;
 	/** Authentication salt. */
 	char salt[IPROTO_SALT_SIZE];
+	/** Opened in this connection transaction or NULL */
+	struct remote_txn* txn;
+};
+
+/** Pool of remote_txn objects. */
+static struct mempool iproto_txnode_pool;
+
+/**
+ * Wrapper to store the remote transaction, queue of its messages
+ * and message to sending on disconnect.
+ */
+struct remote_txn {
+	struct txn *txn;
+	/**
+	 * List of still not processed messages for the same
+	 * transaction.
+	 */
+	struct rlist messages;
+	/*
+	 * Preallocated message to rollback the transaction in tx
+	 * thread if disconnect event occurs.
+	 * We preallocate the disconnect message at the begin of
+	 * the transaction (@sa tx_process_remote_txn()), because
+	 * we can't fail to allocate memory during connection
+	 * closing.
+	 */
+	struct iproto_msg *disconnect;
 };
 
 static struct mempool iproto_connection_pool;
@@ -565,6 +601,8 @@ iproto_msg_new(struct iproto_connection *con)
 			 "connection %s", sio_socketname(con->input.fd));
 		return NULL;
 	}
+	msg->txnode = NULL;
+	rlist_create(&msg->next_in_tx);
 	msg->connection = con;
 	rmean_collect(rmean_net, IPROTO_REQUESTS, 1);
 	return msg;
@@ -653,6 +691,18 @@ iproto_connection_try_to_start_destroy(struct iproto_connection *con)
 	cpipe_push(&tx_pipe, &con->destroy_msg);
 }
 
+/** Rollback transaction if the client was disconnected. */
+static void
+tx_process_rollback_on_disconnect(struct cmsg *m);
+
+static void
+net_finish_rollback_on_disconnect(struct cmsg *m);
+
+static const struct cmsg_hop rollback_on_disconnect_route[] = {
+		{ tx_process_rollback_on_disconnect, &net_pipe },
+		{ net_finish_rollback_on_disconnect, NULL }
+};
+
 /**
  * Initiate a connection shutdown. This method may
  * be invoked many times, and does the internal
@@ -661,6 +711,23 @@ iproto_connection_try_to_start_destroy(struct iproto_connection *con)
 static inline void
 iproto_connection_close(struct iproto_connection *con)
 {
+	struct remote_txn *node = con->txn;
+	if (node != NULL && node->txn != NULL && node->disconnect != NULL) {
+		struct cmsg *msg =
+				(struct cmsg *) node->disconnect;
+		node->disconnect = NULL;
+		/*
+		 * Schedule rollback of the
+		 * transaction in the tx thread.
+		 */
+		assert(((struct iproto_msg *)msg)->txnode->txn != NULL);
+		cmsg_init(msg, rollback_on_disconnect_route);
+		cpipe_push(&tx_pipe, msg);
+	} else if (node != NULL) {
+		mempool_free(&iproto_txnode_pool, node);
+		con->txn = NULL;
+	}
+
 	if (evio_has_fd(&con->input)) {
 		/* Clears all pending events. */
 		ev_io_stop(con->loop, &con->input);
@@ -677,9 +744,11 @@ iproto_connection_close(struct iproto_connection *con)
 		 * is done only once.
 		 */
 		con->p_ibuf->wpos -= con->parse_size;
-		cpipe_push(&tx_pipe, &con->disconnect_msg);
-		assert(con->state == IPROTO_CONNECTION_ALIVE);
-		con->state = IPROTO_CONNECTION_CLOSED;
+		if (con->txn == NULL) {
+			cpipe_push(&tx_pipe, &con->disconnect_msg);
+			assert(con->state == IPROTO_CONNECTION_ALIVE);
+			con->state = IPROTO_CONNECTION_CLOSED;
+		}
 	} else if (con->state == IPROTO_CONNECTION_PENDING_DESTROY) {
 		iproto_connection_try_to_start_destroy(con);
 	} else {
@@ -810,6 +879,10 @@ iproto_enqueue_batch(struct iproto_connection *con, struct ibuf *in)
 	int n_requests = 0;
 	bool stop_input = false;
 	const char *errmsg;
+
+	bool is_first_msg = false;
+	struct remote_txn *txnode = con->txn;
+
 	while (con->parse_size != 0 && !stop_input) {
 		if (iproto_check_msg_max()) {
 			iproto_connection_stop_msg_max_limit(con);
@@ -854,12 +927,43 @@ err_msgpack:
 		msg->len = reqend - reqstart; /* total request length */
 
 		iproto_msg_decode(msg, &pos, reqend, &stop_input);
+
+		if (txnode == NULL) {
+			/*
+			 * If there is no an opened transaction
+			 * and user doesn't try to begin a new
+			 * one, then work as usual, with
+			 * autocommit statements.
+			 */
+			if (msg->header.type != IPROTO_BEGIN)
+				goto push_as_is;
+			txnode = (struct remote_txn *)
+					mempool_alloc_xc(&iproto_txnode_pool);
+			txnode->txn = NULL;
+			rlist_create(&txnode->messages);
+			/*
+			 * Preallocate the disconnect message,
+			 * @sa struct remote_txn description.
+			 */
+			txnode->disconnect = iproto_msg_new(con);
+			txnode->disconnect->header.type = IPROTO_NET_ROLLBACK;
+			txnode->disconnect->txnode = txnode;
+			con->txn = txnode;
+		}
+		msg->txnode = txnode;
+		is_first_msg = rlist_empty(&txnode->messages);
+		rlist_add_tail_entry(&txnode->messages, msg, next_in_tx);
+		if (! is_first_msg)
+			goto after_push;
+
+push_as_is:
 		/*
 		 * This can't throw, but should not be
 		 * done in case of exception.
 		 */
 		cpipe_push_input(&tx_pipe, &msg->base);
 		n_requests++;
+after_push:
 		/* Request is parsed */
 		assert(reqend > reqstart);
 		assert(con->parse_size >= (size_t) (reqend - reqstart));
@@ -1122,6 +1226,7 @@ iproto_connection_new(int fd)
 	con->tx.is_push_pending = false;
 	con->tx.is_push_sent = false;
 	rmean_collect(rmean_net, IPROTO_CONNECTIONS, 1);
+	con->txn = NULL;
 	return con;
 }
 
@@ -1163,6 +1268,12 @@ tx_process1(struct cmsg *msg);
 static void
 tx_process_select(struct cmsg *msg);
 
+/**
+ * Process IPROTO transaction - make BEGIN, COMMIT or ROLLBACK.
+ */
+static void
+tx_process_remote_txn(struct cmsg *m);
+
 static void
 tx_process_sql(struct cmsg *msg);
 
@@ -1186,6 +1297,20 @@ net_end_join(struct cmsg *msg);
 
 static void
 net_end_subscribe(struct cmsg *msg);
+
+/**
+ * Delete the aborted transaction and finish disconnection.
+ */
+static void
+net_finish_rollback_on_disconnect(struct cmsg *m)
+{
+	struct iproto_msg *msg = (struct iproto_msg *) m;
+	mempool_free(&iproto_txnode_pool, msg->txnode);
+	struct iproto_connection *con = msg->connection;
+	con->txn = NULL;
+	cpipe_push(&tx_pipe, &con->disconnect_msg);
+	con->state = IPROTO_CONNECTION_CLOSED;
+}
 
 static const struct cmsg_hop misc_route[] = {
 	{ tx_process_misc, &net_pipe },
@@ -1212,6 +1337,11 @@ static const struct cmsg_hop sql_route[] = {
 	{ net_send_msg, NULL },
 };
 
+static const struct cmsg_hop process_transaction_route[] = {
+		{ tx_process_remote_txn, &net_pipe },
+		{ net_send_msg, NULL },
+};
+
 static const struct cmsg_hop *dml_route[IPROTO_TYPE_STAT_MAX] = {
 	NULL,                                   /* IPROTO_OK */
 	select_route,                           /* IPROTO_SELECT */
@@ -1227,6 +1357,9 @@ static const struct cmsg_hop *dml_route[IPROTO_TYPE_STAT_MAX] = {
 	sql_route,                              /* IPROTO_EXECUTE */
 	NULL,                                   /* IPROTO_NOP */
 	sql_route,                              /* IPROTO_PREPARE */
+	process_transaction_route,              /* IPROTO_BEGIN */
+	process_transaction_route,              /* IPROTO_COMMIT */
+	process_transaction_route,              /* IPROTO_NET_ROLLBACK */
 };
 
 static const struct cmsg_hop join_route[] = {
@@ -1268,6 +1401,9 @@ iproto_msg_decode(struct iproto_msg *msg, const char **pos, const char *reqend,
 	case IPROTO_UPDATE:
 	case IPROTO_DELETE:
 	case IPROTO_UPSERT:
+	case IPROTO_BEGIN:
+	case IPROTO_NET_ROLLBACK:
+	case IPROTO_COMMIT:
 		if (xrow_decode_dml(&msg->header, &msg->dml,
 				    dml_request_key_map(type)))
 			goto error;
@@ -1415,6 +1551,16 @@ tx_check_schema(uint32_t new_schema_version)
 	return 0;
 }
 
+/** Set the transaction to the current fiber. */
+static inline void
+tx_prepare_transaction_for_request(struct remote_txn *node)
+{
+	assert(node != NULL);
+	assert(node->txn != NULL);
+	struct txn *txn = node->txn;
+	fiber_set_txn(fiber(), txn);
+}
+
 static void
 net_discard_input(struct cmsg *m)
 {
@@ -1528,6 +1674,14 @@ static void
 tx_process1(struct cmsg *m)
 {
 	struct iproto_msg *msg = tx_accept_msg(m);
+
+	struct remote_txn *node = msg->txnode;
+	struct txn *txn = NULL;
+	if (node != NULL && node->txn != NULL) {
+		txn = node->txn;
+		tx_prepare_transaction_for_request(node);
+	}
+
 	if (tx_check_schema(msg->header.schema_version))
 		goto error;
 
@@ -1540,6 +1694,14 @@ tx_process1(struct cmsg *m)
 	out = msg->connection->tx.p_obuf;
 	if (iproto_prepare_select(out, &svp) != 0)
 		goto error;
+
+	/*
+	 * Index operations can't begin a new multistatement
+	 * transaction.
+	 */
+	assert(in_txn() == txn);
+	fiber_set_txn(fiber(), NULL);
+
 	if (tuple && tuple_to_obuf(tuple, out))
 		goto error;
 	iproto_reply_select(out, &svp, msg->header.sync, ::schema_version,
@@ -1547,7 +1709,78 @@ tx_process1(struct cmsg *m)
 	iproto_wpos_create(&msg->wpos, out);
 	return;
 error:
+	fiber_set_txn(fiber(), NULL);
 	tx_reply_error(msg);
+}
+
+static void
+tx_process_rollback_on_disconnect(struct cmsg *m)
+{
+	struct iproto_msg *msg = (struct iproto_msg *) m;
+	struct remote_txn *node = msg->txnode;
+	assert(node->txn != NULL);
+	tx_prepare_transaction_for_request(node);
+	box_txn_rollback();
+}
+
+static void
+tx_process_remote_txn(struct cmsg *m)
+{
+	struct iproto_msg *msg = (struct iproto_msg *) m;
+	struct obuf *out = msg->connection->tx.p_obuf;
+	struct remote_txn *node = msg->txnode;
+	struct txn *txn = NULL;
+	enum iproto_type type = (enum iproto_type) msg->header.type;
+	int rc;
+
+	tx_fiber_init(msg->connection->session, msg->header.sync);
+	if (tx_check_schema(msg->header.schema_version))
+		goto error;
+
+	if (type == IPROTO_BEGIN) {
+		assert(node != NULL);
+		if (node->txn != NULL) {
+			diag_set(ClientError, ER_ACTIVE_TRANSACTION);
+			goto error;
+		}
+
+		rc = box_txn_begin();
+		if (rc != 0)
+			goto error;
+		struct txn *txn = in_txn();
+		assert(txn != NULL);
+		node->txn = txn;
+		trigger_clear(&txn->fiber_on_stop);
+		goto ok;
+	}
+	/*
+	 * The user can commit or rollback without errors, if
+	 * there is no transaction.
+	 */
+	if (node == NULL) {
+		goto ok;
+	}
+	txn = node->txn;
+	assert(txn != NULL);
+	tx_prepare_transaction_for_request(node);
+	if (type == IPROTO_COMMIT) {
+		if (box_txn_commit() != 0)
+			goto error;
+		node->txn = NULL;
+	} else if (type == IPROTO_NET_ROLLBACK) {
+		if (box_txn_rollback() != 0)
+			goto error;
+		node->txn = NULL;
+	}
+	goto ok;
+error:
+	fiber_set_txn(fiber(), NULL);
+	tx_reply_error(msg);
+	return;
+ok:
+	fiber_set_txn(fiber(), NULL);
+	iproto_reply_ok(out, msg->header.sync, ::schema_version);
+	iproto_wpos_create(&msg->wpos, out);
 }
 
 static void
@@ -1560,6 +1793,14 @@ tx_process_select(struct cmsg *m)
 	int count;
 	int rc;
 	struct request *req = &msg->dml;
+
+	struct remote_txn *node = msg->txnode;
+	struct txn *txn = NULL;
+	if (node != NULL && node->txn != NULL) {
+		txn = node->txn;
+		tx_prepare_transaction_for_request(node);
+	}
+
 	if (tx_check_schema(msg->header.schema_version))
 		goto error;
 
@@ -1569,6 +1810,10 @@ tx_process_select(struct cmsg *m)
 			req->key, req->key_end, &port);
 	if (rc < 0)
 		goto error;
+	/*
+	 * Select can't begin a new multistatement transaction.
+	 */
+	assert(in_txn() == txn);
 
 	out = msg->connection->tx.p_obuf;
 	if (iproto_prepare_select(out, &svp) != 0) {
@@ -1588,8 +1833,10 @@ tx_process_select(struct cmsg *m)
 	iproto_reply_select(out, &svp, msg->header.sync,
 			    ::schema_version, count);
 	iproto_wpos_create(&msg->wpos, out);
+	fiber_set_txn(fiber(), NULL);
 	return;
 error:
+	fiber_set_txn(fiber(), NULL);
 	tx_reply_error(msg);
 }
 
@@ -1608,6 +1855,14 @@ static void
 tx_process_call(struct cmsg *m)
 {
 	struct iproto_msg *msg = tx_accept_msg(m);
+
+	struct remote_txn *node = msg->txnode;
+	struct txn *txn = NULL;
+	if (node != NULL && node->txn != NULL) {
+		txn = node->txn;
+		tx_prepare_transaction_for_request(node);
+	}
+
 	if (tx_check_schema(msg->header.schema_version))
 		goto error;
 
@@ -1678,9 +1933,42 @@ tx_process_call(struct cmsg *m)
 	iproto_reply_select(out, &svp, msg->header.sync,
 			    ::schema_version, count);
 	iproto_wpos_create(&msg->wpos, out);
-	return;
+	goto check_txn_finish;
+
 error:
 	tx_reply_error(msg);
+
+check_txn_finish:
+	if (in_txn() != txn) {
+		if (txn != NULL) {
+			/*
+			 * The current request commited or aborted
+			 * our transaction.
+			 */
+			assert(in_txn() == NULL);
+			fiber_set_txn(fiber(), NULL);
+			assert(node != NULL);
+			node->txn = NULL;
+			return;
+		}
+		/*
+		 * The current request made implicit BEGIN, for
+		 * example, by calling eval('box.begin()').
+		 * TODO: save this transaction in the hash in the
+		 * net thread and return the identifier to the
+		 * user.
+		 */
+		if (msg->header.type == IPROTO_EVAL) {
+			say_warn("a transaction is active at return from EVAL");
+		} else {
+			assert(msg->header.type == IPROTO_CALL ||
+				   msg->header.type == IPROTO_CALL_16);
+			say_warn("a transaction is active at return from CALL");
+		}
+		box_txn_rollback();
+		return;
+	}
+	fiber_set_txn(fiber(), NULL);
 }
 
 static void
@@ -1689,6 +1977,14 @@ tx_process_misc(struct cmsg *m)
 	struct iproto_msg *msg = tx_accept_msg(m);
 	struct iproto_connection *con = msg->connection;
 	struct obuf *out = con->tx.p_obuf;
+
+	struct remote_txn *node = msg->txnode;
+	struct txn *txn = NULL;
+	if (node != NULL && node->txn != NULL) {
+		txn = node->txn;
+		tx_prepare_transaction_for_request(node);
+	}
+
 	if (tx_check_schema(msg->header.schema_version))
 		goto error;
 
@@ -1721,8 +2017,17 @@ tx_process_misc(struct cmsg *m)
 	} catch (Exception *e) {
 		tx_reply_error(msg);
 	}
+
+	/*
+	 * Misc operations can't begin a new multistatement
+	 * transaction.
+	 */
+	assert(in_txn() == txn);
+
+	fiber_set_txn(fiber(), NULL);
 	return;
 error:
+	fiber_set_txn(fiber(), NULL);
 	tx_reply_error(msg);
 }
 
@@ -1870,6 +2175,40 @@ net_send_msg(struct cmsg *m)
 {
 	struct iproto_msg *msg = (struct iproto_msg *) m;
 	struct iproto_connection *con = msg->connection;
+
+	struct remote_txn *txnode = con->txn;
+	if (txnode == NULL)
+		goto sending;
+
+	assert(msg->txnode == txnode);
+	rlist_del_entry(msg, next_in_tx);
+	if (rlist_empty(&txnode->messages)) {
+		/*
+		 * If no more messages for the current transaction
+		 * and it was just finished, then delete it from
+		 * the hash.
+		 */
+		if (txnode->txn == NULL || msg->header.type == IPROTO_COMMIT ||
+			msg->header.type == IPROTO_NET_ROLLBACK) {
+			iproto_msg_delete(txnode->disconnect);
+			mempool_free(&iproto_txnode_pool, txnode);
+			con->txn = NULL;
+		}
+	} else {
+		/*
+		 * If there are new messages for the transaction
+		 * then schedule their processing.
+		 */
+		struct iproto_msg *next =
+				rlist_first_entry(&txnode->messages, struct iproto_msg,
+								  next_in_tx);
+		assert(next != NULL);
+		assert(next->txnode == txnode);
+		cpipe_push_input(&tx_pipe, (struct cmsg *) next);
+		cpipe_flush_input(&tx_pipe);
+	}
+
+sending:
 
 	if (msg->len != 0) {
 		/* Discard request (see iproto_enqueue_batch()). */
@@ -2058,6 +2397,8 @@ net_cord_f(va_list /* ap */)
 		       sizeof(struct iproto_msg));
 	mempool_create(&iproto_connection_pool, &cord()->slabc,
 		       sizeof(struct iproto_connection));
+	mempool_create(&iproto_txnode_pool, &cord()->slabc,
+				   sizeof(struct remote_txn));
 
 	evio_service_init(loop(), &binary, "binary",
 			  iproto_on_accept, NULL);
