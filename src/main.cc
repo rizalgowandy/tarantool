@@ -79,6 +79,7 @@
 #include "systemd.h"
 #include "crypto/crypto.h"
 #include "core/popen.h"
+#include "core/errstat.h"
 
 static pid_t master_pid = getpid();
 static struct pidfh *pid_file_handle;
@@ -184,45 +185,43 @@ signal_sigwinch_cb(ev_loop *loop, struct ev_signal *w, int revents)
 		rl_resize_terminal();
 }
 
-#if defined(__linux__) && defined(__amd64)
-
-inline void
-dump_x86_64_register(const char *reg_name, unsigned long long val)
+#ifdef TARGET_OS_LINUX
+static inline void
+dump_register(const char *reg_name, unsigned long long val)
 {
 	fprintf(stderr, "  %-9s0x%-17llx%lld\n", reg_name, val, val);
 }
 
-void
-dump_x86_64_registers(ucontext_t *uc)
+static void
+dump_registers(struct errstat_crash *cinfo)
 {
-	dump_x86_64_register("rax", uc->uc_mcontext.gregs[REG_RAX]);
-	dump_x86_64_register("rbx", uc->uc_mcontext.gregs[REG_RBX]);
-	dump_x86_64_register("rcx", uc->uc_mcontext.gregs[REG_RCX]);
-	dump_x86_64_register("rdx", uc->uc_mcontext.gregs[REG_RDX]);
-	dump_x86_64_register("rsi", uc->uc_mcontext.gregs[REG_RSI]);
-	dump_x86_64_register("rdi", uc->uc_mcontext.gregs[REG_RDI]);
-	dump_x86_64_register("rsp", uc->uc_mcontext.gregs[REG_RSP]);
-	dump_x86_64_register("rbp", uc->uc_mcontext.gregs[REG_RBP]);
-	dump_x86_64_register("r8", uc->uc_mcontext.gregs[REG_R8]);
-	dump_x86_64_register("r9", uc->uc_mcontext.gregs[REG_R9]);
-	dump_x86_64_register("r10", uc->uc_mcontext.gregs[REG_R10]);
-	dump_x86_64_register("r11", uc->uc_mcontext.gregs[REG_R11]);
-	dump_x86_64_register("r12", uc->uc_mcontext.gregs[REG_R12]);
-	dump_x86_64_register("r13", uc->uc_mcontext.gregs[REG_R13]);
-	dump_x86_64_register("r14", uc->uc_mcontext.gregs[REG_R14]);
-	dump_x86_64_register("r15", uc->uc_mcontext.gregs[REG_R15]);
-	dump_x86_64_register("rip", uc->uc_mcontext.gregs[REG_RIP]);
-	dump_x86_64_register("eflags", uc->uc_mcontext.gregs[REG_EFL]);
-	dump_x86_64_register("cs", (uc->uc_mcontext.gregs[REG_CSGSFS] >> 0) & 0xffff);
-	dump_x86_64_register("gs", (uc->uc_mcontext.gregs[REG_CSGSFS] >> 16) & 0xffff);
-	dump_x86_64_register("fs", (uc->uc_mcontext.gregs[REG_CSGSFS] >> 32) & 0xffff);
-	dump_x86_64_register("cr2", uc->uc_mcontext.gregs[REG_CR2]);
-	dump_x86_64_register("err", uc->uc_mcontext.gregs[REG_ERR]);
-	dump_x86_64_register("oldmask", uc->uc_mcontext.gregs[REG_OLDMASK]);
-	dump_x86_64_register("trapno", uc->uc_mcontext.gregs[REG_TRAPNO]);
+	dump_register("rax", cinfo->greg.ax);
+	dump_register("rbx", cinfo->greg.bx);
+	dump_register("rcx", cinfo->greg.cx);
+	dump_register("rdx", cinfo->greg.dx);
+	dump_register("rsi", cinfo->greg.si);
+	dump_register("rdi", cinfo->greg.di);
+	dump_register("rsp", cinfo->greg.sp);
+	dump_register("rbp", cinfo->greg.bp);
+	dump_register("r8", cinfo->greg.r8);
+	dump_register("r9", cinfo->greg.r9);
+	dump_register("r10", cinfo->greg.r10);
+	dump_register("r11", cinfo->greg.r11);
+	dump_register("r12", cinfo->greg.r12);
+	dump_register("r13", cinfo->greg.r13);
+	dump_register("r14", cinfo->greg.r14);
+	dump_register("r15", cinfo->greg.r15);
+	dump_register("rip", cinfo->greg.ip);
+	dump_register("eflags", cinfo->greg.flags);
+	dump_register("cs", cinfo->greg.cs);
+	dump_register("gs", cinfo->greg.gs);
+	dump_register("fs", cinfo->greg.fs);
+	dump_register("cr2", cinfo->greg.cr2);
+	dump_register("err", cinfo->greg.err);
+	dump_register("oldmask", cinfo->greg.oldmask);
+	dump_register("trapno", cinfo->greg.trapno);
 }
-
-#endif /* defined(__linux__) && defined(__amd64) */
+#endif /* TARGET_OS_LINUX */
 
 /** Try to log as much as possible before dumping a core.
  *
@@ -242,6 +241,7 @@ dump_x86_64_registers(ucontext_t *uc)
 static void
 sig_fatal_cb(int signo, siginfo_t *siginfo, void *context)
 {
+	struct errstat_crash *cinfo = &errstat_get()->crash_info;
 	static volatile sig_atomic_t in_cb = 0;
 	int fd = STDERR_FILENO;
 	struct sigaction sa;
@@ -253,6 +253,10 @@ sig_fatal_cb(int signo, siginfo_t *siginfo, void *context)
 	}
 
 	in_cb = 1;
+	/*
+	 * Notify errstat engine about the crash.
+	 */
+	errstat_collect_crash(signo, siginfo, context);
 
 	if (signo == SIGSEGV) {
 		fdprintf(fd, "Segmentation fault\n");
@@ -279,8 +283,8 @@ sig_fatal_cb(int signo, siginfo_t *siginfo, void *context)
 	fprintf(stderr, "  context: %p\n", context);
 	fprintf(stderr, "  siginfo: %p\n", siginfo);
 
-#if defined(__linux__) && defined(__amd64)
-	dump_x86_64_registers((ucontext_t *)context);
+#ifdef TARGET_OS_LINUX
+	dump_registers(cinfo);
 #endif
 
 	fdprintf(fd, "Current time: %u\n", (unsigned) time(0));
@@ -290,8 +294,14 @@ sig_fatal_cb(int signo, siginfo_t *siginfo, void *context)
 #ifdef ENABLE_BACKTRACE
 	fdprintf(fd, "Attempting backtrace... Note: since the server has "
 		 "already crashed, \nthis may fail as well\n");
-	print_backtrace();
+	fdprintf(STDERR_FILENO, "%s", cinfo->backtrace_buf);
 #endif
+	/*
+	 * If sending crash report to the feedback server is
+	 * allowed we won't be generating local core dump but
+	 * rather try to send data and exit.
+	 */
+	errstat_exec_send_crash();
 end:
 	/* Try to dump core. */
 	memset(&sa, 0, sizeof(sa));
@@ -815,6 +825,7 @@ main(int argc, char **argv)
 		title_set_script_name(argv[0]);
 	}
 
+	errstat_init(tarantool_bin);
 	export_syms();
 
 	random_init();
