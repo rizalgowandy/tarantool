@@ -79,6 +79,7 @@
 #include "sql_stmt_cache.h"
 #include "msgpack.h"
 #include "raft.h"
+#include "errstat.h"
 #include "trivia/util.h"
 
 static char status[64] = "unknown";
@@ -2665,6 +2666,7 @@ box_cfg_xc(void)
 	port_init();
 	iproto_init();
 	sql_init();
+	box_errstat_cfg();
 
 	int64_t wal_max_size = box_check_wal_max_size(cfg_geti64("wal_max_size"));
 	enum wal_mode wal_mode = box_check_wal_mode(cfg_gets("wal_mode"));
