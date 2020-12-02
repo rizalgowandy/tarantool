@@ -1,5 +1,6 @@
 set(core_sources
     diag.c
+    errstat.c
     say.c
     memory.c
     clock.c
