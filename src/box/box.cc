@@ -554,10 +554,87 @@ box_check_replication_sync_lag(void)
 	return lag;
 }
 
+/**
+ * Evaluate replication syncro quorum number from a formula.
+ */
+static int
+eval_replication_synchro_quorum(int nr_replicas)
+{
+	const char fmt[] =
+		"local expr = [[%s]]\n"
+		"local f, err = loadstring('return ('..expr..')')\n"
+		"if not f then "
+			"error(string.format('Failed to load \%\%s:"
+			"\%\%s', expr, err)) "
+		"end\n"
+		"setfenv(f, {N = %d, math = {"
+			"ceil = math.ceil,"
+			"floor = math.floor,"
+			"abs = math.abs,"
+			"random = math.random,"
+			"min = math.min,"
+			"max = math.abs,"
+			"sqrt = math.sqrt,"
+			"fmod = math.fmod,"
+		"}})\n"
+		"return math.floor(f())\n";
+	int value = -1;
+	const char *expr = cfg_gets("replication_synchro_quorum");
+	const char *buf = tt_sprintf(fmt, expr, nr_replicas);
+
+	luaL_loadstring(tarantool_L, buf);
+	if (lua_pcall(tarantool_L, 0, 1, 0) != 0) {
+		diag_set(ClientError, ER_CFG,
+			 "replication_synchro_quorum",
+			 lua_tostring(tarantool_L, -1));
+		return -1;
+	}
+
+	if (lua_isnumber(tarantool_L, -1))
+		value = (int)lua_tonumber(tarantool_L, -1);
+	lua_pop(tarantool_L, 1);
+
+	/*
+	 * At least we should have 1 node to sync, thus
+	 * if the formula has evaluated to some negative
+	 * value (say it was n-2) do not treat it as an
+	 * error but just yield a minimum valid magnitude.
+	 */
+	if (value >= VCLOCK_MAX) {
+		const int value_max = VCLOCK_MAX - 1;
+		say_warn("replication_synchro_quorum evaluated "
+			 "to value %d, set to %d",
+			 value, value_max);
+		value = value_max;
+	}
+
+	/*
+	 * We never return 0, even if we're in bootstrap
+	 * stage were number of replicas equals zero we
+	 * should consider the node itself as a minimum
+	 * quorum number.
+	 */
+	return MAX(1, value);
+}
+
 static int
 box_check_replication_synchro_quorum(void)
 {
-	int quorum = cfg_geti("replication_synchro_quorum");
+	int quorum = 0;
+
+	if (!cfg_isnumber("replication_synchro_quorum")) {
+		/*
+		 * The formula uses symbolic name 'N' as
+		 * a number of currently registered replicas.
+		 */
+		int value = replicaset.registered_count;
+		quorum = eval_replication_synchro_quorum(value);
+		if (quorum < 0)
+			return -1;
+	} else {
+		quorum = cfg_geti("replication_synchro_quorum");
+	}
+
 	if (quorum <= 0 || quorum >= VCLOCK_MAX) {
 		diag_set(ClientError, ER_CFG, "replication_synchro_quorum",
 			 "the value must be greater than zero and less than "
@@ -910,15 +987,47 @@ box_set_replication_sync_lag(void)
 	replication_sync_lag = box_check_replication_sync_lag();
 }
 
+/**
+ * Renew replication_synchro_quorum value if defined
+ * as a formula and we need to recalculate it.
+ */
+void
+box_update_replication_synchro_quorum(void)
+{
+	if (cfg_isnumber("replication_synchro_quorum")) {
+		/*
+		 * Even if replication_synchro_quorum is a constant
+		 * number the RAFT engine should be notified on
+		 * change of replicas amount.
+		 */
+		box_raft_update_election_quorum();
+		return;
+	}
+
+	/*
+	 * The formula has been verified already on the bootstrap
+	 * stage (and on dynamic reconfig as well), still there
+	 * is a Lua call inside, heck knowns what could go wrong
+	 * there thus panic if we're screwed.
+	 */
+	int value = replicaset.registered_count;
+	int quorum = eval_replication_synchro_quorum(value);
+	if (quorum < 0 || quorum >= VCLOCK_MAX)
+		panic("failed to eval replication_synchro_quorum");
+	say_info("update replication_synchro_quorum = %d", quorum);
+
+	replication_synchro_quorum = quorum;
+	txn_limbo_on_parameters_change(&txn_limbo);
+	box_raft_update_election_quorum();
+}
+
 int
 box_set_replication_synchro_quorum(void)
 {
 	int value = box_check_replication_synchro_quorum();
 	if (value < 0)
 		return -1;
-	replication_synchro_quorum = value;
-	txn_limbo_on_parameters_change(&txn_limbo);
-	box_raft_update_election_quorum();
+	box_update_replication_synchro_quorum();
 	return 0;
 }
 
