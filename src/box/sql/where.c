@@ -4529,6 +4529,7 @@ sqlWhereBegin(Parse * pParse,	/* The parser context */
 		struct SrcList_item *pTabItem = &pTabList->a[pLevel->iFrom];
 		struct space_def *space_def = pTabItem->space->def;
 		pLoop = pLevel->pWLoop;
+		assert(space_def->id != 0);
 		struct space *space = space_cache_find(space_def->id);
 		if (space_def->id == 0 || space_def->opts.is_view) {
 			/* Do nothing */

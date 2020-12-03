@@ -214,6 +214,7 @@ memtx_engine_recover_snapshot_row(struct memtx_engine *memtx,
 	struct request request;
 	if (xrow_decode_dml(row, &request, dml_request_key_map(row->type)) != 0)
 		return -1;
+	assert(request.space_id != 0);
 	struct space *space = space_cache_find(request.space_id);
 	if (space == NULL)
 		return -1;

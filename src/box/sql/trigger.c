@@ -435,6 +435,7 @@ sql_trigger_replace(const char *name, uint32_t space_id,
 {
 	assert(trigger == NULL || strcmp(name, trigger->zName) == 0);
 
+	assert(space_id != 0);
 	struct space *space = space_cache_find(space_id);
 	assert(space != NULL);
 	*old_trigger = NULL;
@@ -501,6 +502,7 @@ sql_trigger_space_id(struct sql_trigger *trigger)
 struct sql_trigger *
 space_trigger_list(uint32_t space_id)
 {
+	assert(space_id != 0);
 	struct space *space = space_cache_find(space_id);
 	assert(space != NULL);
 	assert(space->def != NULL);

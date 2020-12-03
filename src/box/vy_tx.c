@@ -557,6 +557,7 @@ vy_tx_handle_deferred_delete(struct vy_tx *tx, struct txv *v)
 	assert(pk->index_id == 0);
 	assert(flags & VY_STMT_DEFERRED_DELETE);
 
+	assert(pk->space_id != 0);
 	struct space *space = space_cache_find(pk->space_id);
 	if (space == NULL) {
 		/*

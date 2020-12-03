@@ -1209,6 +1209,7 @@ struct Expr*
 space_column_default_expr(uint32_t space_id, uint32_t fieldno)
 {
 	struct space *space;
+	assert(space_id != 0);
 	space = space_cache_find(space_id);
 	assert(space != NULL);
 	assert(space->def != NULL);

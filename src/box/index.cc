@@ -45,6 +45,7 @@ UnsupportedIndexFeature::UnsupportedIndexFeature(const char *file,
 	unsigned line, struct index_def *index_def, const char *what)
 	: ClientError(file, line, ER_UNKNOWN)
 {
+	assert(index_def->space_id != 0);
 	struct space *space = space_cache_find_xc(index_def->space_id);
 	m_errcode = ER_UNSUPPORTED_INDEX_FEATURE;
 	error_format_msg(this, tnt_errcode_desc(m_errcode), index_def->name,
@@ -152,6 +153,7 @@ char *
 box_tuple_extract_key(box_tuple_t *tuple, uint32_t space_id, uint32_t index_id,
 		      uint32_t *key_size)
 {
+	assert(space_id != 0);
 	struct space *space = space_cache_find(space_id);
 	if (space == NULL)
 		return NULL;
@@ -166,6 +168,7 @@ static inline int
 check_index(uint32_t space_id, uint32_t index_id,
 	    struct space **space, struct index **index)
 {
+	assert(space_id != 0);
 	*space = space_cache_find(space_id);
 	if (*space == NULL)
 		return -1;

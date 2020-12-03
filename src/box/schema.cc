@@ -143,6 +143,7 @@ space_foreach(int (*func)(struct space *sp, void *udata), void *udata)
 			uint32_t id;
 			if (tuple_field_u32(tuple, BOX_SPACE_FIELD_ID, &id) != 0)
 				continue;
+			assert(id != 0);
 			space = space_cache_find(id);
 			if (space == NULL)
 				continue;
@@ -314,6 +315,7 @@ schema_find_id(uint32_t system_space_id, uint32_t index_id,
 		*object_id = BOX_ID_NIL;
 		return 0;
 	}
+	assert(system_space_id != 0);
 	struct space *space = space_cache_find(system_space_id);
 	if (space == NULL)
 		return -1;
@@ -601,6 +603,7 @@ func_by_name(const char *name, uint32_t name_len)
 int
 schema_find_grants(const char *type, uint32_t id, bool *out)
 {
+	assert(BOX_PRIV_ID != 0);
 	struct space *priv = space_cache_find(BOX_PRIV_ID);
 	if (priv == NULL)
 		return -1;

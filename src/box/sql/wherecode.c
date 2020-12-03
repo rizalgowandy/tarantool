@@ -135,6 +135,7 @@ explainIndexRange(StrAccum * pStr, WhereLoop * pLoop)
 		if (def != NULL) {
 			z = explainIndexColumnName(def, i);
 		} else {
+			assert(def->space_id != 0);
 			struct space *space = space_cache_find(def->space_id);
 			assert(space != NULL);
 			uint32_t fieldno = def->key_def->parts[i].fieldno;

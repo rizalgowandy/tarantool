@@ -122,6 +122,7 @@ lbox_space_on_replace(struct lua_State *L)
 	}
 	lua_getfield(L, 1, "id"); /* Get space id. */
 	uint32_t id = lua_tonumber(L, lua_gettop(L));
+	assert(id != 0);
 	struct space *space = space_cache_find_xc(id);
 	lua_pop(L, 1);
 
@@ -143,6 +144,7 @@ lbox_space_before_replace(struct lua_State *L)
 	}
 	lua_getfield(L, 1, "id"); /* Get space id. */
 	uint32_t id = lua_tonumber(L, lua_gettop(L));
+	assert(id != 0);
 	struct space *space = space_cache_find_xc(id);
 	lua_pop(L, 1);
 

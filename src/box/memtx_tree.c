@@ -572,6 +572,7 @@ memtx_tree_index_replace(struct index *base, struct tuple *old_tuple,
 			memtx_tree_delete(&index->tree, new_data);
 			if (dup_data.tuple != NULL)
 				memtx_tree_insert(&index->tree, dup_data, NULL);
+			assert(base->def->space_id != 0);
 			struct space *sp = space_cache_find(base->def->space_id);
 			if (sp != NULL)
 				diag_set(ClientError, errcode, base->def->name,
@@ -629,6 +630,7 @@ memtx_tree_index_replace_multikey_one(struct memtx_tree_index *index,
 		memtx_tree_delete(&index->tree, new_data);
 		if (dup_data.tuple != NULL)
 			memtx_tree_insert(&index->tree, dup_data, NULL);
+		assert(index->base.def->space_id != 0);
 		struct space *sp = space_cache_find(index->base.def->space_id);
 		if (sp != NULL) {
 			diag_set(ClientError, errcode, index->base.def->name,

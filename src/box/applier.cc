@@ -208,6 +208,7 @@ apply_snapshot_row(struct xrow_header *row)
 	struct request request;
 	if (xrow_decode_dml(row, &request, dml_request_key_map(row->type)) != 0)
 		return -1;
+	assert(request.space_id != 0);
 	struct space *space = space_cache_find(request.space_id);
 	if (space == NULL)
 		return -1;
@@ -257,6 +258,7 @@ apply_row(struct xrow_header *row)
 		return -1;
 	if (request.type == IPROTO_NOP)
 		return process_nop(&request);
+	assert(request.space_id != 0);
 	struct space *space = space_cache_find(request.space_id);
 	if (space == NULL)
 		return -1;

@@ -115,6 +115,7 @@ sysview_index_create_iterator(struct index *base, enum iterator_type type,
 	struct sysview_index *index = (struct sysview_index *)base;
 	struct sysview_engine *sysview = (struct sysview_engine *)base->engine;
 
+	assert(index->source_space_id != 0);
 	struct space *source = space_cache_find(index->source_space_id);
 	if (source == NULL)
 		return NULL;
@@ -154,6 +155,7 @@ sysview_index_get(struct index *base, const char *key,
 		  uint32_t part_count, struct tuple **result)
 {
 	struct sysview_index *index = (struct sysview_index *)base;
+	assert(index->source_space_id != 0);
 	struct space *source = space_cache_find(index->source_space_id);
 	if (source == NULL)
 		return -1;
@@ -287,6 +289,7 @@ vspace_filter(struct space *source, struct tuple *tuple)
 	uint32_t space_id;
 	if (tuple_field_u32(tuple, BOX_SPACE_FIELD_ID, &space_id) != 0)
 		return false;
+	assert(space_id != 0);
 	struct space *space = space_cache_find(space_id);
 	if (space == NULL)
 		return false;

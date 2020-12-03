@@ -342,6 +342,7 @@ apply_wal_row(struct xstream *stream, struct xrow_header *row)
 	struct request request;
 	xrow_decode_dml_xc(row, &request, dml_request_key_map(row->type));
 	if (request.type != IPROTO_NOP) {
+		assert(request.space_id != 0);
 		struct space *space = space_cache_find_xc(request.space_id);
 		if (box_process_rw(&request, space, NULL) != 0) {
 			say_error("error applying row: %s", request_str(&request));
@@ -1063,6 +1064,7 @@ boxk(int type, uint32_t space_id, const char *format, ...)
 	default:
 		unreachable();
 	}
+	assert(space_id != 0);
 	struct space *space = space_cache_find(space_id);
 	if (space == NULL)
 		return -1;
@@ -1133,6 +1135,7 @@ int
 box_process1(struct request *request, box_tuple_t **result)
 {
 	/* Allow to write to temporary spaces in read-only mode. */
+	assert(request->space_id != 0);
 	struct space *space = space_cache_find(request->space_id);
 	if (space == NULL)
 		return -1;
@@ -1160,6 +1163,7 @@ box_select(uint32_t space_id, uint32_t index_id,
 		return -1;
 	}
 
+	assert(space_id != 0);
 	struct space *space = space_cache_find(space_id);
 	if (space == NULL)
 		return -1;
@@ -1338,6 +1342,7 @@ API_EXPORT int
 box_truncate(uint32_t space_id)
 {
 	try {
+		assert(space_id != 0);
 		struct space *space = space_cache_find_xc(space_id);
 		space_truncate(space);
 		return 0;
@@ -1495,6 +1500,7 @@ box_on_join(const tt_uuid *instance_uuid)
 	box_check_writable_xc();
 
 	/** Find the largest existing replica id. */
+	assert(BOX_CLUSTER_ID != 0);
 	struct space *space = space_cache_find_xc(BOX_CLUSTER_ID);
 	struct index *index = index_find_system_xc(space, 0);
 	struct iterator *it = index_create_iterator_xc(index, ITER_ALL,
@@ -1592,6 +1598,7 @@ box_process_register(struct ev_io *io, struct xrow_header *header)
 	}
 	/* See box_process_join() */
 	box_check_writable_xc();
+	assert(BOX_CLUSTER_ID != 0);
 	struct space *space = space_cache_find_xc(BOX_CLUSTER_ID);
 	access_check_space_xc(space, PRIV_W);
 
@@ -1729,6 +1736,7 @@ box_process_join(struct ev_io *io, struct xrow_header *header)
 	struct replica *replica = replica_by_uuid(&instance_uuid);
 	if (replica == NULL || replica->id == REPLICA_ID_NIL) {
 		box_check_writable_xc();
+		assert(BOX_CLUSTER_ID != 0);
 		struct space *space = space_cache_find_xc(BOX_CLUSTER_ID);
 		access_check_space_xc(space, PRIV_W);
 	}

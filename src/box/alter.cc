@@ -2561,6 +2561,7 @@ on_replace_dd_index(struct trigger * /* trigger */, void *event)
 	if (tuple_field_u32(old_tuple ? old_tuple : new_tuple,
 			    BOX_INDEX_FIELD_ID, &iid) != 0)
 		return -1;
+	assert(id != 0);
 	struct space *old_space = space_cache_find(id);
 	if (old_space == NULL)
 		return -1;
@@ -2842,6 +2843,7 @@ on_replace_dd_truncate(struct trigger * /* trigger */, void *event)
 	uint32_t space_id;
 	if (tuple_field_u32(new_tuple, BOX_TRUNCATE_FIELD_SPACE_ID, &space_id) != 0)
 		return -1;
+	assert(space_id != 0);
 	struct space *old_space = space_cache_find(space_id);
 	if (old_space == NULL)
 		return -1;
@@ -3893,6 +3895,7 @@ priv_def_check(struct priv_def *priv, enum priv_type priv_type)
 		break;
 	case SC_SPACE:
 	{
+		assert(priv->object_id != 0);
 		struct space *space = space_cache_find(priv->object_id);
 		if (space == NULL)
 			return -1;
@@ -4702,6 +4705,7 @@ on_replace_dd_space_sequence(struct trigger * /* trigger */, void *event)
 	if (tuple_field_bool(tuple, BOX_SPACE_SEQUENCE_FIELD_IS_GENERATED,
 			     &is_generated) != 0)
 		return -1;
+	assert(space_id != 0);
 	struct space *space = space_cache_find(space_id);
 	if (space == NULL)
 		return -1;
@@ -5304,6 +5308,7 @@ on_replace_dd_fk_constraint(struct trigger * /* trigger*/, void *event)
 		if (fk_def == NULL)
 			return -1;
 		auto fk_def_guard = make_scoped_guard([=] { free(fk_def); });
+		assert(fk_def->child_id != 0);
 		struct space *child_space = space_cache_find(fk_def->child_id);
 		if (child_space == NULL)
 			return -1;
@@ -5313,6 +5318,7 @@ on_replace_dd_fk_constraint(struct trigger * /* trigger*/, void *event)
 				  "referencing space can't be VIEW");
 			return -1;
 		}
+		assert(fk_def->parent_id != 0);
 		struct space *parent_space = space_cache_find(fk_def->parent_id);
 		if (parent_space == NULL)
 			return -1;
@@ -5464,9 +5470,11 @@ on_replace_dd_fk_constraint(struct trigger * /* trigger*/, void *event)
 		if (fk_def == NULL)
 			return -1;
 		auto fk_def_guard = make_scoped_guard([=] { free(fk_def); });
+		assert(fk_def->child_id != 0);
 		struct space *child_space = space_cache_find(fk_def->child_id);
 		if (child_space == NULL)
 			return -1;
+		assert(fk_def->parent_id != 0);
 		struct space *parent_space = space_cache_find(fk_def->parent_id);
 		if (parent_space == NULL)
 			return -1;
@@ -5630,6 +5638,7 @@ on_replace_dd_ck_constraint(struct trigger * /* trigger*/, void *event)
 	if (tuple_field_u32(old_tuple != NULL ? old_tuple : new_tuple,
 			    BOX_CK_CONSTRAINT_FIELD_SPACE_ID, &space_id) != 0)
 		return -1;
+	assert(space_id != 0);
 	struct space *space = space_cache_find(space_id);
 	if (space == NULL)
 		return -1;
@@ -5776,6 +5785,7 @@ on_replace_dd_func_index(struct trigger *trigger, void *event)
 		if (tuple_field_u32(new_tuple, BOX_FUNC_INDEX_FUNCTION_ID,
 	       			    &fid) != 0)
 			return -1;
+		assert(space_id != 0);
 		space = space_cache_find(space_id);
 		if (space == NULL)
 			return -1;
@@ -5804,6 +5814,7 @@ on_replace_dd_func_index(struct trigger *trigger, void *event)
 		if (tuple_field_u32(old_tuple, BOX_FUNC_INDEX_FIELD_INDEX_ID,
 				    &index_id) != 0)
 			return -1;
+		assert(space_id != 0);
 		space = space_cache_find(space_id);
 		if (space == NULL)
 			return -1;

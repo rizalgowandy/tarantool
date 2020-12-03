@@ -4370,6 +4370,7 @@ vy_deferred_delete_on_replace(struct trigger *trigger, void *event)
 	mp_next(&delete_data_end);
 
 	/* Look up the space. */
+	assert(space_id != 0);
 	struct space *space = space_cache_find(space_id);
 	if (space == NULL)
 		return -1;

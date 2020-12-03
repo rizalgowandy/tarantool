@@ -333,6 +333,7 @@ user_reload_privs(struct user *user)
 	privset_new(&user->privs);
 	/* Load granted privs from _priv space. */
 	{
+		assert(BOX_PRIV_ID != 0);
 		struct space *space = space_cache_find(BOX_PRIV_ID);
 		if (space == NULL)
 			return -1;
