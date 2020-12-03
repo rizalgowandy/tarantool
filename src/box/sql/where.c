@@ -4529,12 +4529,12 @@ sqlWhereBegin(Parse * pParse,	/* The parser context */
 		struct SrcList_item *pTabItem = &pTabList->a[pLevel->iFrom];
 		struct space_def *space_def = pTabItem->space->def;
 		pLoop = pLevel->pWLoop;
-		assert(space_def->id != 0);
-		struct space *space = space_cache_find(space_def->id);
+		struct space *space = NULL;
 		if (space_def->id == 0 || space_def->opts.is_view) {
 			/* Do nothing */
 		} else if ((pLoop->wsFlags & WHERE_IDX_ONLY) == 0 &&
 			   (wctrlFlags & WHERE_OR_SUBCLAUSE) == 0) {
+			space = space_cache_find(space_def->id);
 			if (pWInfo->eOnePass != ONEPASS_OFF)
 				pWInfo->aiCurOnePass[0] = pTabItem->iCursor;
 			assert(space->index_count > 0);
