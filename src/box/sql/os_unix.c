@@ -29,6 +29,7 @@
  * SUCH DAMAGE.
  */
 
+#include "core/random.h"
 #include "sqlInt.h"
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -1474,7 +1475,7 @@ unixGetTempname(int nBuf, char *zBuf)
 		return -1;
 	do {
 		u64 r;
-		sql_randomness(sizeof(r), &r);
+		random_bytes((char *)&r, sizeof(r));
 		assert(nBuf > 2);
 		zBuf[nBuf - 2] = 0;
 		sql_snprintf(nBuf, zBuf,
