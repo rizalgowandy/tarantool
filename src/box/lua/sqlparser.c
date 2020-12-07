@@ -53,30 +53,32 @@ sql_stmt_parse(const char *zSql, sql_stmt **ppStmt, struct sql_parsed_ast *ast)
 	// we have either AST or VDBE, but not both
 	assert(SQL_PARSE_VALID_VDBE(&sParse) != SQL_PARSE_VALID_AST(&sParse));
 	if (SQL_PARSE_VALID_VDBE(&sParse)) {
+		if (db->init.busy == 0) {
+			Vdbe *pVdbe = sParse.pVdbe;
+			sqlVdbeSetSql(pVdbe, zSql, (int)(sParse.zTail - zSql));
+		}
 		if (rc != 0 || db->mallocFailed) {
 			sqlVdbeFinalize(sParse.pVdbe);
 			assert(!(*ppStmt));
-			goto exit_cleanup;
-		}
-		sqlVdbeSetSql(sParse.pVdbe, zSql, (int)(sParse.zTail - zSql));
-		*ppStmt = (sql_stmt *) sParse.pVdbe;
+			//goto exit_cleanup;
+		} else {
+			*ppStmt = (sql_stmt *) sParse.pVdbe;
 
+		}
+		/* Delete any TriggerPrg structures allocated while parsing this statement. */
+		while (sParse.pTriggerPrg) {
+			TriggerPrg *pT = sParse.pTriggerPrg;
+			sParse.pTriggerPrg = pT->pNext;
+			sqlDbFree(db, pT);
+		}
 	} else {	// AST constructed
+		assert(SQL_PARSE_VALID_AST(&sParse));
 		*ast = sParse.parsed_ast;
 		assert(ast->keep_ast == true);
 		sql_ast_set_sql(ast, zSql, (int)(sParse.zTail - zSql));
 	}
 
-#if 0 // FIXME
-	/* Delete any TriggerPrg structures allocated while parsing this statement. */
-	while (sParse.pTriggerPrg) {
-		TriggerPrg *pT = sParse.pTriggerPrg;
-		sParse.pTriggerPrg = pT->pNext;
-		sqlDbFree(db, pT);
-	}
-#endif
-
-exit_cleanup:
+//exit_cleanup:
 	sql_parser_destroy(&sParse);
 	return rc;
 }
