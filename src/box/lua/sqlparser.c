@@ -50,17 +50,22 @@ sql_stmt_parse(const char *zSql, sql_stmt **ppStmt, struct sql_parsed_ast *ast)
 	if (sParse.is_aborted)
 		rc = -1;
 
-	assert(sParse.pVdbe == NULL); // FIXME
-	if (sParse.pVdbe != NULL && (rc != 0 || db->mallocFailed)) {
-		sqlVdbeFinalize(sParse.pVdbe);
-		assert(!(*ppStmt));
-	} else {
+	// we have either AST or VDBE, but not both
+	assert(SQL_PARSE_VALID_VDBE(&sParse) != SQL_PARSE_VALID_AST(&sParse));
+	if (SQL_PARSE_VALID_VDBE(&sParse)) {
+		if (rc != 0 || db->mallocFailed) {
+			sqlVdbeFinalize(sParse.pVdbe);
+			assert(!(*ppStmt));
+			goto exit_cleanup;
+		}
+		sqlVdbeSetSql(sParse.pVdbe, zSql, (int)(sParse.zTail - zSql));
 		*ppStmt = (sql_stmt *) sParse.pVdbe;
+
+	} else {	// AST constructed
+		*ast = sParse.parsed_ast;
+		assert(ast->keep_ast == true);
+		sql_ast_set_sql(ast, zSql, (int)(sParse.zTail - zSql));
 	}
-	*ast = sParse.parsed_ast;
-	assert(ast->keep_ast == true);
-	//if (db->init.busy == 0)
-	sql_ast_set_sql(ast, zSql, (int)(sParse.zTail - zSql));
 
 #if 0 // FIXME
 	/* Delete any TriggerPrg structures allocated while parsing this statement. */
@@ -71,7 +76,8 @@ sql_stmt_parse(const char *zSql, sql_stmt **ppStmt, struct sql_parsed_ast *ast)
 	}
 #endif
 
-	sql_parser_destroy(&sParse); // FIXME
+exit_cleanup:
+	sql_parser_destroy(&sParse);
 	return rc;
 }
 
@@ -153,8 +159,10 @@ sql_ast_generate_vdbe(struct lua_State *L, struct stmt_cache_entry *entry)
 {
 	(void)L;
 	struct sql_parsed_ast * ast = entry->ast;
-	if (entry->ast == NULL)	// there is no AST generation yet
-		return NULL;
+	// nothing to generate yet - this kind of statement is 
+	// not (yet) supported. Eventually will be removed.
+	if (!AST_VALID(entry->ast))
+		return entry->stmt;
 
 	// assumption is that we have not yet completed
 	// bytecode generation for parsed AST
