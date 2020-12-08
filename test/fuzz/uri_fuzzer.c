@@ -8,12 +8,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
         char *buf = calloc(size, sizeof(char*));
         if (!buf)
-                return -1;
+                return 0;
         strncpy(buf, (char*)data, size);
         buf[size] = '\0';
         struct uri uri;
-        int rc = uri_parse(&uri, buf);
+        uri_parse(&uri, buf);
         free(buf);
 
-        return rc;
+        return 0;
 }

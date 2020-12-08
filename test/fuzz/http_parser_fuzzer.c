@@ -9,10 +9,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         http_parser_create(&parser);
         parser.hdr_name = (char *)calloc((int)size, sizeof(char));
         if (parser.hdr_name == NULL)
-                return -1;
+                return 0;
         char *end_buf = buf + size;
-        int rc = http_parse_header_line(&parser, &buf, end_buf, size);
+        http_parse_header_line(&parser, &buf, end_buf, size);
         free(parser.hdr_name);
 
-        return rc;
+        return 0;
 }
