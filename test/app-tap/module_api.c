@@ -1075,13 +1075,15 @@ test_key_def_merge(struct lua_State *L)
 
 	/* Non-conventional prerequisite: list of known flags. */
 	uint32_t known_flags = key_part_def_known_flags();
-	assert(known_flags == (BOX_KEY_PART_DEF_IS_NULLABLE | BOX_KEY_PART_DEF_EXCLUDE_NULL));
+	assert(known_flags == (BOX_KEY_PART_DEF_IS_NULLABLE |
+				BOX_KEY_PART_DEF_EXCLUDE_NULL));
 	(void)known_flags;
 
 	/* Non-conventional prerequisite: certain defaults. */
 	box_key_part_def_t tmp;
 	box_key_part_def_create(&tmp);
 	assert((tmp.flags & BOX_KEY_PART_DEF_IS_NULLABLE) == 0);
+	assert((tmp.flags & BOX_KEY_PART_DEF_EXCLUDE_NULL) == 0);
 	assert(tmp.collation == NULL);
 	assert(tmp.path == NULL);
 

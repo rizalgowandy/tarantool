@@ -549,26 +549,22 @@ index_build(struct index *index, struct index *pk)
 	return 0;
 }
 
-bool index_tuple_is_excluded(struct index *index, struct tuple **old_tuple, struct tuple **new_tuple)
+struct tuple * get_tuple_for_index_slow(struct index *index,
+										struct tuple *tuple)
 {
-	if (*new_tuple == nullptr)
-		return false;
+	if (tuple == nullptr)
+		return tuple;
 	struct key_def* key_def = index->def->key_def;
 	struct key_part* parts = key_def->parts;
 	for (uint32_t i = 0; i < key_def->part_count; ++i) {
 		if (!parts[i].exclude_null)
 			continue;
-		const char* field = tuple_field(*new_tuple, parts[i].fieldno);
+		const char* field = tuple_field(tuple, parts[i].fieldno);
 		if (mp_typeof(*field) == MP_NIL) {
-			if (old_tuple && *old_tuple != nullptr) {
-				*new_tuple = nullptr;
-				return false;
-			} else {
-				return true;
-			}
+			return nullptr;
 		}
 	}
-	return false;
+	return tuple;
 }
 
 /* }}} */

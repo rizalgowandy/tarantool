@@ -198,6 +198,8 @@ struct key_def {
 	uint32_t unique_part_count;
 	/** True, if at least one part can store NULL. */
 	bool is_nullable;
+	/** True if some key part has exclude_null option */
+	bool has_exclude_null;
 	/** True if some key part has JSON path. */
 	bool has_json_paths;
 	/** True if it is a multikey index definition.

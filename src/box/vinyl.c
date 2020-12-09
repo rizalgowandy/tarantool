@@ -1840,14 +1840,14 @@ vy_perform_update(struct vy_env *env, struct vy_tx *tx, struct txn_stmt *stmt,
 		return -1;
 
 	for (uint32_t i = 1; i < space->index_count; ++i) {
-		if (index_tuple_is_excluded(space->index[i], &stmt->old_tuple, &stmt->new_tuple))
-			continue;
+		struct tuple *new_tuple = get_tuple_for_index(space->index[i],
+				stmt->new_tuple);
 		struct vy_lsm *lsm = vy_lsm(space->index[i]);
 		if (vy_is_committed(env, lsm))
 			continue;
 		if (vy_tx_set(tx, lsm, delete) != 0)
 			goto error;
-		if (stmt->new_tuple && vy_tx_set(tx, lsm, stmt->new_tuple) != 0)
+		if (new_tuple != NULL && vy_tx_set(tx, lsm, new_tuple) != 0)
 			goto error;
 	}
 	tuple_unref(delete);
@@ -1950,10 +1950,9 @@ vy_insert_first_upsert(struct vy_env *env, struct vy_tx *tx,
 	if (vy_tx_set(tx, pk, stmt) != 0)
 		return -1;
 	for (uint32_t i = 1; i < space->index_count; ++i) {
-		if (index_tuple_is_excluded(space->index[i], NULL, &stmt))
-			continue;
+		struct tuple *new_tuple = get_tuple_for_index(space->index[i], stmt);
 		struct vy_lsm *lsm = vy_lsm(space->index[i]);
-		if (vy_tx_set(tx, lsm, stmt) != 0)
+		if (vy_tx_set(tx, lsm, new_tuple) != 0)
 			return -1;
 	}
 	return 0;
@@ -2223,12 +2222,12 @@ vy_insert(struct vy_env *env, struct vy_tx *tx, struct txn_stmt *stmt,
 		return -1;
 
 	for (uint32_t iid = 1; iid < space->index_count; ++iid) {
-		if (index_tuple_is_excluded(space->index[iid], &stmt->old_tuple, &stmt->new_tuple))
-			continue;
+		struct tuple *new_tuple = get_tuple_for_index(space->index[iid],
+				stmt->new_tuple);
 		struct vy_lsm *lsm = vy_lsm(space->index[iid]);
 		if (vy_is_committed(env, lsm))
 			continue;
-		if (stmt->new_tuple && vy_tx_set(tx, lsm, stmt->new_tuple) != 0)
+		if (new_tuple != NULL && vy_tx_set(tx, lsm, new_tuple) != 0)
 			return -1;
 	}
 	return 0;
@@ -2309,8 +2308,8 @@ vy_replace(struct vy_env *env, struct vy_tx *tx, struct txn_stmt *stmt,
 			return -1;
 	}
 	for (uint32_t i = 1; i < space->index_count; i++) {
-		if (index_tuple_is_excluded(space->index[i], &stmt->old_tuple, &stmt->new_tuple))
-			continue;
+		struct tuple *new_tuple = get_tuple_for_index(space->index[i],
+				stmt->new_tuple);
 		struct vy_lsm *lsm = vy_lsm(space->index[i]);
 		if (vy_is_committed(env, lsm))
 			continue;
@@ -2319,8 +2318,8 @@ vy_replace(struct vy_env *env, struct vy_tx *tx, struct txn_stmt *stmt,
 			if (rc != 0)
 				break;
 		}
-		if (stmt->new_tuple != NULL) {
-			rc = vy_tx_set(tx, lsm, stmt->new_tuple);
+		if (new_tuple != NULL) {
+			rc = vy_tx_set(tx, lsm, new_tuple);
 			if (rc != 0)
 				break;
 		}
@@ -4245,7 +4244,8 @@ vinyl_space_build_index(struct space *src_space, struct index *new_index,
 		struct tuple *tuple = entry.stmt;
 		if (tuple == NULL)
 			break;
-		if (index_tuple_is_excluded(new_index, NULL, &tuple))
+		struct tuple* new_tuple = get_tuple_for_index(new_index, tuple);
+		if (new_tuple == NULL)
 			continue;
 		/*
 		 * Insert the tuple into the new index unless it
@@ -4260,13 +4260,13 @@ vinyl_space_build_index(struct space *src_space, struct index *new_index,
 		 * could be overwritten by a concurrent transaction,
 		 * in which case we would insert an outdated tuple.
 		 */
-		if (vy_stmt_lsn(tuple) <= build_lsn) {
+		if (vy_stmt_lsn(new_tuple) <= build_lsn) {
 			rc = vy_build_insert_tuple(env, new_lsm,
 						   space_name(src_space),
 						   new_index->def->name,
 						   new_format,
 						   check_unique_constraint,
-						   tuple);
+						   new_tuple);
 			if (rc != 0)
 				break;
 		}

@@ -1999,7 +1999,7 @@ s:insert{2, box.NULL} -- error
 ---
 - error: 'Tuple field 2 type does not match one required by operation: expected number'
 ...
--- exclude_null=true is useless without is_nullable=true
+-- if exclude_null=true, then is_nullable=true (explicitly or implicitly)
 s:drop()
 ---
 ...
@@ -2009,9 +2009,13 @@ s = box.schema.space.create('test', {engine=engine})
 pk = s:create_index('primary', {parts={1, 'number'}})
 ---
 ...
+sk1 = s:create_index('sk1', {parts={{2, 'number', is_nullable=false, exclude_null=true}}})
+---
+- error: 'Illegal parameters, options.parts[1]: exclude_null=true and is_nullable=false
+    are contradictory'
+...
 sk1 = s:create_index('sk1', {parts={{2, 'number', exclude_null=true}}})
 ---
-- error: 'Illegal parameters, options.parts[1]: exclude_null=true must be with is_nullable=true'
 ...
 -- Multipart
 s:drop()
@@ -2026,7 +2030,7 @@ pk = s:create_index('primary', {parts={1, 'number'}})
 parts = {}
 ---
 ...
-parts[1] = {2, 'number', is_nullable=true, exclude_null=true}
+parts[1] = {2, 'number', exclude_null=true}
 ---
 ...
 parts[2] = {3, 'number', is_nullable=true}
@@ -2084,7 +2088,7 @@ s:insert{4, box.NULL}
 ---
 - [4, null]
 ...
-sk1 = s:create_index('sk1', {parts={{2, 'number', is_nullable=true, exclude_null=true}}})
+sk1 = s:create_index('sk1', {parts={{2, 'number', exclude_null=true}}})
 ---
 ...
 sk1.parts
@@ -2125,7 +2129,7 @@ sk1:select{}
   - [2, 22]
 ...
 -- Alter back to exclude_null=true
-sk1:alter({parts={{2, 'number', is_nullable=true, exclude_null=true}}})
+sk1:alter({parts={{2, 'number', exclude_null=true}}})
 ---
 ...
 sk1.parts
@@ -2143,7 +2147,8 @@ sk1:select{}
 -- Alter to the wrong format
 sk1:alter({parts={{2, 'number', is_nullable=false, exclude_null=true}}})
 ---
-- error: 'Illegal parameters, options.parts[1]: exclude_null=true must be with is_nullable=true'
+- error: 'Illegal parameters, options.parts[1]: exclude_null=true and is_nullable=false
+    are contradictory'
 ...
 sk1.parts
 ---
@@ -2200,6 +2205,26 @@ s:select{}
 - - [1, null]
   - [2, null]
   - [3, 33]
+  - [4, null]
+  - [5, 55]
+...
+-- Replace correctness
+_ = s:replace({1, 11})
+---
+...
+_ = s:replace({3, box.NULL})
+---
+...
+sk1:select{}
+---
+- - [1, 11]
+  - [5, 55]
+...
+s:select{}
+---
+- - [1, 11]
+  - [2, null]
+  - [3, null]
   - [4, null]
   - [5, 55]
 ...

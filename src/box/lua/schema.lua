@@ -794,9 +794,12 @@ local function update_index_parts(format, parts)
                       "options.parts[" .. i .. "]: type (boolean) is expected")
         end
         if (not part.is_nullable) and part.exclude_null then
-            box.error(box.error.ILLEGAL_PARAMS,
-                    "options.parts[" .. i .. "]: exclude_null=true must be " ..
-                    "with is_nullable=true")
+            if part.is_nullable ~= nil then
+                box.error(box.error.ILLEGAL_PARAMS,
+                       "options.parts[" .. i .. "]: exclude_null=true and " ..
+                       "is_nullable=false are contradictory")
+            end
+            part.is_nullable = true
         end
         if part.action == nil then
             if fmt and fmt.action ~= nil then

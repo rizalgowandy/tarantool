@@ -60,14 +60,14 @@ part_type_by_name_wrapper(const char *str, uint32_t len)
 	return field_type_by_name(str, len);
 }
 
-#define PART_OPT_TYPE				"type"
-#define PART_OPT_FIELD				"field"
-#define PART_OPT_COLLATION			"collation"
-#define PART_OPT_NULLABILITY		"is_nullable"
-#define PART_OPT_NULLABLE_ACTION	"nullable_action"
-#define PART_OPT_SORT_ORDER	 		"sort_order"
-#define PART_OPT_PATH		 		"path"
-#define PART_OPT_EXCLUDE_NULL		"exclude_null"
+#define PART_OPT_TYPE		 "type"
+#define PART_OPT_FIELD		 "field"
+#define PART_OPT_COLLATION	 "collation"
+#define PART_OPT_NULLABILITY	 "is_nullable"
+#define PART_OPT_NULLABLE_ACTION "nullable_action"
+#define PART_OPT_SORT_ORDER	 "sort_order"
+#define PART_OPT_PATH		 "path"
+#define PART_OPT_EXCLUDE_NULL	 "exclude_null"
 
 const struct opt_def part_def_reg[] = {
 	OPT_DEF_ENUM(PART_OPT_TYPE, field_type, struct key_part_def, type,
@@ -244,9 +244,10 @@ key_def_set_part(struct key_def *def, uint32_t part_no, uint32_t fieldno,
 	assert(part_no < def->part_count);
 	assert(type < field_type_MAX);
 	def->is_nullable |= (nullable_action == ON_CONFLICT_ACTION_NONE);
+	def->has_exclude_null |= exclude_null;
 	def->has_json_paths |= path != NULL;
 	def->parts[part_no].nullable_action = nullable_action;
-	def->parts[part_no].exclude_null |= exclude_null;
+	def->parts[part_no].exclude_null = exclude_null;
 	def->parts[part_no].fieldno = fieldno;
 	def->parts[part_no].type = type;
 	def->parts[part_no].coll = coll;
@@ -291,10 +292,11 @@ key_def_new(const struct key_part_def *parts, uint32_t part_count,
 		}
 		uint32_t path_len = part->path != NULL ? strlen(part->path) : 0;
 		if (key_def_set_part(def, i, part->fieldno, part->type,
-					part->nullable_action, part->exclude_null, coll,
-					part->coll_id, part->sort_order, part->path, path_len,
-					&path_pool, TUPLE_OFFSET_SLOT_NIL,
-					0) != 0)
+				     part->nullable_action, part->exclude_null,
+				     coll, part->coll_id,
+				     part->sort_order, part->path, path_len,
+				     &path_pool, TUPLE_OFFSET_SLOT_NIL,
+				     0) != 0)
 			goto error;
 	}
 	if (for_func_index) {
@@ -1096,6 +1098,8 @@ key_def_merge(const struct key_def *first, const struct key_def *second)
 	new_def->part_count = new_part_count;
 	new_def->unique_part_count = new_part_count;
 	new_def->is_nullable = first->is_nullable || second->is_nullable;
+	new_def->has_exclude_null = first->has_exclude_null ||
+				      second->has_exclude_null;
 	new_def->has_optional_parts = first->has_optional_parts ||
 				      second->has_optional_parts;
 	new_def->is_multikey = first->is_multikey || second->is_multikey;
