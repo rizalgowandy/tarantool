@@ -579,8 +579,8 @@ relay_send_heartbeat(struct relay *relay)
 	}
 }
 
-/** A message to set Raft enabled flag in TX thread from a relay thread. */
-struct relay_is_raft_enabled_msg {
+/** A message to notify the TX thread that relay is operational. */
+struct relay_is_running_msg {
 	/** Base cbus message. */
 	struct cmsg base;
 	/**
@@ -590,44 +590,45 @@ struct relay_is_raft_enabled_msg {
 	struct cmsg_hop route[2];
 	/** Relay pointer to set the flag in. */
 	struct relay *relay;
-	/** New flag value. */
-	bool value;
+	/** Relay running status. */
+	bool is_running;
 	/** Flag to wait for the flag being set, in a relay thread. */
 	bool is_finished;
 };
 
-/** TX thread part of the Raft flag setting, first hop. */
+/** TX thread part of the relay is running notification, first hop. */
 static void
-tx_set_is_raft_enabled(struct cmsg *base)
+tx_notify_is_relay_running(struct cmsg *base)
 {
-	struct relay_is_raft_enabled_msg *msg =
-		(struct relay_is_raft_enabled_msg *)base;
-	msg->relay->tx.is_raft_enabled = msg->value;
+	struct relay_is_running_msg *msg = (struct relay_is_running_msg *)base;
+	/* Never subscribe anonymous replicas to raft updates. */
+	if (!msg->relay->replica->anon)
+		msg->relay->tx.is_raft_enabled = msg->is_running;
 }
 
-/** Relay thread part of the Raft flag setting, second hop. */
+/** Relay thread part of the relay is running notification, second hop. */
 static void
-relay_set_is_raft_enabled(struct cmsg *base)
+relay_notify_is_relay_running(struct cmsg *base)
 {
-	struct relay_is_raft_enabled_msg *msg =
-		(struct relay_is_raft_enabled_msg *)base;
+	struct relay_is_running_msg *msg = (struct relay_is_running_msg *)base;
 	msg->is_finished = true;
 }
 
 /**
- * Set relay Raft enabled flag from a relay thread to be accessed by the TX
+ * Notify the TX thread that the relay is operational.
+ * For now this will only set relay Raft enabled flag to be accessed by the TX
  * thread.
  */
 static void
-relay_send_is_raft_enabled(struct relay *relay,
-			   struct relay_is_raft_enabled_msg *msg, bool value)
+relay_send_is_running(struct relay *relay, struct relay_is_running_msg *msg,
+		      bool is_running)
 {
-	msg->route[0].f = tx_set_is_raft_enabled;
+	msg->route[0].f = tx_notify_is_relay_running;
 	msg->route[0].pipe = &relay->relay_pipe;
-	msg->route[1].f = relay_set_is_raft_enabled;
+	msg->route[1].f = relay_notify_is_relay_running;
 	msg->route[1].pipe = NULL;
 	msg->relay = relay;
-	msg->value = value;
+	msg->is_running = is_running;
 	msg->is_finished = false;
 	cmsg_init(&msg->base, msg->route);
 	cpipe_push(&relay->tx_pipe, &msg->base);
@@ -667,9 +668,8 @@ relay_subscribe_f(va_list ap)
 	cbus_pair("tx", relay->endpoint.name, &relay->tx_pipe,
 		  &relay->relay_pipe, NULL, NULL, cbus_process);
 
-	struct relay_is_raft_enabled_msg raft_enabler;
-	if (!relay->replica->anon)
-		relay_send_is_raft_enabled(relay, &raft_enabler, true);
+	struct relay_is_running_msg relay_is_running_msg;
+	relay_send_is_running(relay, &relay_is_running_msg, true);
 
 	/*
 	 * Setup garbage collection trigger.
@@ -750,8 +750,7 @@ relay_subscribe_f(va_list ap)
 		cpipe_push(&relay->tx_pipe, &relay->status_msg.msg);
 	}
 
-	if (!relay->replica->anon)
-		relay_send_is_raft_enabled(relay, &raft_enabler, false);
+	relay_send_is_running(relay, &relay_is_running_msg, false);
 
 	/*
 	 * Clear garbage collector trigger and WAL watcher.
