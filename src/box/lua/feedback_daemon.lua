@@ -1,5 +1,6 @@
 -- feedback_daemon.lua (internal file)
 --
+local ffi   = require('ffi')
 local log   = require('log')
 local json  = require('json')
 local fiber = require('fiber')
@@ -360,12 +361,18 @@ local function reload(self)
     self:start()
 end
 
+ffi.cdef[[
+void
+crash_cfg(void);
+]]
+
 setmetatable(daemon, {
     __index = {
         set_feedback_params = function()
             daemon.enabled  = box.cfg.feedback_enabled
             daemon.host     = box.cfg.feedback_host
             daemon.interval = box.cfg.feedback_interval
+            ffi.C.crash_cfg()
             reload(daemon)
             return
         end,

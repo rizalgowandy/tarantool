@@ -16,10 +16,22 @@ extern "C" {
 #endif /* defined(__cplusplus) */
 
 /**
+ * Initialize crash subsystem.
+ */
+void
+crash_init(const char *tarantool_bin);
+
+/**
  * Initialize crash signal handlers.
  */
 void
 crash_signal_init(void);
+
+/**
+ * Configure crash engine from box.cfg.
+ */
+void
+crash_cfg(void);
 
 /**
  * Reset crash signal handlers.
