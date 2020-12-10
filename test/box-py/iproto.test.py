@@ -191,7 +191,11 @@ for test in TESTS:
     print("STR", size)
     print("--")
     for fmt in it:
-        print("0x" + fmt.encode("hex"), "=>", end=" ")
+        try:
+            # Python 3
+            print("0x" + "hex".encode("utf-8").hex(), "=>", end=" ")
+        except AttributeError:
+            print("0x" + fmt.encode("hex"), "=>", end=" ")
         field = "*" * size
         c._send_request(RawInsert(c, space_id, "\x91" + fmt + field))
         tuple = space.select(field)[0]
