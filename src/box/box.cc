@@ -1001,6 +1001,25 @@ box_set_replication_anon(void)
 
 }
 
+struct lsn_watcher_data {
+	int *ack_count;
+	int *watcher_count;
+};
+
+static void
+count_confirm_f(void *data)
+{
+	struct lsn_watcher_data *d = (struct lsn_watcher_data *)data;
+	(*d->ack_count)++;
+}
+
+static void
+watcher_destroy_f(void *data)
+{
+	struct lsn_watcher_data *d = (struct lsn_watcher_data *)data;
+	(*d->watcher_count)--;
+}
+
 int
 box_clear_synchro_queue(bool try_wait)
 {
@@ -1011,6 +1030,10 @@ box_clear_synchro_queue(bool try_wait)
 			 "simultaneous invocations");
 		return -1;
 	}
+	/*
+	 * XXX: we may want to write confirm + rollback even when the limbo is
+	 * empty for the sake of limbo ownership transition.
+	 */
 	if (!is_box_configured || txn_limbo_is_empty(&txn_limbo))
 		return 0;
 	uint32_t former_leader_id = txn_limbo.owner_id;
@@ -1032,34 +1055,93 @@ box_clear_synchro_queue(bool try_wait)
 		}
 	}
 
-	if (!txn_limbo_is_empty(&txn_limbo)) {
-		int64_t lsns[VCLOCK_MAX];
-		int len = 0;
-		const struct vclock  *vclock;
+	if (txn_limbo_is_empty(&txn_limbo))
+		return 0;
+
+	/*
+	 * Allocate the watchers statically to not bother with alloc/free.
+	 * This is fine since we have a single execution guard.
+	 */
+	static struct relay_lsn_watcher watchers[VCLOCK_MAX];
+	for (int i = 1; i < VCLOCK_MAX; i++)
+		rlist_create(&watchers[i].in_list);
+
+	int64_t wait_lsn = 0;
+	bool restart = false;
+	do {
+		wait_lsn = txn_limbo_last_entry(&txn_limbo)->lsn;
+		/*
+		 * Take this node into account immediately.
+		 * clear_synchro_queue() is a no-op on the limbo owner for now,
+		 * so all the rows in the limbo must've come through the applier
+		 * and so they already have an lsn assigned, even if their wal
+		 * write isn't finished yet.
+		 */
+		assert(wait_lsn > 0);
+		int count = vclock_get(box_vclock, former_leader_id) >= wait_lsn;
+		int watcher_count = 0;
+		struct lsn_watcher_data data = {
+			.ack_count = &count,
+			.watcher_count = &watcher_count,
+		};
+
 		replicaset_foreach(replica) {
-			if (replica->relay != NULL &&
-			    relay_get_state(replica->relay) != RELAY_OFF &&
-			    !replica->anon) {
-				assert(!tt_uuid_is_equal(&INSTANCE_UUID,
-							 &replica->uuid));
-				vclock = relay_vclock(replica->relay);
-				int64_t lsn = vclock_get(vclock,
-							 former_leader_id);
-				lsns[len++] = lsn;
+			if (replica->anon || replica->relay == NULL ||
+			    relay_get_state(replica->relay) != RELAY_FOLLOW)
+				continue;
+			assert(replica->id != 0);
+			assert(!tt_uuid_is_equal(&INSTANCE_UUID, &replica->uuid));
+
+			if (vclock_get(relay_vclock(replica->relay),
+				       former_leader_id) >= wait_lsn) {
+				count++;
+				continue;
 			}
-		}
-		lsns[len++] = vclock_get(box_vclock, former_leader_id);
-		assert(len < VCLOCK_MAX);
 
-		int64_t confirm_lsn = 0;
-		if (len >= replication_synchro_quorum) {
-			qsort(lsns, len, sizeof(int64_t), cmp_i64);
-			confirm_lsn = lsns[len - replication_synchro_quorum];
+			relay_lsn_watcher_create(&watchers[replica->id],
+						 former_leader_id, wait_lsn,
+						 count_confirm_f,
+						 watcher_destroy_f, &data);
+			relay_set_lsn_watcher(replica->relay,
+					      &watchers[replica->id]);
+			watcher_count++;
 		}
 
-		txn_limbo_force_empty(&txn_limbo, confirm_lsn);
-		assert(txn_limbo_is_empty(&txn_limbo));
-	}
+
+		while (count < replication_synchro_quorum &&
+		       count + watcher_count >= replication_synchro_quorum) {
+			fiber_yield();
+		}
+
+		/*
+		 * In case some new limbo entries arrived, confirm them as well.
+		 */
+		restart = wait_lsn < txn_limbo_last_entry(&txn_limbo)->lsn;
+
+		/*
+		 * Not enough replicas connected. Give user some time to
+		 * reconfigure quorum and replicas some time to reconnect, then
+		 * restart the watchers.
+		 */
+		if (count + watcher_count < replication_synchro_quorum) {
+			say_info("clear_syncrho_queue cannot collect quorum: "
+				 "number of connected replicas (%d) is less "
+				 "than replication_synchro_quorum (%d). "
+				 "Will retry in %.2f seconds",
+				 count + watcher_count,
+				 replication_synchro_quorum,
+				 replication_timeout);
+			fiber_sleep(replication_timeout);
+			restart = true;
+		}
+
+		/* Detach the watchers that haven't fired. */
+		for (int i = 1; i < VCLOCK_MAX; i++)
+			rlist_del_entry(&watchers[i], in_list);
+	} while (restart);
+
+	txn_limbo_force_empty(&txn_limbo, wait_lsn);
+	assert(txn_limbo_is_empty(&txn_limbo));
 	return 0;
 }
 
