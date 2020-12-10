@@ -32,6 +32,7 @@
  */
 
 #include <stdint.h>
+#include "small/rlist.h"
 
 #if defined(__cplusplus)
 extern "C" {
@@ -133,5 +134,48 @@ void
 relay_subscribe(struct replica *replica, int fd, uint64_t sync,
 		struct vclock *replica_vclock, uint32_t replica_version_id,
 		uint32_t replica_id_filter);
+
+/**
+ * A callback invoked once lsn watcher sees the replica has reached the target
+ * lsn for the given replica id.
+ */
+typedef void (*relay_lsn_watcher_f)(void *data);
+
+/**
+ * A relay watcher which notifies tx via calling a given function once the
+ * replica confirms it has received the rows from replica_id up to target_lsn.
+ */
+struct relay_lsn_watcher {
+	/** A replica_id to monitor rows from. */
+	uint32_t replica_id;
+	/** The lsn to wait for. */
+	int64_t target_lsn;
+	/**
+	 * A callback invoked in the tx thread once the watcher sees that
+	 * replica has reached the target lsn.
+	 */
+	relay_lsn_watcher_f notify;
+	/**
+	 * A callback fired once the relay thread exits to notify the waiter
+	 * there's nothing to wait for anymore.
+	 */
+	relay_lsn_watcher_f destroy;
+	/** Data passed to \a notify and \a destroy. */
+	void *data;
+	/** A fiber waiting for this watcher to fire. */
+	struct fiber *waiter;
+	/** A link in relay's watcher list. */
+	struct rlist in_list;
+};
+
+/** Initialize a pre-allocated lsn watcher. */
+void
+relay_lsn_watcher_create(struct relay_lsn_watcher *watcher, uint32_t replica_id,
+			 int64_t target_lsn, relay_lsn_watcher_f notify,
+			 relay_lsn_watcher_f destroy, void *data);
+
+/** Attach the given lsn watcher to the relay. */
+void
+relay_set_lsn_watcher(struct relay *relay, struct relay_lsn_watcher *watcher);
 
 #endif /* TARANTOOL_REPLICATION_RELAY_H_INCLUDED */
