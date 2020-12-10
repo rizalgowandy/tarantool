@@ -250,8 +250,8 @@ lbox_sqlparser_execute(struct lua_State *L)
 
 		port_sql_create(&port, stmt, format, true);
 		if (sql_execute(stmt, &port, region) != 0) {
-			port_destroy(&port);
 			sql_stmt_reset(stmt);
+			port_destroy(&port);
 			return luaT_push_nil_and_error(L);
 		}
 	}
