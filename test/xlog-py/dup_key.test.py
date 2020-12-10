@@ -3,11 +3,6 @@ from __future__ import print_function
 import os
 import yaml
 
-#print """
-#A test case for https://bugs.launchpad.net/tarantool/+bug/1052018
-#panic_on_wal_error doesn't work for duplicate key errors
-#"""
-
 server.stop()
 server.deploy()
 
