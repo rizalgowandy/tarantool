@@ -39,7 +39,7 @@ for (k,v) in list(globals().items()):
 
 def repr_dict(todump):
     d = {}
-    for (k, v) in list(todump.items()):
+    for (k, v) in todump.items():
         k_name = key_names.get(k, k)
         d[k_name] = v
     return repr(d)
