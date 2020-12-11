@@ -687,8 +687,18 @@ sql_execute(struct sql_stmt *stmt, struct port *port, struct region *region)
 		rc = sql_step(stmt);
 		assert(rc != SQL_ROW && rc != 0);
 	}
-	if (rc != SQL_DONE)
+	if (rc != SQL_DONE) {
+		/*
+		 * In SQL, on failure sometimes an error sets to the diag,
+		 * sometimes not. So, let's set an error to the diag if
+		 * the status is a failure and there is no error in the diag.
+		 */
+		if (diag_is_empty(diag_get())) {
+			diag_set(ClientError, ER_SQL_EXECUTE,
+				 "something went wrong");
+		}
 		return -1;
+	}
 	return 0;
 }
 
