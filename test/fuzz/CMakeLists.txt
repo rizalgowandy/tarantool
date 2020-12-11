@@ -16,7 +16,7 @@ target_compile_options(
         -fsanitize=fuzzer,undefined
         >
         $<$<NOT:$<BOOL:${OSS_FUZZ}>>:
-          -fsanitize=fuzzer
+        -fsanitize=fuzzer,address,undefined
         >
         $<$<BOOL:${OSS_FUZZ}>:
         ${CXX}
@@ -33,7 +33,7 @@ target_link_libraries(
         -fsanitize=fuzzer,undefined
         >
         $<$<NOT:$<BOOL:${OSS_FUZZ}>>:
-          -fsanitize=fuzzer
+        -fsanitize=fuzzer,address,undefined
         >
         $<$<BOOL:${OSS_FUZZ}>:
         $ENV{LIB_FUZZING_ENGINE}
