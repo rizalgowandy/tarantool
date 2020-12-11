@@ -1,0 +1,116 @@
+name: CI
+
+on: [push]
+
+env:
+  IMAGE: ghcr.io/avtikhon/tarantool/testing/debian-stretch:latest
+  TRAVIS_MAKE: make -f .travis.mk
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    #runs-on: self-hosted
+
+    strategy:
+      fail-fast: false
+
+    container:
+      image: ghcr.io/avtikhon/tarantool/testing/debian-stretch:latest
+
+    steps:
+      - uses: actions/checkout@v1
+      - name: test
+        run: ${TRAVIS_MAKE} test_debian_no_deps
+
+  debug:
+    runs-on: ubuntu-latest
+    #runs-on: self-hosted
+
+    strategy:
+      fail-fast: false
+
+    container:
+      image: ghcr.io/avtikhon/tarantool/testing/debian-stretch:latest
+
+    steps:
+      - uses: actions/checkout@v1
+      - name: test
+        run: ${TRAVIS_MAKE} test_coverage_debian_no_deps
+
+  release_clang:
+    runs-on: ubuntu-latest
+    #runs-on: self-hosted
+
+    strategy:
+      fail-fast: false
+
+    container:
+      image: ghcr.io/avtikhon/tarantool/testing/debian-stretch:latest
+
+    steps:
+      - uses: actions/checkout@v1
+      - name: test
+        env:
+          CC: clang
+          CXX: clang++
+        run: ${TRAVIS_MAKE} test_debian_no_deps
+
+  release_lto:
+    runs-on: ubuntu-latest
+    #runs-on: self-hosted
+
+    strategy:
+      fail-fast: false
+
+    container:
+      image: ghcr.io/avtikhon/tarantool/testing/debian-buster:latest
+
+    steps:
+      - uses: actions/checkout@v2.3.4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: test
+        env:
+          CMAKE_EXTRA_PARAMS: -DENABLE_LTO=ON
+        run: ${TRAVIS_MAKE} test_debian_no_deps
+
+  release_lto_clang11:
+    runs-on: ubuntu-latest
+    #runs-on: self-hosted
+
+    strategy:
+      fail-fast: false
+
+    container:
+      image: ghcr.io/avtikhon/tarantool/testing/debian-buster:latest
+
+    steps:
+      - uses: actions/checkout@v2.3.4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: test
+        env:
+          CC: clang-11
+          CXX: clang++-11
+          CMAKE_EXTRA_PARAMS: -DENABLE_LTO=ON
+        run: ${TRAVIS_MAKE} test_debian_no_deps
+
+  release_asan_clang11:
+    runs-on: ubuntu-latest
+    #runs-on: self-hosted
+
+    strategy:
+      fail-fast: false
+
+    container:
+      image: ghcr.io/avtikhon/tarantool/testing/debian-buster:latest
+
+    steps:
+      - uses: actions/checkout@v2.3.4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: test
+        run: ${TRAVIS_MAKE} test_asan_debian_no_deps
