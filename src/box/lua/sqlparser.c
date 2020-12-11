@@ -115,7 +115,7 @@ lbox_sqlparser_parse(struct lua_State *L)
 		}
 	} else {
 		ast = entry->ast;
-		//goto return_error; // FIXME - some odd problems here
+		goto return_error; // FIXME - some odd problems here
 #if 0
 		if (sql_stmt_schema_version(stmt) != box_schema_version() &&
 		    !sql_stmt_busy(stmt)) {
