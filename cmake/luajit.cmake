@@ -245,6 +245,7 @@ macro(luajit_build)
     set (luajit_buildoptions
         BUILDMODE=static
         HOST_CC="${luajit_hostcc}"
+        LDFLAGS="${luajit_ldflags}"
         TARGET_CC="${luajit_cc}"
         TARGET_CFLAGS="${luajit_cflags}"
         TARGET_LD="${luajit_ld}"
