@@ -20,6 +20,21 @@ jobs:
     steps:
       - uses: actions/checkout@v1
       - name: test
+        run: ${TRAVIS_MAKE} test_debian_luacheck
+
+  release:
+    runs-on: ubuntu-latest
+    #runs-on: self-hosted
+
+    strategy:
+      fail-fast: false
+
+    container:
+      image: ghcr.io/avtikhon/tarantool/testing/debian-stretch:latest
+
+    steps:
+      - uses: actions/checkout@v1
+      - name: test
         run: ${TRAVIS_MAKE} test_debian_no_deps
 
   debug:
