@@ -61,9 +61,7 @@ if(ENABLE_FUZZER)
             "build setup.")
     endif()
     if (NOT OSS_FUZZ)
-        add_compile_flags("C;CXX"
-            -fsanitize=fuzzer-no-link,address,undefined
-            -fsanitize-blacklist=${CMAKE_SOURCE_DIR}/asan/asan.supp)
+        add_compile_flags("C;CXX" -fsanitize=fuzzer-no-link)
     endif()
 endif()
 
