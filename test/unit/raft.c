@@ -248,11 +248,17 @@ raft_test_recovery(void)
 static void
 raft_test_bad_msg(void)
 {
-	raft_start_test(6);
+	raft_start_test(7);
 	struct raft_msg msg;
 	struct raft_node node;
 	struct vclock vclock;
 	raft_node_create(&node);
+
+	msg = (struct raft_msg){
+		.state = RAFT_STATE_FOLLOWER,
+		.term = 0,
+	};
+	is(raft_node_process_msg(&node, &msg, 2), -1, "term can't be 0");
 
 	msg = (struct raft_msg){
 		.state = 0,
