@@ -36,6 +36,7 @@
 #include "trigger.h"
 #include "fiber.h"
 #include "space.h"
+#include "journal.h"
 
 #if defined(__cplusplus)
 extern "C" {
@@ -104,24 +105,46 @@ enum {
 	/** Signature set for empty transactions. */
 	TXN_SIGNATURE_NOP = 0,
 	/**
+	 * Aliases for journal errors to make all signature codes have the same
+	 * prefix.
+	 */
+	TXN_SIGNATURE_UNKNOWN = JOURNAL_ENTRY_ERR_UNKNOWN,
+	TXN_SIGNATURE_IO = JOURNAL_ENTRY_ERR_IO,
+	TXN_SIGNATURE_CASCADE = JOURNAL_ENTRY_ERR_CASCADE,
+	/**
 	 * The default signature value for failed transactions.
 	 * Indicates either write failure or any other failure
 	 * not caused by synchronous transaction processing.
 	 */
-	TXN_SIGNATURE_ROLLBACK = -1,
+	TXN_SIGNATURE_ROLLBACK = JOURNAL_ENTRY_ERR_MIN - 1,
 	/**
 	 * A value set for failed synchronous transactions
 	 * on master, when not enough acks were collected.
 	 */
-	TXN_SIGNATURE_QUORUM_TIMEOUT = -2,
+	TXN_SIGNATURE_QUORUM_TIMEOUT = JOURNAL_ENTRY_ERR_MIN - 2,
 	/**
 	 * A value set for failed synchronous transactions
 	 * on replica (or any instance during recovery), when a
 	 * transaction is rolled back because ROLLBACK message was
 	 * read.
 	 */
-	TXN_SIGNATURE_SYNC_ROLLBACK = -3,
+	TXN_SIGNATURE_SYNC_ROLLBACK = JOURNAL_ENTRY_ERR_MIN - 3,
+	/**
+	 * Aborted before it could be written due an error which is already
+	 * installed into the global diag.
+	 */
+	TXN_SIGNATURE_ABORT = JOURNAL_ENTRY_ERR_MIN - 4,
 };
+
+/**
+ * Convert a result of a transaction execution to an error installed into the
+ * current diag.
+ */
+void
+diag_set_txn_sign_detailed(const char *file, unsigned line, int64_t signature);
+
+#define diag_set_txn_sign(signature)						\
+	diag_set_txn_sign_detailed(__FILE__, __LINE__, signature)
 
 /**
  * Status of a transaction.
@@ -212,6 +235,10 @@ struct txn_stmt {
 	 * old_tuple to be NULL.
 	 */
 	bool does_require_old_tuple;
+	/**
+	* Request type - IPROTO type code
+	*/
+	uint16_t type;
 	/** Commit/rollback triggers associated with this statement. */
 	struct rlist on_commit;
 	struct rlist on_rollback;
@@ -391,6 +418,10 @@ struct txn {
 	struct rlist in_read_view_txs;
 	/** List of tx_read_trackers with stories that the TX have read. */
 	struct rlist read_set;
+	/** List of point hole reads. @sa struct point_hole_item. */
+	struct rlist point_holes_list;
+	/** List of gap reads. @sa struct gap_item. */
+	struct rlist gap_list;
 };
 
 static inline bool
@@ -466,6 +497,15 @@ void
 txn_rollback(struct txn *txn);
 
 /**
+ * Rollback a transaction due to an error which is already installed into the
+ * global diag. This is preferable over the plain rollback when there are
+ * already triggers installed and they might need to know the exact reason for
+ * the rollback.
+ */
+void
+txn_abort(struct txn *txn);
+
+/**
  * Submit a transaction to the journal.
  * @pre txn == in_txn()
  *
@@ -473,12 +513,13 @@ txn_rollback(struct txn *txn);
  * journal write completion. Note, the journal write may still fail.
  * To track transaction status, one is supposed to use on_commit and
  * on_rollback triggers.
+ * Note, this may yield occasionally, once journal queue gets full.
  *
  * On failure -1 is returned and the transaction is rolled back and
  * freed.
  */
 int
-txn_commit_async(struct txn *txn);
+txn_commit_try_async(struct txn *txn);
 
 /**
  * Most txns don't have triggers, and txn objects
@@ -536,6 +577,8 @@ static inline void
 txn_stmt_on_commit(struct txn_stmt *stmt, struct trigger *trigger)
 {
 	txn_stmt_init_triggers(stmt);
+	/* Statement triggers are private and never have anything to free. */
+	assert(trigger->destroy == NULL);
 	trigger_add(&stmt->on_commit, trigger);
 }
 
@@ -543,6 +586,8 @@ static inline void
 txn_stmt_on_rollback(struct txn_stmt *stmt, struct trigger *trigger)
 {
 	txn_stmt_init_triggers(stmt);
+	/* Statement triggers are private and never have anything to free. */
+	assert(trigger->destroy == NULL);
 	trigger_add(&stmt->on_rollback, trigger);
 }
 
@@ -556,10 +601,10 @@ txn_n_rows(struct txn *txn)
 }
 
 /**
- * Start a new statement.
+ * Start a new statement in @a space with requst @a type (IPROTO_ constant).
  */
 int
-txn_begin_stmt(struct txn *txn, struct space *space);
+txn_begin_stmt(struct txn *txn, struct space *space, uint16_t type);
 
 int
 txn_begin_in_engine(struct engine *engine, struct txn *txn);

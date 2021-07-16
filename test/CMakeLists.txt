@@ -62,10 +62,8 @@ add_subdirectory(app)
 add_subdirectory(app-tap)
 add_subdirectory(box)
 add_subdirectory(box-tap)
+add_subdirectory(sql-tap)
 if(ENABLE_FUZZER)
     add_subdirectory(fuzz)
 endif()
 add_subdirectory(unit)
-
-# Disable connector_c for 1.6
-#add_subdirectory(connector_c)

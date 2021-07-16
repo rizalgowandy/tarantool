@@ -1,6 +1,11 @@
 name: freebsd
 
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  repository_dispatch:
+    types: [backend_automation]
+  workflow_dispatch:
 
 env:
   CI_MAKE: make -f .gitlab.mk
@@ -9,8 +14,9 @@ jobs:
   freebsd:
     # We want to run on external PRs, but not on our own internal PRs
     # as they'll be run by the push to the branch.
-    if: github.event_name == 'push' ||
-        github.event.pull_request.head.repo.full_name != github.repository
+    if: ( github.event_name == 'push' ||
+        github.event.pull_request.head.repo.full_name != github.repository ) &&
+        ! endsWith(github.ref, '-notest')
 
     runs-on: freebsd-sh
 
@@ -43,4 +49,4 @@ jobs:
         with:
           name: freebsd
           retention-days: 21
-          path: test/var/artifacts
+          path: ./artifacts

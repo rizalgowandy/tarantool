@@ -30,6 +30,7 @@ include_files = {
 
 exclude_files = {
     "build/**/*.lua",
+    "test-run/test/test-tarantool/*.test.lua",
     "test/app/*.test.lua",
     "test/box/*.test.lua",
     "test/engine/*.test.lua",
@@ -74,6 +75,12 @@ files["test/box/box.lua"] = {
         "sorted",
         "iproto_request",
     }
+}
+files["test/box/gh-5645-several-iproto-threads.lua"] = {
+    globals = {
+        "errinj_set",
+        "ping",
+    },
 }
 files["test/box-tap/session.test.lua"] = {
     globals = {

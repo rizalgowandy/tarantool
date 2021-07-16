@@ -40,16 +40,19 @@ set(LUAJIT_TEST_BINARY $<TARGET_FILE:tarantool> CACHE STRING
 set(LUAJIT_USE_TEST OFF CACHE BOOL
     "Generate <test> target" FORCE)
 
-# Enable internal LuaJIT assertions for Tarantool Debug build.
 # XXX: There is <strict> module enabled by default in Tarantool
 # built in Debug, so we need to tweak LuaJIT testing environment.
+# XXX: Also, this script "unloads" internal Tarantool's modules
+# and remove globals conflicting with LuaJIT test suites.
+set(LUAJIT_TEST_INIT "${PROJECT_SOURCE_DIR}/test/luajit-test-init.lua"
+    CACHE STRING "Lua code need to be run before tests are started" FORCE)
+
+# Enable internal LuaJIT assertions for Tarantool Debug build.
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    set(LUAJIT_USE_APICHECK ON CACHE BOOL
+    set(LUA_USE_APICHECK ON CACHE BOOL
         "Assertions for the Lua/C API" FORCE)
-    set(LUAJIT_USE_ASSERT ON CACHE BOOL
+    set(LUA_USE_ASSERT ON CACHE BOOL
         "Assertions for the whole LuaJIT VM" FORCE)
-    set(LUAJIT_TEST_INIT "${PROJECT_SOURCE_DIR}/test/luajit-test-init.lua"
-        CACHE STRING "Lua code need to be run before tests are started" FORCE)
 endif()
 
 # Valgrind can be used only with the system allocator. For more
@@ -70,11 +73,22 @@ if(ENABLE_ASAN)
     add_definitions(-DLUAJIT_USE_ASAN=1)
 endif()
 
-if(TARGET_OS_DARWIN)
-    # Necessary to make LuaJIT (and Tarantool) work on Darwin, see
-    # http://luajit.org/install.html.
-    set(CMAKE_EXE_LINKER_FLAGS
-        "${CMAKE_EXE_LINKER_FLAGS} -pagezero_size 10000 -image_base 100000000")
+if(TARGET_OS_DARWIN AND NOT LUAJIT_ENABLE_GC64)
+    # XXX: This is not the best idea to build LuaJIT on MacOS
+    # with GC64 disabled. But nobody will stop you from this.
+    # You are warned. For more info, see the following issue.
+    # https://github.com/tarantool/tarantool/issues/2643
+    message(WARNING "LUAJIT_ENABLE_GC64 is disabled for MacOS. "
+                    "If one wants to know why this is not a good idea, "
+                    "see https://github.com/tarantool/tarantool/issues/2643.")
+    # XXX: Necessary to make LuaJIT (and hence Tarantool) work on
+    # Darwin/x86_64, see the following links for more info:
+    # * http://luajit.org/install.html#embed
+    # * https://github.com/tarantool/luajit/blob/789820a/cmake/SetTargetFlags.cmake
+    if(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
+        set(CMAKE_EXE_LINKER_FLAGS
+            "${CMAKE_EXE_LINKER_FLAGS} -pagezero_size 10000 -image_base 100000000")
+    endif()
 endif()
 
 # Define the locations for LuaJIT sources and artefacts.
