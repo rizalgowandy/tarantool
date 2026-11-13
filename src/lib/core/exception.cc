@@ -36,6 +36,7 @@
 
 #include "fiber.h"
 #include "reflection.h"
+#include "tt_strerror.h"
 
 extern "C" {
 
@@ -50,13 +51,6 @@ exception_raise(struct error *error)
 {
 	Exception *e = (Exception *) error;
 	e->raise();
-}
-
-static void
-exception_log(struct error *error)
-{
-	Exception *e = (Exception *) error;
-	e->log();
 }
 
 const char *
@@ -81,26 +75,12 @@ exception_get_int(struct error *e, const struct method_info *method)
 
 } /* extern "C" */
 
-/** out_of_memory::size is zero-initialized by the linker. */
-static OutOfMemory out_of_memory(__FILE__, __LINE__,
-				 sizeof(OutOfMemory), "malloc", "exception");
-
-static const struct method_info exception_methods[] = {
-	make_method(&type_Exception, "message", &Exception::get_errmsg),
-	make_method(&type_Exception, "log", &Exception::log),
-	METHODS_SENTINEL
-};
-const struct type_info type_Exception = make_type("Exception", NULL,
-	exception_methods);
+const struct type_info type_Exception = make_type("Exception", NULL);
 
 void *
 Exception::operator new(size_t size)
 {
-	void *buf = malloc(size);
-	if (buf != NULL)
-		return buf;
-	diag_set_error(diag_get(), &out_of_memory);
-	throw &out_of_memory;
+	return xmalloc(size);
 }
 
 void
@@ -111,23 +91,15 @@ Exception::operator delete(void *ptr)
 
 Exception::~Exception()
 {
-	if (this != &out_of_memory) {
-		assert(refs == 0);
-	}
+	assert(refs == 0);
 	TRASH((struct error *) this);
 }
 
 Exception::Exception(const struct type_info *type_arg, const char *file,
 		     unsigned line)
 {
-	error_create(this, exception_destroy, exception_raise,
-		     exception_log, type_arg, file, line);
-}
-
-void
-Exception::log() const
-{
-	say_file_line(S_ERROR, file, line, errmsg, "%s", type->name);
+	error_create(this, exception_destroy, exception_raise, type_arg,
+		     file, line);
 }
 
 const struct type_info type_SystemError =
@@ -140,42 +112,24 @@ SystemError::SystemError(const struct type_info *type,
 	saved_errno = errno;
 }
 
-SystemError::SystemError(const char *file, unsigned line,
-			 const char *format, ...)
-	: Exception(&type_SystemError, file, line)
+SystemError::SystemError(const char *file, unsigned line, const char *format,
+			 va_list ap)
+	: SystemError(&type_SystemError, file, line)
 {
-	saved_errno = errno;
-	va_list ap;
-	va_start(ap, format);
 	error_vformat_msg(this, format, ap);
-	va_end(ap);
-}
-
-void
-SystemError::log() const
-{
-	say_file_line(S_SYSERROR, file, line, strerror(saved_errno),
-		      "SystemError %s", errmsg);
+	error_append_msg(this, ": %s", tt_strerror(saved_errno));
 }
 
 const struct type_info type_SocketError =
 	make_type("SocketError", &type_SystemError);
 
 SocketError::SocketError(const char *file, unsigned line,
-			 const char *socketname,
-			 const char *format, ...)
+			 const char *socketname, const char *format, va_list ap)
 	: SystemError(&type_SocketError, file, line)
 {
-	int save_errno = errno;
-
-	char buf[DIAG_ERRMSG_MAX];
-
-	va_list ap;
-	va_start(ap, format);
-	vsnprintf(buf, sizeof(buf), format, ap);
-	va_end(ap);
-	error_format_msg(this, "%s, called on %s", buf, socketname);
-	errno = save_errno;
+	error_vformat_msg(this, format, ap);
+	error_append_msg(this, ", called on %s: %s", socketname,
+			 tt_strerror(saved_errno));
 }
 
 
@@ -220,12 +174,13 @@ FiberIsCancelled::FiberIsCancelled(const char *file, unsigned line)
 	error_format_msg(this, "fiber is cancelled");
 }
 
-void
-FiberIsCancelled::log() const
+const struct type_info type_FiberSliceIsExceeded =
+	make_type("FiberSliceIsExceeded", &type_Exception);
+
+FiberSliceIsExceeded::FiberSliceIsExceeded(const char *file, unsigned line)
+	: Exception(&type_FiberSliceIsExceeded, file, line)
 {
-	say_info("fiber `%s' has been cancelled",
-		 fiber_name(fiber()));
-	say_info("fiber `%s': exiting", fiber_name(fiber()));
+	error_format_msg(this, "fiber slice is exceeded");
 }
 
 const struct type_info type_LuajitError =
@@ -235,122 +190,136 @@ LuajitError::LuajitError(const char *file, unsigned line,
 			 const char *msg)
 	: Exception(&type_LuajitError, file, line)
 {
-	snprintf(errmsg, sizeof(errmsg), "%s", msg ? msg : "");
+	error_format_msg(this, "%s", msg ? msg : "");
 }
 
 const struct type_info type_IllegalParams =
 	make_type("IllegalParams", &type_Exception);
 
 IllegalParams::IllegalParams(const char *file, unsigned line,
-				     const char *format, ...)
+			     const char *format, va_list ap)
 	: Exception(&type_IllegalParams, file, line)
 {
-	va_list ap;
-	va_start(ap, format);
 	error_vformat_msg(this, format, ap);
-	va_end(ap);
 }
 
 const struct type_info type_CollationError =
 	make_type("CollationError", &type_Exception);
 
 CollationError::CollationError(const char *file, unsigned line,
-			       const char *format, ...)
+			       const char *format, va_list ap)
 	: Exception(&type_CollationError, file, line)
 {
-	va_list ap;
-	va_start(ap, format);
 	error_vformat_msg(this, format, ap);
-	va_end(ap);
 }
 
 const struct type_info type_SwimError = make_type("SwimError", &type_Exception);
 
-SwimError::SwimError(const char *file, unsigned line, const char *format, ...)
+SwimError::SwimError(const char *file, unsigned line, const char *format,
+		     va_list ap)
 	: Exception(&type_SwimError, file, line)
 {
-	va_list ap;
-	va_start(ap, format);
 	error_vformat_msg(this, format, ap);
-	va_end(ap);
 }
 
 const struct type_info type_CryptoError =
 	make_type("CryptoError", &type_Exception);
 
-CryptoError::CryptoError(const char *file, unsigned line,
-			 const char *format, ...)
+CryptoError::CryptoError(const char *file, unsigned line, const char *format,
+			 va_list ap)
 	: Exception(&type_CryptoError, file, line)
 {
-	va_list ap;
-	va_start(ap, format);
 	error_vformat_msg(this, format, ap);
-	va_end(ap);
 }
 
 const struct type_info type_RaftError =
 	make_type("RaftError", &type_Exception);
 
-RaftError::RaftError(const char *file, unsigned line, const char *format, ...)
+RaftError::RaftError(const char *file, unsigned line, const char *format,
+		     va_list ap)
 	: Exception(&type_RaftError, file, line)
 {
-	va_list ap;
-	va_start(ap, format);
 	error_vformat_msg(this, format, ap);
-	va_end(ap);
 }
 
-#define BuildAlloc(type)				\
-	void *p = malloc(sizeof(type));			\
-	if (p == NULL)					\
-		return &out_of_memory;
+const struct type_info type_FileFormatError =
+	make_type("FileFormatError", &type_Exception);
+
+FileFormatError::FileFormatError(const char *file, unsigned line,
+				 const char *format, va_list ap)
+	: Exception(&type_FileFormatError, file, line)
+{
+	error_vformat_msg(this, format, ap);
+}
+
+const struct type_info type_EncodeError =
+	make_type("EncodeError", &type_Exception);
+
+EncodeError::EncodeError(const char *file, unsigned line, const char *format,
+			 const char *details)
+	: Exception(&type_EncodeError, file, line)
+{
+	error_format_msg(this, "%s encode error: %s", format, details);
+	error_set_str(this, "format", format);
+	error_set_str(this, "details", details);
+}
+
+const struct type_info type_DecodeError =
+	make_type("DecodeError", &type_Exception);
+
+DecodeError::DecodeError(const char *file, unsigned line, const char *format,
+			 const char *details)
+	: Exception(&type_DecodeError, file, line)
+{
+	error_format_msg(this, "%s decode error: %s", format, details);
+	error_set_str(this, "format", format);
+	error_set_str(this, "details", details);
+}
 
 struct error *
 BuildOutOfMemory(const char *file, unsigned line,
 		 size_t amount, const char *allocator,
 		 const char *object)
 {
-	BuildAlloc(OutOfMemory);
-	return new (p) OutOfMemory(file, line, amount, allocator,
-				   object);
+	return new OutOfMemory(file, line, amount, allocator, object);
 }
 
 struct error *
 BuildTimedOut(const char *file, unsigned line)
 {
-	BuildAlloc(TimedOut);
-	return new (p) TimedOut(file, line);
+	return new TimedOut(file, line);
 }
 
 struct error *
 BuildChannelIsClosed(const char *file, unsigned line)
 {
-	BuildAlloc(ChannelIsClosed);
-	return new (p) ChannelIsClosed(file, line);
+	return new ChannelIsClosed(file, line);
 }
 
 struct error *
 BuildFiberIsCancelled(const char *file, unsigned line)
 {
-	BuildAlloc(FiberIsCancelled);
-	return new (p) FiberIsCancelled(file, line);
+	return new FiberIsCancelled(file, line);
+}
+
+struct error *
+BuildFiberSliceIsExceeded(const char *file, unsigned line)
+{
+	return new FiberSliceIsExceeded(file, line);
 }
 
 struct error *
 BuildLuajitError(const char *file, unsigned line, const char *msg)
 {
-	BuildAlloc(LuajitError);
-	return new (p) LuajitError(file, line, msg);
+	return new LuajitError(file, line, msg);
 }
 
 struct error *
 BuildIllegalParams(const char *file, unsigned line, const char *format, ...)
 {
-	BuildAlloc(IllegalParams);
-	IllegalParams *e =  new (p) IllegalParams(file, line, "");
 	va_list ap;
 	va_start(ap, format);
-	error_vformat_msg(e, format, ap);
+	IllegalParams *e = new IllegalParams(file, line, format, ap);
 	va_end(ap);
 	return e;
 }
@@ -358,11 +327,9 @@ BuildIllegalParams(const char *file, unsigned line, const char *format, ...)
 struct error *
 BuildSystemError(const char *file, unsigned line, const char *format, ...)
 {
-	BuildAlloc(SystemError);
-	SystemError *e = new (p) SystemError(file, line, "");
 	va_list ap;
 	va_start(ap, format);
-	error_vformat_msg(e, format, ap);
+	SystemError *e = new SystemError(file, line, format, ap);
 	va_end(ap);
 	return e;
 }
@@ -370,11 +337,9 @@ BuildSystemError(const char *file, unsigned line, const char *format, ...)
 struct error *
 BuildCollationError(const char *file, unsigned line, const char *format, ...)
 {
-	BuildAlloc(CollationError);
-	CollationError *e =  new (p) CollationError(file, line, "");
 	va_list ap;
 	va_start(ap, format);
-	error_vformat_msg(e, format, ap);
+	CollationError *e = new CollationError(file, line, format, ap);
 	va_end(ap);
 	return e;
 }
@@ -382,11 +347,9 @@ BuildCollationError(const char *file, unsigned line, const char *format, ...)
 struct error *
 BuildSwimError(const char *file, unsigned line, const char *format, ...)
 {
-	BuildAlloc(SwimError);
-	SwimError *e =  new (p) SwimError(file, line, "");
 	va_list ap;
 	va_start(ap, format);
-	error_vformat_msg(e, format, ap);
+	SwimError *e = new SwimError(file, line, format, ap);
 	va_end(ap);
 	return e;
 }
@@ -394,11 +357,9 @@ BuildSwimError(const char *file, unsigned line, const char *format, ...)
 struct error *
 BuildCryptoError(const char *file, unsigned line, const char *format, ...)
 {
-	BuildAlloc(CryptoError);
-	CryptoError *e =  new (p) CryptoError(file, line, "");
 	va_list ap;
 	va_start(ap, format);
-	error_vformat_msg(e, format, ap);
+	CryptoError *e = new CryptoError(file, line, format, ap);
 	va_end(ap);
 	return e;
 }
@@ -407,37 +368,43 @@ struct error *
 BuildSocketError(const char *file, unsigned line, const char *socketname,
 		 const char *format, ...)
 {
-	int save_errno = errno;
-	BuildAlloc(SocketError);
-	SocketError *e =  new (p) SocketError(file, line, socketname, "");
-
-	char buf[DIAG_ERRMSG_MAX];
 	va_list ap;
 	va_start(ap, format);
-	vsnprintf(buf, sizeof(buf), format, ap);
+	SocketError *e = new SocketError(file, line, socketname, format, ap);
 	va_end(ap);
-	error_format_msg(e, "%s, called on %s", buf, socketname);
-	errno = save_errno;
 	return e;
 }
 
 struct error *
 BuildRaftError(const char *file, unsigned line, const char *format, ...)
 {
-	BuildAlloc(RaftError);
-	RaftError *e =  new (p) RaftError(file, line, "");
 	va_list ap;
 	va_start(ap, format);
-	error_vformat_msg(e, format, ap);
+	RaftError *e = new RaftError(file, line, format, ap);
 	va_end(ap);
 	return e;
 }
 
-void
-exception_init()
+struct error *
+BuildFileFormatError(const char *file, unsigned line, const char *format, ...)
 {
-	/* A special workaround for out_of_memory static init */
-	out_of_memory.refs = 1;
+	va_list ap;
+	va_start(ap, format);
+	FileFormatError *e = new FileFormatError(file, line, format, ap);
+	va_end(ap);
+	return e;
 }
 
-#undef BuildAlloc
+struct error *
+BuildEncodeError(const char *file, unsigned line, const char *format,
+		 const char *details)
+{
+	return new EncodeError(file, line, format, details);
+}
+
+struct error *
+BuildDecodeError(const char *file, unsigned line, const char *format,
+		 const char *details)
+{
+	return new DecodeError(file, line, format, details);
+}

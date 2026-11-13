@@ -1,17 +1,14 @@
 from __future__ import print_function
 
-import os
 import sys
-import re
 import yaml
 import uuid
-import glob
 from lib.tarantool_server import TarantoolServer
 
 ## Get cluster uuid
 cluster_uuid = ""
 try:
-    cluster_uuid = yaml.safe_load(server.admin("box.space._schema:get('cluster')",
+    cluster_uuid = yaml.safe_load(server.admin("box.space._schema:get('replicaset_uuid')",
         silent = True))[0][1]
     uuid.UUID("{" + cluster_uuid + "}")
     print("ok - cluster uuid")
@@ -27,22 +24,19 @@ print("-------------------------------------------------------------")
 # Generate replica cluster UUID
 replica_uuid = str(uuid.uuid4())
 
-## Universal read permission is required to perform JOIN/SUBSCRIBE
-rows = list(server.iproto.py_con.join(replica_uuid))
-status = len(rows) == 1 and rows[0].return_message.find("Read access") >= 0 and \
-    "ok" or "not ok"
-print("{} - join without read permissions on universe".format(status))
-rows = list(server.iproto.py_con.subscribe(cluster_uuid, replica_uuid))
-status = len(rows) == 1 and rows[0].return_message.find("Read access") >= 0 and \
-    "ok" or "not ok"
-print("{} - subscribe without read permissions on universe".format(status))
 ## Write permission to space `_cluster` is required to perform JOIN
-server.admin("box.schema.user.grant('guest', 'read', 'universe')")
 server.iproto.reconnect() # re-connect with new permissions
 rows = list(server.iproto.py_con.join(replica_uuid))
 status = len(rows) == 1 and rows[0].return_message.find("Write access") >= 0 and \
     "ok" or "not ok"
 print("{} - join without write permissions to _cluster".format(status))
+
+## Universal read permission is required to perform JOIN
+server.admin("box.schema.user.grant('guest', 'write', 'space', '_cluster')")
+rows = list(server.iproto.py_con.join(replica_uuid))
+status = len(rows) == 1 and rows[0].return_message.find("Read access") >= 0 and \
+    "ok" or "not ok"
+print("{} - join without read permissions on universe".format(status))
 
 def check_join(msg):
     ok = True
@@ -63,14 +57,23 @@ def check_join(msg):
     return server_id
 
 ## JOIN with permissions
-server.admin("box.schema.user.grant('guest', 'write', 'space', '_cluster')")
+server.admin("box.schema.user.grant('guest', 'read', 'universe')")
+server.admin("box.schema.user.grant('guest', 'write', 'space', '_gc_consumers')")
 server.iproto.reconnect() # re-connect with new permissions
 server_id = check_join("join with granted permissions")
+
+## Universal read permission is required to perform SUBSCRIBE
+server.admin("box.schema.user.revoke('guest', 'read', 'universe')")
+rows = list(server.iproto.py_con.subscribe(cluster_uuid, replica_uuid))
+status = len(rows) == 1 and rows[0].return_message.find("Read access") >= 0 and \
+    "ok" or "not ok"
+print("{} - subscribe without read permissions on universe".format(status))
+
 server.iproto.py_con.space("_cluster").delete(server_id)
 
 # JOIN with granted role
-server.admin("box.schema.user.revoke('guest', 'read', 'universe')")
 server.admin("box.schema.user.revoke('guest', 'write', 'space', '_cluster')")
+server.admin("box.schema.user.revoke('guest', 'write', 'space', '_gc_consumers')")
 server.admin("box.schema.user.grant('guest', 'replication')")
 server.iproto.reconnect() # re-connect with new permissions
 server_id = check_join("join with granted role")
@@ -90,7 +93,10 @@ server.admin("box.space._cluster:replace{1, require('uuid').NULL:str()}")
 server.admin("box.space._cluster:replace{1, require('uuid').str()}")
 
 # Update of tail is OK
-server.admin("box.space._cluster:update(1, {{'=', 3, 'test'}})")
+server.admin("box.space._cluster:update(1, {{'=', 4, 'test'}})")
+
+# Self-delete is not ok.
+server.admin("box.space._cluster:delete(1)")
 
 print("-------------------------------------------------------------")
 print("gh-1140: Assertion if replace _cluster tuple for remote server")
@@ -150,9 +156,8 @@ replica.admin("box.info.vclock[{}] == 1".format(replica_id))
 print("-------------------------------------------------------------")
 print("Connect master to replica")
 print("-------------------------------------------------------------")
-replication_source = yaml.safe_load(replica.admin("box.cfg.listen", silent = True))[0]
-sys.stdout.push_filter(replication_source, "<replication_source>")
-master.admin("box.cfg{{ replication_source = '{}' }}".format(replication_source))
+sys.stdout.push_filter(replica.iproto.uri, "<replication_source>")
+master.admin("box.cfg{{ replication_source = '{}' }}".format(replica.iproto.uri))
 master.wait_lsn(replica_id, replica.get_lsn(replica_id))
 
 print("-------------------------------------------------------------")
@@ -180,9 +185,8 @@ print("-------------------------------------------------------------")
 print("Master must not crash then receives orphan rows from replica")
 print("-------------------------------------------------------------")
 
-replication_source = yaml.safe_load(replica.admin("box.cfg.listen", silent = True))[0]
-sys.stdout.push_filter(replication_source, "<replication>")
-master.admin("box.cfg{{ replication = '{}' }}".format(replication_source))
+sys.stdout.push_filter(replica.iproto.uri, "<replication>")
+master.admin("box.cfg{{ replication = '{}' }}".format(replica.iproto.uri))
 
 master.wait_lsn(replica_id, replica.get_lsn(replica_id))
 master.admin("box.info.vclock[{}] == 2".format(replica_id))
@@ -203,10 +207,6 @@ print("-------------------------------------------------------------")
 master.admin("box.snapshot()")
 master.admin("box.info.vclock[{}] == 2".format(replica_id))
 
-replica = TarantoolServer(server.ini)
-replica.script = "replication-py/replica.lua"
-replica.vardir = server.vardir
-replica.rpl_master = master
 replica.deploy()
 replica.wait_lsn(master_id, master.get_lsn(master_id))
 # Check that replica_id was re-used
@@ -234,13 +234,15 @@ failed.script = "replication-py/failed.lua"
 failed.vardir = server.vardir
 failed.rpl_master = master
 failed.name = "failed"
+
+failed.deploy(True, wait=False)
 failed.crash_expected = True
-try:
-    failed.deploy()
-except Exception as e:
-    line = "ER_READONLY"
-    if failed.logfile_pos.seek_once(line) >= 0:
-        print("'{}' exists in server log".format(line))
+line = "READONLY"
+if failed.logfile_pos.seek_wait(line):
+    print("'{}' exists in server log".format(line))
+
+failed.stop()
+failed.cleanup()
 
 master.admin("box.cfg { read_only = false }")
 
@@ -257,7 +259,7 @@ failed.crash_expected = True
 try:
     failed.deploy()
 except Exception as e:
-    line = "ER_REPLICASET_UUID_MISMATCH"
+    line = "REPLICASET_UUID_MISMATCH"
     if failed.logfile_pos.seek_once(line) >= 0:
         print("'{}' exists in server log".format(line))
 

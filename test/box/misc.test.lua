@@ -2,6 +2,8 @@ env = require('test_run')
 test_run = env.new()
 test_run:cmd("push filter 'table: .*' to 'table: <address>'")
 
+is_asan = require('tarantool').build.asan
+
 -- gh-266: box.info() crash on uncofigured box
 package.loaded['box.space'] == nil
 package.loaded['box.index'] == nil
@@ -67,14 +69,14 @@ t;
 ----------------
 string.match(tostring(box.slab.info()), '^table:') ~= nil;
 box.slab.info().arena_used >= 0;
-box.slab.info().arena_size > 0;
+is_asan or box.slab.info().arena_size > 0;
 string.match(tostring(box.slab.stats()), '^table:') ~= nil;
 t = {};
 for k, v in pairs(box.slab.info()) do
     table.insert(t, k)
 end;
 t;
-box.runtime.info().used > 0;
+is_asan or box.runtime.info().used > 0;
 box.runtime.info().maxalloc > 0;
 
 --
@@ -325,21 +327,18 @@ s:drop()
 -- no errors.
 --
 
--- Without argument it is equivalent to new_tuple_format({})
-tuple_format = box.internal.new_tuple_format()
-
 -- If no type that type == "any":
 format = {}
 format[1] = {}
 format[1].name = 'aaa'
-tuple_format = box.internal.new_tuple_format(format)
+tuple_format = box.internal.tuple_format.new(format, true)
 
 -- Function space:format() without arguments returns valid format:
-tuple_format = box.internal.new_tuple_format(box.space._space:format())
+tuple_format = box.internal.tuple_format.new(box.space._space:format(), true)
 
 -- Check is_nullable option fo field
 format[1].is_nullable = true
-tuple_format = box.internal.new_tuple_format(format)
+tuple_format = box.internal.tuple_format.new(format, true)
 
 --
 -- Test that calling _say using FFI w/ null filepointer doesn't

@@ -211,7 +211,11 @@ proc_title_init(int argc, char **argv)
 	char *mem;
 	size_t argv_copy_size, clobber_size;
 	int envc = 0;
-	while (environ[envc]) {
+	/*
+	 * XXX: The whole environment might be reset and environ
+	 * might be NULL as a result of <clearenv>.
+	 */
+	while (environ && environ[envc]) {
 		envc++;
 	}
 	argv_copy_size = sizeof(argv[0]) * (argc + 1);
@@ -361,7 +365,8 @@ proc_title_set(const char *format, ...)
 		if (ident_handle != INVALID_HANDLE_VALUE)
 			CloseHandle(ident_handle);
 
-		sprintf(name, "pgident(%d): %s", MyProcPid, ps_buffer);
+		snprintf(name, sizeof(name), "pgident(%d): %s", MyProcPid,
+			 ps_buffer);
 
 		ident_handle = CreateEvent(NULL, TRUE, FALSE, name);
 	}

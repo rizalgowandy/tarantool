@@ -34,6 +34,7 @@
 #include "tuple_format.h"
 #include "json/json.h"
 #include "fiber.h"
+#include "tt_static.h"
 
 const char *index_type_strs[] = { "HASH", "TREE", "BITSET", "RTREE" };
 
@@ -49,10 +50,100 @@ const struct index_opts index_opts_default = {
 	/* .run_size_ratio      = */ 3.5,
 	/* .bloom_fpr           = */ 0.05,
 	/* .lsn                 = */ 0,
-	/* .stat                = */ NULL,
 	/* .func                = */ 0,
-	/* .hint                = */ true,
+	/* .hint                = */ INDEX_HINT_DEFAULT,
+	/* .covered_fields      = */ NULL,
+	/* .covered_field_count = */ 0,
+	/* .aggregates          = */ NULL,
 };
+
+/**
+ * Parse index hint option from msgpack.
+ * Used as callback to parse a boolean value with 'hint' key in index options.
+ * Move @a data msgpack pointer to the end of msgpack value.
+ * By convention @a opts must point to corresponding struct index_opts.
+ * Return 0 on success or -1 on error (diag is set to IllegalParams).
+ */
+static int
+index_opts_parse_hint(const char **data, void *opts, struct region *region)
+{
+	(void)region;
+	struct index_opts *index_opts = (struct index_opts *)opts;
+	if (mp_typeof(**data) != MP_BOOL) {
+		diag_set(IllegalParams, "'hint' must be boolean");
+		return -1;
+	}
+	bool hint = mp_decode_bool(data);
+	index_opts->hint = hint ? INDEX_HINT_ON : INDEX_HINT_OFF;
+	return 0;
+}
+
+/**
+ * Parse index covers options given as MsgPack in `data' into `opts'. Covered
+ * fields array is allocated on `region'.
+ */
+static int
+index_opts_parse_covered_fields(const char **data, void *opts,
+				struct region *region)
+{
+	struct index_opts *index_opts = (struct index_opts *)opts;
+	if (mp_typeof(**data) != MP_ARRAY) {
+		diag_set(IllegalParams, "'covers' must be array");
+		return -1;
+	}
+	index_opts->covered_field_count = mp_decode_array(data);
+	if (index_opts->covered_field_count != 0)
+		index_opts->covered_fields =
+			xregion_alloc_array(region,
+					    typeof(*index_opts->covered_fields),
+					    index_opts->covered_field_count);
+	for (uint32_t i = 0; i < index_opts->covered_field_count; i++) {
+		if (mp_typeof(**data) != MP_UINT) {
+			diag_set(IllegalParams,
+				 "'covers' elements must be unsigned");
+			return -1;
+		}
+		uint64_t fieldno = mp_decode_uint(data);
+		if (fieldno > UINT32_MAX) {
+			diag_set(IllegalParams,
+				 "'covers' elements must be unsigned");
+			return -1;
+		}
+		index_opts->covered_fields[i] = fieldno;
+	}
+	return 0;
+}
+
+/**
+ * Parse index 'aggregates' option given as MsgPack in 'data' into 'opts'.
+ * The MsgPack is copied to a memory allocated on 'region'.
+ */
+static int
+index_opts_parse_aggregates(const char **data, void *opts,
+			    struct region *region)
+{
+	struct index_opts *index_opts = (struct index_opts *)opts;
+	const char *aggregates = *data;
+	if (mp_typeof(**data) != MP_ARRAY) {
+		diag_set(IllegalParams, "'aggregates' must be array");
+		return -1;
+	}
+	uint32_t aggregate_count = mp_decode_array(data);
+	if (aggregate_count == 0)
+		return 0;
+
+	for (uint32_t i = 0; i < aggregate_count; i++) {
+		if (mp_typeof(**data) != MP_MAP) {
+			diag_set(IllegalParams,
+				 "'aggregates' elements must be map");
+			return -1;
+		}
+		mp_next(data);
+	}
+	index_opts->aggregates = xregion_alloc(region, *data - aggregates);
+	memcpy(index_opts->aggregates, aggregates, *data - aggregates);
+	return 0;
+}
 
 const struct opt_def index_opts_reg[] = {
 	OPT_DEF("unique", OPT_BOOL, struct index_opts, is_unique),
@@ -67,187 +158,151 @@ const struct opt_def index_opts_reg[] = {
 	OPT_DEF("lsn", OPT_INT64, struct index_opts, lsn),
 	OPT_DEF("func", OPT_UINT32, struct index_opts, func_id),
 	OPT_DEF_LEGACY("sql"),
-	OPT_DEF("hint", OPT_BOOL, struct index_opts, hint),
+	OPT_DEF_CUSTOM("hint", index_opts_parse_hint),
+	OPT_DEF_CUSTOM("covers", index_opts_parse_covered_fields),
+	OPT_DEF_CUSTOM("aggregates", index_opts_parse_aggregates),
 	OPT_END,
 };
 
+/**
+ * Normalize index options:
+ *
+ * - remove implicitly covered fields.
+ * - sort covered fields in ascending order.
+ *
+ * The implicitly covered fields are the fields of index key and pk index key.
+ *
+ * The result is allocated with malloc, old `covered_fields` array is freed.
+ */
+static void
+index_opts_normalize(struct index_opts *opts, const struct key_def *cmp_def)
+{
+	if (opts->covered_field_count == 0)
+		return;
+	uint32_t *fields = xmalloc(sizeof(*fields) * opts->covered_field_count);
+	uint32_t j = 0;
+	for (uint32_t i = 0; i < opts->covered_field_count; i++) {
+		if (key_def_find_by_fieldno(
+				cmp_def, opts->covered_fields[i]) == NULL)
+			fields[j++] = opts->covered_fields[i];
+	}
+	qsort(fields, j, sizeof(*fields), cmp_u32);
+	opts->covered_field_count = j;
+	free(opts->covered_fields);
+	if (opts->covered_field_count != 0) {
+		opts->covered_fields = fields;
+	} else {
+		opts->covered_fields = NULL;
+		free(fields);
+	}
+}
+
+/** Duplicate index options. */
+static void
+index_opts_dup(const struct index_opts *opts, struct index_opts *dup)
+{
+	*dup = *opts;
+	if (dup->covered_fields != NULL) {
+		uint32_t *fields = dup->covered_fields;
+		dup->covered_fields =
+			xmalloc(dup->covered_field_count *
+				sizeof(*dup->covered_fields));
+		memcpy(dup->covered_fields, fields,
+		       dup->covered_field_count *
+		       sizeof(*dup->covered_fields));
+	}
+	if (dup->aggregates != NULL)
+		dup->aggregates = mp_dup(dup->aggregates);
+}
+
 struct index_def *
 index_def_new(uint32_t space_id, uint32_t iid, const char *name,
-	      uint32_t name_len, enum index_type type,
+	      uint32_t name_len, const char *space_name,
+	      const char *engine_name, enum index_type type,
 	      const struct index_opts *opts,
 	      struct key_def *key_def, struct key_def *pk_def)
 {
 	assert(name_len <= BOX_NAME_MAX);
 	/* Use calloc to make index_def_delete() safe at all times. */
-	struct index_def *def = (struct index_def *) calloc(1, sizeof(*def));
-	if (def == NULL) {
-		diag_set(OutOfMemory, sizeof(*def), "malloc", "struct index_def");
-		return NULL;
-	}
-	def->name = strndup(name, name_len);
-	if (def->name == NULL) {
-		index_def_delete(def);
-		diag_set(OutOfMemory, name_len + 1, "malloc", "index_def name");
-		return NULL;
-	}
-	if (identifier_check(def->name, name_len)) {
-		index_def_delete(def);
-		return NULL;
-	}
+	struct index_def *def = xcalloc(1, sizeof(*def));
+	def->name = xstrndup(name, name_len);
+	if (space_name != NULL)
+		def->space_name = xstrdup(space_name);
+	memset(def->engine_name, 0, sizeof(def->engine_name));
+	if (engine_name != NULL)
+		strlcpy(def->engine_name, engine_name, ENGINE_NAME_MAX);
 	def->key_def = key_def_dup(key_def);
 	if (iid != 0) {
+		assert(pk_def != NULL);
+		def->pk_def = key_def_dup(pk_def);
 		def->cmp_def = key_def_merge(key_def, pk_def);
-		if (! opts->is_unique) {
-			def->cmp_def->unique_part_count =
-				def->cmp_def->part_count;
-		} else {
+		if (opts->is_unique)
 			def->cmp_def->unique_part_count =
 				def->key_def->part_count;
-		}
 	} else {
 		def->cmp_def = key_def_dup(key_def);
-	}
-	if (def->key_def == NULL || def->cmp_def == NULL) {
-		index_def_delete(def);
-		return NULL;
+		def->pk_def = key_def_dup(key_def);
 	}
 	def->type = type;
 	def->space_id = space_id;
 	def->iid = iid;
-	def->opts = *opts;
-	/* Statistics are initialized separately. */
-	assert(opts->stat == NULL);
+	index_opts_dup(opts, &def->opts);
+	index_opts_normalize(&def->opts, def->cmp_def);
 	return def;
 }
 
 struct index_def *
 index_def_dup(const struct index_def *def)
 {
-	struct index_def *dup = (struct index_def *) malloc(sizeof(*dup));
-	if (dup == NULL) {
-		diag_set(OutOfMemory, sizeof(*dup), "malloc",
-			 "struct index_def");
-		return NULL;
-	}
+	struct index_def *dup = xmalloc(sizeof(*dup));
 	*dup = *def;
-	dup->name = strdup(def->name);
-	if (dup->name == NULL) {
-		free(dup);
-		diag_set(OutOfMemory, strlen(def->name) + 1, "malloc",
-			 "index_def name");
-		return NULL;
-	}
+	dup->name = xstrdup(def->name);
+	if (def->space_name != NULL)
+		dup->space_name = xstrdup(def->space_name);
+	strlcpy(dup->engine_name, def->engine_name, ENGINE_NAME_MAX);
 	dup->key_def = key_def_dup(def->key_def);
 	dup->cmp_def = key_def_dup(def->cmp_def);
-	if (dup->key_def == NULL || dup->cmp_def == NULL) {
-		index_def_delete(dup);
-		return NULL;
-	}
+	dup->pk_def = key_def_dup(def->pk_def);
 	rlist_create(&dup->link);
-	dup->opts = def->opts;
-	if (def->opts.stat != NULL) {
-		dup->opts.stat = index_stat_dup(def->opts.stat);
-		if (dup->opts.stat == NULL) {
-			index_def_delete(dup);
-			return NULL;
-		}
-	}
+	index_opts_dup(&def->opts, &dup->opts);
 	return dup;
 }
 
-size_t
-index_stat_sizeof(const struct index_sample *samples, uint32_t sample_count,
-		  uint32_t field_count)
-{
-	/* Space for index_stat struct itself. */
-	size_t alloc_size = sizeof(struct index_stat);
-	/*
-	 * Space for stat1, log_est and avg_eg arrays.
-	 * stat1 and log_est feature additional field
-	 * to describe total count of tuples in index.
-	 */
-	alloc_size += (3 * field_count + 2) * sizeof(uint32_t);
-	/* Space for samples structs. */
-	alloc_size += sizeof(struct index_sample) * sample_count;
-	/* Space for eq, lt and dlt stats. */
-	alloc_size += 3 * sizeof(uint32_t) * field_count * sample_count;
-	/* Space for sample keys. */
-	for (uint32_t i = 0; i < sample_count; ++i)
-		alloc_size += samples[i].key_size;
-	return alloc_size;
-}
-
-struct index_stat *
-index_stat_dup(const struct index_stat *src)
-{
-	size_t size = index_stat_sizeof(src->samples, src->sample_count,
-					src->sample_field_count);
-	struct index_stat *dup = (struct index_stat *) malloc(size);
-	if (dup == NULL) {
-		diag_set(OutOfMemory, size, "malloc", "index stat");
-		return NULL;
-	}
-	memcpy(dup, src, size);
-	uint32_t array_size = src->sample_field_count * sizeof(uint32_t);
-	uint32_t stat1_offset = sizeof(struct index_stat);
-	char *pos = (char *) dup + stat1_offset;
-	dup->tuple_stat1 = (uint32_t *) pos;
-	pos += array_size + sizeof(uint32_t);
-	dup->tuple_log_est = (log_est_t *) pos;
-	pos += array_size + sizeof(uint32_t);
-	dup->avg_eq = (uint32_t *) pos;
-	pos += array_size;
-	dup->samples = (struct index_sample *) pos;
-	pos += src->sample_count * sizeof(struct index_sample);
-	for (uint32_t i = 0; i < src->sample_count; ++i) {
-		dup->samples[i].eq = (uint32_t *) pos;
-		pos += array_size;
-		dup->samples[i].lt = (uint32_t *) pos;
-		pos += array_size;
-		dup->samples[i].dlt = (uint32_t *) pos;
-		pos += array_size;
-		dup->samples[i].sample_key = pos;
-		pos += dup->samples[i].key_size;
-	}
-	return dup;
-}
-
-/** Free a key definition. */
 void
 index_def_delete(struct index_def *index_def)
 {
 	index_opts_destroy(&index_def->opts);
 	free(index_def->name);
+	free(index_def->space_name);
 
-	if (index_def->key_def) {
-		TRASH(index_def->key_def);
-		free(index_def->key_def);
-	}
+	if (index_def->key_def)
+		key_def_delete(index_def->key_def);
 
-	if (index_def->cmp_def) {
-		TRASH(index_def->cmp_def);
-		free(index_def->cmp_def);
-	}
+	if (index_def->cmp_def)
+		key_def_delete(index_def->cmp_def);
+
+	if (index_def->pk_def)
+		key_def_delete(index_def->pk_def);
 
 	TRASH(index_def);
 	free(index_def);
 }
 
-int
-index_def_cmp(const struct index_def *key1, const struct index_def *key2)
+bool
+index_def_is_equal(const struct index_def *def1, const struct index_def *def2)
 {
-	assert(key1->space_id == key2->space_id);
-	if (key1->iid != key2->iid)
-		return key1->iid < key2->iid ? -1 : 1;
-	if (strcmp(key1->name, key2->name))
-		return strcmp(key1->name, key2->name);
-	if (key1->type != key2->type)
-		return (int) key1->type < (int) key2->type ? -1 : 1;
-	if (index_opts_cmp(&key1->opts, &key2->opts))
-		return index_opts_cmp(&key1->opts, &key2->opts);
-
-	return key_part_cmp(key1->key_def->parts, key1->key_def->part_count,
-			    key2->key_def->parts, key2->key_def->part_count);
+	assert(def1->space_id == def2->space_id);
+	if (def1->iid != def2->iid)
+		return false;
+	if (strcmp(def1->name, def2->name) != 0)
+		return false;
+	if (def1->type != def2->type)
+		return false;
+	if (!index_opts_is_equal(&def1->opts, &def2->opts))
+		return false;
+	return key_part_cmp(
+			def1->key_def->parts, def1->key_def->part_count,
+			def2->key_def->parts, def2->key_def->part_count) == 0;
 }
 
 struct key_def **
@@ -257,61 +312,46 @@ index_def_to_key_def(struct rlist *index_defs, int *size)
 	struct index_def *index_def;
 	rlist_foreach_entry(index_def, index_defs, link)
 		key_count++;
-	size_t bsize;
-	struct key_def **keys =
-		region_alloc_array(&fiber()->gc, typeof(keys[0]), key_count,
-				   &bsize);
-	if (keys == NULL) {
-		diag_set(OutOfMemory, bsize, "region_alloc_array", "keys");
-		return NULL;
-	}
 	*size = key_count;
+	if (key_count == 0)
+		return NULL;
+	struct key_def **keys =
+		xregion_alloc_array(&fiber()->gc, typeof(keys[0]), key_count);
 	key_count = 0;
 	rlist_foreach_entry(index_def, index_defs, link)
 		keys[key_count++] = index_def->key_def;
 	return keys;
 }
 
-bool
-index_def_is_valid(struct index_def *index_def, const char *space_name)
-
+int
+index_def_check(struct index_def *index_def, const char *space_name)
 {
 	if (index_def->iid >= BOX_INDEX_MAX) {
 		diag_set(ClientError, ER_MODIFY_INDEX, index_def->name,
 			 space_name, "index id too big");
-		return false;
+		return -1;
 	}
 	if (index_def->iid == 0 && index_def->opts.is_unique == false) {
 		diag_set(ClientError, ER_MODIFY_INDEX, index_def->name,
 			 space_name, "primary key must be unique");
-		return false;
-	}
-	if (index_def->key_def->part_count == 0) {
-		diag_set(ClientError, ER_MODIFY_INDEX, index_def->name,
-			 space_name, "part count must be positive");
-		return false;
-	}
-	if (index_def->key_def->part_count > BOX_INDEX_PART_MAX) {
-		diag_set(ClientError, ER_MODIFY_INDEX, index_def->name,
-			 space_name, "too many key parts");
-		return false;
+		return -1;
 	}
 	if (index_def->iid == 0 && index_def->key_def->is_multikey) {
 		diag_set(ClientError, ER_MODIFY_INDEX, index_def->name,
 			 space_name, "primary key cannot be multikey");
-		return false;
+		return -1;
 	}
 	if (index_def->iid == 0 && index_def->key_def->for_func_index) {
 		diag_set(ClientError, ER_MODIFY_INDEX, index_def->name,
 			space_name, "primary key can not use a function");
-		return false;
+		return -1;
 	}
 	for (uint32_t i = 0; i < index_def->key_def->part_count; i++) {
 		assert(index_def->key_def->parts[i].type < field_type_MAX);
 		if (index_def->key_def->parts[i].fieldno > BOX_INDEX_FIELD_MAX) {
 			diag_set(ClientError, ER_MODIFY_INDEX, index_def->name,
 				 space_name, "field no is too big");
-			return false;
+			return -1;
 		}
 		for (uint32_t j = 0; j < i; j++) {
 			/*
@@ -327,9 +367,29 @@ index_def_is_valid(struct index_def *index_def, const char *space_name)
 				diag_set(ClientError, ER_MODIFY_INDEX,
 					 index_def->name, space_name,
 					 "same key part is indexed twice");
-				return false;
+				return -1;
 			}
 		}
 	}
-	return true;
+	return 0;
+}
+
+int
+index_def_check_field_types(struct index_def *index_def, const char *space_name)
+{
+	struct key_def *key_def = index_def->key_def;
+
+	for (uint32_t i = 0; i < key_def->part_count; i++) {
+		enum field_type type = key_def->parts[i].type;
+
+		if (type == FIELD_TYPE_ANY || type == FIELD_TYPE_INTERVAL ||
+		    type == FIELD_TYPE_ARRAY || type == FIELD_TYPE_MAP) {
+			diag_set(ClientError, ER_MODIFY_INDEX,
+				 index_def->name, space_name,
+				 tt_sprintf("field type '%s' is not supported",
+					    field_type_strs[type]));
+			return -1;
+		}
+	}
+	return 0;
 }

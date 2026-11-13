@@ -9,6 +9,13 @@
 
 #include "msgpuck.h"
 
+#define IPROTO_FEATURE_ID_STRS_MEMBER(s, ...) \
+	[IPROTO_FEATURE_ ## s] = #s,
+
+const char *iproto_feature_id_strs[iproto_feature_id_MAX] = {
+	IPROTO_FEATURES(IPROTO_FEATURE_ID_STRS_MEMBER)
+};
+
 struct iproto_features IPROTO_CURRENT_FEATURES;
 
 uint32_t
@@ -54,7 +61,8 @@ mp_decode_iproto_features(const char **data, struct iproto_features *features)
 	return 0;
 }
 
-void
+__attribute__((constructor))
+static void
 iproto_features_init(void)
 {
 	iproto_features_create(&IPROTO_CURRENT_FEATURES);
@@ -66,4 +74,24 @@ iproto_features_init(void)
 			    IPROTO_FEATURE_ERROR_EXTENSION);
 	iproto_features_set(&IPROTO_CURRENT_FEATURES,
 			    IPROTO_FEATURE_WATCHERS);
+	iproto_features_set(&IPROTO_CURRENT_FEATURES,
+			    IPROTO_FEATURE_PAGINATION);
+	iproto_features_set(&IPROTO_CURRENT_FEATURES,
+			    IPROTO_FEATURE_SPACE_AND_INDEX_NAMES);
+	iproto_features_set(&IPROTO_CURRENT_FEATURES,
+			    IPROTO_FEATURE_WATCH_ONCE);
+	iproto_features_set(&IPROTO_CURRENT_FEATURES,
+			    IPROTO_FEATURE_DML_TUPLE_EXTENSION);
+	iproto_features_set(&IPROTO_CURRENT_FEATURES,
+			    IPROTO_FEATURE_CALL_RET_TUPLE_EXTENSION);
+	iproto_features_set(&IPROTO_CURRENT_FEATURES,
+			    IPROTO_FEATURE_CALL_ARG_TUPLE_EXTENSION);
+#if defined(ENABLE_FETCH_SNAPSHOT_CURSOR)
+	iproto_features_set(&IPROTO_CURRENT_FEATURES,
+			    IPROTO_FEATURE_FETCH_SNAPSHOT_CURSOR);
+#endif /* defined(ENABLE_FETCH_SNAPSHOT_CURSOR) */
+	iproto_features_set(&IPROTO_CURRENT_FEATURES,
+			    IPROTO_FEATURE_IS_SYNC);
+	iproto_features_set(&IPROTO_CURRENT_FEATURES,
+			    IPROTO_FEATURE_INSERT_ARROW);
 }

@@ -42,6 +42,7 @@
 #include "errcode.h"
 #include "histogram.h"
 #include "index_def.h"
+#include "space_def.h"
 #include "say.h"
 #include "schema.h"
 #include "tuple.h"
@@ -70,7 +71,7 @@ static const int64_t VY_MIN_RANGE_SIZE = 128 * 1024 * 1024;
  */
 static const int64_t VY_MAX_RANGE_SIZE = 2LL * 1024 * 1024 * 1024;
 
-int
+void
 vy_lsm_env_create(struct vy_lsm_env *env, const char *path,
 		  int64_t *p_generation, struct tuple_format *key_format,
 		  vy_upsert_thresh_cb upsert_thresh_cb,
@@ -79,7 +80,7 @@ vy_lsm_env_create(struct vy_lsm_env *env, const char *path,
 	env->empty_key.hint = HINT_NONE;
 	env->empty_key.stmt = vy_key_new(key_format, NULL, 0);
 	if (env->empty_key.stmt == NULL)
-		return -1;
+		panic("failed to allocate vinyl empty key");
 	env->path = path;
 	env->p_generation = p_generation;
 	env->key_format = key_format;
@@ -90,7 +91,6 @@ vy_lsm_env_create(struct vy_lsm_env *env, const char *path,
 	env->lsm_count = 0;
 	mempool_create(&env->history_node_pool, cord_slab_cache(),
 		       sizeof(struct vy_history_node));
-	return 0;
 }
 
 void
@@ -123,7 +123,8 @@ vy_lsm_mem_tree_size(struct vy_lsm *lsm)
 struct vy_lsm *
 vy_lsm_new(struct vy_lsm_env *lsm_env, struct vy_cache_env *cache_env,
 	   struct vy_mem_env *mem_env, struct index_def *index_def,
-	   struct tuple_format *format, struct vy_lsm *pk, uint32_t group_id)
+	   struct space_def *space_def, struct tuple_format *format,
+	   struct vy_lsm *pk)
 {
 	static int64_t run_buckets[] = {
 		0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 50, 100,
@@ -141,39 +142,42 @@ vy_lsm_new(struct vy_lsm_env *lsm_env, struct vy_cache_env *cache_env,
 	lsm->env = lsm_env;
 
 	struct key_def *key_def = key_def_dup(index_def->key_def);
-	if (key_def == NULL)
-		goto fail_key_def;
-
 	struct key_def *cmp_def = key_def_dup(index_def->cmp_def);
-	if (cmp_def == NULL)
-		goto fail_cmp_def;
+	/*
+	 * A unique nullable key definition extended with primary key parts
+	 * (cmp_def) assumes that two tuples are equal *without* comparing
+	 * primary key fields if all secondary key fields are equal and not
+	 * nulls, see tuple_compare_slowpath(). This is a hack required to
+	 * ignore the uniqueness constraint for nulls in memtx. The memtx
+	 * engine can't use the secondary key definition as is (key_def) for
+	 * comparing tuples in the index tree, as it does for a non-nullable
+	 * unique index, because this wouldn't allow insertion of any
+	 * duplicates, including nulls. It couldn't use cmp_def without this
+	 * hack, either, because then conflicting tuples with the same
+	 * secondary key fields would always compare as not equal due to
+	 * different primary key parts.
+	 *
+	 * For Vinyl, this hack isn't required because it explicitly skips
+	 * the uniqueness check if any of the indexed fields are nulls, see
+	 * vy_check_is_unique_secondary(). Furthermore, this hack is harmful
+	 * because Vinyl relies on the fact that two tuples compare as equal by
+	 * cmp_def if and only if *all* key fields (both secondary and primary)
+	 * are equal. For example, this is used in the transaction manager,
+	 * which overwrites statements equal by cmp_def, see vy_tx_set_entry().
+	 *
+	 * We disable this hack by resetting unique_part_count in cmp_def.
+	 */
+	cmp_def->unique_part_count = cmp_def->part_count;
 
 	lsm->cmp_def = cmp_def;
 	lsm->key_def = key_def;
-	if (index_def->iid == 0) {
-		/*
-		 * Disk tuples can be returned to an user from a
-		 * primary key. And they must have field
-		 * definitions as well as space->format tuples.
-		 */
-		lsm->disk_format = format;
-	} else {
-		/*
-		 * To save disk space, we do not store full tuples
-		 * in secondary index runs. Instead we only store
-		 * extended keys (i.e. keys consisting of secondary
-		 * and primary index parts). This is enough to look
-		 * up a full tuple in the primary index.
-		 */
-		lsm->disk_format = lsm_env->key_format;
-
+	if (index_def->iid != 0) {
 		lsm->pk_in_cmp_def = key_def_find_pk_in_cmp_def(lsm->cmp_def,
 								pk->key_def,
 								&fiber()->gc);
 		if (lsm->pk_in_cmp_def == NULL)
 			goto fail_pk_in_cmp_def;
 	}
-	tuple_format_ref(lsm->disk_format);
 
 	if (vy_lsm_stat_create(&lsm->stat) != 0)
 		goto fail_stat;
@@ -199,13 +203,14 @@ vy_lsm_new(struct vy_lsm_env *lsm_env, struct vy_cache_env *cache_env,
 	lsm->pk = pk;
 	if (pk != NULL)
 		vy_lsm_ref(pk);
-	lsm->mem_format = format;
-	tuple_format_ref(lsm->mem_format);
+	lsm->space_def = space_def_dup(space_def);
+	lsm->format = format;
+	tuple_format_ref(lsm->format);
 	heap_node_create(&lsm->in_dump);
 	heap_node_create(&lsm->in_compaction);
 	lsm->space_id = index_def->space_id;
 	lsm->index_id = index_def->iid;
-	lsm->group_id = group_id;
+	lsm->group_id = space_def->opts.group_id;
 	lsm->opts = index_def->opts;
 	vy_lsm_read_set_new(&lsm->read_set);
 	rlist_create(&lsm->on_destroy);
@@ -218,14 +223,11 @@ fail_mem:
 fail_run_hist:
 	vy_lsm_stat_destroy(&lsm->stat);
 fail_stat:
-	tuple_format_unref(lsm->disk_format);
 	if (lsm->pk_in_cmp_def != NULL)
 		key_def_delete(lsm->pk_in_cmp_def);
 fail_pk_in_cmp_def:
 	key_def_delete(cmp_def);
-fail_cmp_def:
 	key_def_delete(key_def);
-fail_key_def:
 	free(lsm);
 fail:
 	return NULL;
@@ -238,7 +240,7 @@ vy_range_tree_free_cb(vy_range_tree_t *t, struct vy_range *range, void *arg)
 	(void)arg;
 	struct vy_slice *slice;
 	rlist_foreach_entry(slice, &range->slices, in_range)
-		vy_slice_wait_pinned(slice);
+		assert(slice->pin_count == 0);
 	vy_range_delete(range);
 	return NULL;
 }
@@ -273,7 +275,6 @@ vy_lsm_delete(struct vy_lsm *lsm)
 
 	vy_range_tree_iter(&lsm->range_tree, NULL, vy_range_tree_free_cb, NULL);
 	vy_range_heap_destroy(&lsm->range_heap);
-	tuple_format_unref(lsm->disk_format);
 	key_def_delete(lsm->cmp_def);
 	key_def_delete(lsm->key_def);
 	if (lsm->pk_in_cmp_def != NULL)
@@ -281,7 +282,8 @@ vy_lsm_delete(struct vy_lsm *lsm)
 	histogram_delete(lsm->run_hist);
 	vy_lsm_stat_destroy(&lsm->stat);
 	vy_cache_destroy(&lsm->cache);
-	tuple_format_unref(lsm->mem_format);
+	space_def_delete(lsm->space_def);
+	tuple_format_unref(lsm->format);
 	TRASH(lsm);
 	free(lsm);
 }
@@ -289,36 +291,6 @@ vy_lsm_delete(struct vy_lsm *lsm)
 int
 vy_lsm_create(struct vy_lsm *lsm)
 {
-	/* Make LSM tree directory. */
-	int rc;
-	char path[PATH_MAX];
-	vy_lsm_snprint_path(path, sizeof(path), lsm->env->path,
-			    lsm->space_id, lsm->index_id);
-	char *path_sep = path;
-	while (*path_sep == '/') {
-		/* Don't create root */
-		++path_sep;
-	}
-	while ((path_sep = strchr(path_sep, '/'))) {
-		/* Recursively create path hierarchy */
-		*path_sep = '\0';
-		rc = mkdir(path, 0777);
-		if (rc == -1 && errno != EEXIST) {
-			diag_set(SystemError, "failed to create directory '%s'",
-		                 path);
-			*path_sep = '/';
-			return -1;
-		}
-		*path_sep = '/';
-		++path_sep;
-	}
-	rc = mkdir(path, 0777);
-	if (rc == -1 && errno != EEXIST) {
-		diag_set(SystemError, "failed to create directory '%s'",
-			 path);
-		return -1;
-	}
-
 	/*
 	 * Allocate a unique id for the new LSM tree, but don't assign
 	 * it until information about the new LSM tree is successfully
@@ -341,7 +313,7 @@ vy_lsm_create(struct vy_lsm *lsm)
 	vy_log_prepare_lsm(id, lsm->space_id, lsm->index_id,
 			   lsm->group_id, lsm->key_def);
 	vy_log_insert_range(id, range->id, NULL, NULL);
-	vy_log_tx_try_commit();
+	vy_log_tx_try_commit_recoverable();
 
 	/* Assign the id. */
 	assert(lsm->id < 0);
@@ -373,7 +345,8 @@ vy_lsm_recover_run(struct vy_lsm *lsm, struct vy_run_recovery_info *run_info,
 	     vy_run_rebuild_index(run, lsm->env->path,
 				  lsm->space_id, lsm->index_id,
 				  lsm->cmp_def, lsm->key_def,
-				  lsm->disk_format, &lsm->opts) != 0)) {
+				  lsm->format, lsm->env->key_format,
+				  &lsm->opts) != 0)) {
 		vy_run_unref(run);
 		return NULL;
 	}
@@ -877,7 +850,7 @@ vy_lsm_rotate_mem(struct vy_lsm *lsm)
 	struct vy_mem *mem;
 
 	assert(lsm->mem != NULL);
-	mem = vy_mem_new(lsm->mem->env, lsm->cmp_def, lsm->mem_format,
+	mem = vy_mem_new(lsm->mem->env, lsm->cmp_def, lsm->format,
 			 *lsm->env->p_generation, space_cache_version);
 	if (mem == NULL)
 		return -1;
@@ -885,6 +858,17 @@ vy_lsm_rotate_mem(struct vy_lsm *lsm)
 	rlist_add_entry(&lsm->sealed, lsm->mem, in_sealed);
 	lsm->mem = mem;
 	lsm->mem_list_version++;
+	return 0;
+}
+
+int
+vy_lsm_rotate_mem_if_required(struct vy_lsm *lsm)
+{
+	if (lsm->mem->space_cache_version != space_cache_version ||
+	    lsm->mem->generation != *lsm->env->p_generation) {
+		if (vy_lsm_rotate_mem(lsm) != 0)
+			return -1;
+	}
 	return 0;
 }
 
@@ -904,8 +888,37 @@ vy_lsm_set(struct vy_lsm *lsm, struct vy_mem *mem,
 {
 	uint32_t format_id = entry.stmt->format_id;
 
-	assert(vy_stmt_is_refable(entry.stmt));
-	assert(*region_stmt == NULL || !vy_stmt_is_refable(*region_stmt));
+	assert(!tuple_is_unreferenced(entry.stmt));
+	assert(*region_stmt == NULL || tuple_is_unreferenced(*region_stmt));
+	assert(vy_stmt_is_key(entry.stmt) ||
+	       format_id == tuple_format_id(mem->format));
+
+	/* Invalidate cache element. */
+	struct vy_entry deleted = vy_entry_none();
+	vy_cache_on_write(&lsm->cache, entry, &deleted);
+
+	/*
+	 * The UPSERT statement can be applied to the cached statement,
+	 * because the cache always contains newest REPLACE statements.
+	 * In such a case the UPSERT, applied to the cached statement,
+	 * can be inserted instead of the original UPSERT.
+	 */
+	bool need_unref = false;
+	if (deleted.stmt != NULL &&
+	    vy_stmt_type(entry.stmt) == IPROTO_UPSERT) {
+		struct vy_entry applied = vy_entry_apply_upsert(
+				entry, deleted, mem->cmp_def, false);
+		/*
+		 * Ignore a memory error, because it is not critical
+		 * to apply the optimization.
+		 */
+		if (applied.stmt != NULL) {
+			entry = applied;
+			need_unref = true;
+		}
+	}
+	if (deleted.stmt != NULL)
+		tuple_unref(deleted.stmt);
 
 	/*
 	 * Allocate region_stmt on demand.
@@ -919,24 +932,18 @@ vy_lsm_set(struct vy_lsm *lsm, struct vy_mem *mem,
 		*region_stmt = vy_stmt_dup_lsregion(entry.stmt,
 						    &mem->env->allocator,
 						    mem->generation);
-		if (*region_stmt == NULL)
-			return -1;
 	}
-	entry.stmt = *region_stmt;
-
-	/* We can't free region_stmt below, so let's add it to the stats */
-	lsm->stat.memory.count.bytes += tuple_size(entry.stmt);
-
-	/* Abort transaction if format was changed by DDL */
-	if (!vy_stmt_is_key(entry.stmt) &&
-	    format_id != tuple_format_id(mem->format)) {
-		diag_set(ClientError, ER_TRANSACTION_CONFLICT);
+	if (need_unref)
+		tuple_unref(entry.stmt);
+	if (*region_stmt == NULL)
 		return -1;
-	}
+
+	entry.stmt = *region_stmt;
+	struct vy_stmt_counter *count = &lsm->stat.memory.count;
 	if (vy_stmt_type(*region_stmt) != IPROTO_UPSERT)
-		return vy_mem_insert(mem, entry);
+		return vy_mem_insert(mem, entry, count);
 	else
-		return vy_mem_insert_upsert(mem, entry);
+		return vy_mem_insert_upsert(mem, entry, count);
 }
 
 /**
@@ -954,15 +961,13 @@ vy_lsm_commit_upsert(struct vy_lsm *lsm, struct vy_mem *mem,
 		     struct vy_entry entry)
 {
 	assert(vy_stmt_type(entry.stmt) == IPROTO_UPSERT);
-	assert(vy_stmt_lsn(entry.stmt) < MAX_LSN);
+	assert(!vy_stmt_is_prepared(entry.stmt));
 	/*
 	 * UPSERT is enabled only for the spaces with the single
 	 * index.
 	 */
 	assert(lsm->index_id == 0);
 
-	struct vy_entry older;
-	int64_t lsn = vy_stmt_lsn(entry.stmt);
 	uint8_t n_upserts = vy_stmt_n_upserts(entry.stmt);
 	/*
 	 * If there are a lot of successive upserts for the same key,
@@ -988,10 +993,12 @@ vy_lsm_commit_upsert(struct vy_lsm *lsm, struct vy_mem *mem,
 		 * one-key continous UPSERTs sequence.
 		 */
 #ifndef NDEBUG
-		older = vy_mem_older_lsn(mem, entry);
+		struct vy_entry older = vy_mem_older_lsn(mem, entry);
 		assert(older.stmt != NULL &&
 		       vy_stmt_type(older.stmt) == IPROTO_UPSERT &&
 		       vy_stmt_n_upserts(older.stmt) == VY_UPSERT_THRESHOLD - 1);
+#else
+		(void)mem;
 #endif
 		if (lsm->env->upsert_thresh_cb == NULL) {
 			/* Squash callback is not installed. */
@@ -1012,67 +1019,6 @@ vy_lsm_commit_upsert(struct vy_lsm *lsm, struct vy_mem *mem,
 		 */
 		return;
 	}
-
-	/*
-	 * If there are no other mems and runs and n_upserts == 0,
-	 * then we can turn the UPSERT into the REPLACE.
-	 */
-	if (n_upserts == 0 &&
-	    lsm->stat.memory.count.rows == lsm->mem->count.rows &&
-	    lsm->run_count == 0) {
-		older = vy_mem_older_lsn(mem, entry);
-		assert(older.stmt == NULL ||
-		       vy_stmt_type(older.stmt) != IPROTO_UPSERT);
-		struct vy_entry upserted;
-		upserted = vy_entry_apply_upsert(entry, older,
-						lsm->cmp_def, false);
-		lsm->stat.upsert.applied++;
-
-		if (upserted.stmt == NULL) {
-			/* OOM */
-			diag_clear(diag_get());
-			return;
-		}
-		int64_t upserted_lsn = vy_stmt_lsn(upserted.stmt);
-		if (upserted_lsn != lsn) {
-			/**
-			 * This could only happen if the upsert completely
-			 * failed and the old tuple was returned.
-			 * In this case we shouldn't insert the same replace
-			 * again.
-			 */
-			assert(older.stmt == NULL ||
-			       upserted_lsn == vy_stmt_lsn(older.stmt));
-			tuple_unref(upserted.stmt);
-			return;
-		}
-		assert(older.stmt == NULL ||
-		       upserted_lsn != vy_stmt_lsn(older.stmt));
-		assert(vy_stmt_type(upserted.stmt) == IPROTO_REPLACE);
-
-		struct tuple *region_stmt =
-			vy_stmt_dup_lsregion(upserted.stmt,
-					     &mem->env->allocator,
-					     mem->generation);
-		if (region_stmt == NULL) {
-			/* OOM */
-			tuple_unref(upserted.stmt);
-			diag_clear(diag_get());
-			return;
-		}
-
-		int rc = vy_lsm_set(lsm, mem, upserted, &region_stmt);
-		/**
-		 * Since we have already allocated mem statement and
-		 * now we replacing one statement with another, the
-		 * vy_lsm_set() cannot fail.
-		 */
-		assert(rc == 0); (void)rc;
-		tuple_unref(upserted.stmt);
-		upserted.stmt = region_stmt;
-		vy_mem_commit_stmt(mem, upserted);
-		lsm->stat.upsert.squashed++;
-	}
 }
 
 void
@@ -1081,14 +1027,18 @@ vy_lsm_commit_stmt(struct vy_lsm *lsm, struct vy_mem *mem,
 {
 	vy_mem_commit_stmt(mem, entry);
 
-	lsm->stat.memory.count.rows++;
-
 	if (vy_stmt_type(entry.stmt) == IPROTO_UPSERT)
 		vy_lsm_commit_upsert(lsm, mem, entry);
 
 	vy_stmt_counter_acct_tuple(&lsm->stat.put, entry.stmt);
 
-	/* Invalidate cache element. */
+	/*
+	 * If a cache chain covering a prepared DELETE statement is added
+	 * to the cache, it will be invisible to any transaction operating in
+	 * the 'read-confirmed' isolation level. To avoid that, we invalidate
+	 * the cache when a statement is confirmed so that the chain can be
+	 * re-created on the next read with its final LSN.
+	 */
 	vy_cache_on_write(&lsm->cache, entry, NULL);
 }
 
@@ -1096,10 +1046,8 @@ void
 vy_lsm_rollback_stmt(struct vy_lsm *lsm, struct vy_mem *mem,
 		     struct vy_entry entry)
 {
-	vy_mem_rollback_stmt(mem, entry);
-
-	/* Invalidate cache element. */
-	vy_cache_on_write(&lsm->cache, entry, NULL);
+	vy_mem_rollback_stmt(mem, entry, &lsm->stat.memory.count);
+	vy_cache_on_rollback(&lsm->cache, entry);
 }
 
 int
@@ -1178,9 +1126,6 @@ vy_lsm_split_range(struct vy_lsm *lsm, struct vy_range *range)
 			if (new_slice != NULL)
 				vy_range_add_slice(part, new_slice);
 		}
-		part->needs_compaction = range->needs_compaction;
-		vy_range_update_compaction_priority(part, &lsm->opts);
-		vy_range_update_dumps_per_compaction(part);
 	}
 
 	/*
@@ -1211,13 +1156,16 @@ vy_lsm_split_range(struct vy_lsm *lsm, struct vy_range *range)
 
 	for (int i = 0; i < n_parts; i++) {
 		part = parts[i];
+		part->needs_compaction = range->needs_compaction;
+		vy_range_update_compaction_priority(part, &lsm->opts);
+		vy_range_update_dumps_per_compaction(part);
 		vy_lsm_add_range(lsm, part);
 		vy_lsm_acct_range(lsm, part);
 	}
 	lsm->range_tree_version++;
 
-	say_info("%s: split range %s by key %s", vy_lsm_name(lsm),
-		 vy_range_str(range), tuple_str(split_key.stmt));
+	say_verbose("%s: split range %s by key %s", vy_lsm_name(lsm),
+		    vy_range_str(range), tuple_str(split_key.stmt));
 
 	rlist_foreach_entry(slice, &range->slices, in_range)
 		vy_slice_wait_pinned(slice);
@@ -1304,8 +1252,8 @@ vy_lsm_coalesce_range(struct vy_lsm *lsm, struct vy_range *range)
 	vy_lsm_add_range(lsm, result);
 	lsm->range_tree_version++;
 
-	say_info("%s: coalesced ranges %s",
-		 vy_lsm_name(lsm), vy_range_str(result));
+	say_verbose("%s: coalesced ranges %s",
+		    vy_lsm_name(lsm), vy_range_str(result));
 	return true;
 
 fail_commit:
@@ -1332,4 +1280,102 @@ vy_lsm_force_compaction(struct vy_lsm *lsm)
 	}
 
 	vy_range_heap_update_all(&lsm->range_heap);
+}
+
+int
+vy_lsm_quantile(struct vy_lsm *lsm, double level,
+		struct vy_entry begin, struct vy_entry end,
+		const char **quantile_key, uint32_t *quantile_key_size)
+{
+	struct key_def *key_def = lsm->key_def;
+	struct key_def *cmp_def = lsm->cmp_def;
+
+	struct vy_range *first_range = vy_range_tree_find_by_key(
+					&lsm->range_tree, ITER_GE, begin);
+	struct vy_range *last_range = vy_range_tree_find_by_key(
+					&lsm->range_tree, ITER_LT, end);
+
+	/*
+	 * Count the total number of tuples in the target range assuming that
+	 * the last layer stores all keys while more recent layers only contain
+	 * incremental updates.
+	 */
+	int64_t total = 0;
+	for (struct vy_range *range = first_range; true;
+	     range = vy_range_tree_next(&lsm->range_tree, range)) {
+		struct vy_entry range_begin =
+			range == first_range ? begin : range->begin;
+		struct vy_entry range_end =
+			range == last_range ? end : range->end;
+		if (!rlist_empty(&range->slices)) {
+			struct vy_slice *slice = rlist_last_entry(
+				&range->slices, struct vy_slice, in_range);
+			total += vy_run_estimate_stmt_count(
+				slice->run, cmp_def, range_begin, range_end);
+		}
+		if (range == last_range)
+			break;
+	}
+
+	*quantile_key = NULL;
+	*quantile_key_size = 0;
+
+	if (total == 0)
+		return 0;
+
+	/* Find the quantile key. */
+	assert(level > 0 && level < 1);
+	const char *key = NULL;
+	int64_t offset = total * level;
+	for (struct vy_range *range = first_range; true;
+	     range = vy_range_tree_next(&lsm->range_tree, range)) {
+		struct vy_entry range_begin =
+			range == first_range ? begin : range->begin;
+		struct vy_entry range_end =
+			range == last_range ? end : range->end;
+		if (rlist_empty(&range->slices))
+			continue;
+		struct vy_slice *slice = rlist_last_entry(
+			&range->slices, struct vy_slice, in_range);
+		int64_t count = vy_run_estimate_stmt_count(
+			slice->run, cmp_def, range_begin, range_end);
+		if (offset >= count) {
+			offset -= count;
+			continue;
+		}
+		key = vy_run_estimate_key_at(slice->run, cmp_def,
+					     range_begin, offset);
+		break;
+	}
+	if (key == NULL)
+		return 0;
+
+	/*
+	 * Since it is an estimate, the found key may be outside the target
+	 * range, in which case we ignore it.
+	 */
+	if (vy_entry_compare_with_raw_key(begin, key, HINT_NONE, cmp_def) > 0)
+		return 0;
+	if (vy_stmt_key_part_count(end.stmt, cmp_def) > 0 &&
+	    vy_entry_compare_with_raw_key(end, key, HINT_NONE, cmp_def) <= 0)
+		return 0;
+	/*
+	 * Keys stored in runs are extended with primary key parts so we
+	 * can't just return the found key to the user, at least, not if
+	 * it's a secondary index. Strip the key of extensions first.
+	 */
+	VERIFY(mp_decode_array(&key) == cmp_def->part_count);
+	uint32_t part_count = 0;
+	const char *key_end = key;
+	while (part_count < key_def->part_count) {
+		mp_next(&key_end);
+		part_count++;
+	}
+	size_t size = mp_sizeof_array(part_count) + (key_end - key);
+	char *buf = xregion_alloc(&fiber()->gc, size);
+	memcpy(mp_encode_array(buf, part_count),
+	       key, key_end - key);
+	*quantile_key = (const char *)buf;
+	*quantile_key_size = size;
+	return 0;
 }

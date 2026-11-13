@@ -9,6 +9,7 @@ macro(zstd_build)
         third_party/zstd/lib/common/debug.c
         third_party/zstd/lib/decompress/zstd_decompress.c
         third_party/zstd/lib/decompress/huf_decompress.c
+        third_party/zstd/lib/decompress/huf_decompress_amd64.S
         third_party/zstd/lib/decompress/zstd_ddict.c
         third_party/zstd/lib/decompress/zstd_decompress_block.c
         third_party/zstd/lib/compress/zstd_double_fast.c
@@ -25,13 +26,17 @@ macro(zstd_build)
         third_party/zstd/lib/compress/zstd_compress_sequences.c
         third_party/zstd/lib/compress/zstd_compress_literals.c
     )
-
+    set(zstd_cflags "${DEPENDENCY_CFLAGS} -O3 -ffast-math")
     if (CC_HAS_WNO_IMPLICIT_FALLTHROUGH)
-        set_source_files_properties(${zstd_src}
-            PROPERTIES COMPILE_FLAGS -Wno-implicit-fallthrough)
+        set(zstd_cflags "${zstd_cflags} -Wno-implicit-fallthrough")
+    endif()
+    if (TARANTOOL_DEBUG)
+        # See lib/common/debug.h,
+        # https://github.com/facebook/zstd/blob/7567769a7e8e8236a2015769a5083d0f090a654b/lib/common/debug.h#L21-L29
+        set(zstd_cflags "${zstd_cflags} -DDEBUG_LEVEL=2")
     endif()
     set_source_files_properties(${zstd_src}
-        PROPERTIES COMPILE_FLAGS -Ofast)
+        PROPERTIES COMPILE_FLAGS ${zstd_cflags})
 
     add_library(zstd STATIC ${zstd_src})
     set(ZSTD_LIBRARIES zstd)

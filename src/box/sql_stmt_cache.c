@@ -63,7 +63,7 @@ sql_stmt_cache_stat(struct info_handler *h)
 }
 
 static size_t
-sql_cache_entry_sizeof(struct sql_stmt *stmt)
+sql_cache_entry_sizeof(struct Vdbe *stmt)
 {
 	return sql_stmt_est_size(stmt) + sizeof(struct stmt_cache_entry);
 }
@@ -97,10 +97,8 @@ static struct stmt_cache_entry *
 stmt_cache_find_entry(uint32_t stmt_id)
 {
 	if (sql_stmt_cache.last_found != NULL) {
-		const char *sql_str =
-			sql_stmt_query_str(sql_stmt_cache.last_found->stmt);
-		uint32_t last_stmt_id = sql_stmt_calculate_id(sql_str,
-							 strlen(sql_str));
+		uint32_t last_stmt_id =
+			sql_stmt_get_id(sql_stmt_cache.last_found->stmt);
 		if (last_stmt_id == stmt_id)
 			return sql_stmt_cache.last_found;
 		/* Fallthrough to slow hash search. */
@@ -130,7 +128,7 @@ sql_stmt_cache_gc(void)
  * Add it to the LRU cache list. Account cache size enlargement.
  */
 static struct stmt_cache_entry *
-sql_cache_entry_new(struct sql_stmt *stmt)
+sql_cache_entry_new(struct Vdbe *stmt)
 {
 	struct stmt_cache_entry *entry = malloc(sizeof(*entry));
 	if (entry == NULL) {
@@ -165,9 +163,8 @@ sql_stmt_cache_entry_unref(struct stmt_cache_entry *entry)
 		 * GC cycle (see sql_stmt_cache_insert()).
 		 */
 		struct sql_stmt_cache *cache = &sql_stmt_cache;
-		const char *sql_str = sql_stmt_query_str(entry->stmt);
-		uint32_t stmt_id = sql_stmt_calculate_id(sql_str,
-							 strlen(sql_str));
+		uint32_t stmt_id = sql_stmt_get_id(entry->stmt);
+		assert(stmt_id != 0);
 		mh_int_t i = mh_i32ptr_find(cache->hash, stmt_id, NULL);
 		assert(i != mh_end(cache->hash));
 		mh_i32ptr_del(cache->hash, i, NULL);
@@ -219,10 +216,9 @@ sql_stmt_unref(uint32_t stmt_id)
 }
 
 int
-sql_stmt_cache_update(struct sql_stmt *old_stmt, struct sql_stmt *new_stmt)
+sql_stmt_cache_update(struct Vdbe *old_stmt, struct Vdbe *new_stmt)
 {
-	const char *sql_str = sql_stmt_query_str(old_stmt);
-	uint32_t stmt_id = sql_stmt_calculate_id(sql_str, strlen(sql_str));
+	uint32_t stmt_id = sql_stmt_get_id(old_stmt);
 	struct stmt_cache_entry *entry = stmt_cache_find_entry(stmt_id);
 	sql_stmt_finalize(entry->stmt);
 	entry->stmt = new_stmt;
@@ -230,7 +226,7 @@ sql_stmt_cache_update(struct sql_stmt *old_stmt, struct sql_stmt *new_stmt)
 }
 
 int
-sql_stmt_cache_insert(struct sql_stmt *stmt)
+sql_stmt_cache_insert(struct Vdbe *stmt)
 {
 	assert(stmt != NULL);
 	struct sql_stmt_cache *cache = &sql_stmt_cache;
@@ -252,8 +248,7 @@ sql_stmt_cache_insert(struct sql_stmt *stmt)
 	struct stmt_cache_entry *entry = sql_cache_entry_new(stmt);
 	if (entry == NULL)
 		return -1;
-	const char *sql_str = sql_stmt_query_str(stmt);
-	uint32_t stmt_id = sql_stmt_calculate_id(sql_str, strlen(sql_str));
+	uint32_t stmt_id = sql_stmt_get_id(stmt);
 	assert(sql_stmt_cache_find(stmt_id) == NULL);
 	const struct mh_i32ptr_node_t id_node = { stmt_id, entry };
 	struct mh_i32ptr_node_t *old_node = NULL;
@@ -263,7 +258,7 @@ sql_stmt_cache_insert(struct sql_stmt *stmt)
 	return 0;
 }
 
-struct sql_stmt *
+struct Vdbe *
 sql_stmt_cache_find(uint32_t stmt_id)
 {
 	struct stmt_cache_entry *entry = stmt_cache_find_entry(stmt_id);

@@ -36,8 +36,10 @@
 #include <lauxlib.h>
 #include <lualib.h>
 #include <sio.h>
+#include "box/lua/trigger.h"
 
 #include "box/box.h"
+#include "box/error.h"
 #include "box/session.h"
 #include "box/user.h"
 #include "box/schema.h"
@@ -51,33 +53,34 @@ static const char *sessionlib_name = "box.session";
 static int
 lbox_session_create(struct lua_State *L)
 {
+	int fd = luaL_optinteger(L, 1, -1);
+	enum session_type type = STR2ENUM(session_type,
+					  luaL_optstring(L, 2, "console"));
 	struct session *session = fiber_get_session(fiber());
 	if (session == NULL) {
-		session = session_create_on_demand();
-		if (session == NULL)
-			return luaT_error(L);
-		session->meta.fd = luaL_optinteger(L, 1, -1);
+		session = session_new_on_demand();
+		session->meta.fd = fd;
+		if (fd >= 0 && type != SESSION_TYPE_REPL) {
+			struct sockaddr_storage addrstorage;
+			struct sockaddr *addr = (struct sockaddr *)&addrstorage;
+			socklen_t addrlen = sizeof(addrstorage);
+			if (sio_getpeername(fd, addr, &addrlen) == 0)
+				session_set_peer_addr(session, addr, addrlen);
+		}
 	}
 	/* If a session already exists, simply reset its type */
-	session_set_type(session, STR2ENUM(session_type,
-					   luaL_optstring(L, 2, "console")));
-
+	session_set_type(session, type);
 	lua_pushnumber(L, session->id);
 	return 1;
 }
 
 /**
- * Return a unique monotonic session
- * identifier. The identifier can be used
- * to check whether or not a session is alive.
- * 0 means there is no session (e.g.
- * a procedure is running in a detached
- * fiber).
+ * Lua wrapper for `box_session_id`.
  */
 static int
 lbox_session_id(struct lua_State *L)
 {
-	lua_pushnumber(L, current_session()->id);
+	luaL_pushuint64(L, box_session_id());
 	return 1;
 }
 
@@ -165,14 +168,18 @@ lbox_session_effective_user(struct lua_State *L)
 static int
 lbox_session_su(struct lua_State *L)
 {
-	if (!box_is_configured())
-		luaL_error(L, "Please call box.cfg{} first");
+	if (box_check_configured() != 0)
+		luaT_error(L);
 	int top = lua_gettop(L);
-	if (top < 1)
-		luaL_error(L, "session.su(): bad arguments");
+	if (top < 1) {
+		diag_set(IllegalParams, "session.su(): bad arguments");
+		luaT_error(L);
+	}
 	struct session *session = current_session();
-	if (session == NULL)
-		luaL_error(L, "session.su(): session does not exist");
+	if (session == NULL) {
+		diag_set(IllegalParams, "session.su(): session does not exist");
+		luaT_error(L);
+	}
 	struct user *user;
 	if (lua_type(L, 1) == LUA_TSTRING) {
 		size_t len;
@@ -191,7 +198,7 @@ lbox_session_su(struct lua_State *L)
 		fiber_set_user(fiber(), &session->credentials);
 		return 0; /* su */
 	}
-	luaL_checktype(L, 2, LUA_TFUNCTION);
+	luaT_checktype(L, 2, LUA_TFUNCTION);
 
 	struct credentials su_credentials;
 	struct credentials *old_credentials = fiber()->storage.credentials;
@@ -215,12 +222,14 @@ lbox_session_su(struct lua_State *L)
 static int
 lbox_session_exists(struct lua_State *L)
 {
-	if (lua_gettop(L) > 1)
-		luaL_error(L, "session.exists(sid): bad arguments");
+	if (lua_gettop(L) > 1) {
+		diag_set(IllegalParams, "session.exists(sid): bad arguments");
+		luaT_error(L);
+	}
 
 	struct session *session;
 	if (lua_gettop(L) == 1)
-		session = session_find(luaL_checkint64(L, -1));
+		session = session_find(luaT_checkint64(L, -1));
 	else
 		session = current_session();
 	lua_pushboolean(L, session != NULL);
@@ -233,16 +242,20 @@ lbox_session_exists(struct lua_State *L)
 static int
 lbox_session_fd(struct lua_State *L)
 {
-	if (lua_gettop(L) > 1)
-		luaL_error(L, "session.fd(sid): bad arguments");
+	if (lua_gettop(L) > 1) {
+		diag_set(IllegalParams, "session.fd(sid): bad arguments");
+		luaT_error(L);
+	}
 
 	struct session *session;
 	if (lua_gettop(L) == 1)
-		session = session_find(luaL_checkint64(L, -1));
+		session = session_find(luaT_checkint64(L, -1));
 	else
 		session = current_session();
-	if (session == NULL)
-		luaL_error(L, "session.fd(): session does not exist");
+	if (session == NULL) {
+		diag_set(IllegalParams, "session.fd(): session does not exist");
+		luaT_error(L);
+	}
 	lua_pushinteger(L, session_fd(session));
 	return 1;
 }
@@ -254,60 +267,34 @@ lbox_session_fd(struct lua_State *L)
 static int
 lbox_session_peer(struct lua_State *L)
 {
-	if (lua_gettop(L) > 1)
-		luaL_error(L, "session.peer(sid): bad arguments");
+	if (lua_gettop(L) > 1) {
+		diag_set(IllegalParams, "session.peer(sid): bad arguments");
+		luaT_error(L);
+	}
 
-	int fd;
 	struct session *session;
 	if (lua_gettop(L) == 1)
-		session = session_find(luaL_checkint(L, 1));
+		session = session_find(luaT_checkint(L, 1));
 	else
 		session = current_session();
-	if (session == NULL)
-		luaL_error(L, "session.peer(): session does not exist");
-	fd = session_fd(session);
-	if (fd < 0) {
+	if (session == NULL) {
+		diag_set(IllegalParams,
+			 "session.peer(): session does not exist");
+		luaT_error(L);
+	}
+	const char *peer = session_peer(session);
+	if (peer == NULL) {
 		lua_pushnil(L); /* no associated peer */
 		return 1;
 	}
-
-	struct sockaddr_storage addr;
-	socklen_t addrlen = sizeof(addr);
-	struct sockaddr *addr_base = (struct sockaddr *)&addr;
-	if (sio_getpeername(fd, addr_base, &addrlen) < 0)
-		luaL_error(L, "session.peer(): getpeername() failed");
-
-	char addrbuf[SERVICE_NAME_MAXLEN];
-	sio_addr_snprintf(addrbuf, sizeof(addrbuf), addr_base, addrlen);
-	lua_pushstring(L, addrbuf);
+	lua_pushstring(L, peer);
 	return 1;
-}
-
-/**
- * run on_connect|on_disconnect trigger
- */
-static int
-lbox_push_on_connect_event(struct lua_State *L, void *event)
-{
-	(void) L;
-	(void) event;
-	return 0;
-}
-
-static int
-lbox_push_on_auth_event(struct lua_State *L, void *event)
-{
-	struct on_auth_trigger_ctx *ctx = (struct on_auth_trigger_ctx *) event;
-	lua_pushstring(L, ctx->username);
-	lua_pushboolean(L, ctx->is_authenticated);
-	return 2;
 }
 
 static int
 lbox_session_on_connect(struct lua_State *L)
 {
-	return lbox_trigger_reset(L, 2, &session_on_connect,
-				  lbox_push_on_connect_event, NULL);
+	return luaT_event_reset_trigger(L, 1, session_on_connect_event);
 }
 
 static int
@@ -322,8 +309,7 @@ lbox_session_run_on_connect(struct lua_State *L)
 static int
 lbox_session_on_disconnect(struct lua_State *L)
 {
-	return lbox_trigger_reset(L, 2, &session_on_disconnect,
-				  lbox_push_on_connect_event, NULL);
+	return luaT_event_reset_trigger(L, 1, session_on_disconnect_event);
 }
 
 static int
@@ -338,15 +324,14 @@ lbox_session_run_on_disconnect(struct lua_State *L)
 static int
 lbox_session_on_auth(struct lua_State *L)
 {
-	return lbox_trigger_reset(L, 2, &session_on_auth,
-				  lbox_push_on_auth_event, NULL);
+	return luaT_event_reset_trigger(L, 1, session_on_auth_event);
 }
 
 static int
 lbox_session_run_on_auth(struct lua_State *L)
 {
 	struct on_auth_trigger_ctx ctx;
-	ctx.username = luaL_optstring(L, 1, "");
+	ctx.user_name = luaL_optlstring(L, 1, "", &ctx.user_name_len);
 	/*
 	 * In earlier versions of tarantool on_auth trigger
 	 * was not invoked on authentication failure and the
@@ -360,16 +345,6 @@ lbox_session_run_on_auth(struct lua_State *L)
 	return 0;
 }
 
-static int
-lbox_push_on_access_denied_event(struct lua_State *L, void *event)
-{
-	struct on_access_denied_ctx *ctx = (struct on_access_denied_ctx *) event;
-	lua_pushstring(L, ctx->access_type);
-	lua_pushstring(L, ctx->object_type);
-	lua_pushstring(L, ctx->object_name);
-	return 3;
-}
-
 /**
  * Push a message using a protocol, depending on a session type.
  * @param L Lua state. First argument on the stack is data to
@@ -381,8 +356,12 @@ static int
 lbox_session_push(struct lua_State *L)
 {
 	struct session *session = current_session();
-	if (lua_gettop(L) != 1)
-		return luaL_error(L, "Usage: box.session.push(data)");
+	if (lua_gettop(L) != 1) {
+		diag_set(IllegalParams, "Usage: box.session.push(data)");
+		luaT_error(L);
+	}
+	if (session_push_check_deprecation() != 0)
+		return luaT_error(L);
 	struct port port;
 	port_lua_create(&port, L);
 	if (session_push(session, &port) != 0)
@@ -398,8 +377,7 @@ lbox_session_push(struct lua_State *L)
 static int
 lbox_session_on_access_denied(struct lua_State *L)
 {
-	return lbox_trigger_reset(L, 2, &on_access_denied,
-				  lbox_push_on_access_denied_event, NULL);
+	return luaT_event_reset_trigger(L, 1, on_access_denied_event);
 }
 
 static int
@@ -518,10 +496,7 @@ session_storage_cleanup(int sid)
 	int top = lua_gettop(L);
 
 	if (ref == LUA_REFNIL) {
-		lua_getfield(L, LUA_REGISTRYINDEX, "_LOADED");
-		if (!lua_istable(L, -1))
-			goto exit;
-		lua_getfield(L, -1, "box");
+		lua_getfield(L, LUA_GLOBALSINDEX, "box");
 		if (!lua_istable(L, -1))
 			goto exit;
 		lua_getfield(L, -1, "session");
@@ -543,6 +518,45 @@ exit:
 	lua_settop(L, top);
 }
 
+/** Drop the whole per-user session idle timeout configuration. */
+static int
+lbox_session_idle_timeout_reset(struct lua_State *L)
+{
+	if (lua_gettop(L) != 0) {
+		diag_set(IllegalParams,
+			 "Usage: box.internal.session.idle_timeout_reset()");
+		return luaT_error(L);
+	}
+	session_idle_timeout_reset();
+	return 0;
+}
+
+/** Set the idle timeout (in seconds) for a single user. */
+static int
+lbox_session_idle_timeout_set(struct lua_State *L)
+{
+	if (lua_gettop(L) != 2 || lua_type(L, 1) != LUA_TSTRING) {
+		diag_set(ClientError, ER_CFG, "session_idle_timeout",
+			 "user name must be a string");
+		return luaT_error(L);
+	}
+	if (!lua_isnumber(L, 2)) {
+		diag_set(ClientError, ER_CFG, "session_idle_timeout",
+			 "timeout must be a number");
+		return luaT_error(L);
+	}
+	double timeout = lua_tonumber(L, 2);
+	if (timeout < 0) {
+		diag_set(ClientError, ER_CFG, "session_idle_timeout",
+			 "timeout must be >= 0");
+		return luaT_error(L);
+	}
+	size_t name_len;
+	const char *name = lua_tolstring(L, 1, &name_len);
+	session_idle_timeout_set(name, (uint32_t)name_len, timeout);
+	return 0;
+}
+
 void
 box_lua_session_init(struct lua_State *L)
 {
@@ -551,9 +565,12 @@ box_lua_session_init(struct lua_State *L)
 		{"run_on_connect",    lbox_session_run_on_connect},
 		{"run_on_disconnect", lbox_session_run_on_disconnect},
 		{"run_on_auth", lbox_session_run_on_auth},
+		{"idle_timeout_reset", lbox_session_idle_timeout_reset},
+		{"idle_timeout_set", lbox_session_idle_timeout_set},
 		{NULL, NULL}
 	};
-	luaL_register(L, "box.internal.session", session_internal_lib);
+	luaL_findtable(L, LUA_GLOBALSINDEX, "box.internal.session", 0);
+	luaL_setfuncs(L, session_internal_lib, 0);
 	lua_pop(L, 1);
 
 	static const struct luaL_Reg sessionlib[] = {
@@ -575,7 +592,8 @@ box_lua_session_init(struct lua_State *L)
 		{"push", lbox_session_push},
 		{NULL, NULL}
 	};
-	luaL_register_module(L, sessionlib_name, sessionlib);
+	luaL_findtable(L, LUA_GLOBALSINDEX, sessionlib_name, 0);
+	luaL_setfuncs(L, sessionlib, 0);
 	lbox_session_settings_init(L);
 	lua_pop(L, 1);
 }

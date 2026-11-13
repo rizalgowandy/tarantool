@@ -69,6 +69,11 @@ struct vy_run_env {
 	 * processing the next read request.
 	 */
 	int next_reader;
+	/**
+	 * We need this flag during compaction in order to determine we can
+	 * unconditionally remove unused runs' files in-place.
+	 */
+	bool initial_join;
 };
 
 /**
@@ -209,6 +214,8 @@ struct vy_slice {
 		/** Link in vy_join_ctx->slices list. */
 		struct rlist in_join;
 	};
+	/** Link in vy_task::compacted_slices. */
+	struct rlist in_compaction;
 	/**
 	 * Indexes of the first and the last page in the run
 	 * that belong to this slice.
@@ -245,11 +252,12 @@ struct vy_run_iterator {
 	struct key_def *cmp_def;
 	/** Key definition provided by the user. */
 	struct key_def *key_def;
-	/**
-	 * Format ot allocate REPLACE and DELETE tuples read from
-	 * pages.
-	 */
+	/** Format for allocating tuples read from disk. */
 	struct tuple_format *format;
+	/** Format for allocating keys read from disk. */
+	struct tuple_format *key_format;
+	/** True if this iterator is for a primary index. */
+	bool is_primary;
 	/** The run slice to iterate. */
 	struct vy_slice *slice;
 
@@ -371,6 +379,24 @@ vy_run_unref(struct vy_run *run)
 }
 
 /**
+ * With a reasonable degree of error, return the number of statements
+ * stored in the given range.
+ */
+int64_t
+vy_run_estimate_stmt_count(struct vy_run *run, struct key_def *cmp_def,
+			   struct vy_entry begin, struct vy_entry end);
+
+/**
+ * With a reasonable degree of error, return the key of the statement
+ * located at the given distance after 'begin' or NULL if not found.
+ *
+ * The returned key belongs to the run so it must not be modified or freed.
+ */
+const char *
+vy_run_estimate_key_at(struct vy_run *run, struct key_def *cmp_def,
+		       struct vy_entry begin, int64_t offset);
+
+/**
  * Load run from disk
  * @param run - run to laod
  * @param dir - path to the vinyl directory
@@ -392,6 +418,7 @@ vy_run_recover(struct vy_run *run, const char *dir,
  * @param cmp_def - key definition with primary key parts
  * @param key_def - user defined key definition
  * @param format - format for allocating tuples read from disk
+ * @param key_format - format for allocating keys read from disk
  * @param opts - index options
  * @return - 0 on sucess, -1 on fail
  */
@@ -400,6 +427,7 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 		     uint32_t space_id, uint32_t iid,
 		     struct key_def *cmp_def, struct key_def *key_def,
 		     struct tuple_format *format,
+		     struct tuple_format *key_format,
 		     const struct index_opts *opts);
 
 enum vy_file_type {
@@ -413,11 +441,21 @@ enum vy_file_type {
 extern const char *vy_file_suffix[];
 
 static inline int
+vy_space_snprint_path(char *buf, int size, const char *dir,
+		      uint32_t space_id)
+{
+	return snprintf(buf, size, "%s/%u", dir, (unsigned)space_id);
+}
+
+static inline int
 vy_lsm_snprint_path(char *buf, int size, const char *dir,
 		    uint32_t space_id, uint32_t iid)
 {
-	return snprintf(buf, size, "%s/%u/%u",
-			dir, (unsigned)space_id, (unsigned)iid);
+	int total = 0;
+	SNPRINT(total, vy_space_snprint_path, buf, size, dir,
+		(unsigned)space_id);
+	SNPRINT(total, snprintf, buf, size, "/%u", (unsigned)iid);
+	return total;
 }
 
 static inline int
@@ -522,7 +560,8 @@ vy_run_iterator_open(struct vy_run_iterator *itr,
 		     struct vy_slice *slice, enum iterator_type iterator_type,
 		     struct vy_entry key, const struct vy_read_view **rv,
 		     struct key_def *cmp_def, struct key_def *key_def,
-		     struct tuple_format *format);
+		     struct tuple_format *format,
+		     struct tuple_format *key_format, bool is_primary);
 
 /**
  * Advance a run iterator to the next key.
@@ -571,8 +610,12 @@ struct vy_slice_stream {
 	 * includes secondary key parts.
 	 */
 	struct key_def *cmp_def;
-	/** Format for allocating REPLACE and DELETE tuples read from pages. */
+	/** Format for allocating tuples read from disk. */
 	struct tuple_format *format;
+	/** Format for allocating keys read from disk. */
+	struct tuple_format *key_format;
+	/** True if this stream is for a primary index. */
+	bool is_primary;
 };
 
 /**
@@ -580,7 +623,8 @@ struct vy_slice_stream {
  */
 void
 vy_slice_stream_open(struct vy_slice_stream *stream, struct vy_slice *slice,
-		     struct key_def *cmp_def, struct tuple_format *format);
+		     struct key_def *cmp_def, struct tuple_format *format,
+		     struct tuple_format *key_format, bool is_primary);
 
 /**
  * Run_writer fills a created run with statements one by one,

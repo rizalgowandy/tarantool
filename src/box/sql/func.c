@@ -36,6 +36,8 @@
  */
 #include "sqlInt.h"
 #include "mem.h"
+#include "port.h"
+#include "func.h"
 #include "vdbeInt.h"
 #include "version.h"
 #include "coll/coll.h"
@@ -46,7 +48,10 @@
 #include <unicode/uchar.h>
 #include <unicode/ucol.h>
 #include "box/coll_id_cache.h"
-#include "box/schema.h"
+#include "box/func_cache.h"
+#include "box/execute.h"
+#include "box/session.h"
+#include "box/tuple_format.h"
 #include "box/user.h"
 #include "assoc.h"
 
@@ -55,7 +60,7 @@ static struct func_sql_builtin **functions;
 
 /** Implementation of the SUM() function. */
 static void
-step_sum(struct sql_context *ctx, int argc, struct Mem *argv)
+step_sum(struct sql_context *ctx, int argc, const struct Mem *argv)
 {
 	assert(argc == 1);
 	(void)argc;
@@ -70,7 +75,7 @@ step_sum(struct sql_context *ctx, int argc, struct Mem *argv)
 
 /** Implementation of the TOTAL() function. */
 static void
-step_total(struct sql_context *ctx, int argc, struct Mem *argv)
+step_total(struct sql_context *ctx, int argc, const struct Mem *argv)
 {
 	assert(argc == 1);
 	(void)argc;
@@ -95,7 +100,7 @@ fin_total(struct Mem *mem)
 
 /** Implementation of the AVG() function. */
 static void
-step_avg(struct sql_context *ctx, int argc, struct Mem *argv)
+step_avg(struct sql_context *ctx, int argc, const struct Mem *argv)
 {
 	assert(argc == 1);
 	(void)argc;
@@ -106,11 +111,7 @@ step_avg(struct sql_context *ctx, int argc, struct Mem *argv)
 	uint32_t *count;
 	if (mem_is_null(ctx->pOut)) {
 		uint32_t size = sizeof(struct Mem) + sizeof(uint32_t);
-		mem = sqlDbMallocRawNN(sql_get(), size);
-		if (mem == NULL) {
-			ctx->is_aborted = true;
-			return;
-		}
+		mem = sql_xmalloc(size);
 		count = (uint32_t *)(mem + 1);
 		mem_create(mem);
 		*count = 1;
@@ -143,7 +144,7 @@ fin_avg(struct Mem *mem)
 
 /** Implementation of the COUNT() function. */
 static void
-step_count(struct sql_context *ctx, int argc, struct Mem *argv)
+step_count(struct sql_context *ctx, int argc, const struct Mem *argv)
 {
 	assert(argc == 0 || argc == 1);
 	if (mem_is_null(ctx->pOut))
@@ -166,7 +167,7 @@ fin_count(struct Mem *mem)
 
 /** Implementation of the MIN() and MAX() functions. */
 static void
-step_minmax(struct sql_context *ctx, int argc, struct Mem *argv)
+step_minmax(struct sql_context *ctx, int argc, const struct Mem *argv)
 {
 	assert(argc == 1);
 	(void)argc;
@@ -199,7 +200,7 @@ step_minmax(struct sql_context *ctx, int argc, struct Mem *argv)
 
 /** Implementation of the GROUP_CONCAT() function. */
 static void
-step_group_concat(struct sql_context *ctx, int argc, struct Mem *argv)
+step_group_concat(struct sql_context *ctx, int argc, const struct Mem *argv)
 {
 	assert(argc == 1 || argc == 2);
 	(void)argc;
@@ -232,42 +233,902 @@ step_group_concat(struct sql_context *ctx, int argc, struct Mem *argv)
 		ctx->is_aborted = true;
 }
 
-static const unsigned char *
-mem_as_ustr(struct Mem *mem)
+/** Implementations of the ABS() function. */
+#if ENABLE_UB_SANITIZER
+static void
+func_abs_int(struct sql_context *ctx, int argc, const struct Mem *argv)
+  __attribute__((no_sanitize("signed-integer-overflow")));
+#endif
+static void
+func_abs_int(struct sql_context *ctx, int argc, const struct Mem *argv)
 {
-	return (const unsigned char *)mem_as_str0(mem);
-}
-
-static const void *
-mem_as_bin(struct Mem *mem)
-{
-	const char *s;
-	if (mem_cast_explicit(mem, FIELD_TYPE_VARBINARY) != 0 &&
-	    mem_to_str(mem) != 0)
-		return NULL;
-	if (mem_get_bin(mem, &s) != 0)
-		return NULL;
-	return s;
+	assert(argc == 1);
+	(void)argc;
+	const struct Mem *arg = &argv[0];
+	if (mem_is_null(arg))
+		return;
+	assert(mem_is_int(arg));
+	uint64_t u = mem_is_uint(arg) ? arg->u.u : (uint64_t)-arg->u.i;
+	mem_set_uint(ctx->pOut, u);
 }
 
 static void
-sql_func_uuid(struct sql_context *ctx, int argc, struct Mem *argv)
+func_abs_double(struct sql_context *ctx, int argc, const struct Mem *argv)
 {
-	if (argc > 1) {
-		diag_set(ClientError, ER_FUNC_WRONG_ARG_COUNT, "UUID",
-			 "one or zero", argc);
+	assert(argc == 1);
+	(void)argc;
+	const struct Mem *arg = &argv[0];
+	if (mem_is_null(arg))
+		return;
+	assert(mem_is_double(arg));
+	mem_set_double(ctx->pOut, arg->u.r < 0 ? -arg->u.r : arg->u.r);
+}
+
+static void
+func_abs_dec(struct sql_context *ctx, int argc, const struct Mem *argv)
+{
+	assert(argc == 1);
+	(void)argc;
+	const struct Mem *arg = &argv[0];
+	if (mem_is_null(arg))
+		return;
+	assert(mem_is_dec(arg));
+	mem_set_dec(ctx->pOut, &arg->u.d);
+	decimal_abs(&ctx->pOut->u.d, &ctx->pOut->u.d);
+}
+
+/** Implementation of the CHAR_LENGTH() function. */
+static void
+func_char_length(struct sql_context *ctx, int argc, const struct Mem *argv)
+{
+	assert(argc == 1);
+	(void)argc;
+	const struct Mem *arg = &argv[0];
+	if (mem_is_null(arg))
+		return;
+	assert(mem_is_str(arg));
+	if (arg->n > SQL_MAX_LENGTH) {
+		ctx->is_aborted = true;
+		diag_set(ClientError, ER_SQL_EXECUTE, "string or blob too big");
+		return;
+	}
+	int32_t n = arg->n;
+	uint32_t len = 0;
+	int32_t offset = 0;
+	while (offset < n) {
+		UChar32 c;
+		U8_NEXT((uint8_t *)arg->z, offset, n, c);
+		++len;
+	}
+	mem_set_uint(ctx->pOut, len);
+}
+
+/** Implementation of the UPPER() and LOWER() functions. */
+static void
+func_lower_upper(struct sql_context *ctx, int argc, const struct Mem *argv)
+{
+	assert(argc == 1);
+	(void)argc;
+	const struct Mem *arg = &argv[0];
+	if (mem_is_null(arg))
+		return;
+	assert(mem_is_str(arg));
+	if (arg->n == 0)
+		return mem_set_str0_static(ctx->pOut, "");
+	const char *str = arg->z;
+	if (arg->n > SQL_MAX_LENGTH) {
+		diag_set(ClientError, ER_SQL_EXECUTE, "string or blob too big");
 		ctx->is_aborted = true;
 		return;
 	}
-	if (argc == 1) {
-		uint64_t version;
-		if (mem_get_uint(&argv[0], &version) != 0) {
-			diag_set(ClientError, ER_SQL_TYPE_MISMATCH,
-				 mem_str(&argv[0]), "integer");
+	int32_t len = arg->n;
+	char *res = sql_xmalloc(len);
+	UErrorCode status = U_ZERO_ERROR;
+	const char *locale = NULL;
+	if (ctx->coll != NULL && ctx->coll->type == COLL_TYPE_ICU) {
+		locale = ucol_getLocaleByType(ctx->coll->collator,
+					      ULOC_VALID_LOCALE, &status);
+	}
+	UCaseMap *cm = ucasemap_open(locale, 0, &status);
+	assert(cm != NULL);
+	assert(ctx->func->def->name[0] == 'U' ||
+	       ctx->func->def->name[0] == 'L');
+	bool is_upper = ctx->func->def->name[0] == 'U';
+	int32_t size =
+		is_upper ?
+		ucasemap_utf8ToUpper(cm, res, len, str, len, &status) :
+		ucasemap_utf8ToLower(cm, res, len, str, len, &status);
+	if (size > len) {
+		res = sql_xrealloc(res, size);
+		status = U_ZERO_ERROR;
+		if (is_upper)
+			ucasemap_utf8ToUpper(cm, res, size, str, len, &status);
+		else
+			ucasemap_utf8ToLower(cm, res, size, str, len, &status);
+	}
+	ucasemap_close(cm);
+	mem_set_str_allocated(ctx->pOut, res, size);
+}
+
+/** Implementation of the NULLIF() function. */
+static void
+func_nullif(struct sql_context *ctx, int argc, const struct Mem *argv)
+{
+	assert(argc == 2);
+	(void)argc;
+	if (!mem_is_comparable(&argv[1])) {
+		ctx->is_aborted = true;
+		diag_set(ClientError, ER_SQL_TYPE_MISMATCH, mem_str(&argv[1]),
+			 "scalar");
+		return;
+	}
+	if (mem_cmp_scalar(&argv[0], &argv[1], ctx->coll) == 0)
+		return;
+	if (mem_copy(ctx->pOut, &argv[0]) != 0)
+		ctx->is_aborted = true;
+}
+
+/** Return the position of the last not removed byte. */
+static inline size_t
+trim_bin_end(const char *str, size_t end, const char *octets,
+	     size_t octets_size, int flags)
+{
+	if ((flags & TRIM_TRAILING) == 0)
+		return end;
+	while (end > 0) {
+		bool is_trimmed = false;
+		char c = str[end - 1];
+		for (size_t i = 0; i < octets_size && !is_trimmed; ++i)
+			is_trimmed = c == octets[i];
+		if (!is_trimmed)
+			break;
+		--end;
+	}
+	return end;
+}
+
+/** Return the position of the first not removed byte. */
+static inline size_t
+trim_bin_start(const char *str, size_t end, const char *octets,
+	       size_t octets_size, int flags)
+{
+	if ((flags & TRIM_LEADING) == 0)
+		return 0;
+	size_t start = 0;
+	while (start < end) {
+		bool is_trimmed = false;
+		char c = str[start];
+		for (size_t i = 0; i < octets_size && !is_trimmed; ++i)
+			is_trimmed = c == octets[i];
+		if (!is_trimmed)
+			break;
+		++start;
+	}
+	return start;
+}
+
+/** Implementation of the TRIM() function for VARBINARY. */
+static void
+func_trim_bin(struct sql_context *ctx, int argc, const struct Mem *argv)
+{
+	if (mem_is_null(&argv[0]))
+		return;
+	int flags = TRIM_BOTH;
+	const char *str = argv[0].z;
+	size_t size = argv[0].n;
+	const char *octets = "\0";
+	size_t octets_size = 1;
+	if (argc == 2) {
+		if (mem_is_null(&argv[1]))
+			return;
+		if (mem_is_bin(&argv[1])) {
+			if (argv[1].n > SQL_MAX_LENGTH) {
+				ctx->is_aborted = true;
+				diag_set(ClientError, ER_SQL_EXECUTE,
+					 "string or blob too big");
+				return;
+			}
+			octets = argv[1].z;
+			octets_size = argv[1].n;
+		} else {
+			assert(mem_is_uint(&argv[1]));
+			flags = argv[1].u.u;
+		}
+	} else if (argc == 3) {
+		if (mem_is_null(&argv[2]))
+			return;
+		assert(mem_is_uint(&argv[1]) && mem_is_bin(&argv[2]));
+		flags = argv[1].u.u;
+		if (argv[2].n > SQL_MAX_LENGTH) {
 			ctx->is_aborted = true;
+			diag_set(ClientError, ER_SQL_EXECUTE,
+				 "string or blob too big");
 			return;
 		}
-		if (version != 4) {
+		octets = argv[2].z;
+		octets_size = argv[2].n;
+	}
+
+	size_t end = trim_bin_end(str, size, octets, octets_size, flags);
+	size_t start = trim_bin_start(str, end, octets, octets_size, flags);
+
+	if (start >= end)
+		return mem_set_bin_static(ctx->pOut, "", 0);
+	mem_copy_bin(ctx->pOut, &str[start], end - start);
+}
+
+/** Return the position of the last not removed character. */
+static inline int32_t
+trim_str_end(const char *str, int32_t end, const char *chars,
+	     uint8_t *chars_len, size_t chars_count, int flags)
+{
+	if ((flags & TRIM_TRAILING) == 0)
+		return end;
+	while (end > 0) {
+		bool is_trimmed = false;
+		const char *c = chars;
+		int32_t len;
+		for (size_t i = 0; i < chars_count && !is_trimmed; ++i) {
+			len = chars_len[i];
+			const char *s = str + end - len;
+			is_trimmed = len <= end && memcmp(c, s, len) == 0;
+			c += len;
+		}
+		if (!is_trimmed)
+			break;
+		assert(len > 0);
+		end -= len;
+	}
+	return end;
+}
+
+/** Return the position of the first not removed character. */
+static inline int32_t
+trim_str_start(const char *str, int32_t end, const char *chars,
+	       uint8_t *chars_len, size_t chars_count, int flags)
+{
+	if ((flags & TRIM_LEADING) == 0)
+		return 0;
+	int32_t start = 0;
+	while (start < end) {
+		bool is_trimmed = false;
+		const char *c = chars;
+		int32_t len;
+		for (size_t i = 0; i < chars_count && !is_trimmed; ++i) {
+			len = chars_len[i];
+			const char *s = str + start;
+			is_trimmed = start + len <= end &&
+				     memcmp(c, s, len) == 0;
+			c += len;
+		}
+		if (!is_trimmed)
+			break;
+		assert(len > 0);
+		start += len;
+	}
+	return start;
+}
+
+/** Implementation of the TRIM() function for STRING. */
+static void
+func_trim_str(struct sql_context *ctx, int argc, const struct Mem *argv)
+{
+	if (mem_is_null(&argv[0]))
+		return;
+	const char *str = argv[0].z;
+	if (argv[0].n > SQL_MAX_LENGTH) {
+		ctx->is_aborted = true;
+		diag_set(ClientError, ER_SQL_EXECUTE, "string or blob too big");
+		return;
+	}
+	int32_t size = argv[0].n;
+	uint64_t flags = TRIM_BOTH;
+	const char *chars = " ";
+	int32_t chars_size = 1;
+	if (argc == 2) {
+		if (mem_is_null(&argv[1]))
+			return;
+		if (mem_is_str(&argv[1])) {
+			if (argv[1].n > SQL_MAX_LENGTH) {
+				ctx->is_aborted = true;
+				diag_set(ClientError, ER_SQL_EXECUTE,
+					 "string or blob too big");
+				return;
+			}
+			chars = argv[1].z;
+			chars_size = argv[1].n;
+		} else {
+			assert(mem_is_uint(&argv[1]));
+			flags = argv[1].u.u;
+		}
+	} else if (argc == 3) {
+		if (mem_is_null(&argv[2]))
+			return;
+		assert(mem_is_uint(&argv[1]) && mem_is_str(&argv[2]));
+		flags = argv[1].u.u;
+		if (argv[2].n > SQL_MAX_LENGTH) {
+			ctx->is_aborted = true;
+			diag_set(ClientError, ER_SQL_EXECUTE,
+				 "string or blob too big");
+			return;
+		}
+		chars = argv[2].z;
+		chars_size = argv[2].n;
+	}
+
+	struct region *region = &fiber()->gc;
+	size_t svp = region_used(region);
+	uint8_t *chars_len = NULL;
+	if (chars_size > 0)
+		chars_len = xregion_alloc(region, chars_size);
+	size_t chars_count = 0;
+
+	int32_t offset = 0;
+	while (offset < chars_size) {
+		UChar32 c;
+		size_t prev = offset;
+		U8_NEXT((uint8_t *)chars, offset, chars_size, c);
+		chars_len[chars_count++] = offset - prev;
+	}
+
+	int32_t end = trim_str_end(str, size, chars, chars_len, chars_count,
+				   flags);
+	int32_t start = trim_str_start(str, end, chars, chars_len, chars_count,
+				       flags);
+	region_truncate(region, svp);
+
+	if (start >= end)
+		return mem_set_str0_static(ctx->pOut, "");
+	mem_copy_str(ctx->pOut, &str[start], end - start);
+}
+
+/** Implementation of the POSITION() function. */
+static void
+func_position_octets(struct sql_context *ctx, int argc, const struct Mem *argv)
+{
+	assert(argc == 2);
+	(void)argc;
+	if (mem_is_any_null(&argv[0], &argv[1]))
+		return;
+	assert(mem_is_bytes(&argv[0]) && mem_is_bytes(&argv[1]));
+
+	const char *key = argv[0].z;
+	const char *str = argv[1].z;
+	size_t key_size = argv[0].n;
+	size_t str_size = argv[1].n;
+	if (key_size <= 0)
+		return mem_set_uint(ctx->pOut, 1);
+	const char *pos = memmem(str, str_size, key, key_size);
+	return mem_set_uint(ctx->pOut, pos == NULL ? 0 : pos - str + 1);
+}
+
+static void
+func_position_characters(struct sql_context *ctx, int argc,
+			 const struct Mem *argv)
+{
+	assert(argc == 2);
+	(void)argc;
+	if (mem_is_any_null(&argv[0], &argv[1]))
+		return;
+	assert(mem_is_str(&argv[0]) && mem_is_str(&argv[1]));
+	if (argv[0].n > SQL_MAX_LENGTH || argv[1].n > SQL_MAX_LENGTH) {
+		ctx->is_aborted = true;
+		diag_set(ClientError, ER_SQL_EXECUTE, "string or blob too big");
+		return;
+	}
+
+	const char *key = argv[0].z;
+	const char *str = argv[1].z;
+	int32_t key_size = argv[0].n;
+	int32_t str_size = argv[1].n;
+	if (key_size <= 0)
+		return mem_set_uint(ctx->pOut, 1);
+
+	int32_t key_end = 0;
+	int32_t str_end = 0;
+	while (key_end < key_size && str_end < str_size) {
+		UChar32 c;
+		U8_NEXT((uint8_t *)key, key_end, key_size, c);
+		U8_NEXT((uint8_t *)str, str_end, str_size, c);
+	}
+	if (key_end < key_size)
+		return mem_set_uint(ctx->pOut, 0);
+
+	struct coll *coll = ctx->coll;
+	if (coll->cmp(key, key_size, str, str_end, coll) == 0)
+		return mem_set_uint(ctx->pOut, 1);
+
+	int32_t i = 2;
+	int32_t str_pos = 0;
+	while (str_end < str_size) {
+		UChar32 c;
+		U8_NEXT((uint8_t *)str, str_pos, str_size, c);
+		U8_NEXT((uint8_t *)str, str_end, str_size, c);
+		const char *s = str + str_pos;
+		if (coll->cmp(key, key_size, s, str_end - str_pos, coll) == 0)
+			return mem_set_uint(ctx->pOut, i);
+		++i;
+	}
+	return mem_set_uint(ctx->pOut, 0);
+}
+
+/** Implementation of the SUBSTR() function. */
+int
+substr_normalize(int64_t base_start, bool is_start_neg, uint64_t base_length,
+		 uint64_t *start, uint64_t *length)
+{
+	if (!is_start_neg && base_start > 0) {
+		*start = (uint64_t)base_start - 1;
+		*length = base_length;
+		return 0;
+	}
+	*start = 0;
+	if (base_length == 0) {
+		*length = 0;
+		return 0;
+	}
+	/*
+	 * We are subtracting 1 from base_length instead of subtracting from
+	 * base_start, since base_start can be INT64_MIN. At the same time,
+	 * base_length is not less than 1.
+	 */
+	int64_t a = base_start;
+	int64_t b = (int64_t)(base_length - 1);
+	int64_t res;
+	bool is_neg;
+	/*
+	 * Integer cannot overflow since non-positive value is added to positive
+	 * value.
+	 */
+	if (sql_add_int(a, a != 0, b, false, &res, &is_neg) != 0) {
+		diag_set(ClientError, ER_SQL_EXECUTE, "integer is overflowed");
+		return -1;
+	}
+	*length = is_neg ? 0 : (uint64_t)res;
+	return 0;
+}
+
+static void
+func_substr_octets(struct sql_context *ctx, int argc, const struct Mem *argv)
+{
+	assert(argc == 2 || argc == 3);
+	if (mem_is_any_null(&argv[0], &argv[1]))
+		return;
+	assert(mem_is_bytes(&argv[0]) && mem_is_int(&argv[1]));
+
+	bool is_str = mem_is_str(&argv[0]);
+	uint64_t size = argv[0].n;
+
+	if (argc == 2) {
+		uint64_t start = mem_is_uint(&argv[1]) && argv[1].u.u > 1 ?
+				 argv[1].u.u - 1 : 0;
+		if (start >= size) {
+			if (is_str)
+				return mem_set_str0_static(ctx->pOut, "");
+			else
+				return mem_set_bin_static(ctx->pOut, "", 0);
+		}
+		char *s = &argv[0].z[start];
+		uint64_t n = size - start;
+		if (is_str)
+			mem_copy_str(ctx->pOut, s, n);
+		else
+			mem_copy_bin(ctx->pOut, s, n);
+		return;
+	}
+
+	assert(argc == 3);
+	if (mem_is_null(&argv[2]))
+		return;
+	assert(mem_is_int(&argv[2]));
+	if (!mem_is_uint(&argv[2])) {
+		diag_set(ClientError, ER_SQL_EXECUTE, "Length of the result "
+			 "cannot be less than 0");
+		ctx->is_aborted = true;
+		return;
+	}
+	uint64_t start;
+	uint64_t length;
+	if (substr_normalize(argv[1].u.i, !mem_is_uint(&argv[1]), argv[2].u.u,
+			     &start, &length) != 0) {
+		ctx->is_aborted = true;
+		return;
+	}
+	if (start >= size || length == 0) {
+		if (is_str)
+			return mem_set_str0_static(ctx->pOut, "");
+		else
+			return mem_set_bin_static(ctx->pOut, "", 0);
+	}
+	char *str = &argv[0].z[start];
+	uint64_t len = MIN(size - start, length);
+	if (is_str)
+		mem_copy_str(ctx->pOut, str, len);
+	else
+		mem_copy_bin(ctx->pOut, str, len);
+}
+
+static void
+func_substr_characters(struct sql_context *ctx, int argc, const
+		       struct Mem *argv)
+{
+	assert(argc == 2 || argc == 3);
+	(void)argc;
+	if (mem_is_any_null(&argv[0], &argv[1]))
+		return;
+	assert(mem_is_str(&argv[0]) && mem_is_int(&argv[1]));
+	if (argv[0].n > SQL_MAX_LENGTH) {
+		ctx->is_aborted = true;
+		diag_set(ClientError, ER_SQL_EXECUTE, "string or blob too big");
+		return;
+	}
+
+	const char *str = argv[0].z;
+	int32_t pos = 0;
+	int32_t end = argv[0].n;
+	if (argc == 2) {
+		uint64_t start = mem_is_uint(&argv[1]) && argv[1].u.u > 1 ?
+				 argv[1].u.u - 1 : 0;
+		for (uint64_t i = 0; i < start && pos < end; ++i) {
+			UChar32 c;
+			U8_NEXT((uint8_t *)str, pos, end, c);
+		}
+		if (pos == end)
+			return mem_set_str_static(ctx->pOut, "", 0);
+		mem_copy_str(ctx->pOut, str + pos, end - pos);
+		return;
+	}
+
+	assert(argc == 3);
+	if (mem_is_null(&argv[2]))
+		return;
+	assert(mem_is_int(&argv[2]));
+	if (!mem_is_uint(&argv[2])) {
+		diag_set(ClientError, ER_SQL_EXECUTE, "Length of the result "
+			 "cannot be less than 0");
+		ctx->is_aborted = true;
+		return;
+	}
+	uint64_t start;
+	uint64_t length;
+	if (substr_normalize(argv[1].u.i, !mem_is_uint(&argv[1]), argv[2].u.u,
+			     &start, &length) != 0) {
+		ctx->is_aborted = true;
+		return;
+	}
+	if (length == 0)
+		return mem_set_str_static(ctx->pOut, "", 0);
+
+	for (uint64_t i = 0; i < start && pos < end; ++i) {
+		UChar32 c;
+		U8_NEXT((uint8_t *)str, pos, end, c);
+	}
+	if (pos == end)
+		return mem_set_str_static(ctx->pOut, "", 0);
+
+	int32_t cur = pos;
+	for (uint64_t i = 0; i < length && cur < end; ++i) {
+		UChar32 c;
+		U8_NEXT((uint8_t *)str, cur, end, c);
+	}
+	assert(cur > pos);
+	mem_copy_str(ctx->pOut, str + pos, cur - pos);
+}
+
+/**
+ * Implementation of the CHAR() function.
+ *
+ * This function takes zero or more arguments, each of which is an integer. It
+ * constructs a string where each character of the string is the unicode
+ * character for the corresponding integer argument.
+ *
+ * If an argument is negative or greater than 0x10ffff, the symbol "�" is used.
+ * Symbol '\0' used instead of NULL argument.
+ */
+static void
+func_char(struct sql_context *ctx, int argc, const struct Mem *argv)
+{
+	if (argc == 0)
+		return mem_set_str_static(ctx->pOut, "", 0);
+	struct region *region = &fiber()->gc;
+	size_t svp = region_used(region);
+	UChar32 *buf = xregion_alloc_array(region, typeof(*buf), argc);
+	size_t len = 0;
+	for (int i = 0; i < argc; ++i) {
+		if (mem_is_null(&argv[i]))
+			buf[i] = 0;
+		else if (!mem_is_uint(&argv[i]) || argv[i].u.u > 0x10ffff)
+			buf[i] = 0xfffd;
+		else
+			buf[i] = argv[i].u.u;
+		len += U8_LENGTH(buf[i]);
+	}
+
+	char *str = sql_xmalloc(len);
+	size_t pos = 0;
+	for (int i = 0; i < argc; ++i) {
+		UBool is_error = false;
+		U8_APPEND((uint8_t *)str, pos, len, buf[i], is_error);
+		assert(!is_error);
+		(void)is_error;
+	}
+	region_truncate(region, svp);
+	assert(pos == len);
+	(void)pos;
+	mem_set_str_allocated(ctx->pOut, str, len);
+}
+
+/**
+ * Implementation of the GREATEST() and LEAST() functions.
+ *
+ * The GREATEST() function returns the largest of the given arguments.
+ * The LEAST() function returns the smallest of the given arguments.
+ */
+static void
+func_greatest_least(struct sql_context *ctx, int argc, const struct Mem *argv)
+{
+	assert(argc > 1);
+	int mask = ctx->func->def->name[0] == 'G' ? -1 : 0;
+	assert(ctx->func->def->name[0] == 'G' ||
+	       ctx->func->def->name[0] == 'L');
+
+	if (mem_is_null(&argv[0]))
+		return;
+	size_t best = 0;
+	for (int i = 1; i < argc; ++i) {
+		if (mem_is_null(&argv[i]))
+			return;
+		int cmp = mem_cmp_scalar(&argv[best], &argv[i], ctx->coll);
+		if ((cmp ^ mask) >= 0)
+			best = i;
+	}
+	if (mem_copy(ctx->pOut, &argv[best]) != 0)
+		ctx->is_aborted = true;
+}
+
+/**
+ * Implementation of the HEX() function.
+ *
+ * The HEX() function returns the hexadecimal representation of the argument.
+ */
+static const char hexdigits[] = {
+	'0', '1', '2', '3', '4', '5', '6', '7',
+	'8', '9', 'A', 'B', 'C', 'D', 'E', 'F'
+};
+
+static void
+func_hex(struct sql_context *ctx, int argc, const struct Mem *argv)
+{
+	assert(argc == 1);
+	(void)argc;
+	const struct Mem *arg = &argv[0];
+	if (mem_is_null(arg))
+		return;
+
+	assert(mem_is_bin(arg));
+	if (arg->n == 0)
+		return mem_set_str0_static(ctx->pOut, "");
+
+	uint32_t size = 2 * arg->n;
+	char *str = sql_xmalloc(size);
+	for (size_t i = 0; i < arg->n; ++i) {
+		char c = arg->z[i];
+		str[2 * i] = hexdigits[(c >> 4) & 0xf];
+		str[2 * i + 1] = hexdigits[c & 0xf];
+	}
+	mem_set_str_allocated(ctx->pOut, str, size);
+}
+
+/** Implementation of the OCTET_LENGTH() function. */
+static void
+func_octet_length(struct sql_context *ctx, int argc, const struct Mem *argv)
+{
+	assert(argc == 1);
+	(void)argc;
+	const struct Mem *arg = &argv[0];
+	if (mem_is_null(arg))
+		return;
+	assert(mem_is_bytes(arg));
+	mem_set_uint(ctx->pOut, arg->n);
+}
+
+/** Implementation of the PRINTF() function. */
+static void
+func_printf(struct sql_context *ctx, int argc, const struct Mem *argv)
+{
+	if (argc < 1 || mem_is_null(&argv[0]))
+		return;
+	if (argc == 1 || !mem_is_str(&argv[0])) {
+		char *str = mem_strdup(&argv[0]);
+		if (str == NULL)
+			ctx->is_aborted = true;
+		else
+			mem_set_str0_allocated(ctx->pOut, str);
+		return;
+	}
+	struct PrintfArguments pargs;
+	struct StrAccum acc;
+	char *format = argv[0].z;
+	pargs.nArg = argc - 1;
+	pargs.nUsed = 0;
+	pargs.apArg = argv + 1;
+	sqlStrAccumInit(&acc, NULL, 0, SQL_MAX_LENGTH);
+	acc.printfFlags = SQL_PRINTF_SQLFUNC;
+	sqlXPrintf(&acc, format, &pargs);
+	assert(acc.accError == 0 || acc.accError == STRACCUM_TOOBIG);
+	if (acc.accError == STRACCUM_TOOBIG) {
+		ctx->is_aborted = true;
+		diag_set(ClientError, ER_SQL_EXECUTE, "string or blob too big");
+		return;
+	}
+	mem_set_str_allocated(ctx->pOut, sqlStrAccumFinish(&acc), acc.nChar);
+}
+
+/**
+ * Implementation of the RANDOM() function.
+ *
+ * This function returns a random INT64 value.
+ */
+static void
+func_random(struct sql_context *ctx, int argc, const struct Mem *argv)
+{
+	(void)argc;
+	(void)argv;
+	int64_t r;
+	sql_randomness(sizeof(r), &r);
+	mem_set_int_with_sign(ctx->pOut, r, r < 0);
+}
+
+/**
+ * Implementation of the RANDOMBLOB() function.
+ *
+ * This function returns a random VARBINARY value. The size of this value is
+ * specified as an argument of the function.
+ */
+static void
+func_randomblob(struct sql_context *ctx, int argc, const struct Mem *argv)
+{
+	assert(argc == 1);
+	(void)argc;
+	const struct Mem *arg = &argv[0];
+	assert(mem_is_null(arg) || mem_is_int(arg));
+	if (mem_is_null(arg) || !mem_is_uint(arg))
+		return;
+	if (arg->u.u == 0)
+		return mem_set_bin_static(ctx->pOut, "", 0);
+	uint64_t len = arg->u.u;
+	if (len > SQL_MAX_LENGTH) {
+		ctx->is_aborted = true;
+		diag_set(ClientError, ER_SQL_EXECUTE, "string or blob too big");
+		return;
+	}
+	char *res = sql_xmalloc(len);
+	sql_randomness(len, res);
+	mem_set_bin_allocated(ctx->pOut, res, len);
+}
+
+/**
+ * Implementation of the ZEROBLOB() function.
+ *
+ * This function returns a zero-filled VARBINARY value. The size of this value
+ * is specified as an argument of the function.
+ */
+static void
+func_zeroblob(struct sql_context *ctx, int argc, const struct Mem *argv)
+{
+	assert(argc == 1);
+	(void)argc;
+	const struct Mem *arg = &argv[0];
+	assert(mem_is_null(arg) || mem_is_int(arg));
+	if (mem_is_null(arg) || !mem_is_uint(arg))
+		return;
+	if (arg->u.u == 0)
+		return mem_set_bin_static(ctx->pOut, "", 0);
+	uint64_t len = arg->u.u;
+	if (len > SQL_MAX_LENGTH) {
+		ctx->is_aborted = true;
+		diag_set(ClientError, ER_SQL_EXECUTE, "string or blob too big");
+		return;
+	}
+	char *res = sql_xmalloc0(len);
+	mem_set_bin_allocated(ctx->pOut, res, len);
+}
+
+/** Implementation of the TYPEOF() function. */
+static void
+func_typeof(struct sql_context *ctx, int argc, const struct Mem *argv)
+{
+	assert(argc == 1);
+	(void)argc;
+	return mem_set_str0_static(ctx->pOut, mem_type_to_str(&argv[0]));
+}
+
+/** Implementation of the ROUND() function for DOUBLE argument. */
+static void
+func_round_double(struct sql_context *ctx, int argc, const struct Mem *argv)
+{
+	assert(argc == 1 || argc == 2);
+	if (mem_is_null(&argv[0]) || (argc == 2 && mem_is_null(&argv[1])))
+		return;
+	assert(mem_is_double(&argv[0]));
+	assert(argc == 1 || mem_is_int(&argv[1]));
+	uint64_t n = (argc == 2 && mem_is_uint(&argv[1])) ? argv[1].u.u : 0;
+	/*
+	 * The smallest positive double value is 2.225E-307, and the value
+	 * before the exponent has a maximum of 15 digits after the decimal
+	 * point. This means that double values cannot have more than 307 + 15
+	 * digits after the decimal point.
+	 */
+	if (n > 322)
+		return mem_copy_as_ephemeral(ctx->pOut, &argv[0]);
+
+	double d = argv[0].u.r;
+	struct Mem *res = ctx->pOut;
+	if (n != 0) {
+		d = atof(tt_sprintf("%.*lf", (int)n, d));
+		return mem_set_double(res, d);
+	}
+	/*
+	 * DOUBLE values greater than 2^53 or less than -2^53 have no digits
+	 * after the decimal point.
+	 */
+	assert(9007199254740992 == (int64_t)1 << 53);
+	if (d <= -9007199254740992.0 || d >= 9007199254740992.0)
+		return mem_set_double(res, d);
+	double delta = d < 0 ? -0.5 : 0.5;
+	return mem_set_double(res, (double)(int64_t)(d + delta));
+}
+
+/** Implementation of the ROUND() function for DECIMAL argument. */
+static void
+func_round_dec(struct sql_context *ctx, int argc, const struct Mem *argv)
+{
+	assert(argc == 1 || argc == 2);
+	if (mem_is_null(&argv[0]) || (argc == 2 && mem_is_null(&argv[1])))
+		return;
+	assert(mem_is_dec(&argv[0]));
+	assert(argc == 1 || mem_is_int(&argv[1]));
+	uint64_t n = (argc == 2 && mem_is_uint(&argv[1])) ? argv[1].u.u : 0;
+
+	mem_set_dec(ctx->pOut, &argv[0].u.d);
+	if (n < DECIMAL_MAX_DIGITS)
+		decimal_round(&ctx->pOut->u.d, n);
+}
+
+/** Implementation of the ROUND() function for INTEGER argument. */
+static void
+func_round_int(struct sql_context *ctx, int argc, const struct Mem *argv)
+{
+	assert(argc == 1 || argc == 2);
+	if (mem_is_null(&argv[0]) || (argc == 2 && mem_is_null(&argv[1])))
+		return;
+	assert(mem_is_int(&argv[0]));
+	assert(argc == 1 || mem_is_int(&argv[1]));
+	return mem_copy_as_ephemeral(ctx->pOut, &argv[0]);
+}
+
+/** Implementation of the ROW_COUNT() function. */
+static void
+func_row_count(struct sql_context *ctx, int argc, const struct Mem *argv)
+{
+	(void)argc;
+	(void)argv;
+	assert(sql_get()->nChange >= 0);
+	return mem_set_uint(ctx->pOut, sql_get()->nChange);
+}
+
+/**
+ * Implementation of the UUID() function.
+ *
+ * Returns a randomly generated UUID value.
+ */
+static void
+func_uuid(struct sql_context *ctx, int argc, const struct Mem *argv)
+{
+	if (argc == 1) {
+		if (mem_is_null(&argv[0]))
+			return;
+		if (!mem_is_uint(&argv[0]) || argv[0].u.u != 4) {
 			diag_set(ClientError, ER_UNSUPPORTED, "Function UUID",
 				 "versions other than 4");
 			ctx->is_aborted = true;
@@ -279,633 +1140,115 @@ sql_func_uuid(struct sql_context *ctx, int argc, struct Mem *argv)
 	mem_set_uuid(ctx->pOut, &uuid);
 }
 
-/*
- * Implementation of the non-aggregate min() and max() functions
- */
+/** Implementation of the VERSION() function. */
 static void
-minmaxFunc(struct sql_context *context, int argc, struct Mem *argv)
-{
-	int i;
-	int iBest;
-	struct coll *pColl;
-	struct func *func = context->func;
-	int mask = sql_func_flag_is_set(func, SQL_FUNC_MAX) ? -1 : 0;
-	if (argc < 2) {
-		diag_set(ClientError, ER_FUNC_WRONG_ARG_COUNT,
-		mask ? "GREATEST" : "LEAST", "at least two", argc);
-		context->is_aborted = true;
-		return;
-	}
-	pColl = context->coll;
-	assert(mask == -1 || mask == 0);
-	iBest = 0;
-	if (mem_is_null(&argv[0]))
-		return;
-	for (i = 1; i < argc; i++) {
-		if (mem_is_null(&argv[i]))
-			return;
-		if ((mem_cmp_scalar(&argv[iBest], &argv[i], pColl) ^ mask) >= 0)
-			iBest = i;
-	}
-	sql_result_value(context, &argv[iBest]);
-}
-
-/*
- * Return the type of the argument.
- */
-static void
-typeofFunc(struct sql_context *context, int argc, struct Mem *argv)
-{
-	(void)argc;
-	const char *z = 0;
-	if ((argv[0].flags & MEM_Number) != 0)
-		return mem_set_str0_static(context->pOut, "number");
-	if ((argv[0].flags & MEM_Scalar) != 0)
-		return mem_set_str0_static(context->pOut, "scalar");
-	switch (argv[0].type) {
-	case MEM_TYPE_INT:
-	case MEM_TYPE_UINT:
-		z = "integer";
-		break;
-	case MEM_TYPE_DEC:
-		z = "decimal";
-		break;
-	case MEM_TYPE_STR:
-		z = "string";
-		break;
-	case MEM_TYPE_DOUBLE:
-		z = "double";
-		break;
-	case MEM_TYPE_BIN:
-	case MEM_TYPE_ARRAY:
-	case MEM_TYPE_MAP:
-		z = "varbinary";
-		break;
-	case MEM_TYPE_BOOL:
-		z = "boolean";
-		break;
-	case MEM_TYPE_NULL:
-		z = "NULL";
-		break;
-	case MEM_TYPE_UUID:
-		z = "uuid";
-		break;
-	default:
-		unreachable();
-		break;
-	}
-	sql_result_text(context, z, -1, SQL_STATIC);
-}
-
-/*
- * Implementation of the length() function
- */
-static void
-lengthFunc(struct sql_context *context, int argc, struct Mem *argv)
-{
-	int len;
-
-	assert(argc == 1);
-	UNUSED_PARAMETER(argc);
-	switch (sql_value_type(&argv[0])) {
-	case MP_BIN:
-	case MP_ARRAY:
-	case MP_MAP:
-	case MP_INT:
-	case MP_UINT:
-	case MP_BOOL:
-	case MP_DOUBLE:{
-			mem_as_bin(&argv[0]);
-			sql_result_uint(context, mem_len_unsafe(&argv[0]));
-			break;
-		}
-	case MP_EXT:
-	case MP_STR:{
-			const unsigned char *z = mem_as_ustr(&argv[0]);
-			if (z == 0)
-				return;
-			len = sql_utf8_char_count(z, mem_len_unsafe(&argv[0]));
-			sql_result_uint(context, len);
-			break;
-		}
-	default:{
-			sql_result_null(context);
-			break;
-		}
-	}
-}
-
-/*
- * Implementation of the abs() function.
- *
- * IMP: R-23979-26855 The abs(X) function returns the absolute value of
- * the numeric argument X.
- */
-static void
-absFunc(struct sql_context *context, int argc, struct Mem *argv)
-{
-	assert(argc == 1);
-	UNUSED_PARAMETER(argc);
-	switch (sql_value_type(&argv[0])) {
-	case MP_UINT: {
-		sql_result_uint(context, mem_get_uint_unsafe(&argv[0]));
-		break;
-	}
-	case MP_INT: {
-		int64_t value = mem_get_int_unsafe(&argv[0]);
-		assert(value < 0);
-		sql_result_uint(context, -value);
-		break;
-	}
-	case MP_NIL:{
-			/* IMP: R-37434-19929 Abs(X) returns NULL if X is NULL. */
-			sql_result_null(context);
-			break;
-		}
-	case MP_BOOL:
-	case MP_BIN:
-	case MP_EXT:
-	case MP_ARRAY:
-	case MP_MAP: {
-		diag_set(ClientError, ER_INCONSISTENT_TYPES, "number",
-			 mem_str(&argv[0]));
-		context->is_aborted = true;
-		return;
-	}
-	default:{
-			/*
-			 * Abs(X) returns 0.0 if X is a string or blob
-			 * that cannot be converted to a numeric value.
-			 */
-			double rVal = mem_get_double_unsafe(&argv[0]);
-			if (rVal < 0)
-				rVal = -rVal;
-			sql_result_double(context, rVal);
-			break;
-		}
-	}
-}
-
-/**
- * Implementation of the position() function.
- *
- * position(needle, haystack) finds the first occurrence of needle
- * in haystack and returns the number of previous characters
- * plus 1, or 0 if needle does not occur within haystack.
- *
- * If both haystack and needle are BLOBs, then the result is one
- * more than the number of bytes in haystack prior to the first
- * occurrence of needle, or 0 if needle never occurs in haystack.
- */
-static void
-position_func(struct sql_context *context, int argc, struct Mem *argv)
-{
-	UNUSED_PARAMETER(argc);
-	struct Mem *needle = &argv[0];
-	struct Mem *haystack = &argv[1];
-	enum mp_type needle_type = sql_value_type(needle);
-	enum mp_type haystack_type = sql_value_type(haystack);
-
-	if (haystack_type == MP_NIL || needle_type == MP_NIL)
-		return;
-	/*
-	 * Position function can be called only with string
-	 * or blob params.
-	 */
-	struct Mem *inconsistent_type_arg = NULL;
-	if (needle_type != MP_STR && needle_type != MP_BIN)
-		inconsistent_type_arg = needle;
-	if (haystack_type != MP_STR && haystack_type != MP_BIN)
-		inconsistent_type_arg = haystack;
-	if (inconsistent_type_arg != NULL) {
-		diag_set(ClientError, ER_INCONSISTENT_TYPES,
-			 "string or varbinary", mem_str(inconsistent_type_arg));
-		context->is_aborted = true;
-		return;
-	}
-	/*
-	 * Both params of Position function must be of the same
-	 * type.
-	 */
-	if (haystack_type != needle_type) {
-		diag_set(ClientError, ER_INCONSISTENT_TYPES,
-			 mem_type_to_str(needle), mem_str(haystack));
-		context->is_aborted = true;
-		return;
-	}
-
-	int n_needle_bytes = mem_len_unsafe(needle);
-	int n_haystack_bytes = mem_len_unsafe(haystack);
-	int position = 1;
-	if (n_needle_bytes > 0) {
-		const unsigned char *haystack_str;
-		const unsigned char *needle_str;
-		if (haystack_type == MP_BIN) {
-			needle_str = mem_as_bin(needle);
-			haystack_str = mem_as_bin(haystack);
-			assert(needle_str != NULL);
-			assert(haystack_str != NULL || n_haystack_bytes == 0);
-			/*
-			 * Naive implementation of substring
-			 * searching: matching time O(n * m).
-			 * Can be improved.
-			 */
-			while (n_needle_bytes <= n_haystack_bytes &&
-			       memcmp(haystack_str, needle_str, n_needle_bytes) != 0) {
-				position++;
-				n_haystack_bytes--;
-				haystack_str++;
-			}
-			if (n_needle_bytes > n_haystack_bytes)
-				position = 0;
-		} else {
-			/*
-			 * Code below handles not only simple
-			 * cases like position('a', 'bca'), but
-			 * also more complex ones:
-			 * position('a', 'bcá' COLLATE "unicode_ci")
-			 * To do so, we need to use comparison
-			 * window, which has constant character
-			 * size, but variable byte size.
-			 * Character size is equal to
-			 * needle char size.
-			 */
-			haystack_str = mem_as_ustr(haystack);
-			needle_str = mem_as_ustr(needle);
-
-			int n_needle_chars =
-				sql_utf8_char_count(needle_str, n_needle_bytes);
-			int n_haystack_chars =
-				sql_utf8_char_count(haystack_str,
-						    n_haystack_bytes);
-
-			if (n_haystack_chars < n_needle_chars) {
-				position = 0;
-				goto finish;
-			}
-			/*
-			 * Comparison window is determined by
-			 * beg_offset and end_offset. beg_offset
-			 * is offset in bytes from haystack
-			 * beginning to window beginning.
-			 * end_offset is offset in bytes from
-			 * haystack beginning to window end.
-			 */
-			int end_offset = 0;
-			for (int c = 0; c < n_needle_chars; c++) {
-				SQL_UTF8_FWD_1(haystack_str, end_offset,
-					       n_haystack_bytes);
-			}
-			int beg_offset = 0;
-			struct coll *coll = context->coll;
-			int c;
-			for (c = 0; c + n_needle_chars <= n_haystack_chars; c++) {
-				if (coll->cmp((const char *) haystack_str + beg_offset,
-					      end_offset - beg_offset,
-					      (const char *) needle_str,
-					      n_needle_bytes, coll) == 0)
-					goto finish;
-				position++;
-				/* Update offsets. */
-				SQL_UTF8_FWD_1(haystack_str, beg_offset,
-					       n_haystack_bytes);
-				SQL_UTF8_FWD_1(haystack_str, end_offset,
-					       n_haystack_bytes);
-			}
-			/* Needle was not found in the haystack. */
-			position = 0;
-		}
-	}
-finish:
-	assert(position >= 0);
-	sql_result_uint(context, position);
-}
-
-/*
- * Implementation of the printf() function.
- */
-static void
-printfFunc(struct sql_context *context, int argc, struct Mem *argv)
-{
-	PrintfArguments x;
-	StrAccum str;
-	const char *zFormat;
-	int n;
-	sql *db = sql_context_db_handle(context);
-
-	if (argc >= 1 && (zFormat = mem_as_str0(&argv[0])) != NULL) {
-		x.nArg = argc - 1;
-		x.nUsed = 0;
-		x.apArg = sqlDbMallocRawNN(sql_get(),
-					   (argc - 1) * sizeof(*x.apArg));
-		if (x.apArg == NULL) {
-			context->is_aborted = true;
-			return;
-		}
-		for (int i = 1; i < argc; ++i)
-			x.apArg[i - 1] = &argv[i];
-		sqlStrAccumInit(&str, db, 0, 0,
-				    db->aLimit[SQL_LIMIT_LENGTH]);
-		str.printfFlags = SQL_PRINTF_SQLFUNC;
-		sqlXPrintf(&str, zFormat, &x);
-		sqlDbFree(sql_get(), x.apArg);
-		n = str.nChar;
-		sql_result_text(context, sqlStrAccumFinish(&str), n,
-				    SQL_DYNAMIC);
-	}
-}
-
-/*
- * Implementation of the substr() function.
- *
- * substr(x,p1,p2)  returns p2 characters of x[] beginning with p1.
- * p1 is 1-indexed.  So substr(x,1,1) returns the first character
- * of x.  If x is text, then we actually count UTF-8 characters.
- * If x is a blob, then we count bytes.
- *
- * If p1 is negative, then we begin abs(p1) from the end of x[].
- *
- * If p2 is negative, return the p2 characters preceding p1.
- */
-static void
-substrFunc(struct sql_context *context, int argc, struct Mem *argv)
-{
-	const unsigned char *z;
-	const unsigned char *z2;
-	int len;
-	int p0type;
-	int64_t p1, p2;
-	int negP2 = 0;
-
-	if (argc != 2 && argc != 3) {
-		diag_set(ClientError, ER_FUNC_WRONG_ARG_COUNT, "SUBSTR",
-			 "1 or 2", argc);
-		context->is_aborted = true;
-		return;
-	}
-	if (mem_is_null(&argv[1]) || (argc == 3 && mem_is_null(&argv[2])))
-		return;
-	p0type = sql_value_type(&argv[0]);
-	p1 = mem_get_int_unsafe(&argv[1]);
-	if (p0type == MP_BIN) {
-		z = mem_as_bin(&argv[0]);
-		len = mem_len_unsafe(&argv[0]);
-		if (z == 0)
-			return;
-		assert(len == mem_len_unsafe(&argv[0]));
-	} else {
-		z = mem_as_ustr(&argv[0]);
-		if (z == 0)
-			return;
-		len = 0;
-		if (p1 < 0)
-			len = sql_utf8_char_count(z, mem_len_unsafe(&argv[0]));
-	}
-	if (argc == 3) {
-		p2 = mem_get_int_unsafe(&argv[2]);
-		if (p2 < 0) {
-			p2 = -p2;
-			negP2 = 1;
-		}
-	} else {
-		p2 = sql_context_db_handle(context)->
-		    aLimit[SQL_LIMIT_LENGTH];
-	}
-	if (p1 < 0) {
-		p1 += len;
-		if (p1 < 0) {
-			p2 += p1;
-			if (p2 < 0)
-				p2 = 0;
-			p1 = 0;
-		}
-	} else if (p1 > 0) {
-		p1--;
-	} else if (p2 > 0) {
-		p2--;
-	}
-	if (negP2) {
-		p1 -= p2;
-		if (p1 < 0) {
-			p2 += p1;
-			p1 = 0;
-		}
-	}
-	assert(p1 >= 0 && p2 >= 0);
-	if (p0type != MP_BIN) {
-		/*
-		 * In the code below 'cnt' and 'n_chars' is
-		 * used because '\0' is not supposed to be
-		 * end-of-string symbol.
-		 */
-		int byte_size = mem_len_unsafe(&argv[0]);
-		int n_chars = sql_utf8_char_count(z, byte_size);
-		int cnt = 0;
-		int i = 0;
-		while (cnt < n_chars && p1) {
-			SQL_UTF8_FWD_1(z, i, byte_size);
-			cnt++;
-			p1--;
-		}
-		z += i;
-		i = 0;
-		for (z2 = z; cnt < n_chars && p2; p2--) {
-			SQL_UTF8_FWD_1(z2, i, byte_size);
-			cnt++;
-		}
-		z2 += i;
-		mem_copy_str(context->pOut, (char *)z, z2 - z);
-	} else {
-		if (p1 + p2 > len) {
-			p2 = len - p1;
-			if (p2 < 0)
-				p2 = 0;
-		}
-		mem_copy_bin(context->pOut, (char *)&z[p1], p2);
-	}
-}
-
-/*
- * Implementation of the round() function
- */
-static void
-roundFunc(struct sql_context *context, int argc, struct Mem *argv)
-{
-	int64_t n = 0;
-	double r;
-	if (argc != 1 && argc != 2) {
-		diag_set(ClientError, ER_FUNC_WRONG_ARG_COUNT, "ROUND",
-			 "1 or 2", argc);
-		context->is_aborted = true;
-		return;
-	}
-	if (argc == 2) {
-		if (mem_is_null(&argv[1]))
-			return;
-		n = mem_get_int_unsafe(&argv[1]);
-		if (n < 0)
-			n = 0;
-	}
-	if (mem_is_null(&argv[0]))
-		return;
-	if (!mem_is_num(&argv[0]) && !mem_is_str(&argv[0])) {
-		diag_set(ClientError, ER_SQL_TYPE_MISMATCH,
-			 mem_str(&argv[0]), "number");
-		context->is_aborted = true;
-		return;
-	}
-	r = mem_get_double_unsafe(&argv[0]);
-	/* If Y==0 and X will fit in a 64-bit int,
-	 * handle the rounding directly,
-	 * otherwise use printf.
-	 */
-	if (n == 0 && r >= 0 && r < (double)(LARGEST_INT64 - 1)) {
-		r = (double)((sql_int64) (r + 0.5));
-	} else if (n == 0 && r < 0 && (-r) < (double)(LARGEST_INT64 - 1)) {
-		r = -(double)((sql_int64) ((-r) + 0.5));
-	} else {
-		const char *rounded_value = tt_sprintf("%.*f", n, r);
-		sqlAtoF(rounded_value, &r, sqlStrlen30(rounded_value));
-	}
-	sql_result_double(context, r);
-}
-
-/*
- * Allocate nByte bytes of space using sqlMalloc(). If the
- * allocation fails, return NULL. If nByte is larger than the
- * maximum string or blob length, then raise an error and return
- * NULL.
- */
-static void *
-contextMalloc(struct sql_context *context, i64 nByte)
-{
-	char *z;
-	sql *db = sql_context_db_handle(context);
-	assert(nByte > 0);
-	testcase(nByte == db->aLimit[SQL_LIMIT_LENGTH]);
-	testcase(nByte == db->aLimit[SQL_LIMIT_LENGTH] + 1);
-	if (nByte > db->aLimit[SQL_LIMIT_LENGTH]) {
-		diag_set(ClientError, ER_SQL_EXECUTE, "string or blob too big");
-		context->is_aborted = true;
-		z = 0;
-	} else {
-		z = sqlMalloc(nByte);
-		if (z == NULL)
-			context->is_aborted = true;
-	}
-	return z;
-}
-
-/*
- * Implementation of the upper() and lower() SQL functions.
- */
-
-#define ICU_CASE_CONVERT(case_type)                                            \
-static void                                                                    \
-case_type##ICUFunc(sql_context *context, int argc, struct Mem *argv)           \
-{                                                                              \
-	char *z1;                                                              \
-	const char *z2;                                                        \
-	int n;                                                                 \
-	UNUSED_PARAMETER(argc);                                                \
-	if (mem_is_bin(&argv[0]) || mem_is_map(&argv[0]) ||                    \
-	    mem_is_array(&argv[0])) {                                          \
-		diag_set(ClientError, ER_INCONSISTENT_TYPES, "string",         \
-			 mem_str(&argv[0]));                                   \
-		context->is_aborted = true;                                    \
-		return;                                                        \
-	}                                                                      \
-	z2 = mem_as_str0(&argv[0]);                                            \
-	n = mem_len_unsafe(&argv[0]);                                          \
-	/*                                                                     \
-	 * Verify that the call to _bytes()                                    \
-	 * does not invalidate the _text() pointer.                            \
-	 */                                                                    \
-	assert(z2 == mem_as_str0(&argv[0]));                                   \
-	if (!z2)                                                               \
-		return;                                                        \
-	z1 = contextMalloc(context, ((i64) n) + 1);                            \
-	if (z1 == NULL) {                                                      \
-		context->is_aborted = true;                                    \
-		return;                                                        \
-	}                                                                      \
-	UErrorCode status = U_ZERO_ERROR;                                      \
-	struct coll *coll = context->coll;                                     \
-	const char *locale = NULL;                                             \
-	if (coll != NULL && coll->type == COLL_TYPE_ICU) {                     \
-		locale = ucol_getLocaleByType(coll->collator,                  \
-					      ULOC_VALID_LOCALE, &status);     \
-	}                                                                      \
-	UCaseMap *case_map = ucasemap_open(locale, 0, &status);                \
-	assert(case_map != NULL);                                              \
-	int len = ucasemap_utf8To##case_type(case_map, z1, n, z2, n, &status); \
-	if (len > n) {                                                         \
-		status = U_ZERO_ERROR;                                         \
-		sql_free(z1);                                              \
-		z1 = contextMalloc(context, ((i64) len) + 1);                  \
-		if (z1 == NULL) {                                              \
-			context->is_aborted = true;                            \
-			return;                                                \
-		}                                                              \
-		ucasemap_utf8To##case_type(case_map, z1, len, z2, n, &status); \
-	}                                                                      \
-	ucasemap_close(case_map);                                              \
-	sql_result_text(context, z1, len, sql_free);                   \
-}                                                                              \
-
-ICU_CASE_CONVERT(Lower);
-ICU_CASE_CONVERT(Upper);
-
-
-/*
- * Some functions like COALESCE() and IFNULL() and UNLIKELY() are implemented
- * as VDBE code so that unused argument values do not have to be computed.
- * However, we still need some kind of function implementation for this
- * routines in the function table.  The noopFunc macro provides this.
- * noopFunc will never be called so it doesn't matter what the implementation
- * is.  We might as well use the "version()" function as a substitute.
- */
-#define noopFunc sql_func_version /* Substitute function - never called */
-
-/*
- * Implementation of random().  Return a random integer.
- */
-static void
-randomFunc(struct sql_context *context, int argc, struct Mem *argv)
+func_version(struct sql_context *ctx, int argc, const struct Mem *argv)
 {
 	(void)argc;
 	(void)argv;
-	int64_t r;
-	sql_randomness(sizeof(r), &r);
-	sql_result_int(context, r);
+	return mem_set_str0_static(ctx->pOut, (char *)tarantool_version());
 }
 
-/*
- * Implementation of randomblob(N).  Return a random blob
- * that is N bytes long.
+/**
+ * Implementation of the UNICODE() function.
+ *
+ * Return the Unicode code point value for the first character of the input
+ * string.
  */
 static void
-randomBlob(struct sql_context *context, int argc, struct Mem *argv)
+func_unicode(struct sql_context *ctx, int argc, const struct Mem *argv)
 {
-	int64_t n;
-	unsigned char *p;
 	assert(argc == 1);
-	UNUSED_PARAMETER(argc);
-	if (mem_is_bin(&argv[0]) || mem_is_map(&argv[0]) ||
-	    mem_is_array(&argv[0])) {
-		diag_set(ClientError, ER_SQL_TYPE_MISMATCH,
-			 mem_str(&argv[0]), "number");
-		context->is_aborted = true;
+	(void)argc;
+	const struct Mem *arg = &argv[0];
+	if (mem_is_null(arg))
+		return;
+	assert(mem_is_str(arg));
+	if (arg->n == 0)
+		return mem_set_uint(ctx->pOut, 0);
+	if (arg->n > SQL_MAX_LENGTH) {
+		ctx->is_aborted = true;
+		diag_set(ClientError, ER_SQL_EXECUTE, "string or blob too big");
 		return;
 	}
-	n = mem_get_int_unsafe(&argv[0]);
-	if (n < 1)
+
+	int32_t pos = 0;
+	int32_t n = arg->n;
+	UChar32 c;
+	U8_NEXT((uint8_t *)arg->z, pos, n, c);
+	(void)pos;
+	mem_set_uint(ctx->pOut, (uint64_t)c);
+}
+
+/**
+ * Implementation of the NOW() function.
+ *
+ * Return the current date and time.
+ */
+static void
+func_now(struct sql_context *ctx, int argc, const struct Mem *argv)
+{
+	assert(argc == 0);
+	(void)argc;
+	(void)argv;
+	struct datetime dt;
+	datetime_ev_now(&dt);
+	mem_set_datetime(ctx->pOut, &dt);
+}
+
+/**
+ * Implementation of the DATE_PART() function.
+ *
+ * Returns the requested information from a DATETIME value.
+ */
+static void
+func_date_part(struct sql_context *ctx, int argc, const struct Mem *argv)
+{
+	assert(argc == 2);
+	(void)argc;
+	const struct Mem *part = &argv[0];
+	const struct Mem *date = &argv[1];
+	if (mem_is_any_null(part, date))
 		return;
-	p = contextMalloc(context, n);
-	if (p) {
-		sql_randomness(n, p);
-		sql_result_blob(context, (char *)p, n, sql_free);
-	}
+	assert(mem_is_str(part) && mem_is_datetime(date));
+	const char *str = tt_cstr(part->z, part->n);
+	const struct datetime *dt = &date->u.dt;
+	if (strcasecmp("millennium", str) == 0)
+		return mem_set_int(ctx->pOut, datetime_millennium(dt));
+	if (strcasecmp("century", str) == 0)
+		return mem_set_int(ctx->pOut, datetime_century(dt));
+	if (strcasecmp("decade", str) == 0)
+		return mem_set_int(ctx->pOut, datetime_decade(dt));
+	if (strcasecmp("year", str) == 0)
+		return mem_set_int(ctx->pOut, datetime_year(dt));
+	if (strcasecmp("quarter", str) == 0)
+		return mem_set_uint(ctx->pOut, datetime_quarter(dt));
+	if (strcasecmp("month", str) == 0)
+		return mem_set_uint(ctx->pOut, datetime_month(dt));
+	if (strcasecmp("week", str) == 0)
+		return mem_set_uint(ctx->pOut, datetime_week(dt));
+	if (strcasecmp("day", str) == 0)
+		return mem_set_uint(ctx->pOut, datetime_day(dt));
+	if (strcasecmp("dow", str) == 0)
+		return mem_set_uint(ctx->pOut, datetime_dow(dt));
+	if (strcasecmp("doy", str) == 0)
+		return mem_set_uint(ctx->pOut, datetime_doy(dt));
+	if (strcasecmp("hour", str) == 0)
+		return mem_set_uint(ctx->pOut, datetime_hour(dt));
+	if (strcasecmp("minute", str) == 0)
+		return mem_set_uint(ctx->pOut, datetime_min(dt));
+	if (strcasecmp("second", str) == 0)
+		return mem_set_uint(ctx->pOut, datetime_sec(dt));
+	if (strcasecmp("millisecond", str) == 0)
+		return mem_set_uint(ctx->pOut, datetime_msec(dt));
+	if (strcasecmp("microsecond", str) == 0)
+		return mem_set_uint(ctx->pOut, datetime_usec(dt));
+	if (strcasecmp("nanosecond", str) == 0)
+		return mem_set_uint(ctx->pOut, datetime_nsec(dt));
+	if (strcasecmp("epoch", str) == 0)
+		return mem_set_int(ctx->pOut, datetime_epoch(dt));
+	if (strcasecmp("timezone_offset", str) == 0)
+		return mem_set_int(ctx->pOut, datetime_tzoffset(dt));
 }
 
 #define Utf8Read(s, e) \
@@ -1128,67 +1471,61 @@ sql_utf8_pattern_compare(const char *pattern,
  * is NULL then result is NULL as well.
  */
 static void
-likeFunc(sql_context *context, int argc, struct Mem *argv)
+likeFunc(sql_context *context, int argc, const struct Mem *argv)
 {
 	u32 escape = SQL_END_OF_STRING;
-	int nPat;
-	if (argc != 2 && argc != 3) {
-		diag_set(ClientError, ER_FUNC_WRONG_ARG_COUNT,
-			 "LIKE", "2 or 3", argc);
+	assert(argc == 2 || argc == 3);
+	if (mem_is_any_null(&argv[0], &argv[1]))
+		return;
+	assert(mem_is_str(&argv[0]) && mem_is_str(&argv[1]));
+	if (argv[0].n > SQL_MAX_LENGTH || argv[1].n > SQL_MAX_LENGTH) {
 		context->is_aborted = true;
+		diag_set(ClientError, ER_SQL_EXECUTE, "string or blob too big");
 		return;
 	}
-	sql *db = sql_context_db_handle(context);
-	int rhs_type = sql_value_type(&argv[0]);
-	int lhs_type = sql_value_type(&argv[1]);
-
-	if (lhs_type != MP_STR || rhs_type != MP_STR) {
-		if (lhs_type == MP_NIL || rhs_type == MP_NIL)
-			return;
-		const char *str = rhs_type != MP_STR ?
-				  mem_str(&argv[0]) : mem_str(&argv[1]);
-		diag_set(ClientError, ER_INCONSISTENT_TYPES, "string", str);
-		context->is_aborted = true;
-		return;
-	}
-	const char *zB = mem_as_str0(&argv[0]);
-	const char *zA = mem_as_str0(&argv[1]);
-	const char *zB_end = zB + mem_len_unsafe(&argv[0]);
-	const char *zA_end = zA + mem_len_unsafe(&argv[1]);
+	const char *zB = argv[0].z;
+	const char *zA = argv[1].z;
+	const char *zB_end = zB + argv[0].n;
+	const char *zA_end = zA + argv[1].n;
 
 	/*
 	 * Limit the length of the LIKE pattern to avoid problems
 	 * of deep recursion and N*N behavior in
 	 * sql_utf8_pattern_compare().
 	 */
-	nPat = mem_len_unsafe(&argv[0]);
-	testcase(nPat == db->aLimit[SQL_LIMIT_LIKE_PATTERN_LENGTH]);
-	testcase(nPat == db->aLimit[SQL_LIMIT_LIKE_PATTERN_LENGTH] + 1);
-	if (nPat > db->aLimit[SQL_LIMIT_LIKE_PATTERN_LENGTH]) {
+	int32_t nPat = argv[0].n;
+	if (nPat > sql_get()->aLimit[SQL_LIMIT_LIKE_PATTERN_LENGTH]) {
 		diag_set(ClientError, ER_SQL_EXECUTE, "LIKE pattern is too "\
 			 "complex");
 		context->is_aborted = true;
 		return;
 	}
-	/* Encoding did not change */
-	assert(zB == mem_as_str0(&argv[0]));
 
 	if (argc == 3) {
+		if (mem_is_null(&argv[2]))
+			return;
+		assert(mem_is_str(&argv[2]));
+		if (argv[2].n > SQL_MAX_LENGTH) {
+			context->is_aborted = true;
+			diag_set(ClientError, ER_SQL_EXECUTE,
+				 "string or blob too big");
+			return;
+		}
 		/*
 		 * The escape character string must consist of a
 		 * single UTF-8 character. Otherwise, return an
 		 * error.
 		 */
-		const unsigned char *zEsc = mem_as_ustr(&argv[2]);
-		if (zEsc == 0)
-			return;
-		if (sql_utf8_char_count(zEsc, mem_len_unsafe(&argv[2])) != 1) {
+		const char *str = argv[2].z;
+		int32_t pos = 0;
+		int32_t end = argv[2].n;
+		U8_NEXT((uint8_t *)str, pos, end, escape);
+		if (pos != end || end == 0) {
 			diag_set(ClientError, ER_SQL_EXECUTE, "ESCAPE "\
 				 "expression must be a single character");
 			context->is_aborted = true;
 			return;
 		}
-		escape = sqlUtf8Read(&zEsc);
 	}
 	if (!zA || !zB)
 		return;
@@ -1203,46 +1540,8 @@ likeFunc(sql_context *context, int argc, struct Mem *argv)
 		context->is_aborted = true;
 		return;
 	}
-	sql_result_bool(context, res == MATCH);
+	mem_set_bool(context->pOut, res == MATCH);
 }
-
-/*
- * Implementation of the NULLIF(x,y) function.  The result is the first
- * argument if the arguments are different.  The result is NULL if the
- * arguments are equal to each other.
- */
-static void
-nullifFunc(struct sql_context *context, int argc, struct Mem *argv)
-{
-	(void)argc;
-	struct coll *pColl = context->coll;
-	if (mem_cmp_scalar(&argv[0], &argv[1], pColl) != 0)
-		sql_result_value(context, &argv[0]);
-}
-
-/**
- * Implementation of the version() function.  The result is the
- * version of the Tarantool that is running.
- *
- * @param context Context being used.
- * @param unused1 Unused.
- * @param unused2 Unused.
- */
-static void
-sql_func_version(struct sql_context *context, int argc, struct Mem *argv)
-{
-	(void)argc;
-	(void)argv;
-	sql_result_text(context, tarantool_version(), -1, SQL_STATIC);
-}
-
-/* Array for converting from half-bytes (nybbles) into ASCII hex
- * digits.
- */
-static const char hexdigits[] = {
-	'0', '1', '2', '3', '4', '5', '6', '7',
-	'8', '9', 'A', 'B', 'C', 'D', 'E', 'F'
-};
 
 /*
  * Implementation of the QUOTE() function.  This function takes a single
@@ -1252,7 +1551,7 @@ static const char hexdigits[] = {
  * single-quote escapes.
  */
 static void
-quoteFunc(struct sql_context *context, int argc, struct Mem *argv)
+quoteFunc(struct sql_context *context, int argc, const struct Mem *argv)
 {
 	assert(argc == 1);
 	UNUSED_PARAMETER(argc);
@@ -1260,194 +1559,90 @@ quoteFunc(struct sql_context *context, int argc, struct Mem *argv)
 	case MEM_TYPE_UUID: {
 		char buf[UUID_STR_LEN + 1];
 		tt_uuid_to_string(&argv[0].u.uuid, &buf[0]);
-		sql_result_text(context, buf, UUID_STR_LEN, SQL_TRANSIENT);
+		mem_copy_str(context->pOut, buf, UUID_STR_LEN);
+		break;
+	}
+	case MEM_TYPE_DATETIME: {
+		char buf[DT_TO_STRING_BUFSIZE];
+		uint32_t len = datetime_snprint(buf, DT_TO_STRING_BUFSIZE,
+						&context->pOut->u.dt);
+		assert(len == strlen(buf));
+		mem_copy_str(context->pOut, buf, len);
+		break;
+	}
+	case MEM_TYPE_INTERVAL: {
+		char buf[DT_IVAL_TO_STRING_BUFSIZE];
+		uint32_t len = interval_snprint(buf,
+						DT_IVAL_TO_STRING_BUFSIZE,
+						&context->pOut->u.itv);
+		assert(len == strlen(buf));
+		mem_copy_str(context->pOut, buf, len);
 		break;
 	}
 	case MEM_TYPE_DOUBLE:
 	case MEM_TYPE_DEC:
 	case MEM_TYPE_UINT:
 	case MEM_TYPE_INT: {
-			sql_result_value(context, &argv[0]);
-			break;
+		if (mem_copy(context->pOut, &argv[0]) != 0)
+			context->is_aborted = true;
+		break;
+	}
+	case MEM_TYPE_MAP:
+	case MEM_TYPE_ARRAY: {
+		char *buf = NULL;
+		int size = mp_snprint(buf, 0, argv[0].z) + 1;
+		assert(size > 0);
+		buf = sql_xmalloc(size);
+		mp_snprint(buf, size, argv[0].z);
+		mem_set_str0_allocated(context->pOut, buf);
+		break;
+	}
+	case MEM_TYPE_BIN: {
+		const char *zBlob = argv[0].z;
+		size_t nBlob = argv[0].n;
+		uint32_t size = 2 * nBlob + 3;
+		char *zText = sql_xmalloc(size);
+		for (size_t i = 0; i < nBlob; i++) {
+			zText[(i * 2) + 2] = hexdigits[(zBlob[i] >> 4) & 0x0F];
+			zText[(i * 2) + 3] = hexdigits[(zBlob[i]) & 0x0F];
 		}
-	case MEM_TYPE_BIN:
-	case MEM_TYPE_ARRAY:
-	case MEM_TYPE_MAP: {
-			char *zText = 0;
-			char const *zBlob = mem_as_bin(&argv[0]);
-			int nBlob = mem_len_unsafe(&argv[0]);
-			assert(zBlob == mem_as_bin(&argv[0]));	/* No encoding change */
-			zText =
-			    (char *)contextMalloc(context,
-						  (2 * (i64) nBlob) + 4);
-			if (zText) {
-				int i;
-				for (i = 0; i < nBlob; i++) {
-					zText[(i * 2) + 2] =
-					    hexdigits[(zBlob[i] >> 4) & 0x0F];
-					zText[(i * 2) + 3] =
-					    hexdigits[(zBlob[i]) & 0x0F];
-				}
-				zText[(nBlob * 2) + 2] = '\'';
-				zText[(nBlob * 2) + 3] = '\0';
-				zText[0] = 'X';
-				zText[1] = '\'';
-				sql_result_text(context, zText, -1,
-						    SQL_TRANSIENT);
-				sql_free(zText);
-			}
-			break;
-		}
+		zText[(nBlob * 2) + 2] = '\'';
+		zText[0] = 'X';
+		zText[1] = '\'';
+		mem_set_str_allocated(context->pOut, zText, size);
+		break;
+	}
 	case MEM_TYPE_STR: {
-			int i, j;
-			u64 n;
-			const unsigned char *zArg = mem_as_ustr(&argv[0]);
-			char *z;
-
-			if (zArg == 0)
-				return;
-			for (i = 0, n = 0; zArg[i]; i++) {
-				if (zArg[i] == '\'')
-					n++;
-			}
-			z = contextMalloc(context, ((i64) i) + ((i64) n) + 3);
-			if (z) {
-				z[0] = '\'';
-				for (i = 0, j = 1; zArg[i]; i++) {
-					z[j++] = zArg[i];
-					if (zArg[i] == '\'') {
-						z[j++] = '\'';
-					}
-				}
-				z[j++] = '\'';
-				z[j] = 0;
-				sql_result_text(context, z, j,
-						    sql_free);
-			}
-			break;
+		const char *str = argv[0].z;
+		uint32_t len = argv[0].n;
+		uint32_t count = 0;
+		for (uint32_t i = 0; i < len; ++i) {
+			if (str[i] == '\'')
+				++count;
 		}
+		uint32_t size = len + count + 2;
+
+		char *res = sql_xmalloc(size);
+		res[0] = '\'';
+		for (uint32_t i = 0, j = 1; i < len; ++i) {
+			res[j++] = str[i];
+			if (str[i] == '\'')
+				res[j++] = '\'';
+		}
+		res[size - 1] = '\'';
+		mem_set_str_allocated(context->pOut, res, size);
+		break;
+	}
 	case MEM_TYPE_BOOL: {
-		sql_result_text(context,
-				SQL_TOKEN_BOOLEAN(argv[0].u.b),
-				-1, SQL_TRANSIENT);
+		mem_set_str0_static(context->pOut,
+				    SQL_TOKEN_BOOLEAN(argv[0].u.b));
 		break;
 	}
 	default:{
-			assert(mem_is_null(&argv[0]));
-			sql_result_text(context, "NULL", 4, SQL_STATIC);
-			break;
-		}
+		assert(mem_is_null(&argv[0]));
+		mem_set_str0_static(context->pOut, "NULL");
 	}
-}
-
-/*
- * The unicode() function.  Return the integer unicode code-point value
- * for the first character of the input string.
- */
-static void
-unicodeFunc(struct sql_context *context, int argc, struct Mem *argv)
-{
-	const unsigned char *z = mem_as_ustr(&argv[0]);
-	(void)argc;
-	if (z && z[0])
-		sql_result_uint(context, sqlUtf8Read(&z));
-}
-
-/*
- * The char() function takes zero or more arguments, each of which is
- * an integer.  It constructs a string where each character of the string
- * is the unicode character for the corresponding integer argument.
- */
-static void
-charFunc(struct sql_context *context, int argc, struct Mem *argv)
-{
-	unsigned char *z, *zOut;
-	int i;
-	zOut = z = sql_malloc64(argc * 4 + 1);
-	if (z == NULL) {
-		context->is_aborted = true;
-		return;
 	}
-	for (i = 0; i < argc; i++) {
-		uint64_t x;
-		unsigned c;
-		if (sql_value_type(&argv[i]) == MP_INT)
-			x = 0xfffd;
-		else
-			x = mem_get_uint_unsafe(&argv[i]);
-		if (x > 0x10ffff)
-			x = 0xfffd;
-		c = (unsigned)(x & 0x1fffff);
-		if (c < 0x00080) {
-			*zOut++ = (u8) (c & 0xFF);
-		} else if (c < 0x00800) {
-			*zOut++ = 0xC0 + (u8) ((c >> 6) & 0x1F);
-			*zOut++ = 0x80 + (u8) (c & 0x3F);
-		} else if (c < 0x10000) {
-			*zOut++ = 0xE0 + (u8) ((c >> 12) & 0x0F);
-			*zOut++ = 0x80 + (u8) ((c >> 6) & 0x3F);
-			*zOut++ = 0x80 + (u8) (c & 0x3F);
-		} else {
-			*zOut++ = 0xF0 + (u8) ((c >> 18) & 0x07);
-			*zOut++ = 0x80 + (u8) ((c >> 12) & 0x3F);
-			*zOut++ = 0x80 + (u8) ((c >> 6) & 0x3F);
-			*zOut++ = 0x80 + (u8) (c & 0x3F);
-		}
-	}
-	sql_result_text64(context, (char *)z, zOut - z, sql_free);
-}
-
-/*
- * The hex() function.  Interpret the argument as a blob.  Return
- * a hexadecimal rendering as text.
- */
-static void
-hexFunc(struct sql_context *context, int argc, struct Mem *argv)
-{
-	int i, n;
-	const unsigned char *pBlob;
-	char *zHex, *z;
-	assert(argc == 1);
-	UNUSED_PARAMETER(argc);
-	pBlob = mem_as_bin(&argv[0]);
-	n = mem_len_unsafe(&argv[0]);
-	assert(pBlob == mem_as_bin(&argv[0]));	/* No encoding change */
-	z = zHex = contextMalloc(context, ((i64) n) * 2 + 1);
-	if (zHex) {
-		for (i = 0; i < n; i++, pBlob++) {
-			unsigned char c = *pBlob;
-			*(z++) = hexdigits[(c >> 4) & 0xf];
-			*(z++) = hexdigits[c & 0xf];
-		}
-		*z = 0;
-		sql_result_text(context, zHex, n * 2, sql_free);
-	}
-}
-
-/*
- * The zeroblob(N) function returns a zero-filled blob of size N bytes.
- */
-static void
-zeroblobFunc(struct sql_context *context, int argc, struct Mem *argv)
-{
-	int64_t n;
-	assert(argc == 1);
-	UNUSED_PARAMETER(argc);
-	n = mem_get_int_unsafe(&argv[0]);
-	if (n < 0)
-		n = 0;
-	if (n > sql_get()->aLimit[SQL_LIMIT_LENGTH]) {
-		diag_set(ClientError, ER_SQL_EXECUTE, "string or binary string"\
-			 "is too big");
-		context->is_aborted = true;
-		return;
-	}
-	char *str = sqlDbMallocZero(sql_get(), n);
-	if (str == NULL) {
-		context->is_aborted = true;
-		return;
-	}
-	mem_set_bin_allocated(context->pOut, str, n);
 }
 
 /*
@@ -1457,75 +1652,62 @@ zeroblobFunc(struct sql_context *context, int argc, struct Mem *argv)
  * must be exact.  Collating sequences are not used.
  */
 static void
-replaceFunc(struct sql_context *context, int argc, struct Mem *argv)
+replaceFunc(struct sql_context *context, int argc, const struct Mem *argv)
 {
 	const unsigned char *zStr;	/* The input string A */
 	const unsigned char *zPattern;	/* The pattern string B */
 	const unsigned char *zRep;	/* The replacement string C */
 	unsigned char *zOut;	/* The output */
-	int nStr;		/* Size of zStr */
-	int nPattern;		/* Size of zPattern */
-	int nRep;		/* Size of zRep */
-	i64 nOut;		/* Maximum size of zOut */
-	int loopLimit;		/* Last zStr[] that might match zPattern[] */
-	int i, j;		/* Loop counters */
+	/* Size of zStr. */
+	size_t nStr;
+	/* Size of zPattern. */
+	size_t nPattern;
+	/* Size of zRep. */
+	size_t nRep;
+	/* Maximum size of zOut. */
+	size_t nOut;
+	/* Last zStr[] that might match zPattern[]. */
+	size_t loopLimit;
+	/* Loop counters. */
+	size_t i, j;
 
 	assert(argc == 3);
-	UNUSED_PARAMETER(argc);
-	zStr = mem_as_ustr(&argv[0]);
-	if (zStr == 0)
+	(void)argc;
+	if (mem_is_any_null(&argv[0], &argv[1]) || mem_is_null(&argv[2]))
 		return;
-	nStr = mem_len_unsafe(&argv[0]);
-	assert(zStr == mem_as_ustr(&argv[0]));	/* No encoding change */
-	zPattern = mem_as_ustr(&argv[1]);
-	if (zPattern == 0) {
-		assert(mem_is_null(&argv[1])
-		       || sql_context_db_handle(context)->mallocFailed);
+	assert(mem_is_bytes(&argv[0]) && mem_is_bytes(&argv[1]) &&
+	       mem_is_bytes(&argv[2]));
+	zStr = (const unsigned char *)argv[0].z;
+	nStr = argv[0].n;
+	zPattern = (const unsigned char *)argv[1].z;
+	nPattern = argv[1].n;
+	if (nPattern == 0 || nPattern > nStr) {
+		/* Copy string if it is not empty. */
+		if (nStr == 0)
+			mem_set_str_static(context->pOut, "", 0);
+		else if (mem_copy(context->pOut, &argv[0]) != 0)
+			context->is_aborted = true;
 		return;
 	}
-	nPattern = mem_len_unsafe(&argv[1]);
-	if (nPattern == 0) {
-		assert(!mem_is_null(&argv[1]));
-		sql_result_value(context, &argv[0]);
-		return;
-	}
-	assert(zPattern == mem_as_ustr(&argv[1]));	/* No encoding change */
-	zRep = mem_as_ustr(&argv[2]);
-	if (zRep == 0)
-		return;
-	nRep = mem_len_unsafe(&argv[2]);
-	assert(zRep == mem_as_ustr(&argv[2]));
+	zRep = (const unsigned char *)argv[2].z;
+	nRep = argv[2].n;
 	nOut = nStr + 1;
-	assert(nOut < SQL_MAX_LENGTH);
-	zOut = contextMalloc(context, (i64) nOut);
-	if (zOut == 0) {
-		return;
-	}
+	zOut = sql_xmalloc(nOut);
 	loopLimit = nStr - nPattern;
 	for (i = j = 0; i <= loopLimit; i++) {
 		if (zStr[i] != zPattern[0]
 		    || memcmp(&zStr[i], zPattern, nPattern)) {
 			zOut[j++] = zStr[i];
 		} else {
-			u8 *zOld;
-			sql *db = sql_context_db_handle(context);
 			nOut += nRep - nPattern;
-			testcase(nOut - 1 == db->aLimit[SQL_LIMIT_LENGTH]);
-			testcase(nOut - 2 == db->aLimit[SQL_LIMIT_LENGTH]);
-			if (nOut - 1 > db->aLimit[SQL_LIMIT_LENGTH]) {
-				diag_set(ClientError, ER_SQL_EXECUTE, "string "\
-					 "or binary string is too big");
+			if (nOut > SQL_MAX_LENGTH) {
+				sql_xfree(zOut);
 				context->is_aborted = true;
-				sql_free(zOut);
+				diag_set(ClientError, ER_SQL_EXECUTE,
+					 "string or blob too big");
 				return;
 			}
-			zOld = zOut;
-			zOut = sql_realloc64(zOut, (int)nOut);
-			if (zOut == 0) {
-				context->is_aborted = true;
-				sql_free(zOld);
-				return;
-			}
+			zOut = sql_xrealloc(zOut, nOut);
 			memcpy(&zOut[j], zRep, nRep);
 			j += nRep;
 			i += nPattern - 1;
@@ -1537,196 +1719,9 @@ replaceFunc(struct sql_context *context, int argc, struct Mem *argv)
 	assert(j <= nOut);
 	zOut[j] = 0;
 	if (context->func->def->returns == FIELD_TYPE_STRING)
-		mem_set_str_dynamic(context->pOut, (char *)zOut, j);
+		mem_set_str_allocated(context->pOut, (char *)zOut, j);
 	else
-		mem_set_bin_dynamic(context->pOut, (char *)zOut, j);
-}
-
-/**
- * Remove characters included in @a trim_set from @a input_str
- * until encounter a character that doesn't belong to @a trim_set.
- * Remove from the side specified by @a flags.
- * @param context SQL context.
- * @param flags Trim specification: left, right or both.
- * @param trim_set The set of characters for trimming.
- * @param char_len Lengths of each UTF-8 character in @a trim_set.
- * @param char_cnt A number of UTF-8 characters in @a trim_set.
- * @param input_str Input string for trimming.
- * @param input_str_sz Input string size in bytes.
- */
-static void
-trim_procedure(struct sql_context *context, enum trim_side_mask flags,
-	       const unsigned char *trim_set, const uint8_t *char_len,
-	       int char_cnt, const unsigned char *input_str, int input_str_sz)
-{
-	if (char_cnt == 0)
-		goto finish;
-	int i, len;
-	const unsigned char *z;
-	if ((flags & TRIM_LEADING) != 0) {
-		while (input_str_sz > 0) {
-			z = trim_set;
-			for (i = 0; i < char_cnt; ++i, z += len) {
-				len = char_len[i];
-				if (len <= input_str_sz
-				    && memcmp(input_str, z, len) == 0)
-					break;
-			}
-			if (i >= char_cnt)
-				break;
-			input_str += len;
-			input_str_sz -= len;
-		}
-	}
-	if ((flags & TRIM_TRAILING) != 0) {
-		while (input_str_sz > 0) {
-			z = trim_set;
-			for (i = 0; i < char_cnt; ++i, z += len) {
-				len = char_len[i];
-				if (len <= input_str_sz
-				    && memcmp(&input_str[input_str_sz - len],
-					      z, len) == 0)
-					break;
-			}
-			if (i >= char_cnt)
-				break;
-			input_str_sz -= len;
-		}
-	}
-finish:
-	if (context->func->def->returns == FIELD_TYPE_STRING)
-		mem_copy_str(context->pOut, (char *)input_str, input_str_sz);
-	else
-		mem_copy_bin(context->pOut, (char *)input_str, input_str_sz);
-}
-
-/**
- * Prepare arguments for trimming procedure. Allocate memory for
- * @a char_len (array of lengths each character in @a trim_set)
- * and fill it.
- *
- * @param context SQL context.
- * @param trim_set The set of characters for trimming.
- * @param[out] char_len Lengths of each character in @ trim_set.
- * @retval >=0 A number of UTF-8 characters in @a trim_set.
- * @retval -1 Memory allocation error.
- */
-static int
-trim_prepare_char_len(struct sql_context *context,
-		      const unsigned char *trim_set, int trim_set_sz,
-		      uint8_t **char_len)
-{
-	/*
-	 * Count the number of UTF-8 characters passing through
-	 * the entire char set, but not up to the '\0' or X'00'
-	 * character. This allows to handle trimming set
-	 * containing such characters.
-	 */
-	int char_cnt = sql_utf8_char_count(trim_set, trim_set_sz);
-	if (char_cnt == 0) {
-		*char_len = NULL;
-		return 0;
-	}
-
-	if ((*char_len = (uint8_t *)contextMalloc(context, char_cnt)) == NULL)
-		return -1;
-
-	int i = 0, j = 0;
-	while(j < char_cnt) {
-		int old_i = i;
-		SQL_UTF8_FWD_1(trim_set, i, trim_set_sz);
-		(*char_len)[j++] = i - old_i;
-	}
-
-	return char_cnt;
-}
-
-/**
- * Normalize args from @a argv input array when it has two args.
- *
- * Case: TRIM(<str>)
- * Call trimming procedure with TRIM_BOTH as the flags and " " as
- * the trimming set.
- *
- * Case: TRIM(LEADING/TRAILING/BOTH FROM <str>)
- * If user has specified side keyword only, then call trimming
- * procedure with the specified side and " " as the trimming set.
- */
-static void
-trim_func_two_args(struct sql_context *context, sql_value *arg1,
-		   sql_value *arg2)
-{
-	const unsigned char *trim_set;
-	if (mem_is_bin(arg1))
-		trim_set = (const unsigned char *)"\0";
-	else
-		trim_set = (const unsigned char *)" ";
-	const unsigned char *input_str;
-	if ((input_str = mem_as_ustr(arg1)) == NULL)
-		return;
-
-	int input_str_sz = mem_len_unsafe(arg1);
-	assert(arg2->type == MEM_TYPE_UINT);
-	uint8_t len_one = 1;
-	trim_procedure(context, arg2->u.u, trim_set,
-		       &len_one, 1, input_str, input_str_sz);
-}
-
-/**
- * Normalize args from @a argv input array when it has three args.
- *
- * Case: TRIM(<character_set> FROM <str>)
- * If user has specified <character_set> only, call trimming procedure with
- * TRIM_BOTH as the flags and that trimming set.
- *
- * Case: TRIM(LEADING/TRAILING/BOTH <character_set> FROM <str>)
- * If user has specified side keyword and <character_set>, then
- * call trimming procedure with that args.
- */
-static void
-trim_func_three_args(struct sql_context *context, sql_value *arg1,
-		     sql_value *arg2, sql_value *arg3)
-{
-	assert(arg2->type == MEM_TYPE_UINT);
-	const unsigned char *input_str, *trim_set;
-	if ((input_str = mem_as_ustr(arg1)) == NULL ||
-	    (trim_set = mem_as_ustr(arg3)) == NULL)
-		return;
-
-	int trim_set_sz = mem_len_unsafe(arg3);
-	int input_str_sz = mem_len_unsafe(arg1);
-	uint8_t *char_len;
-	int char_cnt = trim_prepare_char_len(context, trim_set, trim_set_sz,
-					     &char_len);
-	if (char_cnt == -1)
-		return;
-	trim_procedure(context, arg2->u.u, trim_set, char_len,
-		       char_cnt, input_str, input_str_sz);
-	sql_free(char_len);
-}
-
-/**
- * Normalize args from @a argv input array when it has one,
- * two or three args.
- *
- * This is a dispatcher function that calls corresponding
- * implementation depending on the number of arguments.
-*/
-static void
-trim_func(struct sql_context *context, int argc, struct Mem *argv)
-{
-	switch (argc) {
-	case 2:
-		trim_func_two_args(context, &argv[0], &argv[1]);
-		break;
-	case 3:
-		trim_func_three_args(context, &argv[0], &argv[1], &argv[2]);
-		break;
-	default:
-		diag_set(ClientError, ER_FUNC_WRONG_ARG_COUNT, "TRIM",
-			"2 or 3", argc);
-		context->is_aborted = true;
-	}
+		mem_set_bin_allocated(context->pOut, (char *)zOut, j);
 }
 
 /*
@@ -1736,7 +1731,7 @@ trim_func(struct sql_context *context, int argc, struct Mem *argv)
  * soundex encoding of the string X.
  */
 static void
-soundexFunc(struct sql_context *context, int argc, struct Mem *argv)
+soundexFunc(struct sql_context *context, int argc, const struct Mem *argv)
 {
 	(void) argc;
 	char zResult[8];
@@ -1753,16 +1748,11 @@ soundexFunc(struct sql_context *context, int argc, struct Mem *argv)
 		1, 2, 6, 2, 3, 0, 1, 0, 2, 0, 2, 0, 0, 0, 0, 0,
 	};
 	assert(argc == 1);
-	if (mem_is_bin(&argv[0]) || mem_is_map(&argv[0]) ||
-	    mem_is_array(&argv[0])) {
-		diag_set(ClientError, ER_SQL_TYPE_MISMATCH,
-			 mem_str(&argv[0]), "string");
-		context->is_aborted = true;
-		return;
-	}
-	zIn = (u8 *) mem_as_ustr(&argv[0]);
-	if (zIn == 0)
+	assert(mem_is_null(&argv[0]) || mem_is_str(&argv[0]));
+	if (mem_is_null(&argv[0]) || argv[0].n == 0)
 		zIn = (u8 *) "";
+	else
+		zIn = (unsigned char *)argv[0].z;
 	for (i = 0; zIn[i] && !sqlIsalpha(zIn[i]); i++) {
 	}
 	if (zIn[i]) {
@@ -1783,12 +1773,9 @@ soundexFunc(struct sql_context *context, int argc, struct Mem *argv)
 			zResult[j++] = '0';
 		}
 		zResult[j] = 0;
-		sql_result_text(context, zResult, 4, SQL_TRANSIENT);
+		mem_copy_str(context->pOut, zResult, 4);
 	} else {
-		/* IMP: R-64894-50321 The string "?000" is returned if the argument
-		 * is NULL or contains no ASCII alphabetic characters.
-		 */
-		sql_result_text(context, "?000", 4, SQL_STATIC);
+		mem_set_str_static(context->pOut, "?000", 4);
 	}
 }
 
@@ -1816,7 +1803,7 @@ func_sql_builtin_call_stub(struct func *func, struct port *args,
 }
 
 static void
-sql_builtin_stub(sql_context *ctx, int argc, struct Mem *argv)
+sql_builtin_stub(sql_context *ctx, int argc, const struct Mem *argv)
 {
 	(void) argc; (void) argv;
 	diag_set(ClientError, ER_SQL_EXECUTE,
@@ -1857,13 +1844,12 @@ static struct sql_func_dictionary dictionaries[] = {
 	{"CHAR_LENGTH", 1, 1, 0, true, 0, NULL},
 	{"COALESCE", 2, SQL_MAX_FUNCTION_ARG, SQL_FUNC_COALESCE, true, 0, NULL},
 	{"COUNT", 0, 1, SQL_FUNC_AGG, false, 0, NULL},
-	{"GREATEST", 2, SQL_MAX_FUNCTION_ARG, SQL_FUNC_MAX | SQL_FUNC_NEEDCOLL,
-	 true, 0, NULL},
+	{"DATE_PART", 2, 2, 0, true, 0, NULL},
+	{"GREATEST", 2, SQL_MAX_FUNCTION_ARG, SQL_FUNC_NEEDCOLL, true, 0, NULL},
 	{"GROUP_CONCAT", 1, 2, SQL_FUNC_AGG, false, 0, NULL},
 	{"HEX", 1, 1, 0, true, 0, NULL},
 	{"IFNULL", 2, 2, SQL_FUNC_COALESCE, true, 0, NULL},
-	{"LEAST", 2, SQL_MAX_FUNCTION_ARG, SQL_FUNC_MIN | SQL_FUNC_NEEDCOLL,
-	 true, 0, NULL},
+	{"LEAST", 2, SQL_MAX_FUNCTION_ARG, SQL_FUNC_NEEDCOLL, true, 0, NULL},
 	{"LENGTH", 1, 1, SQL_FUNC_LENGTH, true, 0, NULL},
 	{"LIKE", 2, 3, SQL_FUNC_LIKE | SQL_FUNC_NEEDCOLL, true, 0, NULL},
 	{"LIKELIHOOD", 2, 2, SQL_FUNC_UNLIKELY, true, 0, NULL},
@@ -1874,6 +1860,7 @@ static struct sql_func_dictionary dictionaries[] = {
 	 NULL},
 	{"MIN", 1, 1, SQL_FUNC_MIN | SQL_FUNC_AGG | SQL_FUNC_NEEDCOLL, false, 0,
 	 NULL},
+	{"NOW", 0, 0, 0, true, 0, NULL},
 	{"NULLIF", 2, 2, SQL_FUNC_NEEDCOLL, true, 0, NULL},
 	{"POSITION", 2, 2, SQL_FUNC_NEEDCOLL, true, 0, NULL},
 	{"PRINTF", 0, SQL_MAX_FUNCTION_ARG, 0, true, 0, NULL},
@@ -1887,7 +1874,7 @@ static struct sql_func_dictionary dictionaries[] = {
 	{"SUBSTR", 2, 3, SQL_FUNC_DERIVEDCOLL, true, 0, NULL},
 	{"SUM", 1, 1, SQL_FUNC_AGG, false, 0, NULL},
 	{"TOTAL", 1, 1, SQL_FUNC_AGG, false, 0, NULL},
-	{"TRIM", 2, 3, SQL_FUNC_DERIVEDCOLL, true, 0, NULL},
+	{"TRIM", 1, 3, SQL_FUNC_DERIVEDCOLL, true, 0, NULL},
 	{"TYPEOF", 1, 1, SQL_FUNC_TYPEOF, true, 0, NULL},
 	{"UNICODE", 1, 1, 0, true, 0, NULL},
 	{"UNLIKELY", 1, 1, SQL_FUNC_UNLIKELY, true, 0, NULL},
@@ -1920,7 +1907,7 @@ struct sql_func_definition {
 	/** Type of the result of the implementation. */
 	enum field_type result;
 	/** Call implementation with given arguments. */
-	void (*call)(sql_context *ctx, int argc, struct Mem *argv);
+	void (*call)(sql_context *ctx, int argc, const struct Mem *argv);
 	/** Call finalization function for this implementation. */
 	int (*finalize)(struct Mem *mem);
 };
@@ -1930,32 +1917,42 @@ struct sql_func_definition {
  * function should be defined in succession.
  */
 static struct sql_func_definition definitions[] = {
-	{"ABS", 1, {FIELD_TYPE_INTEGER}, FIELD_TYPE_INTEGER, absFunc, NULL},
-	{"ABS", 1, {FIELD_TYPE_DOUBLE}, FIELD_TYPE_DOUBLE, absFunc, NULL},
+	{"ABS", 1, {FIELD_TYPE_DECIMAL}, FIELD_TYPE_DECIMAL, func_abs_dec,
+	 NULL},
+	{"ABS", 1, {FIELD_TYPE_INTEGER}, FIELD_TYPE_INTEGER, func_abs_int,
+	 NULL},
+	{"ABS", 1, {FIELD_TYPE_DOUBLE}, FIELD_TYPE_DOUBLE, func_abs_double,
+	 NULL},
+	{"AVG", 1, {FIELD_TYPE_DECIMAL}, FIELD_TYPE_DECIMAL, step_avg, fin_avg},
 	{"AVG", 1, {FIELD_TYPE_INTEGER}, FIELD_TYPE_INTEGER, step_avg, fin_avg},
 	{"AVG", 1, {FIELD_TYPE_DOUBLE}, FIELD_TYPE_DOUBLE, step_avg, fin_avg},
-	{"CHAR", -1, {FIELD_TYPE_INTEGER}, FIELD_TYPE_STRING, charFunc, NULL},
-	{"CHAR_LENGTH", 1, {FIELD_TYPE_STRING}, FIELD_TYPE_INTEGER, lengthFunc,
-	 NULL},
-	{"COALESCE", -1, {FIELD_TYPE_ANY}, FIELD_TYPE_SCALAR, sql_builtin_stub,
+	{"CHAR", -1, {FIELD_TYPE_INTEGER}, FIELD_TYPE_STRING, func_char, NULL},
+	{"CHAR_LENGTH", 1, {FIELD_TYPE_STRING}, FIELD_TYPE_INTEGER,
+	 func_char_length, NULL},
+	{"COALESCE", -1, {field_type_MAX}, FIELD_TYPE_SCALAR, sql_builtin_stub,
 	 NULL},
 	{"COUNT", 0, {}, FIELD_TYPE_INTEGER, step_count, fin_count},
-	{"COUNT", 1, {FIELD_TYPE_ANY}, FIELD_TYPE_INTEGER, step_count,
+	{"COUNT", 1, {field_type_MAX}, FIELD_TYPE_INTEGER, step_count,
 	 fin_count},
+	{"DATE_PART", 2, {FIELD_TYPE_STRING, FIELD_TYPE_DATETIME},
+	 FIELD_TYPE_INTEGER, func_date_part, NULL},
 
-	{"GREATEST", -1, {FIELD_TYPE_INTEGER}, FIELD_TYPE_INTEGER, minmaxFunc,
-	 NULL},
-	{"GREATEST", -1, {FIELD_TYPE_DOUBLE}, FIELD_TYPE_DOUBLE, minmaxFunc,
-	 NULL},
-	{"GREATEST", -1, {FIELD_TYPE_NUMBER}, FIELD_TYPE_NUMBER, minmaxFunc,
-	 NULL},
+	{"GREATEST", -1, {FIELD_TYPE_INTEGER}, FIELD_TYPE_INTEGER,
+	 func_greatest_least, NULL},
+	{"GREATEST", -1, {FIELD_TYPE_DOUBLE}, FIELD_TYPE_DOUBLE,
+	 func_greatest_least, NULL},
+	{"GREATEST", -1, {FIELD_TYPE_DECIMAL}, FIELD_TYPE_DECIMAL,
+	 func_greatest_least, NULL},
+	{"GREATEST", -1, {FIELD_TYPE_NUMBER}, FIELD_TYPE_NUMBER,
+	 func_greatest_least, NULL},
 	{"GREATEST", -1, {FIELD_TYPE_VARBINARY}, FIELD_TYPE_VARBINARY,
-	 minmaxFunc, NULL},
-	{"GREATEST", -1, {FIELD_TYPE_UUID}, FIELD_TYPE_UUID, minmaxFunc, NULL},
-	{"GREATEST", -1, {FIELD_TYPE_STRING}, FIELD_TYPE_STRING, minmaxFunc,
-	 NULL},
-	{"GREATEST", -1, {FIELD_TYPE_SCALAR}, FIELD_TYPE_SCALAR, minmaxFunc,
-	 NULL},
+	 func_greatest_least, NULL},
+	{"GREATEST", -1, {FIELD_TYPE_UUID}, FIELD_TYPE_UUID,
+	 func_greatest_least, NULL},
+	{"GREATEST", -1, {FIELD_TYPE_STRING}, FIELD_TYPE_STRING,
+	 func_greatest_least, NULL},
+	{"GREATEST", -1, {FIELD_TYPE_SCALAR}, FIELD_TYPE_SCALAR,
+	 func_greatest_least, NULL},
 
 	{"GROUP_CONCAT", 1, {FIELD_TYPE_STRING}, FIELD_TYPE_STRING,
 	 step_group_concat, NULL},
@@ -1966,37 +1963,45 @@ static struct sql_func_definition definitions[] = {
 	{"GROUP_CONCAT", 2, {FIELD_TYPE_VARBINARY, FIELD_TYPE_VARBINARY},
 	 FIELD_TYPE_VARBINARY, step_group_concat, NULL},
 
-	{"HEX", 1, {FIELD_TYPE_VARBINARY}, FIELD_TYPE_STRING, hexFunc, NULL},
-	{"IFNULL", 2, {FIELD_TYPE_ANY, FIELD_TYPE_ANY}, FIELD_TYPE_SCALAR,
+	{"HEX", 1, {FIELD_TYPE_VARBINARY}, FIELD_TYPE_STRING, func_hex, NULL},
+	{"IFNULL", 2, {field_type_MAX, field_type_MAX}, FIELD_TYPE_SCALAR,
 	 sql_builtin_stub, NULL},
 
-	{"LEAST", -1, {FIELD_TYPE_INTEGER}, FIELD_TYPE_INTEGER, minmaxFunc,
-	 NULL},
-	{"LEAST", -1, {FIELD_TYPE_DOUBLE}, FIELD_TYPE_DOUBLE, minmaxFunc, NULL},
-	{"LEAST", -1, {FIELD_TYPE_NUMBER}, FIELD_TYPE_NUMBER, minmaxFunc, NULL},
-	{"LEAST", -1, {FIELD_TYPE_VARBINARY}, FIELD_TYPE_VARBINARY, minmaxFunc,
-	 NULL},
-	{"LEAST", -1, {FIELD_TYPE_UUID}, FIELD_TYPE_UUID, minmaxFunc, NULL},
-	{"LEAST", -1, {FIELD_TYPE_STRING}, FIELD_TYPE_STRING, minmaxFunc, NULL},
-	{"LEAST", -1, {FIELD_TYPE_SCALAR}, FIELD_TYPE_SCALAR, minmaxFunc, NULL},
+	{"LEAST", -1, {FIELD_TYPE_INTEGER}, FIELD_TYPE_INTEGER,
+	 func_greatest_least, NULL},
+	{"LEAST", -1, {FIELD_TYPE_DOUBLE}, FIELD_TYPE_DOUBLE,
+	 func_greatest_least, NULL},
+	{"LEAST", -1, {FIELD_TYPE_DECIMAL}, FIELD_TYPE_DECIMAL,
+	 func_greatest_least, NULL},
+	{"LEAST", -1, {FIELD_TYPE_NUMBER}, FIELD_TYPE_NUMBER,
+	 func_greatest_least, NULL},
+	{"LEAST", -1, {FIELD_TYPE_VARBINARY}, FIELD_TYPE_VARBINARY,
+	 func_greatest_least, NULL},
+	{"LEAST", -1, {FIELD_TYPE_UUID}, FIELD_TYPE_UUID,
+	 func_greatest_least, NULL},
+	{"LEAST", -1, {FIELD_TYPE_STRING}, FIELD_TYPE_STRING,
+	 func_greatest_least, NULL},
+	{"LEAST", -1, {FIELD_TYPE_SCALAR}, FIELD_TYPE_SCALAR,
+	 func_greatest_least, NULL},
 
-	{"LENGTH", 1, {FIELD_TYPE_STRING}, FIELD_TYPE_INTEGER, lengthFunc,
+	{"LENGTH", 1, {FIELD_TYPE_STRING}, FIELD_TYPE_INTEGER, func_char_length,
 	 NULL},
-	{"LENGTH", 1, {FIELD_TYPE_VARBINARY}, FIELD_TYPE_INTEGER, lengthFunc,
-	 NULL},
+	{"LENGTH", 1, {FIELD_TYPE_VARBINARY}, FIELD_TYPE_INTEGER,
+	 func_octet_length, NULL},
 	{"LIKE", 2, {FIELD_TYPE_STRING, FIELD_TYPE_STRING},
 	 FIELD_TYPE_BOOLEAN, likeFunc, NULL},
 	{"LIKE", 3, {FIELD_TYPE_STRING, FIELD_TYPE_STRING, FIELD_TYPE_STRING},
 	 FIELD_TYPE_BOOLEAN, likeFunc, NULL},
-	{"LIKELIHOOD", 2, {FIELD_TYPE_ANY, FIELD_TYPE_DOUBLE},
+	{"LIKELIHOOD", 2, {field_type_MAX, FIELD_TYPE_DOUBLE},
 	 FIELD_TYPE_BOOLEAN, sql_builtin_stub, NULL},
-	{"LIKELY", 1, {FIELD_TYPE_ANY}, FIELD_TYPE_BOOLEAN, sql_builtin_stub,
+	{"LIKELY", 1, {field_type_MAX}, FIELD_TYPE_BOOLEAN, sql_builtin_stub,
 	 NULL},
-	{"LOWER", 1, {FIELD_TYPE_STRING}, FIELD_TYPE_STRING, LowerICUFunc,
+	{"LOWER", 1, {FIELD_TYPE_STRING}, FIELD_TYPE_STRING, func_lower_upper,
 	 NULL},
 
 	{"MAX", 1, {FIELD_TYPE_INTEGER}, FIELD_TYPE_INTEGER, step_minmax, NULL},
 	{"MAX", 1, {FIELD_TYPE_DOUBLE}, FIELD_TYPE_DOUBLE, step_minmax, NULL},
+	{"MAX", 1, {FIELD_TYPE_DECIMAL}, FIELD_TYPE_DECIMAL, step_minmax, NULL},
 	{"MAX", 1, {FIELD_TYPE_NUMBER}, FIELD_TYPE_NUMBER, step_minmax, NULL},
 	{"MAX", 1, {FIELD_TYPE_VARBINARY}, FIELD_TYPE_VARBINARY, step_minmax,
 	 NULL},
@@ -2006,83 +2011,132 @@ static struct sql_func_definition definitions[] = {
 
 	{"MIN", 1, {FIELD_TYPE_INTEGER}, FIELD_TYPE_INTEGER, step_minmax, NULL},
 	{"MIN", 1, {FIELD_TYPE_DOUBLE}, FIELD_TYPE_DOUBLE, step_minmax, NULL},
+	{"MIN", 1, {FIELD_TYPE_DECIMAL}, FIELD_TYPE_DECIMAL, step_minmax, NULL},
 	{"MIN", 1, {FIELD_TYPE_NUMBER}, FIELD_TYPE_NUMBER, step_minmax, NULL},
 	{"MIN", 1, {FIELD_TYPE_VARBINARY}, FIELD_TYPE_VARBINARY, step_minmax,
 	 NULL},
 	{"MIN", 1, {FIELD_TYPE_UUID}, FIELD_TYPE_UUID, step_minmax, NULL},
 	{"MIN", 1, {FIELD_TYPE_STRING}, FIELD_TYPE_STRING, step_minmax, NULL},
 	{"MIN", 1, {FIELD_TYPE_SCALAR}, FIELD_TYPE_SCALAR, step_minmax, NULL},
+	{"NOW", 0, {}, FIELD_TYPE_DATETIME, func_now, NULL},
 
-	{"NULLIF", 2, {FIELD_TYPE_ANY, FIELD_TYPE_ANY}, FIELD_TYPE_SCALAR,
-	 nullifFunc, NULL},
+	{"NULLIF", 2, {FIELD_TYPE_SCALAR, field_type_MAX}, FIELD_TYPE_SCALAR,
+	 func_nullif, NULL},
+	{"NULLIF", 2, {FIELD_TYPE_UNSIGNED, field_type_MAX},
+	 FIELD_TYPE_UNSIGNED, func_nullif, NULL},
+	{"NULLIF", 2, {FIELD_TYPE_STRING, field_type_MAX}, FIELD_TYPE_STRING,
+	 func_nullif, NULL},
+	{"NULLIF", 2, {FIELD_TYPE_DOUBLE, field_type_MAX}, FIELD_TYPE_DOUBLE,
+	 func_nullif, NULL},
+	{"NULLIF", 2, {FIELD_TYPE_INTEGER, field_type_MAX},
+	 FIELD_TYPE_INTEGER, func_nullif, NULL},
+	{"NULLIF", 2, {FIELD_TYPE_BOOLEAN, field_type_MAX},
+	 FIELD_TYPE_BOOLEAN, func_nullif, NULL},
+	{"NULLIF", 2, {FIELD_TYPE_VARBINARY, field_type_MAX},
+	 FIELD_TYPE_VARBINARY, func_nullif, NULL},
+	{"NULLIF", 2, {FIELD_TYPE_DECIMAL, field_type_MAX},
+	 FIELD_TYPE_DECIMAL, func_nullif, NULL},
+	{"NULLIF", 2, {FIELD_TYPE_UUID, field_type_MAX}, FIELD_TYPE_UUID,
+	 func_nullif, NULL},
+	{"NULLIF", 2, {FIELD_TYPE_DATETIME, field_type_MAX},
+	 FIELD_TYPE_DATETIME, func_nullif, NULL},
+
 	{"POSITION", 2, {FIELD_TYPE_STRING, FIELD_TYPE_STRING},
-	 FIELD_TYPE_INTEGER, position_func, NULL},
-	{"PRINTF", -1, {FIELD_TYPE_ANY}, FIELD_TYPE_STRING, printfFunc, 
-	 NULL},
-	{"QUOTE", 1, {FIELD_TYPE_ANY}, FIELD_TYPE_STRING, quoteFunc, NULL},
-	{"RANDOM", 0, {}, FIELD_TYPE_INTEGER, randomFunc, NULL},
+	 FIELD_TYPE_INTEGER, func_position_characters, NULL},
+	{"POSITION", 2, {FIELD_TYPE_VARBINARY, FIELD_TYPE_VARBINARY},
+	 FIELD_TYPE_INTEGER, func_position_octets, NULL},
+	{"PRINTF", -1, {field_type_MAX}, FIELD_TYPE_STRING, func_printf, NULL},
+	{"QUOTE", 1, {field_type_MAX}, FIELD_TYPE_STRING, quoteFunc, NULL},
+	{"RANDOM", 0, {}, FIELD_TYPE_INTEGER, func_random, NULL},
 	{"RANDOMBLOB", 1, {FIELD_TYPE_INTEGER}, FIELD_TYPE_VARBINARY,
-	 randomBlob, NULL},
+	 func_randomblob, NULL},
 	{"REPLACE", 3,
 	 {FIELD_TYPE_STRING, FIELD_TYPE_STRING, FIELD_TYPE_STRING},
 	 FIELD_TYPE_STRING, replaceFunc, NULL},
 	{"REPLACE", 3,
 	 {FIELD_TYPE_VARBINARY, FIELD_TYPE_VARBINARY, FIELD_TYPE_VARBINARY},
 	 FIELD_TYPE_VARBINARY, replaceFunc, NULL},
-	{"ROUND", 1, {FIELD_TYPE_DOUBLE}, FIELD_TYPE_DOUBLE, roundFunc, NULL},
+	{"ROUND", 1, {FIELD_TYPE_DECIMAL}, FIELD_TYPE_DECIMAL, func_round_dec,
+	 NULL},
+	{"ROUND", 2, {FIELD_TYPE_DECIMAL, FIELD_TYPE_INTEGER},
+	 FIELD_TYPE_DECIMAL, func_round_dec, NULL},
+	{"ROUND", 1, {FIELD_TYPE_DOUBLE}, FIELD_TYPE_DOUBLE, func_round_double,
+	 NULL},
 	{"ROUND", 2, {FIELD_TYPE_DOUBLE, FIELD_TYPE_INTEGER}, FIELD_TYPE_DOUBLE,
-	 roundFunc, NULL},
-	{"ROW_COUNT", 0, {}, FIELD_TYPE_INTEGER, sql_row_count, NULL},
+	 func_round_double, NULL},
+	{"ROUND", 1, {FIELD_TYPE_INTEGER}, FIELD_TYPE_INTEGER, func_round_int,
+	 NULL},
+	{"ROUND", 2, {FIELD_TYPE_INTEGER, FIELD_TYPE_INTEGER},
+	 FIELD_TYPE_INTEGER, func_round_int, NULL},
+	{"ROW_COUNT", 0, {}, FIELD_TYPE_INTEGER, func_row_count, NULL},
 	{"SOUNDEX", 1, {FIELD_TYPE_STRING}, FIELD_TYPE_STRING, soundexFunc,
 	 NULL},
 	{"SUBSTR", 2, {FIELD_TYPE_STRING, FIELD_TYPE_INTEGER},
-	 FIELD_TYPE_STRING, substrFunc, NULL},
+	 FIELD_TYPE_STRING, func_substr_characters, NULL},
 	{"SUBSTR", 3,
 	 {FIELD_TYPE_STRING, FIELD_TYPE_INTEGER, FIELD_TYPE_INTEGER},
-	 FIELD_TYPE_STRING, substrFunc, NULL},
+	 FIELD_TYPE_STRING, func_substr_characters, NULL},
 	{"SUBSTR", 2, {FIELD_TYPE_VARBINARY, FIELD_TYPE_INTEGER},
-	 FIELD_TYPE_VARBINARY, substrFunc, NULL},
+	 FIELD_TYPE_VARBINARY, func_substr_octets, NULL},
 	{"SUBSTR", 3,
 	 {FIELD_TYPE_VARBINARY, FIELD_TYPE_INTEGER, FIELD_TYPE_INTEGER},
-	 FIELD_TYPE_VARBINARY, substrFunc, NULL},
+	 FIELD_TYPE_VARBINARY, func_substr_octets, NULL},
+	{"SUM", 1, {FIELD_TYPE_DECIMAL}, FIELD_TYPE_DECIMAL, step_sum, NULL},
 	{"SUM", 1, {FIELD_TYPE_INTEGER}, FIELD_TYPE_INTEGER, step_sum, NULL},
 	{"SUM", 1, {FIELD_TYPE_DOUBLE}, FIELD_TYPE_DOUBLE, step_sum, NULL},
+	{"TOTAL", 1, {FIELD_TYPE_DECIMAL}, FIELD_TYPE_DOUBLE, step_total,
+	 fin_total},
 	{"TOTAL", 1, {FIELD_TYPE_INTEGER}, FIELD_TYPE_DOUBLE, step_total,
 	 fin_total},
 	{"TOTAL", 1, {FIELD_TYPE_DOUBLE}, FIELD_TYPE_DOUBLE, step_total,
 	 fin_total},
 
-	{"TRIM", 2, {FIELD_TYPE_STRING, FIELD_TYPE_INTEGER},
-	 FIELD_TYPE_STRING, trim_func, NULL},
+	{"TRIM", 1, {FIELD_TYPE_STRING}, FIELD_TYPE_STRING, func_trim_str,
+	 NULL},
+	{"TRIM", 2, {FIELD_TYPE_STRING, FIELD_TYPE_STRING}, FIELD_TYPE_STRING,
+	 func_trim_str, NULL},
+	{"TRIM", 2, {FIELD_TYPE_STRING, FIELD_TYPE_INTEGER}, FIELD_TYPE_STRING,
+	 func_trim_str, NULL},
 	{"TRIM", 3, {FIELD_TYPE_STRING, FIELD_TYPE_INTEGER, FIELD_TYPE_STRING},
-	 FIELD_TYPE_STRING, trim_func, NULL},
+	 FIELD_TYPE_STRING, func_trim_str, NULL},
+	{"TRIM", 1, {FIELD_TYPE_VARBINARY}, FIELD_TYPE_VARBINARY, func_trim_bin,
+	 NULL},
+	{"TRIM", 2, {FIELD_TYPE_VARBINARY, FIELD_TYPE_VARBINARY},
+	 FIELD_TYPE_VARBINARY, func_trim_bin, NULL},
 	{"TRIM", 2, {FIELD_TYPE_VARBINARY, FIELD_TYPE_INTEGER},
-	 FIELD_TYPE_VARBINARY, trim_func, NULL},
+	 FIELD_TYPE_VARBINARY, func_trim_bin, NULL},
 	{"TRIM", 3,
 	 {FIELD_TYPE_VARBINARY, FIELD_TYPE_INTEGER, FIELD_TYPE_VARBINARY},
-	 FIELD_TYPE_VARBINARY, trim_func, NULL},
+	 FIELD_TYPE_VARBINARY, func_trim_bin, NULL},
 
-	{"TYPEOF", 1, {FIELD_TYPE_ANY}, FIELD_TYPE_STRING, typeofFunc, NULL},
-	{"UNICODE", 1, {FIELD_TYPE_STRING}, FIELD_TYPE_INTEGER, unicodeFunc,
+	{"TYPEOF", 1, {field_type_MAX}, FIELD_TYPE_STRING, func_typeof, NULL},
+	{"UNICODE", 1, {FIELD_TYPE_STRING}, FIELD_TYPE_INTEGER, func_unicode,
 	 NULL},
-	{"UNLIKELY", 1, {FIELD_TYPE_ANY}, FIELD_TYPE_BOOLEAN, sql_builtin_stub,
+	{"UNLIKELY", 1, {field_type_MAX}, FIELD_TYPE_BOOLEAN, sql_builtin_stub,
 	 NULL},
-	{"UPPER", 1, {FIELD_TYPE_STRING}, FIELD_TYPE_STRING, UpperICUFunc,
+	{"UPPER", 1, {FIELD_TYPE_STRING}, FIELD_TYPE_STRING, func_lower_upper,
 	 NULL},
-	{"UUID", 0, {}, FIELD_TYPE_UUID, sql_func_uuid, NULL},
-	{"UUID", 1, {FIELD_TYPE_INTEGER}, FIELD_TYPE_UUID, sql_func_uuid, NULL},
-	{"VERSION", 0, {}, FIELD_TYPE_STRING, sql_func_version, NULL},
+	{"UUID", 0, {}, FIELD_TYPE_UUID, func_uuid, NULL},
+	{"UUID", 1, {FIELD_TYPE_INTEGER}, FIELD_TYPE_UUID, func_uuid, NULL},
+	{"VERSION", 0, {}, FIELD_TYPE_STRING, func_version, NULL},
 	{"ZEROBLOB", 1, {FIELD_TYPE_INTEGER}, FIELD_TYPE_VARBINARY,
-	 zeroblobFunc, NULL},
+	 func_zeroblob, NULL},
 };
 
+/** Find built-in function by name. */
 static struct sql_func_dictionary *
-built_in_func_get(const char *name)
+built_in_func_get(const char *name, const char *old_name)
 {
 	uint32_t len = strlen(name);
-	mh_int_t k = mh_strnptr_find_inp(built_in_functions, name, len);
-	if (k == mh_end(built_in_functions))
-		return NULL;
+	mh_int_t k = mh_strnptr_find_str(built_in_functions, name, len);
+	if (k == mh_end(built_in_functions)) {
+		if (old_name == NULL)
+			return NULL;
+		uint32_t old_len = strlen(old_name);
+		k = mh_strnptr_find_str(built_in_functions, old_name, old_len);
+		if (k == mh_end(built_in_functions))
+			return NULL;
+	}
 	return mh_strnptr_node(built_in_functions, k)->val;
 }
 
@@ -2091,7 +2145,7 @@ built_in_func_put(struct sql_func_dictionary *dict)
 {
 	const char *name = dict->name;
 	uint32_t len = strlen(name);
-	assert(built_in_func_get(name) == NULL);
+	assert(built_in_func_get(name, NULL) == NULL);
 
 	uint32_t hash = mh_strn_hash(name, len);
 	const struct mh_strnptr_node_t strnode = {name, len, hash, dict};
@@ -2112,7 +2166,7 @@ built_in_func_put(struct sql_func_dictionary *dict)
 static inline bool
 is_exact(int op, enum field_type a, enum field_type b)
 {
-	return op == TK_NULL || a == b || a == FIELD_TYPE_ANY ||
+	return op == TK_NULL || a == b || a == field_type_MAX ||
 	       (a == FIELD_TYPE_INTEGER && b == FIELD_TYPE_UNSIGNED);
 }
 
@@ -2132,7 +2186,7 @@ is_upcast(int op, enum field_type a, enum field_type b)
 	return is_exact(op, a, b) ||
 	       (a == FIELD_TYPE_NUMBER && sql_type_is_numeric(b)) ||
 	       (a == FIELD_TYPE_SCALAR && b != FIELD_TYPE_MAP &&
-		b != FIELD_TYPE_ARRAY);
+		b != FIELD_TYPE_INTERVAL && b != FIELD_TYPE_ARRAY);
 }
 
 /**
@@ -2148,7 +2202,8 @@ is_upcast(int op, enum field_type a, enum field_type b)
 static inline bool
 is_castable(int op, enum field_type a, enum field_type b)
 {
-	return is_upcast(op, a, b) || op == TK_VARIABLE ||
+	return is_upcast(op, a, b) || sql_token_is_variable(op) ||
+	       op == TK_ID ||
 	       (sql_type_is_numeric(a) && sql_type_is_numeric(b)) ||
 	       b == FIELD_TYPE_ANY;
 }
@@ -2176,6 +2231,8 @@ find_compatible(struct Expr *expr, struct sql_func_dictionary *dict,
 		bool is_match = true;
 		for (int j = 0; j < n && is_match; ++j) {
 			struct Expr *e = expr->x.pList->a[j].pExpr;
+			while (e->op == TK_COLLATE)
+				e = e->pLeft;
 			enum field_type a = types[argc != -1 ? j : 0];
 			enum field_type b = sql_expr_type(e);
 			switch (check) {
@@ -2213,7 +2270,8 @@ find_built_in_func(struct Expr *expr, struct sql_func_dictionary *dict)
 			str = tt_sprintf("at least %d", argc_min);
 		else
 			str = tt_sprintf("from %d to %d", argc_min, argc_max);
-		diag_set(ClientError, ER_FUNC_WRONG_ARG_COUNT, name, str, n);
+		diag_set(ClientError, ER_FUNC_WRONG_ARG_COUNT, name, str, n,
+			 argc_min, argc_max);
 		return NULL;
 	}
 	struct func *func = find_compatible(expr, dict, CHECK_TYPE_EXACT);
@@ -2234,10 +2292,19 @@ struct func *
 sql_func_find(struct Expr *expr)
 {
 	const char *name = expr->u.zToken;
-	struct sql_func_dictionary *dict = built_in_func_get(name);
-	if (dict != NULL)
+	size_t len = strlen(name);
+	char *old_name = NULL;
+	if ((expr->flags & EP_Lookup2) != 0)
+		old_name = sql_legacy_name_new(name, len);
+	struct sql_func_dictionary *dict = built_in_func_get(name, old_name);
+	if (dict != NULL) {
+		sql_xfree(old_name);
 		return find_built_in_func(expr, dict);
-	struct func *func = func_by_name(name, strlen(name));
+	}
+	struct func *func = func_by_name(name, len);
+	if (func == NULL && old_name != NULL)
+		func = func_by_name(old_name, strlen(old_name));
+	sql_xfree(old_name);
 	if (func == NULL) {
 		diag_set(ClientError, ER_NO_SUCH_FUNCTION, name);
 		return NULL;
@@ -2249,21 +2316,50 @@ sql_func_find(struct Expr *expr)
 		return NULL;
 	}
 	int n = expr->x.pList != NULL ? expr->x.pList->nExpr : 0;
-	if (func->def->param_count != n) {
+	int argc = func->def->aggregate == FUNC_AGGREGATE_GROUP ?
+		   func->def->param_count - 1 : func->def->param_count;
+	assert(argc >= 0);
+	if (argc != n) {
 		diag_set(ClientError, ER_FUNC_WRONG_ARG_COUNT, name,
-			 tt_sprintf("%d", func->def->param_count), n);
+			 tt_sprintf("%d", argc), n, argc, argc);
 		return NULL;
 	}
 	return func;
 }
 
-uint32_t
-sql_func_flags(const char *name)
+struct func *
+sql_func_finalize(const char *name)
 {
-	struct sql_func_dictionary *dict = built_in_func_get(name);
-	if (dict == NULL)
+	const char *finalize_name = tt_sprintf("%s_finalize", name);
+	uint32_t len = strlen(finalize_name);
+	struct func *finalize = func_by_name(finalize_name, len);
+	if (finalize == NULL ||
+	    finalize->def->param_count != 1 ||
+	    finalize->def->aggregate == FUNC_AGGREGATE_GROUP)
+		return NULL;
+	return finalize;
+}
+
+uint32_t
+sql_func_flags(const struct Expr *expr)
+{
+	const char *name = expr->u.zToken;
+	size_t len = strlen(name);
+	char *old_name = NULL;
+	if ((expr->flags & EP_Lookup2) != 0)
+		old_name = sql_legacy_name_new(name, len);
+	struct sql_func_dictionary *dict = built_in_func_get(name, old_name);
+	if (dict != NULL) {
+		sql_xfree(old_name);
+		return dict->flags;
+	}
+	struct func *func = func_by_name(name, len);
+	if (func == NULL && old_name != NULL)
+		func = func_by_name(old_name, strlen(old_name));
+	sql_xfree(old_name);
+	if (func == NULL || func->def->aggregate != FUNC_AGGREGATE_GROUP)
 		return 0;
-	return dict->flags;
+	return SQL_FUNC_AGG;
 }
 
 static struct func_vtab func_sql_builtin_vtab;
@@ -2279,37 +2375,26 @@ sql_built_in_functions_cache_init(void)
 	for (uint32_t i = 0; i < nelem(definitions); ++i) {
 		struct sql_func_definition *desc = &definitions[i];
 		const char *name = desc->name;
-		struct sql_func_dictionary *dict = built_in_func_get(name);
+		struct sql_func_dictionary *dict = built_in_func_get(name,
+								     NULL);
 		assert(dict != NULL);
 
 		uint32_t len = strlen(name);
-		uint32_t size = sizeof(struct func_def) + len + 1;
-		struct func_def *def = malloc(size);
-		if (def == NULL)
-			panic("Out of memory on creating SQL built-in");
-		def->fid = i;
-		def->uid = 1;
-		def->body = NULL;
-		def->comment = NULL;
+		struct func_def *def = func_def_new(i, ADMIN, name, len,
+						    FUNC_LANGUAGE_SQL_BUILTIN,
+						    NULL, 0, NULL, 0, NULL);
 		def->setuid = true;
 		def->is_deterministic = dict->is_deterministic;
-		def->is_sandboxed = false;
 		assert(desc->argc != -1 || dict->argc_min != dict->argc_max);
 		def->param_count = desc->argc;
 		def->returns = desc->result;
 		def->aggregate = (dict->flags & SQL_FUNC_AGG) == 0 ?
 				 FUNC_AGGREGATE_NONE : FUNC_AGGREGATE_GROUP;
-		def->language = FUNC_LANGUAGE_SQL_BUILTIN;
-		def->name_len = len;
 		def->exports.sql = true;
-		func_opts_create(&def->opts);
-		memcpy(def->name, name, len + 1);
 
-		struct func_sql_builtin *func = malloc(sizeof(*func));
-		if (func == NULL)
-			panic("Out of memory on creating SQL built-in");
-
+		struct func_sql_builtin *func = xmalloc(sizeof(*func));
 		func->base.def = def;
+		rlist_create(&func->base.func_cache_pin_list);
 		func->base.vtab = &func_sql_builtin_vtab;
 		credentials_create_empty(&func->base.owner_credentials);
 		memset(func->base.access, 0, sizeof(func->base.access));
@@ -2329,9 +2414,10 @@ sql_built_in_functions_cache_init(void)
 	 * another name for CHAR_LENGTH().
 	 */
 	const char *name = "CHARACTER_LENGTH";
-	struct sql_func_dictionary *dict = built_in_func_get(name);
+	struct sql_func_dictionary *dict = built_in_func_get(name, NULL);
 	name = "CHAR_LENGTH";
-	struct sql_func_dictionary *dict_original = built_in_func_get(name);
+	struct sql_func_dictionary *dict_original = built_in_func_get(name,
+								      NULL);
 	dict->count = dict_original->count;
 	dict->functions = dict_original->functions;
 }
@@ -2346,7 +2432,7 @@ sql_built_in_functions_cache_free(void)
 	for (uint32_t i = 0; i < nelem(dictionaries); ++i) {
 		const char *name = dictionaries[i].name;
 		uint32_t len = strlen(name);
-		mh_int_t k = mh_strnptr_find_inp(built_in_functions, name, len);
+		mh_int_t k = mh_strnptr_find_str(built_in_functions, name, len);
 		if (k == mh_end(built_in_functions))
 			continue;
 		mh_strnptr_del(built_in_functions, k, NULL);
@@ -2367,3 +2453,174 @@ static struct func_vtab func_sql_builtin_vtab = {
 	.call = func_sql_builtin_call_stub,
 	.destroy = func_sql_builtin_destroy,
 };
+
+/** Table of methods of SQL user-defined functions. */
+static struct func_vtab func_sql_expr_vtab;
+
+/** SQL user-defined function. */
+struct func_sql_expr {
+	/** Function object base class. */
+	struct func base;
+	/** Prepared SQL statement. */
+	struct Vdbe *stmt;
+};
+
+struct func *
+func_sql_expr_new(const struct func_def *def)
+{
+	struct Expr *expr = sql_expr_compile(def->body);
+	if (expr == NULL)
+		return NULL;
+	struct Parse parser;
+	sql_parser_create(&parser, SQL_DEFAULT_FLAGS);
+	struct Vdbe *v = sqlGetVdbe(&parser);
+	int ref_reg = ++parser.nMem;
+	sqlVdbeAddOp2(v, OP_FuncArg, 0, ref_reg);
+	v->is_sandboxed = 1;
+	parser.vdbe_field_ref_reg = ref_reg;
+
+	sqlVdbeSetNumCols(v, 1);
+	vdbe_metadata_set_col_name(v, 0, def->name);
+	vdbe_metadata_set_col_type(v, 0, field_type_strs[def->returns]);
+	int res_reg = sqlExprCodeTarget(&parser, expr, ++parser.nMem);
+	sqlVdbeAddOp2(v, OP_ResultRow, res_reg, 1);
+
+	bool is_error = parser.is_aborted;
+	sql_finish_coding(&parser);
+	/* Take VDBE out of parser. */
+	parser.pVdbe = NULL;
+	sql_parser_destroy(&parser);
+	sql_expr_delete(expr);
+
+	if (is_error) {
+		sql_stmt_finalize(v);
+		return NULL;
+	}
+	struct func_sql_expr *func = xmalloc(sizeof(*func));
+	func->stmt = v;
+	func->base.vtab = &func_sql_expr_vtab;
+	return &func->base;
+}
+
+int
+func_sql_expr_call(struct func *func, struct port *args, struct port *ret)
+{
+	struct func_sql_expr *func_sql = (struct func_sql_expr *)func;
+	struct Vdbe *stmt = func_sql->stmt;
+	if (args->vtab != &port_c_vtab) {
+		diag_set(ClientError, ER_UNSUPPORTED, "Tarantool",
+			 "SQL functions");
+		return -1;
+	}
+	struct port_c *port = (struct port_c *)args;
+	char buf[32];
+	const char *data;
+	uint32_t mp_size;
+	struct tuple_format *format;
+	struct port_c_entry *pe = port->first;
+	if (pe->type != PORT_C_ENTRY_NULL) {
+		assert(pe->type == PORT_C_ENTRY_MP);
+		data = pe->mp.data;
+		mp_size = pe->mp.size;
+		format = pe->mp.format;
+	} else {
+		char *end = mp_encode_nil(buf);
+		data = buf;
+		mp_size = end - data;
+		format = NULL;
+	}
+
+	struct region *region = &fiber()->gc;
+	size_t svp = region_used(region);
+	port_sql_create(ret, stmt, DQL_EXECUTE, false);
+	/*
+	 * Currently, SQL EXPR functions can only be called in a tuple or field
+	 * constraint. If the format is NULL then it is a field constraint,
+	 * otherwise it is a tuple constraint.
+	 */
+	uint32_t count = format != NULL ? format->total_field_count : 1;
+	struct vdbe_field_ref *ref;
+	size_t size = sizeof(ref->slots[0]) * count + sizeof(*ref);
+	ref = xregion_aligned_alloc(region, size, alignof(*ref));
+	vdbe_field_ref_create(ref, count);
+	if (format != NULL)
+		vdbe_field_ref_prepare_data(ref, data, mp_size);
+	else
+		vdbe_field_ref_prepare_array(ref, 1, data, mp_size);
+	ref->format = format;
+	stmt->func_arg = ref;
+
+	if (sql_step(stmt) != SQL_ROW)
+		goto error;
+
+	uint32_t res_size;
+	char *pos = sql_stmt_func_result_to_msgpack(stmt, &res_size, region);
+	if (pos == NULL)
+		goto error;
+	port_c_add_mp(ret, pos, pos + res_size);
+
+	if (sql_step(stmt) != SQL_DONE)
+		goto error;
+
+	sql_stmt_reset(stmt);
+	region_truncate(region, svp);
+	return 0;
+error:
+	sql_stmt_reset(stmt);
+	region_truncate(region, svp);
+	port_destroy(ret);
+	return -1;
+}
+
+void
+func_sql_expr_destroy(struct func *base)
+{
+	struct func_sql_expr *func = (struct func_sql_expr *)base;
+	sql_stmt_finalize(func->stmt);
+	free(func);
+}
+
+static struct func_vtab func_sql_expr_vtab = {
+	.call = func_sql_expr_call,
+	.destroy = func_sql_expr_destroy,
+};
+
+bool
+func_sql_expr_has_single_arg(const struct func *base, const char *name)
+{
+	assert(base->def->language == FUNC_LANGUAGE_SQL_EXPR);
+	struct func_sql_expr *func = (struct func_sql_expr *)base;
+	struct Vdbe *v = func->stmt;
+	for (int i = 0; i < v->nOp; ++i) {
+		if (v->aOp[i].opcode != OP_FetchByName)
+			continue;
+		if (name == NULL) {
+			name = v->aOp[i].p4.z;
+			continue;
+		}
+		if (strcmp(name, v->aOp[i].p4.z) != 0)
+			return false;
+	}
+	return true;
+}
+
+bool
+func_sql_expr_check_fields(const struct func *base, const struct space_def *def)
+{
+	assert(base->def->language == FUNC_LANGUAGE_SQL_EXPR);
+	struct func_sql_expr *func = (struct func_sql_expr *)base;
+	struct Vdbe *v = func->stmt;
+	for (int i = 0; i < v->nOp; ++i) {
+		if (v->aOp[i].opcode != OP_FetchByName)
+			continue;
+		const char *name = v->aOp[i].p4.z;
+		bool is_exists = false;
+		for (size_t j = 0; j < def->field_count && !is_exists; ++j) {
+			const char *field_name = def->fields[j].name;
+			is_exists = strcmp(name, field_name) == 0;
+		}
+		if (!is_exists)
+			return false;
+	}
+	return true;
+}

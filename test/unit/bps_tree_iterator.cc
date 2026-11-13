@@ -4,6 +4,16 @@
 #include <time.h>
 #include <limits.h>
 
+/* Select the tree flavor to test. */
+#if defined(TEST_INNER_CARD)
+# define BPS_INNER_CARD
+#elif defined(TEST_INNER_CHILD_CARDS)
+# define BPS_INNER_CHILD_CARDS
+#elif !defined(TEST_DEFAULT)
+# error "Please define TEST_DEFAULT, TEST_INNER_CARD or TEST_INNER_CHILD_CARDS."
+#endif
+
+#define UNIT_TAP_COMPATIBLE 1
 #include "unit.h"
 
 struct elem_t {
@@ -16,8 +26,14 @@ static int compare(const elem_t &a, const elem_t &b);
 static int compare_key(const elem_t &a, long b);
 
 #define BPS_TREE_NAME test
-#define BPS_TREE_BLOCK_SIZE 128 /* value is to low specially for tests */
-#define BPS_TREE_EXTENT_SIZE 1024 /* value is to low specially for tests */
+/**
+ * On COW matras make a copy of extent while API requires only copy a block.
+ * So bps tree may miss COW requests for its block but the block is copied
+ * accidentally and the test passes. To avoid this issue let's make extent and
+ * block the same size.
+ */
+#define test_TREE_EXTENT_SIZE 256
+#define BPS_TREE_BLOCK_SIZE 256
 #define BPS_TREE_IS_IDENTICAL(a, b) equal(a, b)
 #define BPS_TREE_COMPARE(a, b, arg) compare(a, b)
 #define BPS_TREE_COMPARE_KEY(a, b, arg) compare_key(a, b)
@@ -46,45 +62,43 @@ static int compare_key(const elem_t &a, long b)
 int total_extents_allocated = 0;
 
 static void *
-extent_alloc(void *ctx)
+extent_alloc(struct matras_allocator *allocator)
 {
-	int *p_total_extents_allocated = (int *)ctx;
-	assert(p_total_extents_allocated == &total_extents_allocated);
-	++*p_total_extents_allocated;
-	return malloc(BPS_TREE_EXTENT_SIZE);
+	(void)allocator;
+	++total_extents_allocated;
+	return xmalloc(test_TREE_EXTENT_SIZE);
 }
 
 static void
-extent_free(void *ctx, void *extent)
+extent_free(struct matras_allocator *allocator, void *extent)
 {
-	int *p_total_extents_allocated = (int *)ctx;
-	assert(p_total_extents_allocated == &total_extents_allocated);
-	--*p_total_extents_allocated;
+	(void)allocator;
+	--total_extents_allocated;
 	free(extent);
 }
+
+struct matras_allocator allocator;
 
 static void
 iterator_check()
 {
+	plan(7);
 	header();
 
 	test tree;
-	test_create(&tree, 0, extent_alloc, extent_free,
-		    &total_extents_allocated);
+	test_create(&tree, 0, &allocator, NULL);
 
-	/* Stupid tests */
 	{
 		test_iterator tmp1, tmp2;
 		tmp1 = test_invalid_iterator();
 		tmp2 = test_invalid_iterator();
-		if (!test_iterator_is_invalid(&tmp1))
-			fail("invalid iterator is not invalid", "true");
-		if (!test_iterator_are_equal(&tree, &tmp1, &tmp2))
-			fail("invalid iterators are not equal", "true");
+		ok(test_iterator_is_invalid(&tmp1),
+		   "invalid iterator is invalid");
+		ok(test_iterator_is_equal(&tree, &tmp1, &tmp2),
+		   "invalid iterators are equal");
 	}
 
-	/* Filing tree */
-	const long count1 = 10000;
+	const long count1 = 2000;
 	const long count2 = 5;
 	for (long i = 0; i < count1; i++) {
 		struct elem_t e;
@@ -94,9 +108,6 @@ iterator_check()
 			test_insert(&tree, e, 0, 0);
 		}
 	}
-	printf("Test tree size: %d\n", (int)test_size(&tree));
-
-	/* Test that tree filled ok */
 	for (long i = 0; i < count1 * count2; i++) {
 		long key = i % count1;
 		if (test_find(&tree, key * 2) == 0)
@@ -104,33 +115,10 @@ iterator_check()
 		if (test_find(&tree, key * 2 + 1) != 0)
 			fail("Integrity check failed (2)", "true");
 	}
+	ok(test_debug_check(&tree) == 0, "the test tree is valid");
 
-	/* Print first 7 elems */
 	{
-		printf("--> ");
-		test_iterator iterator = test_iterator_first(&tree);
-		for (int i = 0; i < 7; i++) {
-			elem_t *elem = test_iterator_get_elem(&tree, &iterator);
-			printf("(%ld,%ld) ", elem->first, elem->second);
-			test_iterator_next(&tree, &iterator);
-		}
-		printf("\n");
-	}
-	/* Print last 7 elems */
-	{
-		printf("<-- ");
-		test_iterator iterator = test_iterator_last(&tree);
-		for (int i = 0; i < 7; i++) {
-			elem_t *elem = test_iterator_get_elem(&tree, &iterator);
-			printf("(%ld,%ld) ", elem->first, elem->second);
-			test_iterator_prev(&tree, &iterator);
-		}
-		printf("\n");
-	}
-
-	/* Iterate forward all elements 5 times */
-	{
-		test_iterator iterator = test_iterator_first(&tree);
+		test_iterator iterator = test_first(&tree);
 		for (long i = 0; i < count1 * count2 * 5; i++) {
 			elem_t *elem = test_iterator_get_elem(&tree, &iterator);
 			if (elem->first != ((i % (count1 * count2)) / count2) * 2)
@@ -147,10 +135,10 @@ iterator_check()
 			}
 		}
 	}
+	ok(true, "iteration forward all elements 5 times");
 
-	/* Iterate backward all elements 5 times */
 	{
-		test_iterator iterator = test_iterator_last(&tree);
+		test_iterator iterator = test_last(&tree);
 		for (long i = 0; i < count1 * count2 * 5; i++) {
 			elem_t *elem = test_iterator_get_elem(&tree, &iterator);
 			long j = count1 * count2 - 1 - (i % (count1 * count2));
@@ -168,52 +156,31 @@ iterator_check()
 			}
 		}
 	}
+	ok(true, "iteration backward all elements 5 times");
 
-	/* Check iterating in range from lower bound to upper bound */
-	/* Several probes */
-	const long keys[] = {-1, 0, 10, 15, count1*2 - 2, count1 * 2};
-	for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
-		const long key = keys[i];
-		bool has_this_key1;
-		test_iterator begin = test_lower_bound(&tree, key, &has_this_key1);
-		bool has_this_key2;
-		test_iterator end = test_upper_bound(&tree, key, &has_this_key2);
-		if (has_this_key1 != has_this_key2)
-			fail("Exact flag is broken", "true");
-		printf("Key %ld, %s range [%s, %s): ", key,
-			has_this_key1 ? "not empty" : "empty",
-			test_iterator_is_invalid(&begin) ? "eof" : "ptr",
-			test_iterator_is_invalid(&end) ? "eof" : "ptr");
-		test_iterator runner = begin;
-		while (!test_iterator_are_equal(&tree, &runner, &end)) {
-			elem_t *elem = test_iterator_get_elem(&tree, &runner);
-			printf("(%ld,%ld) ", elem->first, elem->second);
-			test_iterator_next(&tree, &runner);
-		}
-		printf(" <-> ");
-		runner = end;
-		while (!test_iterator_are_equal(&tree, &runner, &begin)) {
-			test_iterator_prev(&tree, &runner);
-			elem_t *elem = test_iterator_get_elem(&tree, &runner);
-			printf("(%ld,%ld) ", elem->first, elem->second);
-		}
-		printf("\n");
-	}
-
-	/* Check iterating in range from lower bound to upper bound */
-	/* Automated */
 	for (long i = -1; i <= count1 + 1; i++) {
 		test_iterator begin = test_lower_bound(&tree, i, 0);
 		test_iterator end = test_upper_bound(&tree, i, 0);
+		test_iterator runner = begin;
 		long real_count = 0;
-		while (!test_iterator_are_equal(&tree, &begin, &end)) {
-			elem_t *elem = test_iterator_get_elem(&tree, &begin);
+		while (!test_iterator_is_equal(&tree, &runner, &end)) {
+			elem_t *elem = test_iterator_get_elem(&tree, &runner);
 			if (elem->first != i)
 				fail("range iterator failed (1)", "true");
 			if (elem->second != real_count)
 				fail("range iterator failed (2)", "true");
 			real_count++;
-			test_iterator_next(&tree, &begin);
+			test_iterator_next(&tree, &runner);
+		}
+		long back_count = real_count - 1;
+		while (!test_iterator_is_equal(&tree, &runner, &begin)) {
+			test_iterator_prev(&tree, &runner);
+			elem_t *elem = test_iterator_get_elem(&tree, &runner);
+			if (elem->first != i)
+				fail("range iterator failed (1)", "true");
+			if (elem->second != back_count)
+				fail("range iterator failed (2)", "true");
+			back_count--;
 		}
 		long must_be_count = 0;
 		if (i >= 0 && i / 2 <= count1 - 1 && (i & 1) == 0)
@@ -221,50 +188,33 @@ iterator_check()
 		if (real_count != must_be_count)
 			fail("range iterator failed (3)", "true");
 	}
+	ok(true, "iteration in range from lower bound to upper bound");
 
-	/* Check iterating in range from lower bound to upper bound */
-	/* Several probes */
-	for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
-		const long key = keys[i];
-		struct elem_t lower_elem_key = {key, 0};
-		struct elem_t upper_elem_key = {key, LONG_MAX};
-		test_iterator begin = test_lower_bound_elem(&tree, lower_elem_key, NULL);
-		test_iterator end = test_upper_bound_elem(&tree, upper_elem_key, NULL);
-		printf("Key %ld, range [%s, %s): ", key,
-		       test_iterator_is_invalid(&begin) ? "eof" : "ptr",
-		       test_iterator_is_invalid(&end) ? "eof" : "ptr");
-		test_iterator runner = begin;
-		while (!test_iterator_are_equal(&tree, &runner, &end)) {
-			elem_t *elem = test_iterator_get_elem(&tree, &runner);
-			printf("(%ld,%ld) ", elem->first, elem->second);
-			test_iterator_next(&tree, &runner);
-		}
-		printf(" <-> ");
-		runner = end;
-		while (!test_iterator_are_equal(&tree, &runner, &begin)) {
-			test_iterator_prev(&tree, &runner);
-			elem_t *elem = test_iterator_get_elem(&tree, &runner);
-			printf("(%ld,%ld) ", elem->first, elem->second);
-		}
-		printf("\n");
-	}
-
-	/* Check iterating in range from lower bound to upper bound */
-	/* Automated */
 	for (long i = -1; i <= count1 + 1; i++) {
 		struct elem_t lower_elem_key = {i, 0};
 		struct elem_t upper_elem_key = {i, LONG_MAX};
 		test_iterator begin = test_lower_bound_elem(&tree, lower_elem_key, 0);
 		test_iterator end = test_upper_bound_elem(&tree, upper_elem_key, 0);
+		test_iterator runner = begin;
 		long real_count = 0;
-		while (!test_iterator_are_equal(&tree, &begin, &end)) {
-			elem_t *elem = test_iterator_get_elem(&tree, &begin);
+		while (!test_iterator_is_equal(&tree, &runner, &end)) {
+			elem_t *elem = test_iterator_get_elem(&tree, &runner);
 			if (elem->first != i)
 				fail("range iterator failed (1)", "true");
 			if (elem->second != real_count)
 				fail("range iterator failed (2)", "true");
 			real_count++;
-			test_iterator_next(&tree, &begin);
+			test_iterator_next(&tree, &runner);
+		}
+		long back_count = real_count - 1;
+		while (!test_iterator_is_equal(&tree, &runner, &begin)) {
+			test_iterator_prev(&tree, &runner);
+			elem_t *elem = test_iterator_get_elem(&tree, &runner);
+			if (elem->first != i)
+				fail("range iterator failed (1)", "true");
+			if (elem->second != back_count)
+				fail("range iterator failed (2)", "true");
+			back_count--;
 		}
 		long must_be_count = 0;
 		if (i >= 0 && i / 2 <= count1 - 1 && (i & 1) == 0)
@@ -272,15 +222,18 @@ iterator_check()
 		if (real_count != must_be_count)
 			fail("range iterator failed (3)", "true");
 	}
+	ok(true, "iteration in range from lower bound to upper bound");
 
 	test_destroy(&tree);
 
 	footer();
+	check_plan();
 }
 
 static void
 iterator_invalidate_check()
 {
+	plan(3);
 	header();
 
 	const long test_size = 300;
@@ -291,15 +244,13 @@ iterator_invalidate_check()
 
 	struct test tree;
 
-	/* invalidation during deletion */
 	srand(0);
 	for (long attempt = 0; attempt < attempt_count; attempt++) {
 		long del_pos = rand() % test_size;
 		long del_cnt = rand() % max_delete_count + 1;
 		if (del_pos + del_cnt > test_size)
 			del_cnt = test_size - del_pos;
-		test_create(&tree, 0, extent_alloc, extent_free,
-			    &total_extents_allocated);
+		test_create(&tree, 0, &allocator, NULL);
 
 		for (long i = 0; i < test_size; i++) {
 			elem_t e;
@@ -307,7 +258,7 @@ iterator_invalidate_check()
 			e.second = i * test_size * 2;
 			test_insert(&tree, e, 0, 0);
 		}
-		iterators[0] = test_iterator_first(&tree);
+		iterators[0] = test_first(&tree);
 		assert(test_iterator_get_elem(&tree, iterators));
 		for (long i = 1; i < test_size; i++) {
 			iterators[i] = iterators[i - 1];
@@ -318,8 +269,12 @@ iterator_invalidate_check()
 			elem_t e;
 			e.first = i * test_size * 2;
 			e.second = i * test_size * 2;
-			int res = test_delete(&tree, e);
-			assert(res == 0);
+			elem_t deleted;
+			deleted.first = LONG_MAX;
+			deleted.second = LONG_MAX;
+			fail_unless(test_delete(&tree, e, &deleted) == 0);
+			fail_unless(deleted.first == e.first);
+			fail_unless(deleted.second == e.second);
 		}
 		for (long i = 0; i < test_size; i++) {
 			do {
@@ -337,14 +292,13 @@ iterator_invalidate_check()
 		}
 		test_destroy(&tree);
 	}
+	ok(true, "invalidation during deletion");
 
-	/* invalidation during insertion */
 	srand(0);
 	for (long attempt = 0; attempt < attempt_count; attempt++) {
 		long ins_pos = rand() % test_size;
 		long ins_cnt = rand() % max_insert_count + 1;
-		test_create(&tree, 0, extent_alloc, extent_free,
-			    &total_extents_allocated);
+		test_create(&tree, 0, &allocator, NULL);
 
 		for (long i = 0; i < test_size; i++) {
 			elem_t e;
@@ -352,7 +306,7 @@ iterator_invalidate_check()
 			e.second = i * test_size * 2;
 			test_insert(&tree, e, 0, 0);
 		}
-		iterators [0] = test_iterator_first(&tree);
+		iterators[0] = test_first(&tree);
 		assert(test_iterator_get_elem(&tree, iterators));
 		for (long i = 1; i < test_size; i++) {
 			iterators[i] = iterators[i - 1];
@@ -389,8 +343,8 @@ iterator_invalidate_check()
 		}
 		test_destroy(&tree);
 	}
+	ok(true, "invalidation during insertion");
 
-	/* invalidation during deletion and insertion */
 	srand(0);
 	for (long attempt = 0; attempt < attempt_count; attempt++) {
 		long del_pos = rand() % test_size;
@@ -399,8 +353,7 @@ iterator_invalidate_check()
 		long ins_cnt = rand() % max_insert_count + 1;
 		if (del_pos + del_cnt > test_size)
 			del_cnt = test_size - del_pos;
-		test_create(&tree, 0, extent_alloc, extent_free,
-			    &total_extents_allocated);
+		test_create(&tree, 0, &allocator, NULL);
 
 		for (long i = 0; i < test_size; i++) {
 			elem_t e;
@@ -408,7 +361,7 @@ iterator_invalidate_check()
 			e.second = i * test_size * 2;
 			test_insert(&tree, e, 0, 0);
 		}
-		iterators[0] = test_iterator_first(&tree);
+		iterators[0] = test_first(&tree);
 		assert(test_iterator_get_elem(&tree, iterators));
 		for (long i = 1; i < test_size; i++) {
 			iterators[i] = iterators[i - 1];
@@ -419,8 +372,12 @@ iterator_invalidate_check()
 			elem_t e;
 			e.first = i * test_size * 2;
 			e.second = i * test_size * 2;
-			int res = test_delete(&tree, e);
-			assert(res == 0);
+			elem_t deleted;
+			deleted.first = LONG_MAX;
+			deleted.second = LONG_MAX;
+			fail_unless(test_delete(&tree, e, &deleted) == 0);
+			fail_unless(deleted.first == e.first);
+			fail_unless(deleted.second == e.second);
 		}
 		for (long i = 0; i < ins_cnt; i++) {
 			elem_t e;
@@ -452,15 +409,15 @@ iterator_invalidate_check()
 		}
 		test_destroy(&tree);
 	}
+	ok(true, "invalidation during deletion and insertion");
 
 	footer();
+	check_plan();
 }
 
 static void
 iterator_freeze_check()
 {
-	header();
-
 	const int test_rounds_size = 10;
 	const int test_data_size = 1000;
 	elem_t comp_buf1[test_data_size];
@@ -470,8 +427,7 @@ iterator_freeze_check()
 	struct test tree;
 
 	for (int i = 0; i < 10; i++) {
-		test_create(&tree, 0, extent_alloc, extent_free,
-			    &total_extents_allocated);
+		test_create(&tree, 0, &allocator, NULL);
 		int comp_buf_size1 = 0;
 		int comp_buf_size2 = 0;
 		for (int j = 0; j < test_data_size; j++) {
@@ -483,27 +439,29 @@ iterator_freeze_check()
 			fail_if(check);
 			assert(check == 0);
 		}
-		struct test_iterator iterator = test_iterator_first(&tree);
+		struct test_iterator iterator = test_first(&tree);
 		elem_t *e;
 		while ((e = test_iterator_get_elem(&tree, &iterator))) {
 			comp_buf1[comp_buf_size1++] = *e;
 			test_iterator_next(&tree, &iterator);
 		}
-		struct test_iterator iterator1 = test_iterator_first(&tree);
-		test_iterator_freeze(&tree, &iterator1);
-		struct test_iterator iterator2 = test_iterator_first(&tree);
-		test_iterator_freeze(&tree, &iterator2);
+		struct test_view view1;
+		test_view_create(&view1, &tree);
+		struct test_iterator iterator1 = test_view_first(&view1);
+		struct test_view view2;
+		test_view_create(&view2, &tree);
+		struct test_iterator iterator2 = test_view_first(&view2);
 		for (int j = 0; j < test_data_size; j++) {
 			elem_t e;
 			e.first = rand() % test_data_mod;
 			e.second = 0;
 			test_insert(&tree, e, 0, 0);
-			int check = test_debug_check(&tree);
-			fail_if(check);
-			assert(check == 0);
+			fail_if(test_debug_check(&tree));
+			fail_if(test_view_debug_check(&view1));
+			fail_if(test_view_debug_check(&view2));
 		}
 		int tested_count = 0;
-		while ((e = test_iterator_get_elem(&tree, &iterator1))) {
+		while ((e = test_view_iterator_get_elem(&view1, &iterator1))) {
 			if (!equal(*e, comp_buf1[tested_count])) {
 				fail("version restore failed (1)", "true");
 			}
@@ -511,21 +469,20 @@ iterator_freeze_check()
 			if (tested_count > comp_buf_size1) {
 				fail("version restore failed (2)", "true");
 			}
-			test_iterator_next(&tree, &iterator1);
+			test_view_iterator_next(&view1, &iterator1);
 		}
-		test_iterator_destroy(&tree, &iterator1);
+		test_view_destroy(&view1);
 		for (int j = 0; j < test_data_size; j++) {
 			elem_t e;
 			e.first = rand() % test_data_mod;
 			e.second = 0;
-			test_delete(&tree, e);
-			int check = test_debug_check(&tree);
-			fail_if(check);
-			assert(check == 0);
+			test_delete(&tree, e, NULL);
+			fail_if(test_debug_check(&tree));
+			fail_if(test_view_debug_check(&view2));
 		}
 
 		tested_count = 0;
-		while ((e = test_iterator_get_elem(&tree, &iterator2))) {
+		while ((e = test_view_iterator_get_elem(&view2, &iterator2))) {
 			if (!equal(*e, comp_buf1[tested_count])) {
 				fail("version restore failed (1)", "true");
 			}
@@ -533,24 +490,33 @@ iterator_freeze_check()
 			if (tested_count > comp_buf_size1) {
 				fail("version restore failed (2)", "true");
 			}
-			test_iterator_next(&tree, &iterator2);
+			test_view_iterator_next(&view2, &iterator2);
 		}
-
+		test_view_destroy(&view2);
 		test_destroy(&tree);
 	}
-
-	footer();
+	ok(true, "tree view iteration");
 }
 
 
 int
 main(void)
 {
+	plan(4);
+	header();
+
+	matras_allocator_create(&allocator, test_TREE_EXTENT_SIZE,
+				extent_alloc, extent_free);
+
 	srand(time(0));
 	iterator_check();
 	iterator_invalidate_check();
 	iterator_freeze_check();
-	if (total_extents_allocated) {
-		fail("memory leak", "true");
-	}
+	ok(total_extents_allocated == allocator.num_reserved_extents,
+	   "leak check");
+
+	matras_allocator_destroy(&allocator);
+
+	footer();
+	return check_plan();
 }

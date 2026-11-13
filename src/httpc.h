@@ -60,7 +60,11 @@ struct httpc_stat {
  * HTTP Client Environment
  */
 struct httpc_env {
-	/** Curl enviroment. */
+	/** Number of a current active http requests. */
+	int req_count;
+	/** Flag that triggers cleanup. */
+	int cleanup;
+	/** Curl environment. */
 	struct curl_env curl_env;
 	/** Memory pool for requests */
 	struct mempool req_pool;
@@ -77,6 +81,13 @@ struct httpc_env {
  */
 int
 httpc_env_create(struct httpc_env *ctx, int max_conns, int max_total_conns);
+
+/**
+ * Finish HTTP client environment
+ * @param env pointer to a structure to finish
+ */
+void
+httpc_env_finish(struct httpc_env *env);
 
 /**
  * Destroy HTTP client environment
@@ -97,18 +108,20 @@ struct httpc_request {
 	struct httpc_env *env;
 	/** HTTP headers */
 	struct curl_slist *headers;
-	/** Buffer for the request body */
-	struct ibuf body;
-	/** curl resuest. */
+	/** Buffer for data send. */
+	struct ibuf send;
+	/** curl request. */
 	struct curl_request curl_request;
 	/** HTTP status code */
 	int status;
+	/** Number of redirects that were followed. */
+	int redirect_count;
 	/** Error message */
 	const char *reason;
 	/** buffer of headers */
 	struct region resp_headers;
-	/** buffer of body */
-	struct region resp_body;
+	/** Buffer of received data. */
+	struct region recv;
 	/**
 	 * Idle delay, in seconds, that the operating system will
 	 * wait while the connection is idle before sending
@@ -130,6 +143,30 @@ struct httpc_request {
 	 * execution automatically.
 	 */
 	bool set_keep_alive_header;
+	/**
+	 * It's the number of bytes of data in the body of the
+	 * request. The value is equal to "Content-Length"
+	 * header or -1 otherwise.
+	 */
+	long content_length;
+	/** True when chunked io is enabled. */
+	bool io;
+	/**
+	 * Additional buffer of received data to optimize
+	 * chunked io memory allocations in the case of
+	 * large bodies.
+	 */
+	struct ibuf io_recv;
+	/** Condition for data chunk receive signaling. */
+	struct fiber_cond io_recv_cond;
+	/** True when send is activated. */
+	bool io_send;
+	/** True when send is already completed. */
+	bool io_send_closed;
+	/** Condition for data chunk send signaling. */
+	struct fiber_cond io_send_cond;
+	/** Condition for headers read signaling. */
+	struct fiber_cond *io_headers_cond;
 };
 
 /**
@@ -143,7 +180,7 @@ httpc_request_new(struct httpc_env *env, const char *method,
 
 /**
  * @brief Delete HTTP request
- * @param request - reference to object
+ * @param req - reference to object
  * @details Should be called even if error in execute appeared
  */
 void
@@ -403,8 +440,98 @@ void
 httpc_set_accept_encoding(struct httpc_request *req, const char *encoding);
 
 /**
+ * Specify http protocol version for request
+ * @param req request
+ * @param version - http version to use for this request
+ * Version can be 1.1, 2, 2-tls or 2-prior-knowledge
+ * @see https://curl.se/libcurl/c/CURLOPT_HTTP_VERSION.html
+ */
+int
+httpc_set_http_version(struct httpc_request *req, const char *version);
+
+/**
+ * Enable a chunked io interface for the request. It allows to
+ * send and receive data via chunks.
+ *
+ * @param req    Request.
+ * @param method HTTP request method name.
+ * @retval  0 On success.
+ * @retval -1 On error.
+ * @see https://en.wikipedia.org/wiki/Chunked_transfer_encoding
+ * @see https://curl.haxx.se/libcurl/c/CURLOPT_UPLOAD.html
+ */
+int
+httpc_set_io(struct httpc_request *req, const char *method);
+
+/**
+ * Read a next chunk of data.
+ *
+ * @param req     Reference to request object with enabled io.
+ * @param buf     Reference to a data buffer.
+ * @param len     Max data length to read to the buffer.
+ * @param timeout Timeout of waiting for data receive.
+ * @retval >0 The number of bytes read.
+ * @retval  0 The request is completed.
+ * @retval -1 Error.
+ */
+ssize_t
+httpc_request_io_read(struct httpc_request *req, char *buf, size_t len,
+		      double timeout);
+
+/**
+ * Write chunk of data.
+ *
+ * @param req     Reference to request object with enabled io.
+ * @param ptr     Reference to a data buffer.
+ * @param len     Data length to send from the buffer, 0 is the
+ * indicator of the end of sending data.
+ * @param timeout Timeout of waiting for data send.
+ * @retval >0 The number of bytes written.
+ * @retval  0 The request is completed.
+ * @retval -1 Error.
+ */
+ssize_t
+httpc_request_io_write(struct httpc_request *req, const char *ptr, size_t len,
+		       double timeout);
+
+/**
+ * Finish io request.
+ *
+ * @param req     Reference to request object with enabled io.
+ * @param timeout Timeout of waiting for libcurl api.
+ * @retval  0 On success.
+ * @retval -1 On error.
+ */
+int
+httpc_request_io_finish(struct httpc_request *req, double timeout);
+
+/**
+ * This function starts async HTTP request.
+ *
+ * @param req     Reference to request object with filled fields.
+ * @param timeout Timeout of waiting for server headers in case
+ * of io interface.
+ * @retval  0 On success.
+ * @retval -1 On error.
+ */
+int
+httpc_request_start(struct httpc_request *req, double timeout);
+
+/**
+ * This function waits for the CURL request to be completed or
+ * aborts the request by timeout.
+ *
+ * @param req     Reference to request object with filled fields.
+ * @param timeout Timeout of waiting for libcurl api.
+ * @retval  0 On success.
+ * @retval -1 On error.
+ */
+int
+httpc_request_finish(struct httpc_request *req, double timeout);
+
+/**
  * This function does async HTTP request
- * @param request - reference to request object with filled fields
+ * @param req     - reference to request object with filled fields
  * @param timeout - timeout of waiting for libcurl api
  * @return 0 for success or NULL
  */

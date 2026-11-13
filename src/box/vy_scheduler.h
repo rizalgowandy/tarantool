@@ -188,6 +188,13 @@ void
 vy_scheduler_start(struct vy_scheduler *scheduler);
 
 /**
+ * Shutdown scheduler. Shutdown stops all internal fibers/threads.
+ * It may yield.
+ */
+void
+vy_scheduler_shutdown(struct vy_scheduler *scheduler);
+
+/**
  * Destroy a scheduler instance.
  */
 void
@@ -232,20 +239,20 @@ vy_scheduler_force_compaction(struct vy_scheduler *scheduler,
  * after that.
  */
 int
-vy_scheduler_begin_checkpoint(struct vy_scheduler *, bool);
+vy_scheduler_begin_checkpoint(struct vy_scheduler *scheduler);
 
 /**
  * Wait for checkpoint. Please call vy_scheduler_end_checkpoint()
  * after that.
  */
 int
-vy_scheduler_wait_checkpoint(struct vy_scheduler *);
+vy_scheduler_wait_checkpoint(struct vy_scheduler *scheduler);
 
 /**
  * End checkpoint. Called on both checkpoint commit and abort.
  */
 void
-vy_scheduler_end_checkpoint(struct vy_scheduler *);
+vy_scheduler_end_checkpoint(struct vy_scheduler *scheduler);
 
 #if defined(__cplusplus)
 } /* extern "C" */

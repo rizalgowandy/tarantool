@@ -1,9 +1,11 @@
 -- msgpackffi.lua (internal file)
 
+local tweaks = require('internal.tweaks')
 local ffi = require('ffi')
 local buffer = require('buffer')
 local builtin = ffi.C
 local msgpack = require('msgpack') -- .NULL, .array_mt, .map_mt, .cfg
+local varbinary = require('varbinary')
 local int8_ptr_t = ffi.typeof('int8_t *')
 local uint8_ptr_t = ffi.typeof('uint8_t *')
 local uint16_ptr_t = ffi.typeof('uint16_t *')
@@ -30,6 +32,14 @@ uint32_t
 tnt_mp_sizeof_error(const struct error *error);
 char *
 tnt_mp_encode_error(char *data, const struct error *error);
+uint32_t
+tnt_mp_sizeof_datetime(const struct datetime *date);
+char *
+tnt_mp_encode_datetime(char *data, const struct datetime *date);
+char *
+tnt_mp_encode_interval(char *data, const struct interval *itv);
+uint32_t
+tnt_mp_sizeof_interval(const struct interval *itv);
 float
 tnt_mp_decode_float(const char **data);
 double
@@ -41,9 +51,13 @@ decimal_unpack(const char **data, uint32_t len, decimal_t *dec);
 struct tt_uuid *
 uuid_unpack(const char **data, uint32_t len, struct tt_uuid *uuid);
 struct error *
-error_unpack_unsafe(const char **data);
+error_unpack(const char **data, uint32_t len);
 void
 error_unref(struct error *e);
+struct datetime *
+tnt_datetime_unpack(const char **data, uint32_t len, struct datetime *date);
+struct interval *
+tnt_interval_unpack(const char **data, uint32_t len, struct interval *itv);
 ]])
 
 local strict_alignment = (jit.arch == 'arm')
@@ -150,6 +164,16 @@ local function encode_uuid(buf, uuid)
     builtin.tnt_mp_encode_uuid(p, uuid)
 end
 
+local function encode_datetime(buf, date)
+    local p = buf:alloc(builtin.tnt_mp_sizeof_datetime(date))
+    builtin.tnt_mp_encode_datetime(p, date)
+end
+
+local function encode_interval(buf, itv)
+    local p = buf:alloc(builtin.tnt_mp_sizeof_interval(itv))
+    builtin.tnt_mp_encode_interval(p, itv)
+end
+
 local function encode_int(buf, num)
     if num >= 0 then
         if num <= 0x7f then
@@ -194,6 +218,20 @@ local function encode_str(buf, str)
     ffi.copy(p, str, len)
 end
 
+local function encode_bin(buf, bin)
+    local len = #bin
+    buf:reserve(5 + len)
+    if len <= 0xff then
+        encode_u8(buf, 0xc4, len)
+    elseif len <= 0xffff then
+        encode_u16(buf, 0xc5, len)
+    else
+        encode_u32(buf, 0xc6, len)
+    end
+    local p = buf:alloc(len)
+    ffi.copy(p, bin, len)
+end
+
 local function encode_array(buf, size)
     if size <= 0xf then
         encode_fix(buf, 0x90, size)
@@ -236,11 +274,11 @@ local function encode_error(buf, err)
     end
 end
 
-local function encode_r(buf, obj, level)
+local function encode_r(buf, obj, level, trace_level)
 ::restart::
     if type(obj) == "number" then
         -- Lua-way to check that number is an integer
-        if obj % 1 == 0 and obj > -1e63 and obj < 1e64 then
+        if obj % 1 == 0 and obj >= -2^63 and obj < 2^64 then
             encode_int(buf, obj)
         else
             encode_double(buf, obj)
@@ -250,8 +288,10 @@ local function encode_r(buf, obj, level)
     elseif type(obj) == "table" then
         if level >= msgpack.cfg.encode_max_depth then
             if not msgpack.cfg.encode_deep_as_nil then
-                error(string.format('Too high nest level - %d',
-                                    msgpack.cfg.encode_max_depth + 1))
+                box.error(box.error.PROC_LUA,
+                          string.format('Too high nest level - %d',
+                                        msgpack.cfg.encode_max_depth + 1),
+                          trace_level and trace_level + 1)
             end
             encode_nil(buf)
             return
@@ -276,20 +316,22 @@ local function encode_r(buf, obj, level)
             serialize == 'seq' or serialize == 'sequence' then
             encode_array(buf, array_count)
             for i=1,array_count,1 do
-                encode_r(buf, obj[i], level + 1)
+                encode_r(buf, obj[i], level + 1,
+                         trace_level and trace_level + 1)
             end
         elseif (serialize == nil and map_count > 0) or
             serialize == 'map' or serialize == 'mapping' then
             encode_map(buf, array_count + map_count)
             for key, val in pairs(obj) do
-                encode_r(buf, key, level + 1)
-                encode_r(buf, val, level + 1)
+                encode_r(buf, key, level + 1, trace_level and trace_level + 1)
+                encode_r(buf, val, level + 1, trace_level and trace_level + 1)
             end
         elseif type(serialize) == 'function' then
             obj = serialize(obj)
             goto restart
         else
-            error("Invalid __serialize value")
+            box.error(box.error.PROC_LUA, "Invalid __serialize value",
+                      trace_level and trace_level + 1)
         end
     elseif obj == nil then
         encode_nil(buf)
@@ -297,7 +339,7 @@ local function encode_r(buf, obj, level)
         encode_bool(buf, obj)
     elseif type(obj) == "cdata" then
         if obj == nil then -- a workaround for nil
-            encode_nil(buf, obj)
+            encode_nil(buf)
             return
         end
         local ctypeid = tonumber(ffi.typeof(obj))
@@ -305,10 +347,14 @@ local function encode_r(buf, obj, level)
         if fun ~= nil then
             fun(buf, obj)
         else
-            error("can not encode FFI type: '"..ffi.typeof(obj).."'")
+            box.error(box.error.PROC_LUA,
+                      "can not encode FFI type: '"..ffi.typeof(obj).."'",
+                      trace_level and trace_level + 1)
         end
     else
-        error("can not encode Lua type: '"..type(obj).."'")
+        box.error(box.error.PROC_LUA,
+                  "can not encode Lua type: '"..type(obj).."'",
+                  trace_level and trace_level + 1)
     end
 end
 
@@ -335,9 +381,12 @@ on_encode(ffi.typeof('const unsigned char'), encode_int)
 on_encode(ffi.typeof('bool'), encode_bool_cdata)
 on_encode(ffi.typeof('float'), encode_float)
 on_encode(ffi.typeof('double'), encode_double)
+on_encode(ffi.typeof('struct varbinary'), encode_bin)
 on_encode(ffi.typeof('decimal_t'), encode_decimal)
 on_encode(ffi.typeof('struct tt_uuid'), encode_uuid)
 on_encode(ffi.typeof('const struct error &'), encode_error)
+on_encode(ffi.typeof('struct datetime'), encode_datetime)
+on_encode(ffi.typeof('struct interval'), encode_interval)
 
 --------------------------------------------------------------------------------
 -- Decoder
@@ -494,11 +543,23 @@ local function decode_str(data, size)
     return ret
 end
 
-local function decode_array(data, size)
+local function decode_bin(data, size)
+    if tweaks.msgpack_decode_binary_as_string then
+        return decode_str(data, size)
+    end
+    local ret = varbinary.new(data[0], size)
+    data[0] = data[0] + size
+    return ret
+end
+
+local function decode_array(data, size, level)
+    if level >= msgpack.cfg.decode_max_depth then
+        error(string.format('Too high nest level - %d', level + 1))
+    end
     assert (type(size) == "number")
     local arr = {}
     for _ = 1, size do
-        table.insert(arr, decode_r(data))
+        table.insert(arr, decode_r(data, level + 1))
     end
     if not msgpack.cfg.decode_save_metatables then
         return arr
@@ -506,12 +567,15 @@ local function decode_array(data, size)
     return setmetatable(arr, msgpack.array_mt)
 end
 
-local function decode_map(data, size)
+local function decode_map(data, size, level)
+    if level >= msgpack.cfg.decode_max_depth then
+        error(string.format('Too high nest level - %d', level + 1))
+    end
     assert (type(size) == "number")
     local map = {}
     for _ = 1, size do
-        local key = decode_r(data);
-        local val = decode_r(data);
+        local key = decode_r(data, level + 1);
+        local val = decode_r(data, level + 1);
         map[key] = val
     end
     if not msgpack.cfg.decode_save_metatables then
@@ -532,8 +596,8 @@ local ext_decoder = {
         return uuid
     end,
     -- MP_ERROR
-    [3] = function(data)
-        local err = builtin.error_unpack_unsafe(data)
+    [3] = function(data, len)
+        local err = builtin.error_unpack(data, len)
         if err ~= nil then
             err._refs = err._refs + 1
             -- From FFI it is returned as 'struct error *', which is
@@ -544,6 +608,18 @@ local ext_decoder = {
             err = ffi.gc(err, builtin.error_unref)
         end
         return err
+    end,
+    -- MP_DATETIME
+    [4] = function(data, len)
+        local dt = ffi.new("struct datetime")
+        builtin.tnt_datetime_unpack(data, len, dt)
+        return dt
+    end,
+    -- MP_INTERVAL
+    [6] = function(data, len)
+        local itv = ffi.new("struct interval")
+        builtin.tnt_interval_unpack(data, len, itv)
+        return itv
     end,
 }
 
@@ -563,9 +639,9 @@ end
 
 local decoder_hint = {
     --[[{{{ MP_BIN]]
-    [0xc4] = function(data) return decode_str(data, decode_u8(data)) end;
-    [0xc5] = function(data) return decode_str(data, decode_u16(data)) end;
-    [0xc6] = function(data) return decode_str(data, decode_u32(data)) end;
+    [0xc4] = function(data) return decode_bin(data, decode_u8(data)) end;
+    [0xc5] = function(data) return decode_bin(data, decode_u16(data)) end;
+    [0xc6] = function(data) return decode_bin(data, decode_u32(data)) end;
 
     --[[MP_FLOAT, MP_DOUBLE]]
     [0xca] = decode_float;
@@ -589,15 +665,23 @@ local decoder_hint = {
     [0xdb] = function(data) return decode_str(data, decode_u32(data)) end;
 
     --[[MP_ARRAY]]
-    [0xdc] = function(data) return decode_array(data, decode_u16(data)) end;
-    [0xdd] = function(data) return decode_array(data, decode_u32(data)) end;
+    [0xdc] = function(data, level)
+        return decode_array(data, decode_u16(data), level)
+    end;
+    [0xdd] = function(data, level)
+        return decode_array(data, decode_u32(data), level)
+    end;
 
     --[[MP_MAP]]
-    [0xde] = function(data) return decode_map(data, decode_u16(data)) end;
-    [0xdf] = function(data) return decode_map(data, decode_u32(data)) end;
+    [0xde] = function(data, level)
+        return decode_map(data, decode_u16(data), level)
+    end;
+    [0xdf] = function(data, level)
+        return decode_map(data, decode_u32(data), level)
+    end;
 }
 
-decode_r = function(data)
+decode_r = function(data, level)
     local c = data[0][0]
     data[0] = data[0] + 1
     if c <= 0x7f then
@@ -605,9 +689,9 @@ decode_r = function(data)
     elseif c >= 0xa0 and c <= 0xbf then
         return decode_str(data, bit.band(c, 0x1f)) -- fixstr
     elseif c >= 0x90 and c <= 0x9f then
-        return decode_array(data, bit.band(c, 0xf)) -- fixarray
+        return decode_array(data, bit.band(c, 0xf), level) -- fixarray
     elseif c >= 0x80 and c <= 0x8f then
-        return decode_map(data, bit.band(c, 0xf)) -- fixmap
+        return decode_map(data, bit.band(c, 0xf), level) -- fixmap
     elseif c >= 0xe0 then
         return tonumber(ffi.cast('signed char',c)) -- negfixint
     elseif c == 0xc0 then
@@ -621,7 +705,7 @@ decode_r = function(data)
     else
         local fun = decoder_hint[c];
         assert (type(fun) == "function")
-        return fun(data)
+        return fun(data, level)
     end
 end
 
@@ -651,13 +735,13 @@ local function decode_unchecked(str, offset)
         offset = check_offset(offset, #str)
         local buf = ffi.cast(char_ptr_t, str)
         local bufp = ffi.new('const unsigned char *[1]', buf + offset - 1)
-        local r = decode_r(bufp)
+        local r = decode_r(bufp, 0)
         return r, bufp[0] - buf + 1
     elseif ffi.istype(char_ptr_t, str) then
         -- Note: ffi.istype() ignores the const qualifier, so both
         -- (char *) and (const char *) buffers are valid.
         local bufp = ffi.new('const unsigned char *[1]', str)
-        local r = decode_r(bufp)
+        local r = decode_r(bufp, 0)
         return r, ffi.cast(ffi.typeof(str), bufp[0])
     else
         error("msgpackffi.decode_unchecked(str, offset) -> res, new_offset | "..

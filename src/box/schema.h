@@ -34,7 +34,9 @@
 #include <stdint.h>
 #include <stdio.h> /* snprintf */
 #include "error.h"
-#include "space.h"
+#include "func_cache.h"
+#include "space_cache.h"
+#include "schema_def.h"
 
 #if defined(__cplusplus)
 extern "C" {
@@ -42,80 +44,76 @@ extern "C" {
 
 struct func;
 
-extern uint32_t schema_version;
-extern uint32_t space_cache_version;
+/**
+ * See `box_schema_version`.
+ */
+extern uint64_t schema_version;
 extern uint32_t dd_version_id;
 
 /** Triggers invoked after schema initialization. */
 extern struct rlist on_schema_init;
 
 /**
- * Try to look up a space by space number in the space cache.
- * FFI-friendly no-exception-thrown space lookup function.
+ * List of schema features, which are not available only since some schema
+ * version and should be blocked until box.schema.upgrade() is called.
  *
- * @return NULL if space not found, otherwise space object.
+ * Feature description is:
+ *   _(<token>, <number>, <major>, <minor>, <patch>)
+ * where:
+ *   token			- the enum constant for the feature, also
+ *				  used in the error message.
+ *   number			- sequential number of the feature
+ *   major, minor, patch	- version number
+ *
+ * If schema version is less than 2.11.1, then all DDL is blocked until
+ * user upgrades at least to 2.11.1. This list consists of features,
+ * which appeared after 2.11.1 and which are blocked until some version.
+ *
+ * The only exception for now is persistent names feature. Even though
+ * they appeared in 3.0.0, we allow using them on schema version 2.11.5
+ * to simplify the upgrade process.
  */
-struct space *
-space_by_id(uint32_t id);
+#define SCHEMA_FEATURES(_) \
+	_(SCHEMA_FEATURE_DDL_BEFORE_UPGRADE, 0, 2, 11, 1) \
+	_(SCHEMA_FEATURE_PERSISTENT_NAMES, 1, 2, 11, 5) \
+	_(SCHEMA_FEATURE_PERSISTENT_TRIGGERS, 2, 3, 1, 0) \
+
+ENUM(schema_feature, SCHEMA_FEATURES);
+extern const char *schema_feature_strs[];
+extern const struct version schema_feature_version[];
 
 /**
- * Try to look up a space by space name in the space name cache.
+ * Checks whether the feature is available on the current schema.
  *
- * @return NULL if space not found, otherwise space object.
+ * @param feature identifier of the feature.
+ *
+ * @retval 0 on success.
+ * @retval -1 on error.
  */
-struct space *
-space_by_name(const char *name);
+int
+schema_check_feature(enum schema_feature feature);
 
-uint32_t
+/**
+ * Returns true if data dictionary checks may be skipped by the current fiber.
+ *
+ * We disable some data dictionary checks for schema upgrade and downgrade, for
+ * example, we allow dropping a system space.
+ */
+bool
+dd_check_is_disabled(void);
+
+/** \cond public */
+
+/**
+ * Returns the current version of the database schema, an unsigned number
+ * that goes up when there is a major change in the schema, i.e., on DDL
+ * operations.
+ * \sa IPROTO_SCHEMA_VERSION
+ */
+API_EXPORT uint64_t
 box_schema_version(void);
 
-static inline struct space *
-space_cache_find(uint32_t id)
-{
-	static uint32_t prev_space_cache_version = 0;
-	static struct space *space = NULL;
-	if (prev_space_cache_version != space_cache_version)
-		space = NULL;
-	if (space && space->def->id == id)
-		return space;
-	if ((space = space_by_id(id))) {
-		prev_space_cache_version = space_cache_version;
-		return space;
-	}
-	diag_set(ClientError, ER_NO_SUCH_SPACE, int2str(id));
-	return NULL;
-}
-
-/**
- * Insert a new function object in the function cache.
- * @param func Function object to insert.
- */
-void
-func_cache_insert(struct func *func);
-
-void
-func_cache_delete(uint32_t fid);
-
-struct func *
-func_by_id(uint32_t fid);
-
-struct func *
-func_by_name(const char *name, uint32_t name_len);
-
-/** Call a visitor function on every space in the space cache. */
-int
-space_foreach(int (*func)(struct space *sp, void *udata), void *udata);
-
-/**
- * Try to look up object name by id and type of object.
- *
- * @return NULL if object of type not found, otherwise name of object.
- */
-const char *
-schema_find_name(enum schema_object_type type, uint32_t object_id);
-
-bool
-space_is_system(struct space *space);
+/** \endcond public */
 
 /**
  * Find a sequence by id. Return NULL if the sequence was
@@ -142,27 +140,6 @@ schema_find_id(uint32_t system_space_id, uint32_t index_id, const char *name,
 
 #if defined(__cplusplus)
 } /* extern "C" */
-
-static inline struct space *
-space_cache_find_xc(uint32_t id)
-{
-	struct space *space = space_cache_find(id);
-	if (space == NULL)
-		diag_raise();
-	return space;
-}
-
-/**
- * Update contents of the space cache.
- *
- * If @old_space is NULL, insert @new_space into the cache.
- * If @new_space is NULL, delete @old_space from the cache.
- * If neither @old_space nor @new_space is NULL, replace
- * @old_space with @new_space in the cache (both spaces must
- * have the same id).
- */
-void
-space_cache_replace(struct space *old_space, struct space *new_space);
 
 void
 schema_init(void);
@@ -205,40 +182,15 @@ sequence_cache_delete(uint32_t id);
 #endif /* defined(__cplusplus) */
 
 /**
- * Triggers fired after committing a change in space definition.
- * The space is passed to the trigger callback in the event
- * argument. It is the new space in case of create/update or
- * the old space in case of drop.
- */
-extern struct rlist on_alter_space;
-
-/**
  * Triggers fired after committing a change in sequence definition.
  * It is passed the txn statement that altered the sequence.
  */
 extern struct rlist on_alter_sequence;
 
 /**
- * Triggers fired after access denied error is created.
- */
-extern struct rlist on_access_denied;
-
-/**
  * Triggers fired after committing a change in _func space.
  */
 extern struct rlist on_alter_func;
-
-/**
- * Context passed to on_access_denied trigger.
- */
-struct on_access_denied_ctx {
-	/** Type of declined access */
-	const char *access_type;
-	/** Type of object the required access was denied to */
-	const char *object_type;
-	/** Name of object the required access was denied to */
-	const char *object_name;
-};
 
 /** Global grants to classes of objects. */
 struct entity_access {
@@ -258,19 +210,14 @@ entity_access_get(enum schema_object_type type)
 {
 	switch (type) {
 	case SC_SPACE:
-	case SC_ENTITY_SPACE:
 		return entity_access.space;
 	case SC_FUNCTION:
-	case SC_ENTITY_FUNCTION:
 		return entity_access.function;
 	case SC_USER:
-	case SC_ENTITY_USER:
 		return entity_access.user;
 	case SC_ROLE:
-	case SC_ENTITY_ROLE:
 		return entity_access.role;
 	case SC_SEQUENCE:
-	case SC_ENTITY_SEQUENCE:
 		return entity_access.sequence;
 	default:
 		return NULL;

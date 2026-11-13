@@ -29,51 +29,44 @@
  * THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  */
-#include "small/rlist.h"
-#include "vclock/vclock.h"
-
-#include <stdint.h>
+#include "latch.h"
+#include "errinj.h"
+#include "txn_limbo_queue.h"
 
 #if defined(__cplusplus)
 extern "C" {
 #endif /* defined(__cplusplus) */
 
-struct txn;
+struct raft;
 struct synchro_request;
 
-/**
- * Transaction and its quorum metadata, to be stored in limbo.
- */
-struct txn_limbo_entry {
-	/** Link for limbo's queue. */
-	struct rlist in_queue;
-	/** Transaction, waiting for a quorum. */
-	struct txn *txn;
+/** Limbo state. */
+enum txn_limbo_state {
 	/**
-	 * LSN of the transaction by the originator's vclock
-	 * component. May be -1 in case the transaction is not
-	 * written to WAL yet.
+	 * The limbo has no owner and is empty. It makes no effect on this
+	 * instance.
 	 */
-	int64_t lsn;
+	TXN_LIMBO_STATE_INACTIVE,
 	/**
-	 * Number of ACKs. Or in other words - how many replicas
-	 * confirmed receipt of the transaction.
+	 * The limbo is actively and fully owned by the current instance right
+	 * now and is writable.
 	 */
-	int ack_count;
+	TXN_LIMBO_STATE_LEADER,
 	/**
-	 * Result flags. Only one of them can be true. But both
-	 * can be false if the transaction is still waiting for
-	 * its resolution.
+	 * The limbo is owned by somebody (even perhaps by this instance), but
+	 * this instance can't put new transactions into it.
+	 *
+	 * The case of it being owned by another node is clear - that other node
+	 * will put transactions into the queue and this instance will apply
+	 * them.
+	 *
+	 * But it can also be that the queue is owned by the current instance in
+	 * a term mismatching the Raft elections. Technically, the ownership is
+	 * with the current instance, but actually it can't be fully exercised
+	 * yet / already.
 	 */
-	bool is_commit;
-	bool is_rollback;
+	TXN_LIMBO_STATE_REPLICA,
 };
-
-static inline bool
-txn_limbo_entry_is_complete(const struct txn_limbo_entry *e)
-{
-	return e->is_commit || e->is_rollback;
-}
 
 /**
  * Limbo is a place where transactions are stored, which are
@@ -86,49 +79,15 @@ txn_limbo_entry_is_complete(const struct txn_limbo_entry *e)
  *     as they wouldn't depend on each other directly.
  */
 struct txn_limbo {
+	/** Limbo state. */
+	enum txn_limbo_state state;
 	/**
-	 * Queue of limbo entries. Ordered by LSN. Some of the
-	 * entries in the end may not have an LSN yet (their local
-	 * WAL write is still in progress), but their order won't
-	 * change anyway. Because WAL write completions will give
-	 * them LSNs in the same order.
+	 * Triggers run on every event which might update the limbo state. Even
+	 * when the state didn't actually change.
 	 */
-	struct rlist queue;
-	/**
-	 * Number of entries in limbo queue.
-	 */
-	int64_t len;
-	/**
-	 * Instance ID of the owner of all the transactions in the
-	 * queue. Strictly speaking, nothing prevents to store not
-	 * own transactions here, originated from some other
-	 * instance. But still the queue may contain only
-	 * transactions of the same instance. Otherwise LSN order
-	 * won't make sense - different nodes have own independent
-	 * LSNs in their vclock components.
-	 */
-	uint32_t owner_id;
-	/**
-	 * Condition to wait for completion. It is supposed to be
-	 * signaled when the synchro parameters change. Allowing
-	 * the sleeping fibers to reconsider their timeouts when
-	 * the parameters are updated.
-	 */
-	struct fiber_cond wait_cond;
-	/**
-	 * All components of the vclock are versions of the limbo
-	 * owner's LSN, how it is visible on other nodes. For
-	 * example, assume instance ID of the limbo is 1. Then
-	 * vclock[1] here is local LSN of the instance 1.
-	 * vclock[2] is how replica with ID 2 sees LSN of
-	 * instance 1.
-	 * vclock[3] is how replica with ID 3 sees LSN of
-	 * instance 1, and so on.
-	 * In that way by looking at this vclock it is always can
-	 * be said up to which LSN there is a sync quorum for
-	 * transactions, created on the limbo's owner node.
-	 */
-	struct vclock vclock;
+	struct rlist on_state_update;
+	/** Synchronous transactions and other ones depending on them. */
+	struct txn_limbo_queue queue;
 	/**
 	 * Latest terms received with PROMOTE entries from remote instances.
 	 * Limbo uses them to filter out the transactions coming not from the
@@ -141,44 +100,62 @@ struct txn_limbo {
 	 * It is related to raft term, but not the same. Synchronous replication
 	 * represented by the limbo is interested only in the won elections
 	 * ended with PROMOTE request.
+	 *
 	 * It means the limbo's term might be smaller than the raft term, while
 	 * there are ongoing elections, or the leader is already known and this
-	 * instance hasn't read its PROMOTE request yet. During other times the
-	 * limbo and raft are in sync and the terms are the same.
+	 * instance hasn't read its PROMOTE request yet.
+	 *
+	 * It can also be bigger than raft's term in case the limbo has received
+	 * and persisted a PROMOTE request before raft's own messages are
+	 * delivered.
+	 *
+	 * During other times the limbo and raft are in sync and the terms are
+	 * the same.
 	 */
-	uint64_t promote_greatest_term;
+	uint64_t term;
+	/** To linearize any sort of state changes. */
+	struct latch state_latch;
 	/**
-	 * Maximal LSN gathered quorum and either already confirmed in WAL, or
-	 * whose confirmation is in progress right now. Any attempt to confirm
-	 * something smaller than this value can be safely ignored. Moreover,
-	 * any attempt to rollback something starting from <= this LSN is
-	 * illegal.
+	 * If there is an ongoing PROMOTE being applied. It is not immediate at
+	 * least because it needs to be written into the journal.
 	 */
-	int64_t confirmed_lsn;
+	bool is_transition_in_progress;
 	/**
-	 * Total number of performed rollbacks. It used as a guard
-	 * to do some actions assuming all limbo transactions will
-	 * be confirmed, and to check that there were no rollbacks
-	 * in the end.
+	 * If the limbo is being recovered right now and isn't serving new
+	 * requests. Only re-applying old ones. This is used in order to
+	 * distinguish between old and new promotion.
 	 */
-	int64_t rollback_count;
+	bool is_in_recovery;
 	/**
-	 * Whether the limbo is in rollback mode. The meaning is exactly the
-	 * same as for the similar WAL flag. In theory this should be deleted
-	 * if the limbo will be ever moved to WAL thread. It would reuse the WAL
-	 * flag.
-	 * It is a sign to immediately rollback all new limbo entries, if there
-	 * is an existing rollback in progress. This technique is called
-	 * 'cascading rollback'. Cascading rollback does not allow to write to
-	 * WAL anything new so as not to violate the 'reversed rollback order'
-	 * rule.
-	 * Without cascading rollback it could happen, that the limbo would
-	 * start writing ROLLBACK to WAL, then a new transaction would be added
-	 * to limbo and sent to WAL too. In the result the new transaction would
-	 * be stored in WAL after ROLLBACK, and yet it should be rolled back too
-	 * by the 'reversed rollback order' rule - contradiction.
+	 * If the limbo has seen a fresh promote after recovery was finished.
+	 * A node can't be a leader until it sees / makes a newly made promote
+	 * since its restart.
 	 */
-	bool is_in_rollback;
+	bool saw_promote;
+	/**
+	 * Whether this instance validates incoming synchro requests. When the
+	 * setting is on, the instance only allows CONFIRM/ROLLBACK from the
+	 * limbo owner, tracks PROMOTE/DEMOTE term and owner_id consistency.
+	 * The filtering is turned off during bootstrap, because it makes no
+	 * sense when applying a full copy of a remote instance's data. There
+	 * can't be any inconsistencies.
+	 */
+	bool do_validate;
+	/**
+	 * The elections state machine that controls the limbo when elections
+	 * are enabled.
+	 */
+	struct raft *raft;
+	/**
+	 * Asynchronously tries to close the gap between the `confirmed_lsn` and
+	 * the `volatile_confirmed_lsn` by writing a CONFIRM request to the WAL
+	 * and retrying it on failure. Must always be woken up when the
+	 * `volatile_confirmed_lsn` is updated separately from the
+	 * `confirmed_lsn`.
+	 */
+	struct fiber *worker;
+	/** A trigger invoked on replica acks. */
+	struct trigger on_ack;
 };
 
 /**
@@ -191,25 +168,31 @@ extern struct txn_limbo txn_limbo;
 static inline bool
 txn_limbo_is_empty(struct txn_limbo *limbo)
 {
-	return rlist_empty(&limbo->queue);
+	return txn_limbo_queue_is_empty(&limbo->queue);
 }
 
+static inline void
+txn_limbo_lock(struct txn_limbo *limbo)
+{
+	latch_lock(&limbo->state_latch);
+}
+
+static inline void
+txn_limbo_unlock(struct txn_limbo *limbo)
+{
+	latch_unlock(&limbo->state_latch);
+}
+
+/**
+ * Make the limbo actualize its state in case any conditions affecting it have
+ * been changed.
+ */
+void
+txn_limbo_update_state(struct txn_limbo *limbo);
+
+/** See if submission to the limbo would yield if done right now. */
 bool
-txn_limbo_is_ro(struct txn_limbo *limbo);
-
-static inline struct txn_limbo_entry *
-txn_limbo_first_entry(struct txn_limbo *limbo)
-{
-	return rlist_first_entry(&limbo->queue, struct txn_limbo_entry,
-				 in_queue);
-}
-
-static inline struct txn_limbo_entry *
-txn_limbo_last_entry(struct txn_limbo *limbo)
-{
-	return rlist_last_entry(&limbo->queue, struct txn_limbo_entry,
-				in_queue);
-}
+txn_limbo_would_block(struct txn_limbo *limbo);
 
 /**
  * Return the latest term as seen in PROMOTE requests from instance with id
@@ -219,18 +202,6 @@ static inline uint64_t
 txn_limbo_replica_term(const struct txn_limbo *limbo, uint32_t replica_id)
 {
 	return vclock_get(&limbo->promote_term_map, replica_id);
-}
-
-/**
- * Check whether replica with id @a source_id is too old to apply synchronous
- * data from it. The check is only valid when elections are enabled.
- */
-static inline bool
-txn_limbo_is_replica_outdated(const struct txn_limbo *limbo,
-			      uint32_t replica_id)
-{
-	return txn_limbo_replica_term(limbo, replica_id) <
-	       limbo->promote_greatest_term;
 }
 
 /**
@@ -244,76 +215,102 @@ txn_limbo_last_synchro_entry(struct txn_limbo *limbo);
  * Allocate, create, and append a new transaction to the limbo.
  * The limbo entry is allocated on the transaction's region.
  */
-struct txn_limbo_entry *
-txn_limbo_append(struct txn_limbo *limbo, uint32_t id, struct txn *txn);
+int
+txn_limbo_submit(struct txn_limbo *limbo, uint32_t id, struct txn *txn,
+		 size_t approx_len);
+
+/**
+ * Wait until all the limbo entries existing at the moment of calling are fully
+ * submitted into the limbo.
+ *
+ * It is guaranteed that if this function returns success, then all those limbo
+ * entries have been submitted to WAL. And the caller, for example, might do a
+ * journal sync right away to find out the vclock at the moment of the last
+ * limbo entry journal write.
+ *
+ * Any limbo entries added during the waiting are not going to be waited for.
+ * And are guaranteed not to be sent to the journal yet after this function
+ * returns success, until the next yield of the caller fiber.
+ */
+int
+txn_limbo_flush(struct txn_limbo *limbo);
 
 /** Remove the entry from the limbo, mark as rolled back. */
 void
 txn_limbo_abort(struct txn_limbo *limbo, struct txn_limbo_entry *entry);
 
-/**
- * Assign a remote LSN to a limbo entry. That happens when a
- * remote transaction is added to the limbo and starts waiting for
- * a confirm.
- */
+/** Assign the LSN to the queue entry. */
 void
-txn_limbo_assign_remote_lsn(struct txn_limbo *limbo,
-			    struct txn_limbo_entry *entry, int64_t lsn);
+txn_limbo_assign_lsn(struct txn_limbo *limbo, uint32_t origin_id,
+		     struct txn_limbo_entry *entry, int64_t lsn);
 
-/**
- * Assign a local LSN to a limbo entry. That happens when a local
- * transaction is written to WAL.
- */
-void
-txn_limbo_assign_local_lsn(struct txn_limbo *limbo,
-			   struct txn_limbo_entry *entry, int64_t lsn);
-
-/**
- * Assign an LSN to a limbo entry. Works both with local and
- * remote transactions. The function exists to be used in a
- * context, where a transaction is not known whether it is local
- * or not. For example, when a transaction is committed not bound
- * to any fiber (txn_commit_try_async()), it can be created by applier
- * (then it is remote) or by recovery (then it is local). Besides,
- * recovery can commit remote transactions as well, when works on
- * a replica - it will recover data received from master.
- */
-void
-txn_limbo_assign_lsn(struct txn_limbo *limbo, struct txn_limbo_entry *entry,
-		     int64_t lsn);
-
-/**
- * Ack all transactions up to the given LSN on behalf of the
- * replica with the specified ID.
- */
-void
-txn_limbo_ack(struct txn_limbo *limbo, uint32_t replica_id, int64_t lsn);
-
-/**
- * Block the current fiber until the transaction in the limbo
- * entry is either committed or rolled back.
- * If timeout is reached before acks are collected, the tx is
- * rolled back as well as all the txs in the limbo following it.
- * Returns -1 when rollback was performed and tx has to be freed.
- *          0 when tx processing can go on.
- */
-int
+/** Try to wait for the given entry's completion. */
+enum txn_limbo_wait_entry_result
 txn_limbo_wait_complete(struct txn_limbo *limbo, struct txn_limbo_entry *entry);
 
-/** Execute a synchronous replication request. */
+/**
+ * Initiate execution of a synchronous replication request.
+ */
+static inline void
+txn_limbo_begin(struct txn_limbo *limbo)
+{
+	ERROR_INJECT_COUNTDOWN(ERRINJ_TXN_LIMBO_BEGIN_DELAY_COUNTDOWN, {
+		struct errinj *e =
+			errinj(ERRINJ_TXN_LIMBO_BEGIN_DELAY, ERRINJ_BOOL);
+		e->bparam = true;
+	});
+	ERROR_INJECT_YIELD(ERRINJ_TXN_LIMBO_BEGIN_DELAY);
+	txn_limbo_lock(limbo);
+}
+
+/** Commit a synchronous replication request. */
+static inline void
+txn_limbo_commit(struct txn_limbo *limbo)
+{
+	txn_limbo_unlock(limbo);
+}
+
+/** Rollback a synchronous replication request. */
+static inline void
+txn_limbo_rollback(struct txn_limbo *limbo)
+{
+	txn_limbo_unlock(limbo);
+}
+
+/**
+ * Prepare a limbo request for WAL write and commit. And check if the request is
+ * valid. Similar to txn_stmt prepare.
+ */
+int
+txn_limbo_req_prepare(struct txn_limbo *limbo,
+		      const struct synchro_request *req);
+
+/**
+ * Rollback a limbo request after a fail, such as a bad WAL write. Similar to
+ * txn_stmt rollback.
+ */
 void
+txn_limbo_req_rollback(struct txn_limbo *limbo,
+		       const struct synchro_request *req);
+
+/**
+ * Commit a synchronous replication request after a successful WAL write.
+ * Similar to txn_stmt commit.
+ */
+void
+txn_limbo_req_commit(struct txn_limbo *limbo,
+		     const struct synchro_request *req);
+
+/** Process a synchronous replication request. */
+int
 txn_limbo_process(struct txn_limbo *limbo, const struct synchro_request *req);
 
 /**
- * Waiting for confirmation of all "sync" transactions
- * during confirm timeout or fail.
+ * Wait until the last transaction in the limbo is finished and gets its result.
  */
 int
-txn_limbo_wait_confirm(struct txn_limbo *limbo);
-
-/** Wait until the limbo is empty. Regardless of how its transactions end. */
-int
-txn_limbo_wait_empty(struct txn_limbo *limbo, double timeout);
+txn_limbo_wait_last_txn(struct txn_limbo *limbo, bool *is_rollback,
+			double timeout);
 
 /**
  * Persist limbo state to a given synchro request.
@@ -323,18 +320,11 @@ txn_limbo_checkpoint(const struct txn_limbo *limbo,
 		     struct synchro_request *req);
 
 /**
- * Write a PROMOTE request, which has the same effect as CONFIRM(@a lsn) and
- * ROLLBACK(@a lsn + 1) combined.
+ * Execute promotion/demotion to catch up with the Raft state, in case this node
+ * is a Raft leader in a new term, and the limbo is behind.
  */
-void
-txn_limbo_write_promote(struct txn_limbo *limbo, int64_t lsn, uint64_t term);
-
-/**
- * Write a DEMOTE request.
- * It has the same effect as PROMOTE and additionally clears limbo ownership.
- */
-void
-txn_limbo_write_demote(struct txn_limbo *limbo, int64_t lsn, uint64_t term);
+int
+txn_limbo_promote(struct txn_limbo *limbo, uint16_t type, double timeout);
 
 /**
  * Update qsync parameters dynamically.
@@ -343,10 +333,59 @@ void
 txn_limbo_on_parameters_change(struct txn_limbo *limbo);
 
 /**
+ * Rollback all the volatile txns. That is, the ones waiting for space in the
+ * limbo and not yet sent to the journal. It is supposed to happen when some
+ * older txn wants to get rolled back. For example, when its WAL write fails.
+ * The it must cascading-rollback all the newer txns, including the ones not yet
+ * visible to the journal.
+ */
+void
+txn_limbo_rollback_all_volatile(struct txn_limbo *limbo);
+
+/** Start filtering incoming syncrho requests. */
+void
+txn_limbo_filter_enable(struct txn_limbo *limbo);
+
+/** Stop filtering incoming synchro requests. */
+void
+txn_limbo_filter_disable(struct txn_limbo *limbo);
+
+/** Tell the limbo that the recovery is finished. */
+void
+txn_limbo_finish_recovery(struct txn_limbo *limbo);
+
+/** Return whether limbo has an owner. */
+static inline bool
+txn_limbo_has_owner(struct txn_limbo *limbo)
+{
+	return limbo->queue.owner_id != REPLICA_ID_NIL;
+}
+
+/** Return whether limbo is owned by current instance. */
+static inline bool
+txn_limbo_is_owned_by_current_instance(const struct txn_limbo *limbo)
+{
+	return txn_limbo_queue_is_owned_by_current_instance(&limbo->queue);
+}
+
+/**
  * Initialize qsync engine.
  */
 void
-txn_limbo_init();
+txn_limbo_init(struct raft *raft);
+
+/**
+ * Denitialize qsync engine.
+ */
+void
+txn_limbo_free();
+
+void
+txn_limbo_shutdown(void);
+
+/** Set maximal limbo size in bytes. */
+void
+txn_limbo_set_max_size(struct txn_limbo *limbo, int64_t size);
 
 #if defined(__cplusplus)
 }

@@ -4,8 +4,7 @@ local buffer = require('buffer')
 local msgpack = require('msgpack')
 local crypto = require('crypto')
 local fiber = require('fiber')
-local internal = require('swim')
-local schedule_task = fiber._internal.schedule_task
+local internal = require('swim.lib')
 local cord_ibuf_take = buffer.internal.cord_ibuf_take
 local cord_ibuf_put = buffer.internal.cord_ibuf_put
 
@@ -828,25 +827,31 @@ end
 --
 -- Add or/and delete a trigger on member event. Possible usages:
 --
--- * on_member_event(new[, ctx]) - add a new trigger. It should
+-- * on_member_event(new[, ctx][, name]) - add a new trigger. It should
 --   accept 3 arguments: an updated member, an events object, an
---   optional @a ctx parameter passed as is.
+--   optional @a ctx parameter passed as is. If name is passed as
+--   the third parameter, the new trigger is set by name.
 --
 -- * on_member_event(new, old[, ctx]) - add a new trigger @a new
 --   if not nil, in place of @a old trigger.
 --
+-- * on_member_event(new, old, name[, ctx]) - add a new trigger
+--   @a new if not nil by passed name, @a old is ignored. Name
+--   must be a string, otherwise it is considered to be a ctx.
+--
+-- * on_member_event{func = new, name = name, ctx = ctx} - add
+--   a new trigger @a new if not nil by passed name.
+--
 -- * on_member_event() - get a list of triggers.
 --
-local function swim_on_member_event(s, new, old, ctx)
+local function swim_on_member_event(s, ...)
     local ptr = swim_check_instance(s, 'swim:on_member_event')
-    if type(old) ~= 'function' then
-        ctx = old
-        old = nil
-    end
+    local new, old, name, ctx =
+        internal.swim_on_member_event_normalize_arguments(...)
     if new ~= nil then
         new = swim_on_member_event_new(s, new, ctx)
     end
-    return internal.swim_on_member_event(ptr, new, old)
+    return internal.swim_on_member_event(ptr, new, old, name)
 end
 
 --
@@ -974,19 +979,6 @@ swim_cfg_not_configured_mt.__call = swim_cfg_first_call
 local cache_table_mt = { __mode = 'v' }
 
 --
--- SWIM garbage collection function. It can't delete the SWIM
--- instance immediately, because it is invoked by Lua GC. Firstly,
--- it is not safe to yield in FFI - Jit can't survive a yield.
--- Secondly, it is not safe to yield in any GC function, because
--- it stops garbage collection. Instead, here GC is delayed, works
--- at the end of the event loop, and deletes the instance
--- asynchronously.
---
-local function swim_gc(ptr)
-    schedule_task(internal.swim_delete, ptr)
-end
-
---
 -- Create a new SWIM instance, and configure if @a cfg is
 -- provided.
 --
@@ -1011,10 +1003,7 @@ local function swim_new(cfg)
         generation = fiber.time64()
     end
     local ptr = internal.swim_new(generation)
-    if ptr == nil then
-        return nil, box.error.last()
-    end
-    ffi.gc(ptr, swim_gc)
+    ffi.gc(ptr, internal.swim_gc)
     local s = setmetatable({
         ptr = ptr,
         cfg = setmetatable({index = {}}, swim_cfg_not_configured_mt),

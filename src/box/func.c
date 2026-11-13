@@ -29,13 +29,16 @@
  * SUCH DAMAGE.
  */
 #include "func.h"
+#include "func_adapter.h"
 #include "fiber.h"
 #include "assoc.h"
+#include "call.h"
 #include "lua/call.h"
 #include "diag.h"
 #include "port.h"
 #include "schema.h"
 #include "session.h"
+#include "sql/func.h"
 
 /**
  * Parsed symbol and package names.
@@ -128,7 +131,7 @@ schema_module_free(void)
 static struct schema_module *
 cache_find(const char *name, const char *name_end)
 {
-	mh_int_t i = mh_strnptr_find_inp(modules, name, name_end - name);
+	mh_int_t i = mh_strnptr_find_str(modules, name, name_end - name);
 	if (i == mh_end(modules))
 		return NULL;
 	return mh_strnptr_node(modules, i)->val;
@@ -169,7 +172,7 @@ cache_update(struct schema_module *module)
 	const char *str = module->base->package;
 	size_t len = module->base->package_len;
 
-	mh_int_t i = mh_strnptr_find_inp(modules, str, len);
+	mh_int_t i = mh_strnptr_find_str(modules, str, len);
 	if (i == mh_end(modules))
 		panic("func: failed to update cache: %s", str);
 
@@ -186,7 +189,7 @@ cache_del(struct schema_module *module)
 	const char *str = module->base->package;
 	size_t len = module->base->package_len;
 
-	mh_int_t i = mh_strnptr_find_inp(modules, str, len);
+	mh_int_t i = mh_strnptr_find_str(modules, str, len);
 	if (i != mh_end(modules)) {
 		struct schema_module *v;
 		v = mh_strnptr_node(modules, i)->val;
@@ -379,11 +382,39 @@ restore_fail:
 	return -1;
 }
 
+static int
+func_dummy_call(struct func *func, struct port *args, struct port *ret)
+{
+	(void)func;
+	(void)args;
+	(void)ret;
+	diag_set(ClientError, ER_UNSUPPORTED, func->def->name, "call");
+	return -1;
+}
+
+static void
+func_dummy_destroy(struct func *func)
+{
+	free(func);
+}
+
 static struct func *
-func_c_new(struct func_def *def);
+func_dummy_new(void)
+{
+	static const struct func_vtab func_dummy_vtab = {
+		.call = func_dummy_call,
+		.destroy = func_dummy_destroy,
+	};
+	struct func *func = xmalloc(sizeof(*func));
+	func->vtab = &func_dummy_vtab;
+	return func;
+}
+
+static struct func *
+func_c_new(const struct func_def *def);
 
 struct func *
-func_new(struct func_def *def)
+func_new(const struct func_def *def)
 {
 	struct func *func;
 	switch (def->language) {
@@ -393,12 +424,24 @@ func_new(struct func_def *def)
 	case FUNC_LANGUAGE_LUA:
 		func = func_lua_new(def);
 		break;
+	case FUNC_LANGUAGE_SQL_EXPR:
+		func = func_sql_expr_new(def);
+		break;
+	case FUNC_LANGUAGE_SQL_BUILTIN:
+		/*
+		 * 'SQL_BUILTIN' was dropped in 2.9, but we still need to
+		 * handle creation of such functions to support upgrade from
+		 * previous versions.
+		 */
+		func = func_dummy_new();
+		break;
 	default:
 		unreachable();
 	}
 	if (func == NULL)
 		return NULL;
-	func->def = def;
+	func->def = func_def_dup(def);
+	rlist_create(&func->func_cache_pin_list);
 	/** Nobody has access to the function but the owner. */
 	memset(func->access, 0, sizeof(func->access));
 	/*
@@ -417,7 +460,7 @@ func_new(struct func_def *def)
 }
 
 static struct func *
-func_c_new(MAYBE_UNUSED struct func_def *def)
+func_c_new(MAYBE_UNUSED const struct func_def *def)
 {
 	assert(def->language == FUNC_LANGUAGE_C);
 	assert(def->body == NULL && !def->is_sandboxed);
@@ -500,14 +543,14 @@ static struct func_vtab func_c_vtab = {
 void
 func_delete(struct func *func)
 {
+	assert(rlist_empty(&func->func_cache_pin_list));
 	struct func_def *def = func->def;
 	credentials_destroy(&func->owner_credentials);
 	func->vtab->destroy(func);
 	free(def);
 }
 
-/** Check "EXECUTE" permissions for a given function. */
-static int
+int
 func_access_check(struct func *func)
 {
 	struct credentials *credentials = effective_user();
@@ -526,6 +569,10 @@ func_access_check(struct func *func)
 	if ((func_access & PRIV_U) != 0 ||
 	    (func->def->uid != credentials->uid &&
 	     func_access & ~func->access[credentials->auth_token].effective)) {
+		if (func->def->language == FUNC_LANGUAGE_LUA &&
+		    func->def->body == NULL)
+			return access_check_lua_call(func->def->name,
+						     func->def->name_len);
 		/* Access violation, report error. */
 		struct user *user = user_find(credentials->uid);
 		if (user != NULL) {
@@ -539,10 +586,9 @@ func_access_check(struct func *func)
 }
 
 int
-func_call(struct func *base, struct port *args, struct port *ret)
+func_call_no_access_check(struct func *base, struct port *args,
+			  struct port *ret)
 {
-	if (func_access_check(base) != 0)
-		return -1;
 	/**
 	 * Change the current user id if the function is
 	 * a set-definer-uid one. If the function is not
@@ -571,4 +617,71 @@ func_call(struct func *base, struct port *args, struct port *ret)
 	if (orig_credentials)
 		fiber_set_user(fiber(), orig_credentials);
 	return rc;
+}
+
+/**
+ * Specialization of func_adapter for persistent functions.
+ */
+struct func_adapter_func {
+	/**
+	 * Base class.
+	 */
+	struct func_adapter base;
+	/**
+	 * A holder for underlying func.
+	 */
+	struct func_cache_holder holder;
+};
+
+/**
+ * Call the function with ports. Access check is not performed.
+ */
+static int
+func_adapter_func_call(struct func_adapter *base, struct port *args, struct port *ret)
+{
+	struct func_adapter_func *func = (struct func_adapter_func *)base;
+
+	/* Create and use local ports if passed ones are NULL. */
+	struct port args_local, ret_local;
+	if (args == NULL) {
+		port_c_create(&args_local);
+		args = &args_local;
+	}
+	if (ret == NULL)
+		ret = &ret_local;
+
+	int rc = func_call_no_access_check(func->holder.func, args, ret);
+
+	/* Destroy local ports if they were used. */
+	if (args == &args_local)
+		port_destroy(args);
+	/* Port with returned values is initialized only on success. */
+	if (rc == 0 && ret == &ret_local)
+		port_destroy(ret);
+	return rc;
+}
+
+/**
+ * Virtual destructor.
+ */
+static void
+func_adapter_func_destroy(struct func_adapter *func_base)
+{
+	struct func_adapter_func *func = (struct func_adapter_func *)func_base;
+	func_unpin(&func->holder);
+	free(func);
+}
+
+struct func_adapter *
+func_adapter_func_create(struct func *pfunc, enum func_holder_type type)
+{
+	static const struct func_adapter_vtab vtab = {
+		.call = func_adapter_func_call,
+		.destroy = func_adapter_func_destroy,
+	};
+	struct func_adapter_func *func = xmalloc(sizeof(*func));
+	struct func_adapter base = {.vtab = &vtab};
+	func->base = base;
+	func_pin(pfunc, &func->holder, type);
+	return &func->base;
 }

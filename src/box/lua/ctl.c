@@ -38,12 +38,18 @@
 
 #include "lua/utils.h"
 #include "lua/trigger.h"
+#include "box/lua/trigger.h"
 
 #include "box/box.h"
 #include "box/schema.h"
 #include "box/engine.h"
 #include "box/memtx_engine.h"
 #include "box/raft.h"
+#include "box/replication.h"
+#include "box/security.h"
+#include "box/wal.h"
+
+#include "core/event.h"
 
 static int
 lbox_ctl_wait_ro(struct lua_State *L)
@@ -51,7 +57,7 @@ lbox_ctl_wait_ro(struct lua_State *L)
 	int index = lua_gettop(L);
 	double timeout = TIMEOUT_INFINITY;
 	if (index > 0)
-		timeout = luaL_checknumber(L, 1);
+		timeout = luaT_checknumber(L, 1);
 	if (box_wait_ro(true, timeout) != 0)
 		return luaT_error(L);
 	return 0;
@@ -63,7 +69,7 @@ lbox_ctl_wait_rw(struct lua_State *L)
 	int index = lua_gettop(L);
 	double timeout = TIMEOUT_INFINITY;
 	if (index > 0)
-		timeout = luaL_checknumber(L, 1);
+		timeout = luaT_checknumber(L, 1);
 	if (box_wait_ro(false, timeout) != 0)
 		return luaT_error(L);
 	return 0;
@@ -72,20 +78,25 @@ lbox_ctl_wait_rw(struct lua_State *L)
 static int
 lbox_ctl_on_shutdown(struct lua_State *L)
 {
-	return lbox_trigger_reset(L, 2, &box_on_shutdown_trigger_list,
-				  NULL, NULL);
+	return luaT_event_reset_trigger(L, 1, box_on_shutdown_event);
 }
 
 static int
 lbox_ctl_on_schema_init(struct lua_State *L)
 {
-	return lbox_trigger_reset(L, 2, &on_schema_init, NULL, NULL);
+	struct event *event = event_get("box.ctl.on_schema_init", true);
+	return luaT_event_reset_trigger(L, 1, event);
 }
 
 static int
+lbox_ctl_on_recovery_state(struct lua_State *L)
+{
+	return luaT_event_reset_trigger(L, 1, box_on_recovery_state_event);
+}
+static int
 lbox_ctl_on_election(struct lua_State *L)
 {
-	return lbox_trigger_reset(L, 2, &box_raft_on_broadcast, NULL, NULL);
+	return luaT_event_reset_trigger(L, 1, box_raft_on_election_event);
 }
 
 static int
@@ -105,6 +116,29 @@ lbox_ctl_demote(struct lua_State *L)
 }
 
 static int
+lbox_ctl_make_bootstrap_leader(struct lua_State *L)
+{
+	bool graceful = false;
+
+	if (!lua_isnoneornil(L, 1)) {
+		if (!lua_istable(L, 1)) {
+			diag_set(IllegalParams,
+				 "box.ctl.make_bootstrap_leader() expects a "
+				 "table as the first argument, got %s",
+				 luaL_typename(L, 1));
+			return luaT_error(L);
+		}
+		lua_getfield(L, 1, "graceful");
+		graceful = lua_toboolean(L, -1) != 0;
+		lua_pop(L, 1);
+	}
+
+	if (box_make_bootstrap_leader(graceful) != 0)
+		return luaT_error(L);
+	return 0;
+}
+
+static int
 lbox_ctl_is_recovery_finished(struct lua_State *L)
 {
 	struct memtx_engine *memtx;
@@ -119,19 +153,84 @@ lbox_ctl_set_on_shutdown_timeout(struct lua_State *L)
 {
 	int index = lua_gettop(L);
 	if (index != 1) {
-		lua_pushstring(L, "function expected one argument");
-		lua_error(L);
+		diag_set(IllegalParams, "function expected one argument");
+		luaT_error(L);
 	}
 
-	double wait_time = luaL_checknumber(L, 1);
+	double wait_time = luaT_checknumber(L, 1);
 	if (wait_time <= 0) {
-		lua_pushstring(L, "on_shutdown timeout must be greater "
-			       "then zero");
-		lua_error(L);
+		diag_set(IllegalParams,
+			 "on_shutdown timeout must be greater then zero");
+		luaT_error(L);
 	}
 
 	on_shutdown_trigger_timeout = wait_time;
 	return 0;
+}
+
+/**
+ * Enable or disable security.iproto_lockdown option.
+ */
+static int
+lbox_ctl_set_iproto_lockdown(struct lua_State *L)
+{
+#if defined(ENABLE_SECURITY)
+	int index = lua_gettop(L);
+	if (index != 1 || !lua_isboolean(L, 1)) {
+		diag_set(IllegalParams,
+			 "function expected one boolean argument");
+		luaT_error(L);
+	}
+	bool new_val = lua_toboolean(L, 1);
+	if (security_set_iproto_lockdown(new_val) != 0)
+		return luaT_error(L);
+#else
+	diag_set(IllegalParams,
+		 "box.ctl.iproto_lockdown() is available only in "
+		 "Enterprise Edition builds.");
+	luaT_error(L);
+#endif
+	return 0;
+}
+
+static int
+lbox_ctl_wal_sync(struct lua_State *L)
+{
+	if (box_check_configured() != 0)
+		return luaT_error(L);
+	if (journal_sync(NULL))
+		return luaT_error(L);
+	return 0;
+}
+
+static int
+lbox_ctl_replica_gc(struct lua_State *L)
+{
+	const char *uuid_str = luaT_checkstring(L, 1);
+	struct tt_uuid uuid;
+	if (tt_uuid_from_string(uuid_str, &uuid) != 0) {
+		diag_set(IllegalParams, "Invalid UUID: %s", uuid_str);
+		luaT_error(L);
+	}
+	if (replica_gc(&uuid) != 0)
+		luaT_error(L);
+	return 0;
+}
+
+/** Register a Lua liveness probe callback. */
+static int
+lbox_ctl_liveness_probe(struct lua_State *L)
+{
+	int argc = lua_gettop(L);
+	lua_getglobal(L, "require");
+	lua_pushliteral(L, "internal.healthcheck");
+	if (lua_pcall(L, 1, 1, 0) != 0)
+		return luaT_error(L);
+	lua_getfield(L, -1, "liveness_probe");
+	lua_remove(L, -2);
+	lua_insert(L, 1);
+	lua_call(L, argc, LUA_MULTRET);
+	return lua_gettop(L);
 }
 
 static const struct luaL_Reg lbox_ctl_lib[] = {
@@ -139,19 +238,26 @@ static const struct luaL_Reg lbox_ctl_lib[] = {
 	{"wait_rw", lbox_ctl_wait_rw},
 	{"on_shutdown", lbox_ctl_on_shutdown},
 	{"on_schema_init", lbox_ctl_on_schema_init},
+	{"on_recovery_state", lbox_ctl_on_recovery_state},
 	{"on_election", lbox_ctl_on_election},
 	{"promote", lbox_ctl_promote},
 	/* An old alias. */
 	{"clear_synchro_queue", lbox_ctl_promote},
 	{"demote", lbox_ctl_demote},
+	{"make_bootstrap_leader", lbox_ctl_make_bootstrap_leader},
 	{"is_recovery_finished", lbox_ctl_is_recovery_finished},
 	{"set_on_shutdown_timeout", lbox_ctl_set_on_shutdown_timeout},
+	{"iproto_lockdown", lbox_ctl_set_iproto_lockdown},
+	{"wal_sync", lbox_ctl_wal_sync},
+	{"replica_gc", lbox_ctl_replica_gc},
+	{"liveness_probe", lbox_ctl_liveness_probe},
 	{NULL, NULL}
 };
 
 void
 box_lua_ctl_init(struct lua_State *L)
 {
-	luaL_register_module(L, "box.ctl", lbox_ctl_lib);
+	luaL_findtable(L, LUA_GLOBALSINDEX, "box.ctl", 0);
+	luaL_setfuncs(L, lbox_ctl_lib, 0);
 	lua_pop(L, 1);
 }

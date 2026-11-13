@@ -136,16 +136,12 @@ box.cfg{read_only=false}
 
 box.space.test:insert{2}
  | ---
- | - error: Can't modify data because this instance is in read-only mode.
+ | - error: Can't modify data on a read-only instance - box.cfg.read_only is true
  | ...
 
 box.space.loc:drop()
  | ---
- | - error: Can't modify data because this instance is in read-only mode.
- | ...
-box.space.loc:truncate()
- | ---
- | - error: Can't modify data because this instance is in read-only mode.
+ | - error: Can't modify data on a read-only instance - box.cfg.read_only is true
  | ...
 
 test_run:cmd('switch default')
@@ -411,9 +407,17 @@ test_run:cmd([[create server replica with rpl_master=replica_anon1,\
  | ---
  | - true
  | ...
-test_run:cmd('start server replica with crash_expected=True')
+test_run:cmd('start server replica with wait_load=False, wait=False, crash_expected=True')
  | ---
- | - false
+ | - true
+ | ...
+test_run:wait_log('replica', 'Anonymous replica does not support registration of non%-anonymous nodes.', nil, 10)
+ | ---
+ | - Anonymous replica does not support registration of non-anonymous nodes.
+ | ...
+test_run:cmd('stop server replica')
+ | ---
+ | - true
  | ...
 test_run:cmd('delete server replica')
  | ---
@@ -450,9 +454,9 @@ test_run:cmd('set variable repl_source to "replica_anon1.listen"')
 box.cfg{replication=repl_source}
  | ---
  | ...
-test_run:wait_log('replica', 'ER_UNSUPPORTED: Anonymous replica does not support non.anonymous followers.', nil, 10)
+test_run:wait_log('replica', 'Anonymous replica does not support non.anonymous followers.', nil, 10)
  | ---
- | - 'ER_UNSUPPORTED: Anonymous replica does not support non-anonymous followers.'
+ | - Anonymous replica does not support non-anonymous followers.
  | ...
 test_run:cmd('switch default')
  | ---

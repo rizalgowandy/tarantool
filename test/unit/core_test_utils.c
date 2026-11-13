@@ -29,9 +29,23 @@
  * SUCH DAMAGE.
  */
 
+#include <stdint.h>
+
 /**
  * Mock function to resolve circular dependencies in unit tests
  */
 void cord_on_yield(void)
 {
+}
+
+uint32_t
+field_name_hash(const char *str, uint32_t len)
+{
+	return str[0] + len;
+}
+
+uint32_t
+iproto_key_hash(const char *str, uint32_t len)
+{
+	return str[0] + len;
 }

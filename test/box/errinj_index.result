@@ -95,9 +95,9 @@ for i = 501,2500 do s:insert{i, i} end
 ---
 - error: Failed to allocate 16384 bytes in mempool for new slab
 ...
-s:delete{1}
+s:delete{1} -- still can delete, it does not require extents if no read view
 ---
-- error: Failed to allocate 16384 bytes in mempool for new slab
+- [1, 1, 'test1']
 ...
 res = {}
 ---
@@ -107,8 +107,7 @@ for i = 1,10 do table.insert(res, (s:get{i})) end
 ...
 res
 ---
-- - [1, 1, 'test1']
-  - [2, 2, 'test2']
+- - [2, 2, 'test2']
   - [3, 3, 'test3']
   - [4, 4, 'test4']
   - [5, 5, 'test5']
@@ -121,18 +120,17 @@ res
 res = {}
 ---
 ...
-for i = 501,510 do table.insert(res, (s:get{i})) end
+for i = 501,2500 do table.insert(res, (s:get{i})) end
 ---
 ...
-res
+#res -- only could insert some of entries with the extents reserved previously
 ---
-- []
+- 612
 ...
---count must be exactly 10
-function check_iter_and_size() local count = 0 for _, t in s.index[0]:pairs() do count = count + 1 end return count == 10 and "ok" or "fail" end
+function check_iter_and_size(num) local count = 0 for _, t in s.index[0]:pairs() do count = count + 1 end return count == num and "ok" or "fail" end
 ---
 ...
-check_iter_and_size()
+check_iter_and_size(621)
 ---
 - ok
 ...
@@ -140,11 +138,11 @@ for i = 2501,3500 do s:insert{i, i} end
 ---
 - error: Failed to allocate 16384 bytes in mempool for new slab
 ...
-s:delete{2}
+s:delete{2} -- still can delete, it does not require extents if no read view
 ---
-- error: Failed to allocate 16384 bytes in mempool for new slab
+- [2, 2, 'test2']
 ...
-check_iter_and_size()
+check_iter_and_size(620)
 ---
 - ok
 ...
@@ -156,9 +154,7 @@ for i = 1,10 do table.insert(res, (s:get{i})) end
 ...
 res
 ---
-- - [1, 1, 'test1']
-  - [2, 2, 'test2']
-  - [3, 3, 'test3']
+- - [3, 3, 'test3']
   - [4, 4, 'test4']
   - [5, 5, 'test5']
   - [6, 6, 'test6']
@@ -182,9 +178,7 @@ for i = 1,10 do table.insert(res, (s:get{i})) end
 ...
 res
 ---
-- - [1, 1, 'test1']
-  - [2, 2, 'test2']
-  - [3, 3, 'test3']
+- - [3, 3, 'test3']
   - [4, 4, 'test4']
   - [5, 5, 'test5']
   - [6, 6, 'test6']
@@ -205,9 +199,7 @@ for i = 1,10 do table.insert(res, (s:get{i})) end
 ...
 res
 ---
-- - [1, 1, 'test1']
-  - [2, 2, 'test2']
-  - [3, 3, 'test3']
+- - [3, 3, 'test3']
   - [4, 4, 'test4']
   - [5, 5, 'test5']
   - [6, 6, 'test6']
@@ -275,16 +267,16 @@ for _, t in s.index[0]:pairs() do table.insert(res, t) end
 ...
 res
 ---
-- - [1, 1, 'test1']
-  - [2, 2, 'test2']
-  - [3, 3, 'test3']
-  - [4, 4, 'test4']
-  - [5, 5, 'test5']
-  - [6, 6, 'test6']
+- - [3, 3, 'test3']
   - [7, 7, 'test7']
-  - [8, 8, 'test8']
-  - [9, 9, 'test9']
+  - [1, 1, 'test1']
   - [10, 10, 'test10']
+  - [9, 9, 'test9']
+  - [2, 2, 'test2']
+  - [5, 5, 'test5']
+  - [8, 8, 'test8']
+  - [6, 6, 'test6']
+  - [4, 4, 'test4']
 ...
 errinj.set("ERRINJ_INDEX_ALLOC", true)
 ---
@@ -317,24 +309,24 @@ for _, t in s.index[0]:pairs() do table.insert(res, t) end
 ...
 res
 ---
-- - [1, 1, 'test1']
-  - [2, 2, 'test2']
-  - [3, 3, 'test3']
-  - [4, 4, 'test4']
-  - [5, 5, 'test5']
-  - [6, 6, 'test6']
+- - [3, 3, 'test3']
   - [7, 7, 'test7']
-  - [8, 8, 'test8']
-  - [9, 9, 'test9']
+  - [1, 1, 'test1']
   - [10, 10, 'test10']
+  - [9, 9, 'test9']
+  - [2, 2, 'test2']
+  - [5, 5, 'test5']
+  - [8, 8, 'test8']
+  - [6, 6, 'test6']
+  - [4, 4, 'test4']
 ...
 for i = 501,2500 do s:insert{i, i} end
 ---
 - error: Failed to allocate 16384 bytes in mempool for new slab
 ...
-s:delete{1}
+s:delete{1} -- still can delete, it does not require extents if no read view
 ---
-- error: Failed to allocate 16384 bytes in mempool for new slab
+- [1, 1, 'test1']
 ...
 res = {}
 ---
@@ -344,8 +336,7 @@ for i = 1,10 do table.insert(res, (s:get{i})) end
 ...
 res
 ---
-- - [1, 1, 'test1']
-  - [2, 2, 'test2']
+- - [2, 2, 'test2']
   - [3, 3, 'test3']
   - [4, 4, 'test4']
   - [5, 5, 'test5']
@@ -358,24 +349,14 @@ res
 res = {}
 ---
 ...
-for i = 501,510 do table.insert(res, (s:get{i})) end
+for i = 501,2500 do table.insert(res, (s:get{i})) end
 ---
 ...
-res
+#res -- only could insert some of entries with the extents reserved previously
 ---
-- []
+- 1014
 ...
-res = {}
----
-...
-for i = 2001,2010 do table.insert(res, (s:get{i})) end
----
-...
-res
----
-- []
-...
-check_iter_and_size()
+check_iter_and_size(1023)
 ---
 - ok
 ...
@@ -383,11 +364,11 @@ for i = 2501,3500 do s:insert{i, i} end
 ---
 - error: Failed to allocate 16384 bytes in mempool for new slab
 ...
-s:delete{2}
+s:delete{2} -- still can delete, it does not require extents if no read view
 ---
-- error: Failed to allocate 16384 bytes in mempool for new slab
+- [2, 2, 'test2']
 ...
-check_iter_and_size()
+check_iter_and_size(1023)
 ---
 - ok
 ...
@@ -399,9 +380,7 @@ for i = 1,10 do table.insert(res, (s:get{i})) end
 ...
 res
 ---
-- - [1, 1, 'test1']
-  - [2, 2, 'test2']
-  - [3, 3, 'test3']
+- - [3, 3, 'test3']
   - [4, 4, 'test4']
   - [5, 5, 'test5']
   - [6, 6, 'test6']
@@ -414,11 +393,11 @@ for i = 3501,4500 do s:insert{i, i} end
 ---
 - error: Failed to allocate 16384 bytes in mempool for new slab
 ...
-s:delete{3}
+s:delete{3} -- still can delete, it does not require extents if no read view
 ---
-- error: Failed to allocate 16384 bytes in mempool for new slab
+- [3, 3, 'test3']
 ...
-check_iter_and_size()
+check_iter_and_size(1023)
 ---
 - ok
 ...
@@ -437,10 +416,7 @@ for i = 1,10 do table.insert(res, (s:get{i})) end
 ...
 res
 ---
-- - [1, 1, 'test1']
-  - [2, 2, 'test2']
-  - [3, 3, 'test3']
-  - [4, 4, 'test4']
+- - [4, 4, 'test4']
   - [5, 5, 'test5']
   - [6, 6, 'test6']
   - [7, 7, 'test7']
@@ -460,10 +436,7 @@ for i = 1,10 do table.insert(res, (s:get{i})) end
 ...
 res
 ---
-- - [1, 1, 'test1']
-  - [2, 2, 'test2']
-  - [3, 3, 'test3']
-  - [4, 4, 'test4']
+- - [4, 4, 'test4']
   - [5, 5, 'test5']
   - [6, 6, 'test6']
   - [7, 7, 'test7']
@@ -488,6 +461,18 @@ res
   - [5008, 5008]
   - [5009, 5009]
   - [5010, 5010]
+...
+errinj.set("ERRINJ_INDEX_OOM", true)
+---
+- ok
+...
+s:replace{3594, 3594}
+---
+- error: Failed to allocate 0 bytes in errinj for errinj
+...
+errinj.set("ERRINJ_INDEX_OOM", false)
+---
+- ok
 ...
 s:drop()
 ---

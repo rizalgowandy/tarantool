@@ -579,8 +579,7 @@ ops = {{'=', '[4][4][1]', 1}, {'=', '[4][4][1]', 2}}
 t:update(ops)
 t:upsert(ops)
 
--- First two operations produce zero length bar update in field
--- [4][4][5][4]. The third operation should raise an error.
+-- First two operations produce zero length bar update in field [4][4][5][4].
 ops = {{'+', '[4][4][5][4]', 13000}, {'=', '[4][4][5][1]', 8000}, {'+', '[4][4][5][4]', 1}}
 t:update(ops)
 t:upsert(ops)
@@ -610,6 +609,71 @@ t:upsert(ops)
 -- Error - array update should check that its token is a number.
 -- Parent field won't guarantee that.
 ops = {{'=', '[3]', {0}}, {'=', '[4][3]', 3.5}, {'=', '[4][4][1]', 4.5}, {'=', '[4][4][2]', 5.5}, {'=', '[4][4].key', 6.5}}
+t:update(ops)
+t:upsert(ops)
+
+--
+-- gh-7705: update of a map/array which was inserted into an existing map/array
+-- by a bar update could crash.
+--
+ops = {{'=', '[2].key1', {key11 = 1}}, {'=', '[2].key1.key12', {key21 = 2}}}
+t:update(ops)
+t:upsert(ops)
+
+ops = {{'=', '[3][1]', {1000}}, {'=', '[3][1][2]', 2000}}
+t:update(ops)
+t:upsert(ops)
+
+--
+-- gh-8216: attempt to make an update inside a just created array field could
+-- crash.
+--
+t:update({{'=', '[3]', {a = 33}}, {'+', '[3].a', 1}})
+t:update({{'=', '[4]', {1}}, {'+', '[4][1]', 1}})
+-- Same about updating internals of a newly created bar field.
+t:update({{'=', '[4][6]', {a = 33}}, {'+', '[4][6].aa', 1}})
+t:update({{'=', '[4][4]', {3}}, {'+', '[4][4][1]', 1}})
+
+-- Try more than 2 levels of nested insertions.
+ops = {{'=', '[2].key1', {key11 = 1}}, {'=', '[2].key1.key12', {key21 = 2}},    \
+       {'=', '[2].key1.key12.key22', {key31 = 3}},                              \
+       {'=', '[2].key1.key12.key22.key32', 4}}
+t:update(ops)
+t:upsert(ops)
+
+ops = {{'=', '[3][1]', {1000}}, {'=', '[3][1][2]', {2000, 3000}},               \
+       {'=', '[3][1][2][3]', {4000, 5000, 6000}},                               \
+       {'=', '[3][1][2][3][4]', 7000}}
+t:update(ops)
+t:upsert(ops)
+
+-- Try the difference not on the first part of the path (not counting the first
+-- level of tuple).
+ops = {{'=', '[4][6].f', {g = 1}}, {'=', '[4][6].f.h', {k = 2}}}
+t:update(ops)
+t:upsert(ops)
+
+ops = {{'=', '[4][4][5][6]', {1000}}, {'=', '[4][4][5][6][2]', 2000}}
+t:update(ops)
+t:upsert(ops)
+
+-- Try nesting a second op into the bar operand.
+ops = {{'=', '[4][6].f', {g = {h = 1}}}, {'=', '[4][6].f.g.k', {l = 2}}}
+t:update(ops)
+t:upsert(ops)
+
+ops = {{'=', '[4][4][5][6]', {{1000}}}, {'=', '[4][4][5][6][1][2]', 2000}}
+t:update(ops)
+t:upsert(ops)
+
+-- Try nesting a second op into the bar operand more than once.
+ops = {{'=', '[4][6].f', {g = {h = 1}}}, {'=', '[4][6].f.g.k', {l = 2}},        \
+       {'=', '[4][6].f.g.m', {n = 3}}}
+t:update(ops)
+t:upsert(ops)
+
+ops = {{'=', '[4][4][5][6]', {{1000}}}, {'=', '[4][4][5][6][1][2]', 2000},        \
+       {'=', '[4][4][5][6][1][3]', 3000}}
 t:update(ops)
 t:upsert(ops)
 
@@ -783,3 +847,127 @@ s:drop()
 -- reversed order both on not specified fields.
 --
 box.tuple.new({1}):update({{'=', 4, 4}, {'=', 3, 3}})
+
+--
+-- gh-8226: allow several updates of the same field
+--
+-- Test deep bar update and then set somewhere in the middle
+t = box.tuple.new({7, {a = {b = {c = {d = 2}}}}, 11})
+t:update({{'+', '[2].a.b.c.d', 2}, {'=', '[2].a.b.c', 7}})
+-- Double update of a field inside an array.
+t = box.tuple.new({7, 1, 11})
+t:update({{'+', 2, 1}, {'+', 2, 2}})
+t = box.tuple.new({7, 1, 11})
+t:update({{'+', 2, 2}, {'+', 2, 3}, {'-', 2, 7}})
+t = box.tuple.new({7, 1.1, 11})
+t:update({{'+', 2, 0.1}, {'+', 2, 0.2}})
+t = box.tuple.new({7, 0.9, 11})
+t:update({{'+', 2, 0.2}, {'-', 2, 0.3}})
+t = box.tuple.new({7, decimal.new('1.1000000000000001'), 11})
+t:update({{'+', 2, 0.1}, {'+', 2, 0.2}})
+t = box.tuple.new({7, decimal.new('0.9000000000000001'), 11})
+t:update({{'+', 2, 0.2}, {'-', 2, 0.3}})
+t = box.tuple.new({7, 0x1, 11})
+t:update({{'|', 2, 0x10}, {'|', 2, 0x100}})
+t = box.tuple.new({7, 0x111, 11})
+t:update({{'&', 2, 0x110}, {'&', 2, 0x101}})
+t = box.tuple.new({7, 0x0, 11})
+t:update({{'^', 2, 0x1}, {'^', 2, 0x10}})
+t = box.tuple.new({7, 0x101, 11})
+t:update({{'|', 2, 0x10}, {'&', 2, 0x110}})
+t = box.tuple.new({7,'aa11bbb222zzzzz', 11})
+-- test some double update into the string field
+t:update({{':', 2, 3, 2, '!'}, {':', 2, 7, 3, '^'}})
+-- test conversion with empty chunk and insertion of empty chunk into rope
+t:update({{':', 2, 3, 2, ''}, {':', 2, 6, 3, ''}})
+-- test erasure of zero characters from rope
+t:update({{':', 2, 3, 2, ''}, {':', 2, 9, 0, '++'}})
+-- test conversion with first empty chunk
+t:update({{':', 2, 1, 2, 'AA'}, {':', 2, 8, 3, '333'}})
+-- test conversion with last empty chunk
+t:update({{':', 2, 11, 5, 'ZZZZZ'}, {':', 2, 8, 3, '333'}})
+-- test triple update into the string field (skipping conversion)
+t:update({{':', 2, 3, 2, '!'}, {':', 2, 7, 3, '^'}, {':', 2, 2, 10, '+'}})
+-- Fail to apply scalar op to non scalar/nop field in array
+t = box.tuple.new({7, {x = 2}, 11})
+ops = {{'+', '[2].x', 2}, {'+', 2, 2}}
+t:update(ops)
+t:upsert(ops)
+--
+-- Below first update will become a bar so we need second update to create map
+-- node.
+--
+-- Double update of a field inside a map.
+t = box.tuple.new({7, {a = 1, b = 3}, 11})
+t:update({{'+', '[2].b', 2}, {'+', '[2].a', 2}, {'+', '[2].a', 3}})
+-- Fail to apply scalar op to non scalar/nop field in map
+t = box.tuple.new({7, {a = {x = 2}, b = 3}, 11})
+ops = {{'+', '[2].b', 2}, {'+', '[2].a.x', 2}, {'+', '[2].a', 2}}
+t:update(ops)
+t:upsert(ops)
+-- Update into leaf scalar bar
+t = box.tuple.new({7, {a = 1}, 11})
+t:update({{'+', '[2].a', 2}, {'+', '[2].a', 3}})
+-- Update into bar set
+t = box.tuple.new({7, {b = 1}, 11})
+t:update({{'=', '[2].b', 2}, {'+', '[2].b', 2}})
+t:update({{'=', '[2].b', {x = 2}}, {'+', '[2].b.x', 2}})
+-- Allow to set scalar to array field and then do scalar operation
+-- on the same field.
+t = box.tuple.new({7, 1, 11})
+t:update({{'=', 2, 2}, {'+', 2, 2}})
+-- Allow to set map/array to array field and then do update inside it.
+t:update({{'=', 2, {a = 2}}, {'+', '[2].a', 2}})
+t:update({{'=', 2, {a = 2}}, {'!', '[2].b', 3}})
+t:update({{'=', 2, {a = 2, b = 3}}, {'#', '[2].b', 1}})
+t:update({{'=', 2, {a = 2, b = 3}}, {'=', '[2].b', 4}})
+--
+-- Below first update will become a bar so we need second update to create map
+-- node.
+--
+-- Allow to set scalar to map field and then do scalar operation
+-- on the same field.
+t = box.tuple.new({7, {a = 1, b = 1}, 11})
+t:update({{'+', '[2].a', 1}, {'=', '[2].b', 2}, {'+', '[2].b', 2}})
+-- Allow to set map/array to map field and then do update inside it.
+t:update({{'+', '[2].a', 1}, {'=', '[2].b', {x = 2}}, {'+', '[2].b.x', 2}})
+t:update({{'+', '[2].a', 1}, {'=', '[2].b', {x = 2}}, {'!', '[2].b.y', 3}})
+t:update({{'+', '[2].a', 1}, {'=', '[2].b', {x = 2, y = 3}}, {'#', '[2].b.y', 1}})
+t:update({{'+', '[2].a', 1}, {'=', '[2].b', {x = 2, y = 3}}, {'=', '[2].b.y', 4}})
+-- Allow to set scalar to array field and then do scalar operation
+-- on the same field.
+t = box.tuple.new({7, 11})
+t:update({{'!', 2, 2}, {'+', 2, 2}})
+-- Allow to set map/array to array field and then do update inside it.
+t:update({{'!', 2, {a = 2}}, {'+', '[2].a', 2}})
+t:update({{'!', 2, {a = 2}}, {'!', '[2].b', 3}})
+t:update({{'!', 2, {a = 2, b = 3}}, {'#', '[2].b', 1}})
+t:update({{'!', 2, {a = 2, b = 3}}, {'=', '[2].b', 4}})
+--
+-- Below first update will become a bar so we need second update to create map
+-- node.
+--
+-- Allow to set scalar to map field and then do scalar operation
+-- on the same field.
+t = box.tuple.new({7, {a = 1}, 11})
+t:update({{'+', '[2].a', 1}, {'!', '[2].b', 2}, {'+', '[2].b', 2}})
+-- Allow to set map/array to map field and then do update inside it.
+t:update({{'+', '[2].a', 1}, {'!', '[2].b', {x = 2}}, {'+', '[2].b.x', 2}})
+t:update({{'+', '[2].a', 1}, {'!', '[2].b', {x = 2}}, {'!', '[2].b.y', 3}})
+t:update({{'+', '[2].a', 1}, {'!', '[2].b', {x = 2, y = 3}}, {'#', '[2].b.y', 1}})
+t:update({{'+', '[2].a', 1}, {'!', '[2].b', {x = 2, y = 3}}, {'=', '[2].b.y', 4}})
+-- Test removing field and then inserting it
+t = box.tuple.new({7, 5, 11})
+t:update({{'#', 2, 1}, {'!', 2, 6}})
+t = box.tuple.new{7, {a = 2, b = 5}, 11}
+t:update({{'+', '[2].a', 2}, {'#', '[2].b', 1}, {'!', '[2].b', 6}})
+t:update({{'#', '[2].b', 1}, {'!', '[2].b', 6}})
+-- Test inserting field and then removing it
+t = box.tuple.new({7, 11})
+t:update({{'!', 2, 5}, {'#', 2, 1}})
+t = box.tuple.new({7, {a = 2}, 11})
+t:update({{'+', '[2].a', 2}, {'!', '[2].b', 7}, {'#', '[2].b', 1}})
+t:update({{'!', '[2].b', 7}, {'#', '[2].b', 1}})
+-- Test bar insert of non scalar value and then changing inside it
+t = box.tuple.new({7, {a = {a = 2}}, 11})
+t:update({{'!', '[2].a.b', {x = {x = {y = 2}}}}, {'+', '[2].a.b.x.x.y', 2}})

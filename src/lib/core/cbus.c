@@ -88,16 +88,13 @@ cpipe_flush_cb(ev_loop * /* loop */, struct ev_async *watcher,
 	       int /* events */);
 
 void
-cpipe_create(struct cpipe *pipe, const char *consumer)
+cpipe_create_noev(struct cpipe *pipe, const char *consumer)
 {
 	stailq_create(&pipe->input);
 
 	pipe->n_input = 0;
 	pipe->max_input = INT_MAX;
-	pipe->producer = cord()->loop;
-
-	ev_async_init(&pipe->flush_input, cpipe_flush_cb);
-	pipe->flush_input.data = pipe;
+	pipe->producer = NULL;
 	rlist_create(&pipe->on_flush);
 
 	tt_pthread_mutex_lock(&cbus.mutex);
@@ -110,6 +107,15 @@ cpipe_create(struct cpipe *pipe, const char *consumer)
 	pipe->endpoint = endpoint;
 	++pipe->endpoint->n_pipes;
 	tt_pthread_mutex_unlock(&cbus.mutex);
+}
+
+void
+cpipe_create(struct cpipe *pipe, const char *consumer)
+{
+	cpipe_create_noev(pipe, consumer);
+	pipe->producer = loop();
+	ev_async_init(&pipe->flush_input, cpipe_flush_cb);
+	pipe->flush_input.data = pipe;
 }
 
 struct cmsg_poison {
@@ -132,15 +138,8 @@ cbus_endpoint_poison_f(struct cmsg *msg)
 void
 cpipe_destroy(struct cpipe *pipe)
 {
-	/*
-	 * The thread should not be canceled while mutex is locked.
-	 * And everything else must be protected for consistency.
-	*/
-	int old_cancel_state;
-	tt_pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_cancel_state);
-
-	ev_async_stop(pipe->producer, &pipe->flush_input);
-
+	if (pipe->producer != NULL)
+		ev_async_stop(pipe->producer, &pipe->flush_input);
 	static const struct cmsg_hop route[1] = {
 		{cbus_endpoint_poison_f, NULL}
 	};
@@ -151,7 +150,7 @@ cpipe_destroy(struct cpipe *pipe)
 	cmsg_init(&poison->msg, route);
 	poison->endpoint = pipe->endpoint;
 	/*
-	 * Avoid the general purpose cpipe_push_input() since
+	 * Avoid the general purpose cpipe_push() since
 	 * we want to control the way the poison message is
 	 * delivered.
 	 */
@@ -171,9 +170,6 @@ cpipe_destroy(struct cpipe *pipe)
 	 */
 	ev_async_send(endpoint->consumer, &endpoint->async);
 	tt_pthread_mutex_unlock(&endpoint->mutex);
-
-	tt_pthread_setcancelstate(old_cancel_state, NULL);
-
 	TRASH(pipe);
 }
 
@@ -181,8 +177,6 @@ static void
 cbus_create(struct cbus *bus)
 {
 	bus->stats = rmean_new(cbus_stat_strings, CBUS_STAT_LAST);
-	if (bus->stats == NULL)
-		panic_syserror("cbus_create");
 
 	/* Initialize queue lock mutex. */
 	(void) tt_pthread_mutex_init(&bus->mutex, NULL);
@@ -279,30 +273,15 @@ cbus_endpoint_destroy(struct cbus_endpoint *endpoint,
 	return 0;
 }
 
-static void
-cpipe_flush_cb(ev_loop *loop, struct ev_async *watcher, int events)
+void
+cpipe_flush(struct cpipe *pipe)
 {
-	(void) loop;
-	(void) events;
-	struct cpipe *pipe = (struct cpipe *) watcher->data;
-	struct cbus_endpoint *endpoint = pipe->endpoint;
 	if (pipe->n_input == 0)
 		return;
-
+	struct cbus_endpoint *endpoint = pipe->endpoint;
 	trigger_run(&pipe->on_flush, pipe);
 	/* Trigger task processing when the queue becomes non-empty. */
 	bool output_was_empty;
-
-	/*
-	 * We need to set a thread cancellation guard, because
-	 * another thread may cancel the current thread
-	 * (write() is a cancellation point in ev_async_send)
-	 * and the activation of the ev_async watcher
-	 * through ev_async_send will fail.
-	 */
-
-	int old_cancel_state;
-	tt_pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_cancel_state);
 
 	tt_pthread_mutex_lock(&endpoint->mutex);
 	output_was_empty = stailq_empty(&endpoint->output);
@@ -317,8 +296,14 @@ cpipe_flush_cb(ev_loop *loop, struct ev_async *watcher, int events)
 
 		ev_async_send(endpoint->consumer, &endpoint->async);
 	}
+}
 
-	tt_pthread_setcancelstate(old_cancel_state, NULL);
+static void
+cpipe_flush_cb(ev_loop *loop, struct ev_async *watcher, int events)
+{
+	(void)loop;
+	(void)events;
+	cpipe_flush(watcher->data);
 }
 
 void
@@ -409,15 +394,12 @@ cbus_call_done(struct cmsg *m)
 	fiber_wakeup(msg->caller);
 }
 
-/**
- * Execute a synchronous call over cbus.
- */
-int
-cbus_call(struct cpipe *callee, struct cpipe *caller, struct cbus_call_msg *msg,
-	cbus_call_f func, cbus_call_f free_cb, double timeout)
+/** Submit a call for execution without waiting for completion. */
+static void
+cbus_call_submit(struct cpipe *callee, struct cpipe *caller,
+		 struct cbus_call_msg *msg, cbus_call_f func,
+		 cbus_call_f free_cb)
 {
-	int rc;
-
 	diag_create(&msg->diag);
 	msg->caller = fiber();
 	msg->complete = false;
@@ -432,65 +414,37 @@ cbus_call(struct cpipe *callee, struct cpipe *caller, struct cbus_call_msg *msg,
 	msg->rc = 0;
 
 	cpipe_push(callee, cmsg(msg));
+}
 
-	fiber_yield_timeout(timeout);
-	if (msg->complete == false) {           /* timed out or cancelled */
-		msg->caller = NULL;
-		if (fiber_is_cancelled())
-			diag_set(FiberIsCancelled);
-		else
+int
+cbus_call_timeout(struct cpipe *callee, struct cpipe *caller,
+		  struct cbus_call_msg *msg, cbus_call_f func,
+		  cbus_call_f free_cb, double timeout)
+{
+	cbus_call_submit(callee, caller, msg, func, free_cb);
+
+	ev_tstamp deadline = ev_monotonic_now(loop()) + timeout;
+	do {
+		bool exceeded = fiber_yield_deadline(deadline);
+		if (exceeded) {
+			msg->caller = NULL;
 			diag_set(TimedOut);
-		return -1;
-	}
-	if ((rc = msg->rc))
+			return -1;
+		}
+	} while (!msg->complete);
+
+	if (msg->rc != 0)
 		diag_move(&msg->diag, &fiber()->diag);
-	return rc;
-}
-
-struct cbus_flush_msg {
-	struct cmsg cmsg;
-	bool complete;
-	struct fiber_cond cond;
-};
-
-static void
-cbus_flush_perform(struct cmsg *cmsg)
-{
-	(void)cmsg;
-}
-
-static void
-cbus_flush_complete(struct cmsg *cmsg)
-{
-	struct cbus_flush_msg *msg = container_of(cmsg,
-			struct cbus_flush_msg, cmsg);
-	msg->complete = true;
-	fiber_cond_signal(&msg->cond);
+	return msg->rc;
 }
 
 void
-cbus_flush(struct cpipe *callee, struct cpipe *caller,
-	   void (*process_cb)(struct cbus_endpoint *endpoint))
+cbus_call_async(struct cpipe *callee, struct cpipe *caller,
+		struct cbus_call_msg *msg, cbus_call_f func,
+		cbus_call_f free_cb)
 {
-	struct cmsg_hop route[] = {
-		{cbus_flush_perform, caller},
-		{cbus_flush_complete, NULL},
-	};
-	struct cbus_flush_msg msg;
-
-	cmsg_init(&msg.cmsg, route);
-	msg.complete = false;
-	fiber_cond_create(&msg.cond);
-
-	cpipe_push(callee, &msg.cmsg);
-
-	while (true) {
-		if (process_cb != NULL)
-			process_cb(caller->endpoint);
-		if (msg.complete)
-			break;
-		fiber_cond_wait(&msg.cond);
-	}
+	cbus_call_submit(callee, caller, msg, func, free_cb);
+	msg->caller = NULL;
 }
 
 struct cbus_pair_msg {
@@ -662,6 +616,7 @@ cbus_loop(struct cbus_endpoint *endpoint)
 {
 	while (true) {
 		cbus_process(endpoint);
+		fiber_check_gc();
 		if (fiber_is_cancelled())
 			break;
 		fiber_yield();
@@ -690,6 +645,6 @@ cbus_stop_loop(struct cpipe *pipe)
 	cmsg_init(cancel, route);
 
 	cpipe_push(pipe, cancel);
-	ev_invoke(pipe->producer, &pipe->flush_input, EV_CUSTOM);
+	cpipe_flush(pipe);
 }
 

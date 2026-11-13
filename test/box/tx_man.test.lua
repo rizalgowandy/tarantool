@@ -54,6 +54,26 @@ tx2:commit() -- note that tx2 commits first.
 tx1:commit()
 s:select{}
 
+-- Insert read/write conflicts.
+s:delete{1}
+tx1:begin()
+tx2:begin()
+tx1('s:insert{1, 1}')
+tx2('s:insert{1, 2}')
+tx1:commit()
+tx2:commit()
+s:select{}
+
+-- Insert read/write conflicts, different order.
+s:delete{1}
+tx1:begin()
+tx2:begin()
+tx1('s:insert{1, 1}')
+tx2('s:insert{1, 2}')
+tx2:commit() -- note that tx2 commits first.
+tx1:commit()
+s:select{}
+
 -- Implicit read/write conflicts.
 s:replace{1, 0}
 tx1:begin()
@@ -596,6 +616,23 @@ check()
 tx1:commit()
 tx2:commit()
 
+-- Check that rolled back story is accounted correctly.
+s:truncate()
+tx1:begin()
+tx1('s:replace{0, 0}')
+tx1:rollback()
+s:count()
+
+-- Check that invisible read-view story is accounted correctly.
+s:truncate()
+s:insert{0, 0}
+tx1:begin()
+tx1('s:select{0}')
+s:replace{0, 1}
+tx1:commit()
+s:delete{0}
+s:count()
+
 -- Check different orders
 s:truncate()
 tx1:begin()
@@ -742,21 +779,22 @@ tx1:commit()
 box.space.t:drop()
 
 -- https://github.com/tarantool/tarantool/issues/5892
-box.execute([[CREATE TABLE u (column1 INT PRIMARY KEY, column2 INT);]])
+box.execute([[CREATE TABLE U (COLUMN1 INT PRIMARY KEY, COLUMN2 INT);]])
+box.schema.user.grant('guest', 'execute', 'sql')
 box.schema.user.grant('guest', 'read,write', 'space', 'U')
 conn = require('net.box').connect(box.cfg.listen)
 
-box.execute([[INSERT INTO u VALUES (1, 20);]])
+box.execute([[INSERT INTO U VALUES (1, 20);]])
 box.execute([[START TRANSACTION;]])
-box.execute([[SELECT * FROM u;]])
+box.execute([[SELECT * FROM SEQSCAN U;]])
 
-conn:execute([[UPDATE u SET column2 = 21;]])
+conn:execute([[UPDATE U SET COLUMN2 = 21;]])
 
-box.execute([[UPDATE u SET column2 = 22;]])
+box.execute([[UPDATE U SET COLUMN2 = 22;]])
 box.execute([[COMMIT;]])
-box.execute([[SELECT * FROM u;]])
+box.execute([[SELECT * FROM SEQSCAN U;]])
 
-box.execute([[DROP TABLE u ;]])
+box.execute([[DROP TABLE U ;]])
 
 --https://github.com/tarantool/tarantool/issues/6193
 s = box.schema.create_space('test')
@@ -1151,36 +1189,37 @@ s:drop()
 
 -- https://github.com/tarantool/tarantool/issues/5801
 -- flaw #1
-box.execute([[CREATE TABLE k1 (s1 INT PRIMARY KEY);]])
-box.execute([[CREATE TABLE k2 (s1 INT PRIMARY KEY, s2 INT REFERENCES k1);]])
-box.execute([[CREATE TABLE k3 (c INTEGER PRIMARY KEY AUTOINCREMENT);]])
-box.execute([[CREATE TABLE k4 (s1 INT PRIMARY KEY);]])
+box.execute([[CREATE TABLE K1 (S1 INT PRIMARY KEY);]])
+box.execute([[CREATE TABLE K2 (S1 INT PRIMARY KEY, S2 INT REFERENCES K1);]])
+box.execute([[CREATE INDEX I1 ON K2(S2);]])
+box.execute([[CREATE TABLE K3 (C INTEGER PRIMARY KEY AUTOINCREMENT);]])
+box.execute([[CREATE TABLE K4 (S1 INT PRIMARY KEY);]])
 box.schema.user.grant('guest', 'read,write', 'space', 'K1', {if_not_exists=true})
 box.schema.user.grant('guest', 'read,write', 'space', 'K2', {if_not_exists=true})
 
 net_box = require('net.box')
 conn = net_box.connect(box.cfg.listen)
 
-box.execute([[INSERT INTO k1 VALUES (1);]])
+box.execute([[INSERT INTO K1 VALUES (1);]])
 box.execute([[START TRANSACTION;]])
-box.execute([[INSERT INTO k2 VALUES (99,1);]])
+box.execute([[INSERT INTO K2 VALUES (99,1);]])
 
 conn:execute([[DELETE FROM K1;]])
 box.execute([[COMMIT;]])
 
 -- flaw #2
-box.execute([[DELETE FROM k2;]])
-box.execute([[DELETE FROM k1;]])
+box.execute([[DELETE FROM K2;]])
+box.execute([[DELETE FROM K1;]])
 tx1:begin()
-tx1('box.execute([[SELECT COUNT() from k1]])')
-box.execute([[INSERT INTO k1 VALUES (1);]])
-tx1('box.execute([[SELECT COUNT() from k1]])')
+tx1('box.execute([[SELECT COUNT() FROM SEQSCAN K1]])')
+box.execute([[INSERT INTO K1 VALUES (1);]])
+tx1('box.execute([[SELECT COUNT() FROM SEQSCAN K1]])')
 tx1:commit()
 
-box.execute([[DROP TABLE k4;]])
-box.execute([[DROP TABLE k3;]])
-box.execute([[DROP TABLE k2;]])
-box.execute([[DROP TABLE k1;]])
+box.execute([[DROP TABLE K4;]])
+box.execute([[DROP TABLE K3;]])
+box.execute([[DROP TABLE K2;]])
+box.execute([[DROP TABLE K1;]])
 
 -- gh-6318: make sure that space alter does not result in dirty read.
 --
@@ -1241,4 +1280,3 @@ tx1:commit()
 test_run:cmd("switch default")
 test_run:cmd("stop server tx_man")
 test_run:cmd("cleanup server tx_man")
-

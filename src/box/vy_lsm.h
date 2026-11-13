@@ -52,6 +52,7 @@ extern "C" {
 #endif /* defined(__cplusplus) */
 
 struct histogram;
+struct space_def;
 struct tuple;
 struct tuple_format;
 struct vy_lsm;
@@ -70,7 +71,12 @@ struct vy_lsm_env {
 	const char *path;
 	/** Memory generation counter. */
 	int64_t *p_generation;
-	/** Tuple format for keys (SELECT). */
+	/**
+	 * Tuple format used for creating key statements (e.g.
+	 * statements read from secondary index runs). It doesn't
+	 * impose any restrictions on tuple fields, neither does
+	 * it setup offset map.
+	 */
 	struct tuple_format *key_format;
 	/** Key (SELECT) with no parts. */
 	struct vy_entry empty_key;
@@ -129,7 +135,7 @@ struct vy_lsm_env {
 };
 
 /** Create a common LSM tree environment. */
-int
+void
 vy_lsm_env_create(struct vy_lsm_env *env, const char *path,
 		  int64_t *p_generation, struct tuple_format *key_format,
 		  vy_upsert_thresh_cb upsert_thresh_cb,
@@ -202,21 +208,10 @@ struct vy_lsm {
 	 * to a primary index.
 	 */
 	struct key_def *pk_in_cmp_def;
-	/**
-	 * Tuple format for tuples of this LSM tree created when
-	 * reading pages from disk.
-	 * Is distinct from mem_format only for secondary keys,
-	 * whose tuples have MP_NIL in all "gap" positions between
-	 * positions of the secondary and primary key fields.
-	 * These gaps are necessary to make such tuples comparable
-	 * with tuples from vy_mem, while using the same cmp_def.
-	 * Since upserts are never present in secondary keys, is
-	 * used only for REPLACE and DELETE
-	 * tuples.
-	 */
-	struct tuple_format *disk_format;
+	/** Copy of the space definition. */
+	struct space_def *space_def;
 	/** Tuple format of the space this LSM tree belongs to. */
-	struct tuple_format *mem_format;
+	struct tuple_format *format;
 	/**
 	 * If this LSM tree is for a secondary index, the following
 	 * variable points to the LSM tree of the primary index of
@@ -344,7 +339,8 @@ vy_lsm_mem_tree_size(struct vy_lsm *lsm);
 struct vy_lsm *
 vy_lsm_new(struct vy_lsm_env *lsm_env, struct vy_cache_env *cache_env,
 	   struct vy_mem_env *mem_env, struct index_def *index_def,
-	   struct tuple_format *format, struct vy_lsm *pk, uint32_t group_id);
+	   struct space_def *space_def, struct tuple_format *format,
+	   struct vy_lsm *pk);
 
 /** Free an LSM tree object. */
 void
@@ -425,8 +421,8 @@ vy_lsm_update_pk(struct vy_lsm *lsm, struct vy_lsm *pk)
  *
  * This function is called when an LSM tree is created
  * after recovery is complete or during remote recovery.
- * It initializes the range tree, makes the LSM tree
- * directory, and writes the LSM tree record to vylog.
+ * It initializes the range tree and writes the LSM tree
+ * record to vylog.
  */
 int
 vy_lsm_create(struct vy_lsm *lsm);
@@ -539,6 +535,21 @@ int
 vy_lsm_rotate_mem(struct vy_lsm *lsm);
 
 /**
+ * Allocate a new in-memory tree if either of the following
+ * conditions is true:
+ *
+ * - Generation has increased after the tree was created.
+ *   In this case we need to dump the tree as is in order to
+ *   guarantee dump consistency.
+ *
+ * - Schema state has increased after the tree was created.
+ *   We have to seal the tree, because we don't support mixing
+ *   statements of different formats in the same tree.
+ */
+int
+vy_lsm_rotate_mem_if_required(struct vy_lsm *lsm);
+
+/**
  * Remove an in-memory tree from the sealed list of an LSM tree,
  * unaccount and delete it.
  */
@@ -589,6 +600,14 @@ vy_lsm_coalesce_range(struct vy_lsm *lsm, struct vy_range *range);
  */
 void
 vy_lsm_force_compaction(struct vy_lsm *lsm);
+
+/**
+ * Find a quantile in a range, see index_vtab::quantile().
+ */
+int
+vy_lsm_quantile(struct vy_lsm *lsm, double level,
+		struct vy_entry begin, struct vy_entry end,
+		const char **quantile_key, uint32_t *quantile_key_size);
 
 /**
  * Insert a statement into the in-memory index of an LSM tree. If

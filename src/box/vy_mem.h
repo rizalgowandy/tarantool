@@ -118,7 +118,6 @@ vy_mem_tree_cmp_key(struct vy_entry entry, struct vy_mem_tree_key *key,
 
 #define BPS_TREE_NAME vy_mem_tree
 #define BPS_TREE_BLOCK_SIZE 512
-#define BPS_TREE_EXTENT_SIZE VY_MEM_TREE_EXTENT_SIZE
 #define BPS_TREE_COMPARE(a, b, cmp_def) vy_mem_tree_cmp(a, b, cmp_def)
 #define BPS_TREE_COMPARE_KEY(a, b, cmp_def) vy_mem_tree_cmp_key(a, b, cmp_def)
 #define BPS_TREE_IS_IDENTICAL(a, b) vy_entry_is_equal(a, b)
@@ -130,7 +129,6 @@ vy_mem_tree_cmp_key(struct vy_entry entry, struct vy_mem_tree_key *key,
 
 #undef BPS_TREE_NAME
 #undef BPS_TREE_BLOCK_SIZE
-#undef BPS_TREE_EXTENT_SIZE
 #undef BPS_TREE_COMPARE
 #undef BPS_TREE_COMPARE_KEY
 #undef bps_tree_elem_t
@@ -158,10 +156,14 @@ vy_mem_tree_cmp_key(struct vy_entry entry, struct vy_mem_tree_key *key,
 struct vy_mem {
 	/** Vinyl memory environment. */
 	struct vy_mem_env *env;
-	/** Link in range->sealed list. */
+	/** Link in vy_lsm::sealed. */
 	struct rlist in_sealed;
+	/** Link in vy_task::dumped_mems. */
+	struct rlist in_dump;
 	/** BPS tree */
 	struct vy_mem_tree tree;
+	/* The matras allocator used by the tree. */
+	struct matras_allocator matras_allocator;
 	/** Size of memory used for storing tree extents. */
 	size_t tree_extent_size;
 	/** Number of statements. */
@@ -282,24 +284,28 @@ vy_mem_older_lsn(struct vy_mem *mem, struct vy_entry entry);
  * Insert a statement into the in-memory level.
  * @param mem        vy_mem.
  * @param entry      Vinyl statement.
+ * @param count      Statement counter to update.
  *
  * @retval  0 Success.
  * @retval -1 Memory error.
  */
 int
-vy_mem_insert(struct vy_mem *mem, struct vy_entry entry);
+vy_mem_insert(struct vy_mem *mem, struct vy_entry entry,
+	      struct vy_stmt_counter *count);
 
 /**
  * Insert an upsert statement into the mem.
  *
  * @param mem Mem to insert to.
  * @param entry Upsert statement to insert.
+ * @param count Statement counter to update.
  *
  * @retval  0 Success.
  * @retval -1 Memory error.
  */
 int
-vy_mem_insert_upsert(struct vy_mem *mem, struct vy_entry entry);
+vy_mem_insert_upsert(struct vy_mem *mem, struct vy_entry entry,
+		     struct vy_stmt_counter *count);
 
 /**
  * Confirm insertion of a statement into the in-memory level.
@@ -313,9 +319,11 @@ vy_mem_commit_stmt(struct vy_mem *mem, struct vy_entry entry);
  * Remove a statement from the in-memory level.
  * @param mem        vy_mem.
  * @param entry      Vinyl statement.
+ * @param count      Statement counter to update.
  */
 void
-vy_mem_rollback_stmt(struct vy_mem *mem, struct vy_entry entry);
+vy_mem_rollback_stmt(struct vy_mem *mem, struct vy_entry entry,
+		     struct vy_stmt_counter *count);
 
 /**
  * Iterator for in-memory level.
@@ -364,6 +372,19 @@ struct vy_mem_iterator {
 
 	/* Is false until first .._next_.. method is called */
 	bool search_started;
+	/**
+	 * The iterator may return prepared (unconfirmed) statements only if
+	 * this flag is set. If any prepared statements are skipped because of
+	 * this flag, min_skipped_plsn will be set to the min LSN among all
+	 * skipped prepared statements. The transaction is supposed to update
+	 * its read view accordingly to guarantee serializability.
+	 */
+	bool is_prepared_ok;
+	/**
+	 * Initialized to INT64_MAX. Set to the min LSN among all skipped
+	 * prepared statements if is_prepared_ok is false.
+	 */
+	int64_t min_skipped_plsn;
 };
 
 /**
@@ -372,7 +393,8 @@ struct vy_mem_iterator {
 void
 vy_mem_iterator_open(struct vy_mem_iterator *itr, struct vy_mem_iterator_stat *stat,
 		     struct vy_mem *mem, enum iterator_type iterator_type,
-		     struct vy_entry key, const struct vy_read_view **rv);
+		     struct vy_entry key, const struct vy_read_view **rv,
+		     bool is_prepared_ok);
 
 /**
  * Advance a mem iterator to the next key.
@@ -418,13 +440,18 @@ struct vy_mem_stream {
 	struct vy_mem *mem;
 	/** Current position */
 	struct vy_mem_tree_iterator curr_pos;
+	/** The last tuple returned to user */
+	struct vy_entry entry;
+	/** Format for allocating tuples fetched from the in-memory index. */
+	struct tuple_format *format;
 };
 
 /**
  * Open a mem stream. Use vy_stmt_stream api for further work.
  */
 void
-vy_mem_stream_open(struct vy_mem_stream *stream, struct vy_mem *mem);
+vy_mem_stream_open(struct vy_mem_stream *stream, struct vy_mem *mem,
+		   struct tuple_format *format);
 
 #if defined(__cplusplus)
 } /* extern "C" */

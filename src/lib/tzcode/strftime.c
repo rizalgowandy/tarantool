@@ -35,68 +35,16 @@
 
 #include "private.h"
 #include "trivia/util.h"
+#include "datetime.h"
 #include "tzcode.h"
+#include "timezone.h"
+#include "timelocal.h"
 
 #include <assert.h>
+#include <limits.h>
 #include <locale.h>
 #include <stdbool.h>
 #include <stdio.h>
-
-struct lc_time_T {
-	const char *mon[MONTHSPERYEAR];
-	const char *month[MONTHSPERYEAR];
-	const char *wday[DAYSPERWEEK];
-	const char *weekday[DAYSPERWEEK];
-	const char *X_fmt;
-	const char *x_fmt;
-	const char *c_fmt;
-	const char *am;
-	const char *pm;
-	const char *date_fmt;
-};
-
-#define Locale (&C_time_locale)
-
-static const struct lc_time_T C_time_locale = {
-	{"Jan", "Feb", "Mar", "Apr", "May", "Jun",
-	 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"},
-	{"January", "February", "March", "April", "May", "June",
-	 "July", "August", "September", "October", "November", "December"},
-	{"Sun", "Mon", "Tue", "Wed",
-	 "Thu", "Fri", "Sat"},
-	{"Sunday", "Monday", "Tuesday", "Wednesday",
-	 "Thursday", "Friday", "Saturday"},
-
-	/* X_fmt */
-	"%H:%M:%S",
-
-	/*
-	 ** x_fmt
-	 ** C99 and later require this format.
-	 ** Using just numbers (as here) makes Quakers happier;
-	 ** it's also compatible with SVR4.
-	 */
-	"%m/%d/%y",
-
-	/*
-	 ** c_fmt
-	 ** C99 and later require this format.
-	 ** Previously this code used "%D %X", but we now conform to C99.
-	 ** Note that
-	 ** "%a %b %d %H:%M:%S %Y"
-	 ** is used by Solaris 2.3.
-	 */
-	"%a %b %e %T %Y",
-
-	/* am */
-	"AM",
-
-	/* pm */
-	"PM",
-
-	/* date_fmt */
-	"%a %b %e %H:%M:%S %Z %Y"
-};
 
 static int pow10[] = { 1,      10,	100,	  1000,	     10000,
 		       100000, 1000000, 10000000, 100000000, 1000000000 };
@@ -125,9 +73,11 @@ tnt_strftime(char *s, size_t maxsize, const char *format,
 	tzset();
 	enum warn warn = IN_NONE;
 
+	if (s != NULL && maxsize > 0)
+		s[0] = '\0';
 	ssize_t total = _fmt(s, maxsize, format, t, &warn);
 	assert(total >= 0);
-	assert(maxsize == 0 || s[MIN((size_t)total, maxsize - 1)] == 0);
+	assert(maxsize == 0 || s[MIN((size_t)total, maxsize - 1)] == '\0');
 
 	return (size_t)total;
 }
@@ -328,17 +278,30 @@ _fmt(char *buf, ssize_t size, const char *format, const struct tnt_tm *t,
 						format - mod_len);
 					continue;
 				}
-				width = (int)strtol(format - mod_len,
-						    (char **)NULL, 10);
+				/*
+				 ** We cannot cast returned value of strtol
+				 ** to int in place, as the returned value has
+				 ** long type: so, when width is more then
+				 ** INT_MAX but less then LONG_MAX,
+				 ** no errno will be set, we won't distinguish
+				 ** if overflow happens.
+				 */
+				errno = 0;
+				long tmp_width = strtol(format - mod_len,
+							(char **)NULL, 10);
+				width = (int)tmp_width;
+				if (tmp_width < INT_MIN || tmp_width > INT_MAX ||
+				    errno != 0 || width < 0 || width > 9)
+					width = 9;
 				/* fallthru */
 			case 'f': {
 				int nsec = t->tm_nsec;
-				assert(nsec < 1000000000);
+				assert(nsec < MAX_NANOS_PER_SEC);
 
 				/*
 				 ** no length modifier provided -
 				 ** enable default mode, as in
-				 ** tnt_datetime_to_string()
+				 ** datetime_snprint()
 				 */
 				if (width == 0) {
 					if ((nsec % 1000000) == 0) {
@@ -351,7 +314,6 @@ _fmt(char *buf, ssize_t size, const char *format, const struct tnt_tm *t,
 						width = 9;
 					}
 				} else {
-					width = width >= 9 ? 9 : width;
 					nsec /= pow10[9 - width];
 				}
 				SNPRINT(total, snprintf, buf, size,
@@ -532,15 +494,11 @@ _fmt(char *buf, ssize_t size, const char *format, const struct tnt_tm *t,
 					t->tm_year, TM_YEAR_BASE, true, true);
 				continue;
 			case 'Z':
-				if (t->tm_isdst >= 0)
-					SNPRINT(total, _add, buf, size,
-						tzname[t->tm_isdst != 0]);
-				/*
-				 ** C99 and later say that %Z must be
-				 ** replaced by the empty string if the
-				 ** time zone abbreviation is not
-				 ** determinable.
-				 */
+				if (t->tm_tzindex == 0)
+					continue;
+				assert(timezone_name(t->tm_tzindex) != NULL);
+				SNPRINT(total, snprintf, buf, size,
+					"%s", timezone_name(t->tm_tzindex));
 				continue;
 			case 'z': {
 				long diff;

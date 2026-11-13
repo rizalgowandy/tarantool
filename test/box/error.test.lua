@@ -5,11 +5,13 @@ space = box.schema.space.create('tweedledum')
 index = space:create_index('primary', { type = 'hash' })
 
 box.error({code = 123, reason = 'test'})
-box.error(box.error.ILLEGAL_PARAMS, "bla bla")
+box.error(box.error.ILLEGAL_PARAMS, "foo")
 box.error()
 e = box.error.last()
 e
-e:unpack()
+u = e:unpack()
+u.trace[1].line = nil
+u
 e.type
 e.code
 e.message
@@ -70,7 +72,7 @@ t = {}
 test_run:cmd("setopt delimiter ';'")
 
 for k,v in pairs(box.error) do
-   if type(v) == 'number' then
+   if type(v) == 'number' and not k:startswith('TEST') then
     t[v] = 'box.error.'..tostring(k)
    end
 end;
@@ -89,8 +91,6 @@ assert(box.error.last() == err)
 --
 box.error.set(1)
 box.error.set(nil)
-box.error.set(box.error.last())
-assert(box.error.last() == err)
 -- Check that box.error.new() does not set error to diag.
 --
 box.error.clear()
@@ -241,7 +241,7 @@ e:unpack()
 -- Try to omit message.
 e = box.error.new({type = 'TestType'})
 e:unpack()
--- Try too long type name.
+-- Try long type name.
 e = box.error.new({type = string.rep('a', 128)})
 #e.type
 
@@ -275,3 +275,7 @@ box.schema.func.drop('runtimeerror')
 --
 err = box.error.new('TestType', 'Message arg1: %s. Message arg2: %u', '1', 2)
 err.message
+
+-- gh-4975: errors in init scripts are stripped
+err = box.error.new('TestType', string.rep('a', 10000))
+string.len(err.message)

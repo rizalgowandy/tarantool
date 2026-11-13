@@ -29,7 +29,12 @@
  * SUCH DAMAGE.
  */
 #include "memtx_tree.h"
+#include "index.h"
+#include "key_def_raw.h"
 #include "memtx_engine.h"
+#include "memtx_sort_data.h"
+#include "memtx_tuple_compression.h"
+#include "memtx_index.h"
 #include "space.h"
 #include "schema.h" /* space_by_id(), space_cache_find() */
 #include "errinj.h"
@@ -39,8 +44,22 @@
 #include "tuple.h"
 #include "txn.h"
 #include "memtx_tx.h"
-#include <qsort_arg.h>
+#include "scoped_guard.h"
+#include "trivia/config.h"
+#include "trivia/util.h"
+#include "tt_sort.h"
 #include <small/mempool.h>
+
+/**
+ * Check if an index has a tree with hints enabled given its definition.
+ */
+static bool
+memtx_tree_index_uses_hint(struct index_def *def)
+{
+	return def->key_def->for_func_index ||
+	       def->key_def->is_multikey ||
+	       def->opts.hint == INDEX_HINT_ON;
+}
 
 /**
  * Struct that is used as a key in BPS tree definition.
@@ -93,6 +112,38 @@ struct memtx_tree_data<true> :  memtx_tree_data<false> {
 };
 
 /**
+ * Construct an MVCC entry from a tuple and its tree-stored hint.
+ *
+ * Regular indexes may use a hint to accelerate tree comparisons, but MVCC
+ * identifies their entries by tuple only. Multikey and functional indexes use
+ * the hint to identify a particular index entry, so it is kept as the entry
+ * key data.
+ */
+static struct memtx_index_entry
+memtx_tree_index_entry(struct index *index, struct tuple *tuple, hint_t hint)
+{
+	bool preserve_hint = index->def->key_def->is_multikey ||
+			     index->def->key_def->for_func_index;
+	return (struct memtx_index_entry) {
+		.tuple = tuple,
+		.key_data = tuple != NULL && preserve_hint ? hint : HINT_NONE,
+	};
+}
+
+/**
+ * Construct an MVCC entry from tree data. NULL data produces a null entry.
+ */
+template<bool USE_HINT>
+static struct memtx_index_entry
+memtx_tree_index_entry(struct index *index,
+		       const struct memtx_tree_data<USE_HINT> *data)
+{
+	if (data == NULL)
+		return memtx_index_entry_null;
+	return memtx_tree_index_entry(index, data->tuple, data->hint);
+}
+
+/**
  * Test whether BPS tree elements are identical i.e. represent
  * the same tuple at the same position in the tree.
  * @param a - First BPS tree element to compare.
@@ -107,9 +158,30 @@ memtx_tree_data_is_equal(const struct memtx_tree_data_common *a,
 	return a->tuple == b->tuple;
 }
 
+/**
+ * Test whether the tree element under an iterator is the element the
+ * iterator has fetched last. Unlike memtx_tree_data_is_equal(), the hint is
+ * compared too: a multikey or functional index has several elements of one
+ * tuple, and after a tree modification the iterator must not take one of
+ * them for another. Regular indexes have one element per tuple, so their
+ * hints are equal whenever the tuples are.
+ *
+ * memtx_tree_data_is_equal() itself must not compare hints: it is the
+ * identity check of the tree deletion by value, and a functional index
+ * deletes the entries of a tuple by freshly built keys, whose hints (pointers)
+ * differ from the ones in the tree.
+ */
+template<bool USE_HINT>
+static bool
+tree_iterator_at_last(const struct memtx_tree_data<USE_HINT> *check,
+		      const struct memtx_tree_data<USE_HINT> *last)
+{
+	return check->tuple == last->tuple && check->hint == last->hint;
+}
+
+#define BPS_INNER_CARD
 #define BPS_TREE_NAME memtx_tree
 #define BPS_TREE_BLOCK_SIZE (512)
-#define BPS_TREE_EXTENT_SIZE MEMTX_EXTENT_SIZE
 #define BPS_TREE_COMPARE(a, b, arg)\
 	tuple_compare((&a)->tuple, (&a)->hint, (&b)->tuple, (&b)->hint, arg)
 #define BPS_TREE_COMPARE_KEY(a, b, arg)\
@@ -141,7 +213,6 @@ memtx_tree_data_is_equal(const struct memtx_tree_data_common *a,
 
 #undef BPS_TREE_NAME
 #undef BPS_TREE_BLOCK_SIZE
-#undef BPS_TREE_EXTENT_SIZE
 #undef BPS_TREE_COMPARE
 #undef BPS_TREE_COMPARE_KEY
 #undef BPS_TREE_IS_IDENTICAL
@@ -162,6 +233,18 @@ struct memtx_tree_selector<true> : NS_USE_HINT::memtx_tree {};
 
 template <bool USE_HINT>
 using memtx_tree_t = struct memtx_tree_selector<USE_HINT>;
+
+template <bool USE_HINT>
+struct memtx_tree_view_selector;
+
+template <>
+struct memtx_tree_view_selector<false> : NS_NO_HINT::memtx_tree_view {};
+
+template <>
+struct memtx_tree_view_selector<true> : NS_USE_HINT::memtx_tree_view {};
+
+template <bool USE_HINT>
+using memtx_tree_view_t = struct memtx_tree_view_selector<USE_HINT>;
 
 template <bool USE_HINT>
 struct memtx_tree_iterator_selector;
@@ -199,15 +282,74 @@ struct memtx_tree_index {
 	size_t build_array_size, build_array_alloc_size;
 	struct memtx_gc_task gc_task;
 	memtx_tree_iterator_t<USE_HINT> gc_iterator;
+	/** Whether index is functional. */
+	bool is_func;
 };
 
 /* {{{ Utilities. *************************************************/
+
+/**
+ * Canonicalizes the iterator type and key.
+ */
+static void
+canonicalize_lookup(enum iterator_type *type,
+		    const char **key, uint32_t part_count)
+{
+	assert(part_count == 0 || *key != NULL);
+	assert(*type >= 0 && *type < iterator_type_MAX);
+
+	if (part_count == 0) {
+		/*
+		 * If no key is specified, downgrade equality
+		 * iterators to a full range.
+		 */
+		*type = iterator_type_is_reverse(*type) ? ITER_LE : ITER_GE;
+		*key = NULL;
+	}
+
+	if (*type == ITER_ALL)
+		*type = ITER_GE;
+}
 
 template <class TREE>
 static inline struct key_def *
 memtx_tree_cmp_def(TREE *tree)
 {
-	return tree->arg;
+	return tree->common.arg;
+}
+
+/**
+ * Return the hint to store in a tree element for an index entry.
+ *
+ * Multikey and functional indexes store the entry key data, which is part of
+ * the logical entry identity. Regular tree indexes ignore it: when this
+ * template is instantiated with USE_HINT, they compute their comparison hint
+ * locally from the tree comparison definition.
+ */
+template<bool USE_HINT>
+static hint_t
+memtx_tree_entry_hint(struct memtx_tree_index<USE_HINT> *index,
+		      struct memtx_index_entry entry)
+{
+	assert(USE_HINT);
+	if (index->base.def->key_def->is_multikey ||
+	    index->base.def->key_def->for_func_index)
+		return entry.key_data;
+	assert(entry.tuple != NULL);
+	return tuple_hint(entry.tuple, memtx_tree_cmp_def(&index->tree));
+}
+
+/** Construct tree data from an index entry. */
+template<bool USE_HINT>
+static struct memtx_tree_data<USE_HINT>
+memtx_tree_data_from_entry(struct memtx_tree_index<USE_HINT> *index,
+			   struct memtx_index_entry entry)
+{
+	struct memtx_tree_data<USE_HINT> data;
+	data.tuple = entry.tuple;
+	if (USE_HINT)
+		data.set_hint(memtx_tree_entry_hint(index, entry));
+	return data;
 }
 
 template <bool USE_HINT>
@@ -229,8 +371,26 @@ struct tree_iterator {
 	struct iterator base;
 	memtx_tree_iterator_t<USE_HINT> tree_iterator;
 	enum iterator_type type;
+	struct memtx_tree_key_data<USE_HINT> after_data;
 	struct memtx_tree_key_data<USE_HINT> key_data;
-	struct memtx_tree_data<USE_HINT> current;
+	/** The amount of tuples to skip after the iterator start. */
+	uint32_t offset;
+	/**
+	 * Data that was fetched last, needed to make iterators stable.
+	 * Contains NULL as pointer to tuple only if there was no data fetched.
+	 * Otherwise, tuple pointer is not NULL, even if iterator is
+	 * exhausted - pagination relies on it.
+	 */
+	struct memtx_tree_data<USE_HINT> last;
+	/**
+	 * For functional indexes only: reference to the functional index key
+	 * at the last iterator position.
+	 *
+	 * Since pinning a tuple doesn't prevent its functional keys from being
+	 * deleted, we need to reference the key so that we can use it to
+	 * restore the iterator position.
+	 */
+	struct tuple *last_func_key;
 	/** Memory pool the iterator was allocated from. */
 	struct mempool *pool;
 };
@@ -241,6 +401,54 @@ static_assert(sizeof(struct tree_iterator<false>) <= MEMTX_ITERATOR_SIZE,
 static_assert(sizeof(struct tree_iterator<true>) <= MEMTX_ITERATOR_SIZE,
 	      "sizeof(struct tree_iterator<true>) must be less than or equal "
 	      "to MEMTX_ITERATOR_SIZE");
+
+/** Set last fetched tuple. */
+template <bool USE_HINT>
+static inline void
+tree_iterator_set_last_tuple(struct tree_iterator<USE_HINT> *it,
+			     struct tuple *tuple)
+{
+	assert(tuple != NULL);
+	if (it->last.tuple != NULL)
+		tuple_unref(it->last.tuple);
+	it->last.tuple = tuple;
+	tuple_ref(tuple);
+}
+
+/** Set hint of last fetched tuple. */
+template <bool USE_HINT>
+static inline void
+tree_iterator_set_last_hint(struct tree_iterator<USE_HINT> *it, hint_t hint)
+{
+	if (!USE_HINT)
+		return;
+	struct index *index = index_weak_ref_get_index_checked(
+		&it->base.index_ref);
+	if (it->last_func_key != NULL)
+		tuple_unref(it->last_func_key);
+	it->last_func_key = NULL;
+	if (hint != HINT_NONE && index->def->key_def->for_func_index) {
+		it->last_func_key = (struct tuple *)hint;
+		tuple_ref(it->last_func_key);
+	}
+	it->last.set_hint(hint);
+}
+
+/**
+ * Set last fetched data to iterator to keep it stable. Do not set NULL
+ * data or tuple to keep last actually fetched tuple for pagination.
+ * Prerequisites: last is not NULL and last->tuple is not NULL.
+ * Use set_last_tuple and set_last_hint manually to free occupied resources.
+ */
+template <bool USE_HINT>
+static inline void
+tree_iterator_set_last(struct tree_iterator<USE_HINT> *it,
+		       struct memtx_tree_data<USE_HINT> *last)
+{
+	assert(last != NULL && last->tuple != NULL);
+	tree_iterator_set_last_tuple(it, last->tuple);
+	tree_iterator_set_last_hint(it, last->hint);
+}
 
 template <bool USE_HINT>
 static void
@@ -259,55 +467,78 @@ static void
 tree_iterator_free(struct iterator *iterator)
 {
 	struct tree_iterator<USE_HINT> *it = get_tree_iterator<USE_HINT>(iterator);
-	struct tuple *tuple = it->current.tuple;
-	if (tuple != NULL)
-		tuple_unref(tuple);
+	if (it->last.tuple != NULL)
+		tuple_unref(it->last.tuple);
+	if (it->last_func_key != NULL)
+		tuple_unref(it->last_func_key);
 	mempool_free(it->pool, it);
 }
 
-static int
-tree_iterator_dummie(struct iterator *iterator, struct tuple **ret)
+/*
+ * If the iterator's underlying tuple does not match its last tuple, it needs
+ * to be repositioned.
+ *
+ * Returns the element the iterator is positioned at: the last element, if it
+ * is still in the index, or the next one, which is NULL at the end of the
+ * index. The last element may be gone, e.g. if the transaction of the
+ * iterator was aborted, or the iterator was created out of a transaction.
+ */
+template <bool USE_HINT>
+static struct memtx_tree_data<USE_HINT> *
+tree_iterator_prev_reposition(struct tree_iterator<USE_HINT> *iterator,
+			      struct memtx_tree_index<USE_HINT> *index)
 {
-	(void)iterator;
-	*ret = NULL;
-	return 0;
+	bool exact = false;
+	iterator->tree_iterator =
+		memtx_tree_lower_bound_elem(&index->tree, iterator->last,
+					    &exact);
+	struct memtx_tree_data<USE_HINT> *successor =
+		memtx_tree_iterator_get_elem(&index->tree,
+					     &iterator->tree_iterator);
+	if (exact)
+		tree_iterator_set_last(iterator, successor);
+	return successor;
 }
 
 template <bool USE_HINT>
 static int
 tree_iterator_next_base(struct iterator *iterator, struct tuple **ret)
 {
+	struct space *space;
+	struct index *index_base;
+	index_weak_ref_get_checked(&iterator->index_ref, &space, &index_base);
 	struct memtx_tree_index<USE_HINT> *index =
-		(struct memtx_tree_index<USE_HINT> *)iterator->index;
+		(struct memtx_tree_index<USE_HINT> *)index_base;
 	struct tree_iterator<USE_HINT> *it = get_tree_iterator<USE_HINT>(iterator);
-	assert(it->current.tuple != NULL);
+	assert(it->last.tuple != NULL);
 	struct memtx_tree_data<USE_HINT> *check =
 		memtx_tree_iterator_get_elem(&index->tree, &it->tree_iterator);
-	if (check == NULL || !memtx_tree_data_is_equal(check, &it->current)) {
+	if (check == NULL || !tree_iterator_at_last(check, &it->last)) {
 		it->tree_iterator = memtx_tree_upper_bound_elem(&index->tree,
-								it->current, NULL);
+								it->last, NULL);
 	} else {
 		memtx_tree_iterator_next(&index->tree, &it->tree_iterator);
 	}
-	tuple_unref(it->current.tuple);
 	struct memtx_tree_data<USE_HINT> *res =
 		memtx_tree_iterator_get_elem(&index->tree, &it->tree_iterator);
-	if (res == NULL) {
-		iterator->next = tree_iterator_dummie;
-		it->current.tuple = NULL;
-		*ret = NULL;
+	*ret = res != NULL ? res->tuple : NULL;
+	struct memtx_index_entry entry =
+		memtx_tree_index_entry(index_base, res);
+	if (*ret == NULL) {
+		iterator->next_internal = exhausted_iterator_next;
 	} else {
-		*ret = res->tuple;
-		tuple_ref(*ret);
-		it->current = *res;
+		tree_iterator_set_last<USE_HINT>(it, res);
+		struct txn *txn = in_txn();
+		*ret = memtx_tx_index_entry_clarify(txn, space, index_base,
+						    entry);
 	}
-	struct index *idx = iterator->index;
-	struct space *space = space_by_id(iterator->space_id);
 	/*
 	 * Pass no key because any write to the gap between that
 	 * two tuples must lead to conflict.
 	 */
-	memtx_tx_track_gap(in_txn(), space, idx, *ret, ITER_GE, NULL, 0);
+	memtx_tx_track_gap(in_txn(), space, index_base, entry, ITER_GE,
+			   NULL, 0);
+
 	return 0;
 }
 
@@ -315,37 +546,45 @@ template <bool USE_HINT>
 static int
 tree_iterator_prev_base(struct iterator *iterator, struct tuple **ret)
 {
+	struct space *space;
+	struct index *index_base;
+	index_weak_ref_get_checked(&iterator->index_ref, &space, &index_base);
 	struct memtx_tree_index<USE_HINT> *index =
-		(struct memtx_tree_index<USE_HINT> *)iterator->index;
+		(struct memtx_tree_index<USE_HINT> *)index_base;
 	struct tree_iterator<USE_HINT> *it = get_tree_iterator<USE_HINT>(iterator);
-	assert(it->current.tuple != NULL);
+	assert(it->last.tuple != NULL);
 	struct memtx_tree_data<USE_HINT> *check =
 		memtx_tree_iterator_get_elem(&index->tree, &it->tree_iterator);
-	if (check == NULL || !memtx_tree_data_is_equal(check, &it->current)) {
-		it->tree_iterator = memtx_tree_lower_bound_elem(&index->tree,
-								it->current, NULL);
-	}
+	if (check == NULL || !tree_iterator_at_last(check, &it->last))
+		check = tree_iterator_prev_reposition(it, index);
 	memtx_tree_iterator_prev(&index->tree, &it->tree_iterator);
-	struct tuple *successor = it->current.tuple;
+	/* The gap is tracked on the element in the index, not the last one. */
+	struct memtx_index_entry successor_entry =
+		memtx_tree_index_entry(index_base, check);
+	if (successor_entry.tuple != NULL)
+		tuple_ref(successor_entry.tuple);
 	struct memtx_tree_data<USE_HINT> *res =
 		memtx_tree_iterator_get_elem(&index->tree, &it->tree_iterator);
-	if (!res) {
-		iterator->next = tree_iterator_dummie;
-		it->current.tuple = NULL;
-		*ret = NULL;
+	*ret = res != NULL ? res->tuple : NULL;
+	struct memtx_index_entry entry =
+		memtx_tree_index_entry(index_base, res);
+	if (*ret == NULL) {
+		iterator->next_internal = exhausted_iterator_next;
 	} else {
-		*ret = res->tuple;
-		tuple_ref(*ret);
-		it->current = *res;
+		tree_iterator_set_last<USE_HINT>(it, res);
+		struct txn *txn = in_txn();
+		*ret = memtx_tx_index_entry_clarify(txn, space, index_base,
+						    entry);
 	}
-	struct index *idx = iterator->index;
-	struct space *space = space_by_id(iterator->space_id);
 	/*
 	 * Pass no key because any write to the gap between that
 	 * two tuples must lead to conflict.
 	 */
-	memtx_tx_track_gap(in_txn(), space, idx, successor, ITER_LE, NULL, 0);
-	tuple_unref(successor);
+	memtx_tx_track_gap(in_txn(), space, index_base, successor_entry,
+			   ITER_LE, NULL, 0);
+
+	if (successor_entry.tuple != NULL)
+		tuple_unref(successor_entry.tuple);
 	return 0;
 }
 
@@ -353,54 +592,54 @@ template <bool USE_HINT>
 static int
 tree_iterator_next_equal_base(struct iterator *iterator, struct tuple **ret)
 {
+	struct space *space;
+	struct index *index_base;
+	index_weak_ref_get_checked(&iterator->index_ref, &space, &index_base);
 	struct memtx_tree_index<USE_HINT> *index =
-		(struct memtx_tree_index<USE_HINT> *)iterator->index;
+		(struct memtx_tree_index<USE_HINT> *)index_base;
 	struct tree_iterator<USE_HINT> *it = get_tree_iterator<USE_HINT>(iterator);
-	assert(it->current.tuple != NULL);
+	assert(it->last.tuple != NULL);
 	struct memtx_tree_data<USE_HINT> *check =
 		memtx_tree_iterator_get_elem(&index->tree, &it->tree_iterator);
-	if (check == NULL || !memtx_tree_data_is_equal(check, &it->current)) {
+	if (check == NULL || !tree_iterator_at_last(check, &it->last)) {
 		it->tree_iterator = memtx_tree_upper_bound_elem(&index->tree,
-								it->current, NULL);
+								it->last, NULL);
 	} else {
 		memtx_tree_iterator_next(&index->tree, &it->tree_iterator);
 	}
-	tuple_unref(it->current.tuple);
 	struct memtx_tree_data<USE_HINT> *res =
 		memtx_tree_iterator_get_elem(&index->tree, &it->tree_iterator);
 	/* Use user key def to save a few loops. */
+	struct memtx_index_entry entry =
+		memtx_tree_index_entry(index_base, res);
 	if (res == NULL ||
 	    tuple_compare_with_key(res->tuple, res->hint,
 				   it->key_data.key,
 				   it->key_data.part_count,
 				   it->key_data.hint,
 				   index->base.def->key_def) != 0) {
-		iterator->next = tree_iterator_dummie;
-		it->current.tuple = NULL;
+		iterator->next_internal = exhausted_iterator_next;
 		*ret = NULL;
-	} else {
-		*ret = res->tuple;
-		tuple_ref(*ret);
-		it->current = *res;
-	}
-	struct index *idx = iterator->index;
-	struct space *space = space_by_id(iterator->space_id);
-	if (*ret == NULL) {
 		/*
 		 * Got end of key. Store gap from the previous tuple to the
 		 * key boundary in nearby tuple.
 		 */
-		struct tuple *nearby_tuple = res == NULL ? NULL : res->tuple;
-		memtx_tx_track_gap(in_txn(), space, idx, nearby_tuple, ITER_EQ,
-				   it->key_data.key, it->key_data.part_count);
+		memtx_tx_track_gap(in_txn(), space, index_base, entry,
+				   ITER_EQ, it->key_data.key,
+				   it->key_data.part_count);
 	} else {
+		tree_iterator_set_last<USE_HINT>(it, res);
+		struct txn *txn = in_txn();
+		*ret = memtx_tx_index_entry_clarify(txn, space, index_base,
+						    entry);
 		/*
 		 * Pass no key because any write to the gap between that
 		 * two tuples must lead to conflict.
 		 */
-		memtx_tx_track_gap(in_txn(), space, idx, *ret, ITER_GE,
-				   NULL, 0);
+		memtx_tx_track_gap(in_txn(), space, index_base, entry,
+				   ITER_GE, NULL, 0);
 	}
+
 	return 0;
 }
 
@@ -408,18 +647,23 @@ template <bool USE_HINT>
 static int
 tree_iterator_prev_equal_base(struct iterator *iterator, struct tuple **ret)
 {
+	struct space *space;
+	struct index *index_base;
+	index_weak_ref_get_checked(&iterator->index_ref, &space, &index_base);
 	struct memtx_tree_index<USE_HINT> *index =
-		(struct memtx_tree_index<USE_HINT> *)iterator->index;
+		(struct memtx_tree_index<USE_HINT> *)index_base;
 	struct tree_iterator<USE_HINT> *it = get_tree_iterator<USE_HINT>(iterator);
-	assert(it->current.tuple != NULL);
+	assert(it->last.tuple != NULL);
 	struct memtx_tree_data<USE_HINT> *check =
 		memtx_tree_iterator_get_elem(&index->tree, &it->tree_iterator);
-	if (check == NULL || !memtx_tree_data_is_equal(check, &it->current)) {
-		it->tree_iterator = memtx_tree_lower_bound_elem(&index->tree,
-								it->current, NULL);
-	}
+	if (check == NULL || !tree_iterator_at_last(check, &it->last))
+		check = tree_iterator_prev_reposition(it, index);
 	memtx_tree_iterator_prev(&index->tree, &it->tree_iterator);
-	struct tuple *successor = it->current.tuple;
+	/* The gap is tracked on the element in the index, not the last one. */
+	struct memtx_index_entry successor_entry =
+		memtx_tree_index_entry(index_base, check);
+	if (successor_entry.tuple != NULL)
+		tuple_ref(successor_entry.tuple);
 	struct memtx_tree_data<USE_HINT> *res =
 		memtx_tree_iterator_get_elem(&index->tree, &it->tree_iterator);
 	/* Use user key def to save a few loops. */
@@ -429,32 +673,32 @@ tree_iterator_prev_equal_base(struct iterator *iterator, struct tuple **ret)
 				   it->key_data.part_count,
 				   it->key_data.hint,
 				   index->base.def->key_def) != 0) {
-		iterator->next = tree_iterator_dummie;
-		it->current.tuple = NULL;
+		iterator->next_internal = exhausted_iterator_next;
 		*ret = NULL;
-	} else {
-		*ret = res->tuple;
-		tuple_ref(*ret);
-		it->current = *res;
-	}
-	struct index *idx = iterator->index;
-	struct space *space = space_by_id(iterator->space_id);
-	if (*ret == NULL) {
+
 		/*
 		 * Got end of key. Store gap from the key boundary to the
 		 * previous tuple in nearby tuple.
 		 */
-		memtx_tx_track_gap(in_txn(), space, idx, successor, ITER_REQ,
-				   it->key_data.key, it->key_data.part_count);
+		memtx_tx_track_gap(in_txn(), space, index_base, successor_entry,
+				   ITER_REQ, it->key_data.key,
+				   it->key_data.part_count);
 	} else {
+		tree_iterator_set_last<USE_HINT>(it, res);
+		struct txn *txn = in_txn();
+		struct memtx_index_entry entry =
+			memtx_tree_index_entry(index_base, res);
+		*ret = memtx_tx_index_entry_clarify(txn, space, index_base,
+						    entry);
 		/*
 		 * Pass no key because any write to the gap between that
 		 * two tuples must lead to conflict.
 		 */
-		memtx_tx_track_gap(in_txn(), space, idx, successor, ITER_LE,
-				   NULL, 0);
+		memtx_tx_track_gap(in_txn(), space, index_base, successor_entry,
+				   ITER_LE, NULL, 0);
 	}
-	tuple_unref(successor);
+	if (successor_entry.tuple != NULL)
+		tuple_unref(successor_entry.tuple);
 	return 0;
 }
 
@@ -463,33 +707,12 @@ template <bool USE_HINT>							\
 static int									\
 name(struct iterator *iterator, struct tuple **ret)				\
 {										\
-	memtx_tree_t<USE_HINT> *tree =						\
-		&((struct memtx_tree_index<USE_HINT> *)iterator->index)->tree;	\
-	struct tree_iterator<USE_HINT> *it =   					\
-		get_tree_iterator<USE_HINT>(iterator);				\
-	memtx_tree_iterator_t<USE_HINT> *ti = &it->tree_iterator;		\
-	struct index *idx = iterator->index;					\
-	bool is_multikey = iterator->index->def->key_def->is_multikey;		\
-	struct txn *txn = in_txn();						\
-	struct space *space = space_by_id(iterator->space_id);			\
-	bool is_rw = txn != NULL;						\
 	do {									\
 		int rc = name##_base<USE_HINT>(iterator, ret);			\
-		if (rc != 0 || *ret == NULL)					\
+		if (rc != 0 ||							\
+		    iterator->next_internal == exhausted_iterator_next)		\
 			return rc;						\
-		uint32_t mk_index = 0;						\
-		if (is_multikey) {						\
-			struct memtx_tree_data<USE_HINT> *check =		\
-				memtx_tree_iterator_get_elem(tree, ti);		\
-			assert(check != NULL);					\
-			mk_index = (uint32_t)check->hint;			\
-		}								\
-		*ret = memtx_tx_tuple_clarify(txn, space, *ret,			\
-					      idx, mk_index, is_rw);		\
 	} while (*ret == NULL);							\
-	tuple_unref(it->current.tuple);						\
-	it->current.tuple = *ret;						\
-	tuple_ref(it->current.tuple);						\
 	return 0;								\
 }										\
 struct forgot_to_add_semicolon
@@ -505,58 +728,91 @@ template <bool USE_HINT>
 static void
 tree_iterator_set_next_method(struct tree_iterator<USE_HINT> *it)
 {
-	assert(it->current.tuple != NULL);
+	assert(it->last.tuple != NULL);
 	switch (it->type) {
 	case ITER_EQ:
-		it->base.next = tree_iterator_next_equal<USE_HINT>;
+		it->base.next_internal = tree_iterator_next_equal<USE_HINT>;
 		break;
 	case ITER_REQ:
-		it->base.next = tree_iterator_prev_equal<USE_HINT>;
-		break;
-	case ITER_ALL:
-		it->base.next = tree_iterator_next<USE_HINT>;
+		it->base.next_internal = tree_iterator_prev_equal<USE_HINT>;
 		break;
 	case ITER_LT:
 	case ITER_LE:
-		it->base.next = tree_iterator_prev<USE_HINT>;
+	case ITER_PP:
+		it->base.next_internal = tree_iterator_prev<USE_HINT>;
 		break;
 	case ITER_GE:
 	case ITER_GT:
-		it->base.next = tree_iterator_next<USE_HINT>;
+	case ITER_NP:
+		it->base.next_internal = tree_iterator_next<USE_HINT>;
 		break;
 	default:
 		/* The type was checked in initIterator */
 		assert(false);
 	}
+	it->base.next = memtx_iterator_next;
 }
 
-template <bool USE_HINT>
-static int
-tree_iterator_start(struct iterator *iterator, struct tuple **ret)
+/**
+ * Creates an iterator based on the given key, after data and iterator type.
+ * Also updates @a start_data and iterator @a type as required.
+ *
+ * @param tree - the tree to lookup in;
+ * @param start_data - the key to lookup with, may be updated;
+ * @param after_data - the after key, can be empty if not required;
+ * @param type - the lookup iterator type, may be updated;
+ * @param region - the region to allocate a new @a start_data on if required.
+ * @param[out] iterator - the result of the lookup;
+ * @param[out] offset - the offset @a iterator points to;
+ * @param[out] equals - true if the lookup gave the exact key match;
+ * @param[out] initial_elem - the optional pointer to the element approached on
+ *  the initial lookup, stepped over if the iterator is reverse, see the end of
+ *  this function for more information.
+ *
+ * @retval true on success;
+ * @retval false if the iteration must be stopped without an error.
+ */
+template<bool USE_HINT>
+static bool
+memtx_tree_lookup(memtx_tree_t<USE_HINT> *tree,
+		  struct memtx_tree_key_data<USE_HINT> *start_data,
+		  struct memtx_tree_key_data<USE_HINT> after_data,
+		  enum iterator_type *type, struct region *region,
+		  memtx_tree_iterator_t<USE_HINT> *iterator,
+		  size_t *offset, bool *equals,
+		  struct memtx_tree_data<USE_HINT> **initial_elem)
 {
-	*ret = NULL;
-	struct memtx_tree_index<USE_HINT> *index =
-		(struct memtx_tree_index<USE_HINT> *)iterator->index;
-	struct tree_iterator<USE_HINT> *it = get_tree_iterator<USE_HINT>(iterator);
-	it->base.next = tree_iterator_dummie;
-	memtx_tree_t<USE_HINT> *tree = &index->tree;
-	enum iterator_type type = it->type;
-	struct txn *txn = in_txn();
-	struct space *space = space_by_id(iterator->space_id);
-	assert(space != NULL || iterator->space_id == 0);
-	struct index *idx = iterator->index;
-	struct key_def *cmp_def = index->base.def->cmp_def;
+	struct key_def *cmp_def = memtx_tree_cmp_def(tree);
+
+	if ((*type == ITER_NP || *type == ITER_PP) &&
+	    after_data.key == NULL) {
+		if (!prepare_start_prefix_iterator(type, &start_data->key,
+						   start_data->part_count,
+						   cmp_def, region))
+			return false;
+		if (USE_HINT) {
+			hint_t hint = key_hint(start_data->key,
+					       start_data->part_count, cmp_def);
+			start_data->set_hint(hint);
+		}
+	}
+
 	/*
-	 * The key is full - all parts a present. If key if full, EQ and REQ
-	 * queries can return no more than one tuple.
+	 * Since iteration with equality iterators returns first found tuple,
+	 * we need a special flag for EQ and REQ if we want to start iteration
+	 * after specified key (this flag will affect the choice between
+	 * lower bound and upper bound for the above iterators).
+	 * As for range iterators with equality, we can simply change them
+	 * to their equivalents with inequality.
 	 */
-	bool key_is_full = it->key_data.part_count == cmp_def->part_count;
-	/* The flag will be change to true if found tuple equals to the key. */
-	bool equals = false;
-	assert(it->current.tuple == NULL);
-	if (it->key_data.key == NULL) {
-		assert(type == ITER_GE || type == ITER_LE);
-		if (iterator_type_is_reverse(it->type))
+	bool skip_equal_tuple = after_data.key != NULL;
+	if (skip_equal_tuple && *type != ITER_EQ && *type != ITER_REQ)
+		*type = iterator_type_is_reverse(*type) ? ITER_LT : ITER_GT;
+
+	/* Perform the initial lookup. */
+	if (start_data->key == NULL) {
+		assert(*type == ITER_GE || *type == ITER_LE);
+		if (iterator_type_is_reverse(*type)) {
 			/*
 			 * For all reverse iterators we will step back,
 			 * see the and explanation code below.
@@ -564,77 +820,240 @@ tree_iterator_start(struct iterator *iterator, struct tuple **ret)
 			 * a back step from invalid iterator set its
 			 * position to the last element. Let's use that.
 			 */
-			invalidate_tree_iterator(&it->tree_iterator);
-		else
-			it->tree_iterator = memtx_tree_iterator_first(tree);
+			invalidate_tree_iterator(iterator);
+			*offset = memtx_tree_size(tree);
+		} else {
+			*iterator = memtx_tree_first(tree);
+			*offset = 0;
+		}
+
 		/* If there is at least one tuple in the tree, it is
 		 * efficiently equals to the empty key. */
-		equals = memtx_tree_size(tree) != 0;
+		*equals = memtx_tree_size(tree) != 0;
 	} else {
-		if (type == ITER_ALL || type == ITER_EQ ||
-		    type == ITER_GE || type == ITER_LT) {
-			it->tree_iterator =
-				memtx_tree_lower_bound(tree, &it->key_data,
-						       &equals);
-		} else { // ITER_GT, ITER_REQ, ITER_LE
-			it->tree_iterator =
-				memtx_tree_upper_bound(tree, &it->key_data,
-						       &equals);
+		/*
+		 * We use lower_bound on equality iterators instead of LE
+		 * because if iterator is reversed, we will take a step back.
+		 * Also it is used for LT iterator, and after a step back
+		 * iterator will point to a tuple lower than key.
+		 * So, lower_bound is used for EQ, GE and LT iterators,
+		 * upper_bound is used for REQ, GT, LE iterators.
+		 */
+		bool need_lower_bound = *type == ITER_EQ || *type == ITER_GE ||
+					*type == ITER_LT;
+
+		/*
+		 * If we need to skip first tuple in EQ and REQ iterators,
+		 * let's just change lower_bound to upper_bound or vice-versa.
+		 */
+		if (skip_equal_tuple && (*type == ITER_EQ || *type == ITER_REQ))
+			need_lower_bound = !need_lower_bound;
+
+		if (need_lower_bound) {
+			*iterator = memtx_tree_lower_bound_get_offset(
+				tree, start_data, equals, offset);
+		} else {
+			*iterator = memtx_tree_upper_bound_get_offset(
+				tree, start_data, equals, offset);
 		}
 	}
-	if (!equals && (type == ITER_EQ || type == ITER_REQ)) {
-		/* Found nothing */
-		if (key_is_full)
-			memtx_tx_track_point(txn, space, idx, it->key_data.key);
-		return 0;
-	}
-	if ((!key_is_full || (type != ITER_EQ && type != ITER_REQ)) &&
-	    memtx_tx_manager_use_mvcc_engine) {
-		/* it->tree_iterator is positioned on successor of a key! */
-		struct memtx_tree_data<USE_HINT> *succ_data =
-			memtx_tree_iterator_get_elem(tree, &it->tree_iterator);
-		struct tuple *successor =
-			succ_data == NULL ? NULL : succ_data->tuple;
-		memtx_tx_track_gap(in_txn(), space, idx, successor, type,
-				   it->key_data.key, it->key_data.part_count);
-	}
-	if (iterator_type_is_reverse(type)) {
+
+	/* Save the element we approached on the initial lookup. */
+	*initial_elem = memtx_tree_iterator_get_elem(tree, iterator);
+
+	if (iterator_type_is_reverse(*type)) {
 		/*
-		 * Because of limitations of tree search API we use use
-		 * lower_bound for LT search and upper_bound for LE
-		 * and REQ searches. Thus we found position to the
+		 * Because of limitations of tree search API we use
+		 * lower_bound for LT search and upper_bound for LE and
+		 * REQ searches. In both cases we find a position to the
 		 * right of the target one. Let's make a step to the
 		 * left to reach target position.
 		 * If we found an invalid iterator all the elements in
 		 * the tree are less (less or equal) to the key, and
-		 * iterator_next call will convert the iterator to the
+		 * iterator_prev call will convert the iterator to the
 		 * last position in the tree, that's what we need.
 		 */
-		memtx_tree_iterator_prev(tree, &it->tree_iterator);
+		memtx_tree_iterator_prev(tree, iterator);
+		--*offset; /* Unsigned underflow possible. */
 	}
+	return true;
+}
 
-	struct memtx_tree_data<USE_HINT> *res =
-		memtx_tree_iterator_get_elem(tree, &it->tree_iterator);
-	if (!res)
+template<bool USE_HINT>
+static int
+tree_iterator_start(struct iterator *iterator, struct tuple **ret)
+{
+	struct region *region = &fiber()->gc;
+	RegionGuard region_guard(region);
+
+	*ret = NULL;
+	iterator->next_internal = exhausted_iterator_next;
+
+	struct tree_iterator<USE_HINT> *it =
+		get_tree_iterator<USE_HINT>(iterator);
+	assert(it->last.tuple == NULL);
+
+	struct space *space;
+	struct index *index_base;
+	index_weak_ref_get_checked(&iterator->index_ref, &space, &index_base);
+	struct memtx_tree_index<USE_HINT> *index =
+		(struct memtx_tree_index<USE_HINT> *)index_base;
+	memtx_tree_t<USE_HINT> *tree = &index->tree;
+	struct memtx_tree_key_data<USE_HINT> start_data =
+		it->after_data.key != NULL ? it->after_data : it->key_data;
+	enum iterator_type type = it->type;
+	size_t curr_offset;
+	/* The flag is true if the found tuple equals to the key. */
+	bool equals;
+	struct memtx_tree_data<USE_HINT> *initial_elem;
+	if (!memtx_tree_lookup(tree, &start_data, it->after_data,
+			       &type, region, &it->tree_iterator,
+			       &curr_offset, &equals, &initial_elem))
 		return 0;
-	*ret = res->tuple;
-	tuple_ref(*ret);
-	it->current = *res;
-	tree_iterator_set_next_method(it);
 
-	bool is_multikey = iterator->index->def->key_def->is_multikey;
-	bool is_rw = txn != NULL;
-	uint32_t mk_index = is_multikey ? (uint32_t)res->hint : 0;
-	*ret = memtx_tx_tuple_clarify(txn, space, *ret, idx, mk_index, is_rw);
-	if (*ret == NULL) {
-		return iterator->next(iterator, ret);
-	} else {
-		tuple_unref(it->current.tuple);
-		it->current.tuple = *ret;
-		tuple_ref(it->current.tuple);
+	/*
+	 * The initial element could potentially be a successor of the key: we
+	 * need to track gap based on it.
+	 */
+	struct memtx_index_entry successor_entry =
+		memtx_tree_index_entry(index_base, initial_elem);
+
+	struct memtx_tree_data<USE_HINT> *res = initial_elem;
+
+	/*
+	 * If the iterator type is not reverse, the initial_elem is the result
+	 * of the first iteration step. Otherwise the lookup function performs
+	 * an extra step back, so we need to actualize the current element now.
+	 */
+	if (iterator_type_is_reverse(type))
+		res = memtx_tree_iterator_get_elem(tree, &it->tree_iterator);
+
+	/* Skip the amount of tuples required. */
+	struct txn *txn = in_txn();
+	if (it->offset != 0 && res != NULL) {
+		/* Normalize the unsigned underflow to SIZE_MAX if expected. */
+		size_t skip = it->offset;
+		bool reverse = iterator_type_is_reverse(type);
+		if (reverse && skip > curr_offset + 1)
+			skip = curr_offset + 1;
+
+		/* Skip raw tuples and actualize the current element. */
+		curr_offset = reverse ? curr_offset - skip : curr_offset + skip;
+		it->tree_iterator = memtx_tree_iterator_at(tree, curr_offset);
+		res = memtx_tree_iterator_get_elem(tree, &it->tree_iterator);
+
+		/*
+		 * We have logarithmically skipped tuples, but some of them may
+		 * be invisible to the current transaction. Let's skip further
+		 * if required AND if we haven't reached the end of the index.
+		 */
+		size_t skip_more_visible = res == NULL ? 0 :
+			memtx_tx_index_invisible_count_matching_until(
+				txn, space, index_base, type, start_data.key,
+				start_data.part_count, res->tuple, res->hint);
+		memtx_tree_iterator_t<USE_HINT> *iterator = &it->tree_iterator;
+		while (skip_more_visible != 0 && res != NULL) {
+			struct memtx_index_entry entry =
+				memtx_tree_index_entry(index_base, res);
+			if (memtx_tx_index_entry_is_visible(txn, space,
+							    index_base, entry))
+				skip_more_visible--;
+			if (reverse)
+				memtx_tree_iterator_prev(tree, iterator);
+			else
+				memtx_tree_iterator_next(tree, iterator);
+			res = memtx_tree_iterator_get_elem(tree, iterator);
+		}
 	}
 
-	return 0;
+	bool is_eq = type == ITER_EQ || type == ITER_REQ;
+
+	/* If we skip tuple, flag equals is not actual - need to refresh it. */
+	if (((it->after_data.key != NULL && is_eq) || it->offset != 0) &&
+	    res != NULL) {
+		equals = tuple_compare_with_key(res->tuple, res->hint,
+						it->key_data.key,
+						it->key_data.part_count,
+						it->key_data.hint,
+						index->base.def->key_def) == 0;
+	}
+
+	/*
+	 * Equality iterators requires exact key match: if the result does not
+	 * equal to the key, iteration ends.
+	 */
+	bool eq_match = equals || !is_eq;
+	if (res != NULL && eq_match) {
+		tree_iterator_set_last(it, res);
+		tree_iterator_set_next_method(it);
+		struct memtx_index_entry entry =
+			memtx_tree_index_entry(index_base, res);
+		*ret = memtx_tx_index_entry_clarify(txn, space, index_base,
+						    entry);
+	}
+
+	/*
+	 * If the key is full then all parts present, so EQ and REQ iterators
+	 * can return no more than one tuple.
+	 */
+	struct key_def *cmp_def = index->base.def->cmp_def;
+	bool key_is_full = start_data.part_count == cmp_def->part_count;
+	if (it->offset != 0) {
+		if (res == NULL || !eq_match) {
+			/*
+			 * We have stepped over some amount of tuples and got to
+			 * the end of the index or stepped over the matching set
+			 * (if iterator is EQ or REQ). Lets inform MVCC like we
+			 * have counted tuples in the index by our iterator and
+			 * key. Insertion or deletion of any matching tuple into
+			 * the index will conflict with us.
+			 */
+			memtx_tx_track_count(txn, space, index_base,
+					     type, start_data.key,
+					     start_data.part_count);
+
+		} else {
+			/*
+			 * We have stepped over some amount of tuples and got to
+			 * a tuple. Changing the amount of matching tuples prior
+			 * to the approached one must conflict with us, so lets
+			 * inform MVCC like we have counted tuples in the index
+			 * by our key and iterator until the approached tuple.
+			 *
+			 * The approached tuple itself is read above, so its
+			 * replacement or deletion is tracked already.
+			 */
+			memtx_tx_track_count_until(txn, space, index_base,
+						   type, start_data.key,
+						   start_data.part_count,
+						   res->tuple, res->hint);
+		}
+		/*
+		 * We track all the skipped tuples using one of count trackers,
+		 * so no extra tracking is required in this case, insertion or
+		 * deletion of a matching tuple will be caught.
+		 */
+		goto end;
+	}
+	if (key_is_full && !eq_match)
+		memtx_tx_track_point(txn, space, index_base, it->key_data.key);
+	/*
+	 * Since MVCC operates with `key_def` of index but `start_data` can
+	 * contain key extracted with `cmp_def`, we should crop it by passing
+	 * `part_count` not greater than `key_def->part_count`.
+	 */
+	if (!key_is_full ||
+	    ((type == ITER_GE || type == ITER_LE) && !equals) ||
+	    (type == ITER_GT || type == ITER_LT))
+		memtx_tx_track_gap(txn, space, index_base, successor_entry,
+				   type, start_data.key,
+				   MIN(start_data.part_count,
+				       index_base->def->key_def->part_count));
+
+end:
+
+	return res == NULL || !eq_match || *ret != NULL ? 0 :
+	       iterator->next_internal(iterator, ret);
 }
 
 /* }}} */
@@ -669,12 +1088,16 @@ memtx_tree_index_gc_run(struct memtx_gc_task *task, bool *done)
 	memtx_tree_t<USE_HINT> *tree = &index->tree;
 	memtx_tree_iterator_t<USE_HINT> *itr = &index->gc_iterator;
 
+	const bool is_func = index->is_func;
 	unsigned int loops = 0;
 	while (!memtx_tree_iterator_is_invalid(itr)) {
 		struct memtx_tree_data<USE_HINT> *res =
 			memtx_tree_iterator_get_elem(tree, itr);
 		memtx_tree_iterator_next(tree, itr);
-		tuple_unref(res->tuple);
+		if (is_func)
+			tuple_unref((struct tuple *)res->hint);
+		else
+			tuple_unref(res->tuple);
 		if (++loops >= YIELD_LOOPS) {
 			*done = false;
 			return;
@@ -710,14 +1133,18 @@ memtx_tree_index_destroy(struct index *base)
 	struct memtx_tree_index<USE_HINT> *index =
 		(struct memtx_tree_index<USE_HINT> *)base;
 	struct memtx_engine *memtx = (struct memtx_engine *)base->engine;
-	if (base->def->iid == 0) {
+	if (base->def->iid == 0 || index->is_func) {
 		/*
 		 * Primary index. We need to free all tuples stored
 		 * in the index, which may take a while. Schedule a
 		 * background task in order not to block tx thread.
+		 *
+		 * Functional index. For every tuple we need to
+		 * free all functional keys associated with this tuple.
+		 * Let's do it in background also.
 		 */
 		index->gc_task.vtab = get_memtx_tree_index_gc_vtab<USE_HINT>();
-		index->gc_iterator = memtx_tree_iterator_first(&index->tree);
+		index->gc_iterator = memtx_tree_first(&index->tree);
 		memtx_engine_schedule_gc(memtx, &index->gc_task);
 	} else {
 		/*
@@ -741,8 +1168,9 @@ memtx_tree_index_update_def(struct index *base)
 	 * NULLs. To correctly compare these NULLs extended key
 	 * def must be used. For details @sa tuple_compare.cc.
 	 */
-	index->tree.arg = def->opts.is_unique && !def->key_def->is_nullable ?
-						def->key_def : def->cmp_def;
+	index->tree.common.arg = def->opts.is_unique &&
+				 !def->key_def->is_nullable ?
+				 def->key_def : def->cmp_def;
 }
 
 static bool
@@ -762,7 +1190,7 @@ memtx_tree_index_size(struct index *base)
 	struct space *space = space_by_id(base->def->space_id);
 	/* Substract invisible count. */
 	return memtx_tree_size(&index->tree) -
-	       memtx_tx_index_invisible_count(in_txn(), space, base);
+	       memtx_tx_track_count(in_txn(), space, base, ITER_GE, NULL, 0);
 }
 
 template <bool USE_HINT>
@@ -774,15 +1202,96 @@ memtx_tree_index_bsize(struct index *base)
 	return memtx_tree_mem_used(&index->tree);
 }
 
+template<bool USE_HINT>
+static int
+memtx_tree_index_quantile(struct index *base, double level,
+			  const char *begin_key, uint32_t begin_part_count,
+			  const char *end_key, uint32_t end_part_count,
+			  const char **quantile_key,
+			  uint32_t *quantile_key_size)
+{
+	struct memtx_tree_index<USE_HINT> *index =
+		(struct memtx_tree_index<USE_HINT> *)base;
+	memtx_tree_t<USE_HINT> *tree = &index->tree;
+	struct key_def *key_def = base->def->key_def;
+
+	struct memtx_tree_key_data<USE_HINT> begin_data;
+	begin_data.key = begin_key;
+	begin_data.part_count = begin_part_count;
+	if (USE_HINT)
+		begin_data.set_hint(
+			key_hint(begin_key, begin_part_count, key_def));
+
+	struct memtx_tree_key_data<USE_HINT> end_data;
+	end_data.key = end_key;
+	end_data.part_count = end_part_count;
+	if (USE_HINT)
+		end_data.set_hint(
+			key_hint(end_key, end_part_count, key_def));
+
+	size_t begin_offset;
+	memtx_tree_lower_bound_get_offset(tree, &begin_data, NULL,
+					  &begin_offset);
+	size_t end_offset;
+	if (end_data.part_count > 0) {
+		memtx_tree_lower_bound_get_offset(tree, &end_data, NULL,
+						  &end_offset);
+	} else {
+		end_offset = memtx_tree_size(tree);
+	}
+	if (end_offset <= begin_offset) {
+		*quantile_key = NULL;
+		*quantile_key_size = 0;
+		return 0;
+	}
+
+	assert(level > 0 && level < 1);
+	size_t offset = begin_offset + (end_offset - begin_offset) * level;
+	memtx_tree_iterator_t<USE_HINT> itr =
+		memtx_tree_iterator_at(tree, offset);
+	assert(!memtx_tree_iterator_is_invalid(&itr));
+	struct memtx_tree_data<USE_HINT> *data =
+		memtx_tree_iterator_get_elem(tree, &itr);
+	if (key_def->for_func_index) {
+		*quantile_key = tuple_data_range((struct tuple *)data->hint,
+						 quantile_key_size);
+		void *buf = xregion_alloc(&fiber()->gc, *quantile_key_size);
+		memcpy(buf, *quantile_key, *quantile_key_size);
+		*quantile_key = (const char *)buf;
+	} else {
+		int multikey_idx = key_def->is_multikey ?
+				   (int)data->hint : MULTIKEY_NONE;
+		*quantile_key = tuple_extract_key(data->tuple, key_def,
+						  multikey_idx,
+						  quantile_key_size);
+	}
+	return 0;
+}
+
 template <bool USE_HINT>
 static int
 memtx_tree_index_random(struct index *base, uint32_t rnd, struct tuple **result)
 {
 	struct memtx_tree_index<USE_HINT> *index =
 		(struct memtx_tree_index<USE_HINT> *)base;
-	struct memtx_tree_data<USE_HINT> *res = memtx_tree_random(&index->tree, rnd);
-	*result = res != NULL ? res->tuple : NULL;
-	return 0;
+	struct txn *txn = in_txn();
+	struct space *space = space_by_id(base->def->space_id);
+	if (memtx_tree_index_size<USE_HINT>(base) == 0) {
+		*result = NULL;
+		memtx_tx_track_gap(txn, space, base, memtx_index_entry_null,
+				   ITER_GE, NULL, 0);
+		return 0;
+	}
+
+	do {
+		struct memtx_tree_data<USE_HINT> *res =
+			memtx_tree_random(&index->tree, rnd++);
+		assert(res != NULL);
+		struct memtx_index_entry entry =
+			memtx_tree_index_entry(base, res);
+		*result = memtx_tx_index_entry_clarify(txn, space, base, entry);
+	} while (*result == NULL);
+	return memtx_prepare_result_tuple(space, result);
 }
 
 template <bool USE_HINT>
@@ -790,15 +1299,118 @@ static ssize_t
 memtx_tree_index_count(struct index *base, enum iterator_type type,
 		       const char *key, uint32_t part_count)
 {
-	if (type == ITER_ALL)
-		return memtx_tree_index_size<USE_HINT>(base); /* optimization */
-	return generic_index_count(base, type, key, part_count);
+	assert(memtx_tree_index_uses_hint(base->def) == USE_HINT);
+
+	struct region *region = &fiber()->gc;
+	RegionGuard region_guard(region);
+
+	struct memtx_tree_index<USE_HINT> *index =
+		(struct memtx_tree_index<USE_HINT> *)base;
+
+	canonicalize_lookup(&type, &key, part_count);
+
+	memtx_tree_t<USE_HINT> *tree = &index->tree;
+	struct key_def *cmp_def = memtx_tree_cmp_def(&index->tree);
+	struct memtx_tree_key_data<USE_HINT> start_data;
+	start_data.key = key;
+	start_data.part_count = part_count;
+	if (USE_HINT)
+		start_data.set_hint(key_hint(key, part_count, cmp_def));
+	struct memtx_tree_key_data<USE_HINT> null_after_data = {};
+	memtx_tree_iterator_t<USE_HINT> unused;
+	size_t begin_offset;
+	bool equals;
+	struct memtx_tree_data<USE_HINT> *initial_elem;
+	if (!memtx_tree_lookup(tree, &start_data, null_after_data, &type,
+			       region, &unused, &begin_offset, &equals,
+			       &initial_elem))
+		return 0;
+
+	struct txn *txn = in_txn();
+	struct space *space = space_by_id(base->def->space_id);
+	size_t full_size = memtx_tree_size(tree);
+	size_t end_offset;
+
+	/* Fast path: not found equal with full key. */
+	if (start_data.part_count == cmp_def->part_count &&
+	    !equals && (type == ITER_EQ || type == ITER_REQ)) {
+		/*
+		 * Inform MVCC like we have attempted to read a full key and
+		 * found nothing. Insertion of this exact key into the tree
+		 * will conflict with us.
+		 */
+		memtx_tx_track_point(txn, space, base, start_data.key);
+		return 0; /* No tuple matching the full key. */
+	}
+
+	/* Fast path: not found with reverse iterator. */
+	if (begin_offset == (size_t)-1) {
+		assert(iterator_type_is_reverse(type));
+		/*
+		 * Inform MVCC that we have attempted to read a tuple prior
+		 * to the successor (the first tuple in the tree or NULL if
+		 * the tree is empty) and got nothing by our key and iterator.
+		 * If someone writes a matching tuple at the beginning of the
+		 * tree it will conflict with us.
+		 */
+		struct memtx_index_entry entry =
+			memtx_tree_index_entry(base, initial_elem);
+		memtx_tx_track_gap(txn, space, base, entry, type,
+				   start_data.key, start_data.part_count);
+		return 0; /* No tuples prior to the first one. */
+	}
+
+	/* Fast path: not found with forward iterator. */
+	if (begin_offset == full_size) {
+		assert(!iterator_type_is_reverse(type));
+		/*
+		 * Inform MVCC that we have attempted to read a tuple right to
+		 * the rightest one in the tree (NULL successor) and thus, got
+		 * nothing. If someone writes a tuple matching our key+iterator
+		 * pair at the end of the tree it will conflict with us. The
+		 * tree can be empty here.
+		 */
+		memtx_tx_track_gap(txn, space, base, memtx_index_entry_null,
+				   type, start_data.key, start_data.part_count);
+		return 0; /* No tuples beyond the last one. */
+	}
+
+	/*
+	 * Now, when we have the first tuple and its offset, let's find the
+	 * boundary of the iteration.
+	 */
+	if (type == ITER_EQ) {
+		memtx_tree_upper_bound_get_offset(tree, &start_data,
+						  NULL, &end_offset);
+	} else if (type == ITER_REQ) {
+		memtx_tree_lower_bound_get_offset(tree, &start_data,
+						  NULL, &end_offset);
+		end_offset--; /* Unsigned underflow possible. */
+	} else {
+		end_offset = iterator_type_is_reverse(type) ? -1 : full_size;
+	}
+
+	size_t full_count = ((ssize_t)end_offset - begin_offset) *
+			    iterator_direction(type);
+
+	/*
+	 * Inform MVCC that we have counted tuples in the index by our key and
+	 * iterator. Insertion or deletion of any matching tuple anywhere in the
+	 * index will conflict with us.
+	 *
+	 * It returns the amount of invisible counted tuples BTW.
+	 */
+	size_t invisible_count = memtx_tx_track_count(
+		txn, space, base, type, start_data.key, start_data.part_count);
+
+	return full_count - invisible_count;
 }
 
 template <bool USE_HINT>
 static int
-memtx_tree_index_get(struct index *base, const char *key,
-		     uint32_t part_count, struct tuple **result)
+memtx_tree_index_get_internal(struct index *base, const char *key,
+			      uint32_t part_count, struct tuple **result,
+			      bool is_rw)
 {
 	assert(base->def->opts.is_unique &&
 	       part_count == base->def->key_def->part_count);
@@ -816,505 +1428,273 @@ memtx_tree_index_get(struct index *base, const char *key,
 		memtx_tree_find(&index->tree, &key_data);
 	if (res == NULL) {
 		*result = NULL;
-		if (part_count == cmp_def->part_count)
-			memtx_tx_track_point(txn, space, base, key);
+		assert(part_count == cmp_def->unique_part_count);
+		memtx_tx_track_point(txn, space, base, key);
 		return 0;
 	}
-	bool is_rw = txn != NULL;
-	bool is_multikey = base->def->key_def->is_multikey;
-	uint32_t mk_index = is_multikey ? (uint32_t)res->hint : 0;
-	*result = memtx_tx_tuple_clarify(txn, space, res->tuple, base,
-					 mk_index, is_rw);
+	struct memtx_index_entry entry = memtx_tree_index_entry(base, res);
+	*result = is_rw ?
+		memtx_tx_index_entry_clarify_rw(txn, space, base, entry) :
+		memtx_tx_index_entry_clarify(txn, space, base, entry);
 	return 0;
 }
 
+/**
+ * Implementation of iterator position for general and multikey indexes.
+ */
+template <bool USE_HINT, bool IS_MULTIKEY>
+static inline int
+tree_iterator_position_impl(struct memtx_tree_data<USE_HINT> *last,
+			    struct index_def *def,
+			    const char **pos, uint32_t *size)
+{
+	static_assert(!IS_MULTIKEY || USE_HINT,
+		      "Multikey index actually uses hint.");
+	struct tuple *tuple = last != NULL ? last->tuple : NULL;
+	if (tuple == NULL) {
+		*pos = NULL;
+		*size = 0;
+		return 0;
+	}
+	int mk_idx = MULTIKEY_NONE;
+	if (IS_MULTIKEY)
+		mk_idx = (int)last->hint;
+	const char *key = tuple_extract_key(tuple, def->cmp_def, mk_idx, size);
+	if (key == NULL)
+		return -1;
+	*pos = key;
+	return 0;
+}
+
+/**
+ * Implementation of iterator position for general and multikey indexes.
+ */
+template <bool USE_HINT, bool IS_MULTIKEY>
+static int
+tree_iterator_position(struct iterator *it, const char **pos, uint32_t *size)
+{
+	static_assert(!IS_MULTIKEY || USE_HINT,
+		      "Multikey index actually uses hint.");
+	struct memtx_tree_index<USE_HINT> *index =
+		(struct memtx_tree_index<USE_HINT> *)
+		index_weak_ref_get_index_checked(&it->index_ref);
+	struct tree_iterator<USE_HINT> *tree_it =
+		get_tree_iterator<USE_HINT>(it);
+	return tree_iterator_position_impl<USE_HINT, IS_MULTIKEY>(
+		&tree_it->last, index->base.def, pos, size);
+}
+
+/**
+ * Implementation of iterator position for functional indexes.
+ */
+static int
+tree_iterator_position_func_impl(struct memtx_tree_data<true> *last,
+				 struct index_def *def,
+				 const char **pos, uint32_t *size)
+{
+	/*
+	 * Сmp_def in the functional index is the functional key and the
+	 * primary key right after it. So to extract cmp_def in func index,
+	 * we need to pack an array with concatenated func key and primary key.
+	 */
+	if (last == NULL || last->tuple == NULL) {
+		*pos = NULL;
+		*size = 0;
+		return 0;
+	}
+	/* Extract func key. */
+	uint32_t func_key_size;
+	const char *func_key = tuple_data_range(
+		(struct tuple *)last->hint, &func_key_size);
+	uint32_t func_key_len = mp_decode_array(&func_key);
+	/* Extract primary key. */
+	struct key_def *pk_def = def->pk_def;
+	uint32_t pk_size;
+	const char *pk_key = tuple_extract_key(last->tuple, pk_def,
+					       MULTIKEY_NONE, &pk_size);
+	uint32_t pk_key_len = mp_decode_array(&pk_key);
+	/* Calculate allocation size and allocate buffer. */
+	func_key_size -= mp_sizeof_array(func_key_len);
+	pk_size -= mp_sizeof_array(pk_key_len);
+	uint32_t alloc_size = mp_sizeof_array(func_key_len + pk_key_len) +
+		func_key_size + pk_size;
+	char *data = (char *)xregion_alloc(&fiber()->gc, alloc_size);
+	*size = alloc_size;
+	*pos = data;
+	/* Pack an array with concatenated func key and primary key. */
+	data = mp_encode_array(data, func_key_len + pk_key_len);
+	memcpy(data, func_key, func_key_size);
+	data += func_key_size;
+	memcpy(data, pk_key, pk_size);
+	return 0;
+}
+
+/**
+ * Implementation of iterator position for functional indexes.
+ */
+static int
+tree_iterator_position_func(struct iterator *it, const char **pos,
+			    uint32_t *size)
+{
+	struct index *index = index_weak_ref_get_index_checked(&it->index_ref);
+	struct tree_iterator<true> *tree_it = get_tree_iterator<true>(it);
+	return tree_iterator_position_func_impl(&tree_it->last, index->def,
+						pos, size);
+}
+
+/**
+ * Adds OOM injection and setting txn flag `TXN_STMT_ROLLBACK' on OOM
+ * to `memtx_tree_insert'.
+ */
+template<bool USE_HINT>
+static int
+memtx_tree_index_insert_impl(struct memtx_tree_index<USE_HINT> *index,
+			     struct memtx_tree_data<USE_HINT> new_data,
+			     struct memtx_tree_data<USE_HINT> *dup_data,
+			     struct memtx_tree_data<USE_HINT> *suc_data)
+{
+	if (index_inject_oom() != 0)
+		goto fail;
+	if (memtx_tree_insert(&index->tree, new_data, dup_data, suc_data) != 0)
+		goto fail;
+	return 0;
+fail:
+	txn_set_flags(in_txn(), TXN_STMT_ROLLBACK);
+	return -1;
+}
+
+/**
+ * Adds OOM injection and setting txn flag `TXN_STMT_ROLLBACK' on OOM
+ * to `memtx_tree_delete'.
+ */
+template<bool USE_HINT>
+static int
+memtx_tree_index_delete_impl(struct memtx_tree_index<USE_HINT> *index,
+			     struct memtx_tree_data<USE_HINT> elem_data,
+			     struct memtx_tree_data<USE_HINT> *del_data)
+{
+	if (index_inject_oom() != 0)
+		goto fail;
+	if (memtx_tree_delete(&index->tree, elem_data, del_data) != 0)
+		goto fail;
+	return 0;
+fail:
+	txn_set_flags(in_txn(), TXN_STMT_ROLLBACK);
+	return -1;
+}
+
+/**
+ * Adds OOM injection and setting txn flag `TXN_STMT_ROLLBACK' on OOM
+ * to `memtx_tree_delete_value'.
+ */
+template<bool USE_HINT>
+static int
+memtx_tree_index_delete_value_impl(struct memtx_tree_index<USE_HINT> *index,
+				   struct memtx_tree_data<USE_HINT> elem_data,
+				   struct memtx_tree_data<USE_HINT> *del_data)
+{
+	if (index_inject_oom() != 0)
+		goto fail;
+	if (memtx_tree_delete_value(&index->tree, elem_data, del_data) != 0)
+		goto fail;
+	return 0;
+fail:
+	txn_set_flags(in_txn(), TXN_STMT_ROLLBACK);
+	return -1;
+}
+
+/** Insert a new value into the tree and check for duplicates. */
 template <bool USE_HINT>
 static int
-memtx_tree_index_replace(struct index *base, struct tuple *old_tuple,
-			 struct tuple *new_tuple, enum dup_replace_mode mode,
-			 struct tuple **result, struct tuple **successor)
+memtx_tree_index_replace(struct index *base,
+			 struct tuple *old_tuple,
+			 struct memtx_index_entry new_entry,
+			 enum dup_replace_mode mode,
+			 struct memtx_index_entry *result,
+			 struct memtx_index_entry *successor)
 {
 	struct memtx_tree_index<USE_HINT> *index =
 		(struct memtx_tree_index<USE_HINT> *)base;
-	struct key_def *cmp_def = memtx_tree_cmp_def(&index->tree);
-	if (new_tuple) {
-		struct memtx_tree_data<USE_HINT> new_data;
-		new_data.tuple = new_tuple;
-		if (USE_HINT)
-			new_data.set_hint(tuple_hint(new_tuple, cmp_def));
-		struct memtx_tree_data<USE_HINT> dup_data, suc_data;
-		dup_data.tuple = suc_data.tuple = NULL;
-
-		/* Try to optimistically replace the new_tuple. */
-		int tree_res = memtx_tree_insert(&index->tree, new_data,
-						 &dup_data, &suc_data);
-		if (tree_res) {
-			diag_set(OutOfMemory, MEMTX_EXTENT_SIZE,
-				 "memtx_tree_index", "replace");
-			return -1;
-		}
-
-		uint32_t errcode = replace_check_dup(old_tuple,
-						     dup_data.tuple, mode);
-		if (errcode) {
-			memtx_tree_delete(&index->tree, new_data);
-			if (dup_data.tuple != NULL)
-				memtx_tree_insert(&index->tree, dup_data, NULL, NULL);
-			struct space *sp = space_cache_find(base->def->space_id);
-			if (sp != NULL) {
-				if (errcode == ER_TUPLE_FOUND) {
-					diag_set(ClientError, errcode,
-						 base->def->name,
-						 space_name(sp),
-						 tuple_str(dup_data.tuple),
-						 tuple_str(new_data.tuple));
-				} else {
-					diag_set(ClientError, errcode,
-						 base->def->name,
-						 space_name(sp));
-				}
-			}
-			return -1;
-		}
-		*successor = suc_data.tuple;
-		if (dup_data.tuple != NULL) {
-			*result = dup_data.tuple;
-			return 0;
-		}
-	}
-	if (old_tuple) {
-		struct memtx_tree_data<USE_HINT> old_data;
-		old_data.tuple = old_tuple;
-		if (USE_HINT)
-			old_data.set_hint(tuple_hint(old_tuple, cmp_def));
-		memtx_tree_delete(&index->tree, old_data);
-	}
-	*result = old_tuple;
-	return 0;
-}
-
-/**
- * Perform tuple insertion by given multikey index.
- * In case of replacement, all old tuple entries are deleted
- * by all it's multikey indexes.
- */
-static int
-memtx_tree_index_replace_multikey_one(struct memtx_tree_index<true> *index,
-			struct tuple *old_tuple, struct tuple *new_tuple,
-			enum dup_replace_mode mode, hint_t hint,
-			struct memtx_tree_data<true> *replaced_data,
-			bool *is_multikey_conflict)
-{
-	struct memtx_tree_data<true> new_data, dup_data;
-	new_data.tuple = new_tuple;
-	new_data.hint = hint;
+	assert(new_entry.tuple != NULL);
+	*result = memtx_index_entry_null;
+	*successor = memtx_index_entry_null;
+	struct memtx_tree_data<USE_HINT> new_data =
+		memtx_tree_data_from_entry(index, new_entry);
+	struct memtx_tree_data<USE_HINT> dup_data, suc_data;
 	dup_data.tuple = NULL;
-	*is_multikey_conflict = false;
-	if (memtx_tree_insert(&index->tree, new_data, &dup_data, NULL) != 0) {
-		diag_set(OutOfMemory, MEMTX_EXTENT_SIZE, "memtx_tree_index",
-			 "replace");
+	suc_data.tuple = NULL;
+
+	/* Try to optimistically replace the new_tuple. */
+	if (memtx_tree_index_insert_impl(index, new_data, &dup_data,
+					 &suc_data) != 0)
 		return -1;
-	}
-	int errcode = 0;
-	if (dup_data.tuple == new_tuple) {
-		/*
-		 * When tuple contains the same key multiple
-		 * times, the previous key occurrence is pushed
-		 * out of the index.
-		 */
-		*is_multikey_conflict = true;
-	} else if ((errcode = replace_check_dup(old_tuple, dup_data.tuple,
-					        mode)) != 0) {
-		/* Rollback replace. */
-		memtx_tree_delete(&index->tree, new_data);
+	if (dup_data.tuple == new_data.tuple)
+		goto out;
+	if (index_check_dup(&index->base, old_tuple, new_data.tuple,
+			    dup_data.tuple, mode) != 0) {
+		VERIFY(memtx_tree_index_delete_impl<USE_HINT>(index, new_data,
+							      NULL) == 0);
 		if (dup_data.tuple != NULL)
-			memtx_tree_insert(&index->tree, dup_data, NULL, NULL);
-		struct space *sp = space_cache_find(index->base.def->space_id);
-		if (sp != NULL) {
-			if (errcode == ER_TUPLE_FOUND) {
-				diag_set(ClientError, errcode,
-					 index->base.def->name,
-					 space_name(sp),
-					 tuple_str(dup_data.tuple),
-					 tuple_str(new_data.tuple));
-			} else {
-				diag_set(ClientError, errcode,
-	     				 index->base.def->name,
-	     				 space_name(sp));
-			}
-		}
+			VERIFY(memtx_tree_index_insert_impl<USE_HINT>(
+				index, dup_data, NULL, NULL) == 0);
 		return -1;
 	}
-	*replaced_data = dup_data;
-	return 0;
-}
-
-/**
- * Rollback the sequence of memtx_tree_index_replace_multikey_one
- * insertions with multikey indexes [0, err_multikey_idx - 1]
- * where the err_multikey_idx is the first multikey index where
- * error has been raised.
- *
- * This routine can't fail because all replaced_tuple (when
- * specified) nodes in tree are already allocated (they might be
- * overridden with new_tuple, but they definitely present) and
- * delete operation is fault-tolerant.
- */
-static void
-memtx_tree_index_replace_multikey_rollback(struct memtx_tree_index<true> *index,
-			struct tuple *new_tuple, struct tuple *replaced_tuple,
-			int err_multikey_idx)
-{
-	struct memtx_tree_data<true> data;
-	if (replaced_tuple != NULL) {
-		/* Restore replaced tuple index occurrences. */
-		struct key_def *cmp_def = memtx_tree_cmp_def(&index->tree);
-		data.tuple = replaced_tuple;
-		uint32_t multikey_count =
-			tuple_multikey_count(replaced_tuple, cmp_def);
-		for (int i = 0; (uint32_t) i < multikey_count; i++) {
-			data.hint = i;
-			memtx_tree_insert(&index->tree, data, NULL, NULL);
-		}
-	}
-	/*
-	 * Rollback new_tuple insertion by multikey index
-	 * [0, multikey_idx).
-	 */
-	data.tuple = new_tuple;
-	for (int i = 0; i < err_multikey_idx; i++) {
-		data.hint = i;
-		memtx_tree_delete_value(&index->tree, data, NULL);
-	}
-}
-
-/**
- * :replace() function for a multikey index: replace old tuple
- * index entries with ones from the new tuple.
- *
- * In a multikey index a single tuple is associated with 0..N keys
- * of the b+*tree. Imagine old tuple key set is called "old_keys"
- * and a new tuple set is called "new_keys". This function must
- * 1) delete all removed keys: (new_keys - old_keys)
- * 2) update tuple pointer in all preserved keys: (old_keys ^ new_keys)
- * 3) insert data for all new keys (new_keys - old_keys).
- *
- * Compare with a standard unique or non-unique index, when a key
- * is present only once, so whenever we encounter a duplicate, it
- * is guaranteed to point at the old tuple (in non-unique indexes
- * we augment the secondary key parts with primary key parts, so
- * b+*tree still contains unique entries only).
- *
- * To reduce the number of insert and delete operations on the
- * tree, this function attempts to optimistically add all keys
- * from the new tuple to the tree first.
- *
- * When this step finds a duplicate, it's either of the following:
- * - for a unique multikey index, it may be the old tuple or
- *   some other tuple. Since unique index forbids duplicates,
- *   this branch ends with an error unless we found the old tuple.
- * - for a non-unique multikey index, both secondary and primary
- *   key parts must match, so it's guaranteed to be the old tuple.
- *
- * In other words, when an optimistic insert finds a duplicate,
- * it's either an error, in which case we roll back all the new
- * keys from the tree and abort the procedure, or the old tuple,
- * which we save to get back to, later.
- *
- * When adding new keys finishes, we have completed steps
- * 2) and 3):
- * - added set (new_keys - old_keys) to the index
- * - updated set (new_keys ^ old_keys) with a new tuple pointer.
- *
- * We now must perform 1), which is remove (old_keys - new_keys).
- *
- * This is done by using the old tuple pointer saved from the
- * previous step. To not accidentally delete the common key
- * set of the old and the new tuple, we don't using key parts alone
- * to compare - we also look at b+* tree value that has the tuple
- * pointer, and delete old tuple entries only.
- */
-static int
-memtx_tree_index_replace_multikey(struct index *base, struct tuple *old_tuple,
-			struct tuple *new_tuple, enum dup_replace_mode mode,
-			struct tuple **result, struct tuple **successor)
-{
-	struct memtx_tree_index<true> *index =
-		(struct memtx_tree_index<true> *)base;
-
-	/* MUTLIKEY doesn't support successor for now. */
-	*successor = NULL;
-
-	struct key_def *cmp_def = memtx_tree_cmp_def(&index->tree);
-	*result = NULL;
-	if (new_tuple != NULL) {
-		int multikey_idx = 0, err = 0;
-		uint32_t multikey_count =
-			tuple_multikey_count(new_tuple, cmp_def);
-		for (; (uint32_t) multikey_idx < multikey_count;
-		     multikey_idx++) {
-			bool is_multikey_conflict;
-			struct memtx_tree_data<true> replaced_data;
-			err = memtx_tree_index_replace_multikey_one(index,
-						old_tuple, new_tuple, mode,
-						multikey_idx, &replaced_data,
-						&is_multikey_conflict);
-			if (err != 0)
-				break;
-			if (replaced_data.tuple != NULL &&
-			    !is_multikey_conflict) {
-				assert(*result == NULL ||
-				       *result == replaced_data.tuple);
-				*result = replaced_data.tuple;
-			}
-		}
-		if (err != 0) {
-			memtx_tree_index_replace_multikey_rollback(index,
-					new_tuple, *result, multikey_idx);
-			return -1;
-		}
-		if (*result != NULL) {
-			assert(old_tuple == NULL || old_tuple == *result);
-			old_tuple = *result;
-		}
-	}
-	if (old_tuple != NULL) {
-		struct memtx_tree_data<true> data;
-		data.tuple = old_tuple;
-		uint32_t multikey_count =
-			tuple_multikey_count(old_tuple, cmp_def);
-		for (int i = 0; (uint32_t) i < multikey_count; i++) {
-			data.hint = i;
-			memtx_tree_delete_value(&index->tree, data, NULL);
-		}
+out:
+	result->tuple = dup_data.tuple;
+	successor->tuple = suc_data.tuple;
+	if (index->base.def->key_def->is_multikey ||
+	    index->base.def->key_def->for_func_index) {
+		result->key_data =
+			dup_data.tuple != NULL ? dup_data.hint : HINT_NONE;
+		successor->key_data =
+			suc_data.tuple != NULL ? suc_data.hint : HINT_NONE;
 	}
 	return 0;
 }
 
-/** A dummy key allocator used when removing tuples from an index. */
-static const char *
-func_index_key_dummy_alloc(struct tuple *tuple, const char *key,
-			   uint32_t key_sz)
-{
-	(void) tuple;
-	(void) key_sz;
-	return key;
-}
-
-/**
- * An undo entry for multikey functional index replace operation.
- * Used to roll back a failed insert/replace and restore the
- * original key_hint(s) and to commit a completed insert/replace
- * and destruct old tuple key_hint(s).
-*/
-struct func_key_undo {
-	/** A link to organize entries in list. */
-	struct rlist link;
-	/** An inserted record copy. */
-	struct memtx_tree_data<true> key;
-};
-
-/** Allocate a new func_key_undo on given region. */
-struct func_key_undo *
-func_key_undo_new(struct region *region)
-{
-	size_t size;
-	struct func_key_undo *undo = region_alloc_object(region, typeof(*undo),
-							 &size);
-	if (undo == NULL) {
-		diag_set(OutOfMemory, size, "region_alloc_object", "undo");
-		return NULL;
-	}
-	return undo;
-}
-
-/**
- * Rollback a sequence of memtx_tree_index_replace_multikey_one
- * insertions for functional index. Routine uses given list to
- * return a given index object in it's original state.
- */
-static void
-memtx_tree_func_index_replace_rollback(struct memtx_tree_index<true> *index,
-				       struct rlist *old_keys,
-				       struct rlist *new_keys)
-{
-	struct func_key_undo *entry;
-	rlist_foreach_entry(entry, new_keys, link) {
-		memtx_tree_delete_value(&index->tree, entry->key, NULL);
-		tuple_chunk_delete(entry->key.tuple,
-				   (const char *)entry->key.hint);
-	}
-	rlist_foreach_entry(entry, old_keys, link)
-		memtx_tree_insert(&index->tree, entry->key, NULL, NULL);
-}
-
-/**
- * @sa memtx_tree_index_replace_multikey().
- * Use the functional index function from the key definition
- * to build a key list. Then each returned key is reallocated in
- * engine's memory as key_hint object and is used as comparison
- * hint.
- * To release key_hint memory in case of replace failure
- * we use a list of undo records which are allocated on region.
- * It is used to restore the original b+* entries with their
- * original key_hint(s) pointers in case of failure and release
- * the now useless hints of old items in case of success.
- */
+/** Delete one exact value from the tree. */
+template<bool USE_HINT>
 static int
-memtx_tree_func_index_replace(struct index *base, struct tuple *old_tuple,
-			struct tuple *new_tuple, enum dup_replace_mode mode,
-			struct tuple **result, struct tuple **successor)
+memtx_tree_index_delete(struct index *base, struct memtx_index_entry entry,
+			struct memtx_index_entry *result)
 {
-	/* FUNC doesn't support successor for now. */
-	*successor = NULL;
-
-	struct memtx_tree_index<true> *index =
-		(struct memtx_tree_index<true> *)base;
-	struct index_def *index_def = index->base.def;
-	assert(index_def->key_def->for_func_index);
-
-	int rc = -1;
-	struct region *region = &fiber()->gc;
-	size_t region_svp = region_used(region);
-
-	*result = NULL;
-	struct key_list_iterator it;
-	if (new_tuple != NULL) {
-		struct rlist old_keys, new_keys;
-		rlist_create(&old_keys);
-		rlist_create(&new_keys);
-		if (key_list_iterator_create(&it, new_tuple, index_def, true,
-					     tuple_chunk_new) != 0)
-			goto end;
-		int err = 0;
-		const char *key;
-		struct func_key_undo *undo;
-		while ((err = key_list_iterator_next(&it, &key)) == 0 &&
-			key != NULL) {
-			/* Perform insertion, log it in list. */
-			undo = func_key_undo_new(region);
-			if (undo == NULL) {
-				tuple_chunk_delete(new_tuple, key);
-				err = -1;
-				break;
-			}
-			undo->key.tuple = new_tuple;
-			undo->key.hint = (hint_t)key;
-			rlist_add(&new_keys, &undo->link);
-			bool is_multikey_conflict;
-			struct memtx_tree_data<true> old_data;
-			old_data.tuple = NULL;
-			err = memtx_tree_index_replace_multikey_one(index,
-						old_tuple, new_tuple,
-						mode, (hint_t)key, &old_data,
-						&is_multikey_conflict);
-			if (err != 0)
-				break;
-			if (old_data.tuple != NULL && !is_multikey_conflict) {
-				undo = func_key_undo_new(region);
-				if (undo == NULL) {
-					/*
-					 * Can't append this
-					 * operation in rollback
-					 * journal. Roll it back
-					 * manually.
-					 */
-					memtx_tree_insert(&index->tree,
-							  old_data, NULL, NULL);
-					err = -1;
-					break;
-				}
-				undo->key = old_data;
-				rlist_add(&old_keys, &undo->link);
-				*result = old_data.tuple;
-			} else if (old_data.tuple != NULL &&
-				   is_multikey_conflict) {
-				/*
-				 * Remove the replaced tuple undo
-				 * from undo list.
-				 */
-				tuple_chunk_delete(new_tuple,
-						(const char *)old_data.hint);
-				rlist_foreach_entry(undo, &new_keys, link) {
-					if (undo->key.hint == old_data.hint) {
-						rlist_del(&undo->link);
-						break;
-					}
-				}
-			}
-		}
-		if (key != NULL || err != 0) {
-			memtx_tree_func_index_replace_rollback(index,
-						&old_keys, &new_keys);
-			goto end;
-		}
-		if (*result != NULL) {
-			assert(old_tuple == NULL || old_tuple == *result);
-			old_tuple = *result;
-		}
-		/*
-		 * Commit changes: release hints for
-		 * replaced entries.
-		 */
-		rlist_foreach_entry(undo, &old_keys, link) {
-			tuple_chunk_delete(undo->key.tuple,
-					   (const char *)undo->key.hint);
-		}
+	struct memtx_tree_index<USE_HINT> *index =
+		(struct memtx_tree_index<USE_HINT> *)base;
+	*result = memtx_index_entry_null;
+	assert(entry.tuple != NULL);
+	struct memtx_tree_data<USE_HINT> old_data =
+		memtx_tree_data_from_entry(index, entry);
+	struct memtx_tree_data<USE_HINT> deleted_data;
+	deleted_data.tuple = NULL;
+	if (memtx_tree_index_delete_value_impl<USE_HINT>(index, old_data,
+							 &deleted_data) != 0)
+		return -1;
+	if (deleted_data.tuple != NULL) {
+		result->tuple = deleted_data.tuple;
+		if (index->base.def->key_def->is_multikey ||
+		    index->base.def->key_def->for_func_index)
+			result->key_data = deleted_data.hint;
 	}
-	if (old_tuple != NULL) {
-		if (key_list_iterator_create(&it, old_tuple, index_def, false,
-					     func_index_key_dummy_alloc) != 0)
-			goto end;
-		struct memtx_tree_data<true> data, deleted_data;
-		data.tuple = old_tuple;
-		const char *key;
-		while (key_list_iterator_next(&it, &key) == 0 && key != NULL) {
-			data.hint = (hint_t) key;
-			deleted_data.tuple = NULL;
-			memtx_tree_delete_value(&index->tree, data,
-						&deleted_data);
-			if (deleted_data.tuple != NULL) {
-				/*
-				 * Release related hint on
-				 * successful node deletion.
-				 */
-				tuple_chunk_delete(deleted_data.tuple,
-					(const char *)deleted_data.hint);
-			}
-		}
-		assert(key == NULL);
-	}
-	rc = 0;
-end:
-	region_truncate(region, region_svp);
-	return rc;
+	return 0;
 }
 
 template <bool USE_HINT>
 static struct iterator *
-memtx_tree_index_create_iterator(struct index *base, enum iterator_type type,
-				 const char *key, uint32_t part_count)
+memtx_tree_index_create_iterator_with_offset(
+	struct index *base, enum iterator_type type, const char *key,
+	uint32_t part_count, const char *pos, uint32_t offset)
 {
 	struct memtx_tree_index<USE_HINT> *index =
 		(struct memtx_tree_index<USE_HINT> *)base;
 	struct memtx_engine *memtx = (struct memtx_engine *)base->engine;
 	struct key_def *cmp_def = memtx_tree_cmp_def(&index->tree);
 
-	assert(part_count == 0 || key != NULL);
-	if (type > ITER_GT) {
-		diag_set(UnsupportedIndexFeature, base->def,
-			 "requested iterator type");
-		return NULL;
-	}
+	canonicalize_lookup(&type, &key, part_count);
 
-	if (part_count == 0) {
-		/*
-		 * If no key is specified, downgrade equality
-		 * iterators to a full range.
-		 */
-		type = iterator_type_is_reverse(type) ? ITER_LE : ITER_GE;
-		key = NULL;
-	}
+	ERROR_INJECT(ERRINJ_INDEX_ITERATOR_NEW, {
+		diag_set(ClientError, ER_INJECTION, "iterator fail");
+		return NULL;
+	});
 
 	struct tree_iterator<USE_HINT> *it = (struct tree_iterator<USE_HINT> *)
 		mempool_alloc(&memtx->iterator_pool);
@@ -1325,16 +1705,49 @@ memtx_tree_index_create_iterator(struct index *base, enum iterator_type type,
 	}
 	iterator_create(&it->base, base);
 	it->pool = &memtx->iterator_pool;
-	it->base.next = tree_iterator_start<USE_HINT>;
+	it->base.next_internal = tree_iterator_start<USE_HINT>;
+	it->base.next = memtx_iterator_next;
 	it->base.free = tree_iterator_free<USE_HINT>;
+	if (base->def->key_def->for_func_index) {
+		assert(USE_HINT);
+		it->base.position = tree_iterator_position_func;
+	} else if (base->def->key_def->is_multikey) {
+		assert(USE_HINT);
+		it->base.position = tree_iterator_position<true, true>;
+	} else {
+		it->base.position = tree_iterator_position<USE_HINT, false>;
+	}
 	it->type = type;
 	it->key_data.key = key;
 	it->key_data.part_count = part_count;
 	if (USE_HINT)
 		it->key_data.set_hint(key_hint(key, part_count, cmp_def));
 	invalidate_tree_iterator(&it->tree_iterator);
-	it->current.tuple = NULL;
+	it->last.tuple = NULL;
+	if (USE_HINT)
+		it->last.set_hint(HINT_NONE);
+	it->last_func_key = NULL;
+	if (pos != NULL) {
+		it->after_data.key = pos;
+		it->after_data.part_count = cmp_def->part_count;
+		if (USE_HINT)
+			it->after_data.set_hint(HINT_NONE);
+	} else {
+		it->after_data.key = NULL;
+		it->after_data.part_count = 0;
+	}
+	it->offset = offset;
 	return (struct iterator *)it;
+}
+
+template<bool USE_HINT>
+static struct iterator *
+memtx_tree_index_create_iterator(struct index *base, enum iterator_type type,
+				 const char *key, uint32_t part_count,
+				 const char *pos)
+{
+	return memtx_tree_index_create_iterator_with_offset<USE_HINT>(
+		base, type, key, part_count, pos, 0);
 }
 
 template <bool USE_HINT>
@@ -1411,7 +1824,7 @@ template <bool USE_HINT>
 static int
 memtx_tree_index_build_next(struct index *base, struct tuple *tuple)
 {
-	if (index_filter_tuple(base, tuple) == NULL)
+	if (tuple_key_is_excluded(tuple, base->def->key_def, MULTIKEY_NONE))
 		return 0;
 	struct memtx_tree_index<USE_HINT> *index =
 		(struct memtx_tree_index<USE_HINT> *)base;
@@ -1428,6 +1841,9 @@ memtx_tree_index_build_next_multikey(struct index *base, struct tuple *tuple)
 	uint32_t multikey_count = tuple_multikey_count(tuple, cmp_def);
 	for (uint32_t multikey_idx = 0; multikey_idx < multikey_count;
 	     multikey_idx++) {
+		if (tuple_key_is_excluded(tuple, base->def->key_def,
+					  multikey_idx))
+			continue;
 		if (memtx_tree_index_build_array_append(index, tuple,
 							multikey_idx) != 0)
 			return -1;
@@ -1438,32 +1854,39 @@ memtx_tree_index_build_next_multikey(struct index *base, struct tuple *tuple)
 static int
 memtx_tree_func_index_build_next(struct index *base, struct tuple *tuple)
 {
-	struct memtx_tree_index<true> *index = (struct memtx_tree_index<true> *)base;
+	struct memtx_engine *memtx = (struct memtx_engine *)base->engine;
+	struct memtx_tree_index<true> *index =
+		(struct memtx_tree_index<true> *)base;
 	struct index_def *index_def = index->base.def;
 	assert(index_def->key_def->for_func_index);
+	/* Make sure that key_def is not multikey - we rely on it below. */
+	assert(!index_def->key_def->is_multikey);
 
 	struct region *region = &fiber()->gc;
 	size_t region_svp = region_used(region);
 
 	struct key_list_iterator it;
 	if (key_list_iterator_create(&it, tuple, index_def, false,
-				     tuple_chunk_new) != 0)
+				     memtx->func_key_format) != 0)
 		return -1;
 
-	const char *key;
+	struct key_def *key_def = index_def->key_def;
+	struct tuple *key;
 	uint32_t insert_idx = index->build_array_size;
 	while (key_list_iterator_next(&it, &key) == 0 && key != NULL) {
+		if (tuple_key_is_excluded(key, key_def, MULTIKEY_NONE))
+			continue;
 		if (memtx_tree_index_build_array_append(index, tuple,
 							(hint_t)key) != 0)
 			goto error;
+		tuple_ref(key);
 	}
 	assert(key == NULL);
 	region_truncate(region, region_svp);
 	return 0;
 error:
 	for (uint32_t i = insert_idx; i < index->build_array_size; i++) {
-		tuple_chunk_delete(index->build_array[i].tuple,
-				   (const char *)index->build_array[i].hint);
+		tuple_unref((struct tuple *)index->build_array[i].hint);
 	}
 	region_truncate(region, region_svp);
 	return -1;
@@ -1476,8 +1899,8 @@ error:
  */
 template <bool USE_HINT>
 static void
-memtx_tree_index_build_array_deduplicate(struct memtx_tree_index<USE_HINT> *index,
-			void (*destroy)(struct tuple *tuple, const char *hint))
+memtx_tree_index_build_array_deduplicate(
+	struct memtx_tree_index<USE_HINT> *index)
 {
 	if (index->build_array_size == 0)
 		return;
@@ -1499,15 +1922,22 @@ memtx_tree_index_build_array_deduplicate(struct memtx_tree_index<USE_HINT> *inde
 		}
 		r_idx++;
 	}
-	if (destroy != NULL) {
+	if (cmp_def->for_func_index) {
 		/* Destroy deduplicated entries. */
 		for (r_idx = w_idx + 1;
 		     r_idx < index->build_array_size; r_idx++) {
-			destroy(index->build_array[r_idx].tuple,
-				(const char *)index->build_array[r_idx].hint);
+			hint_t hint = index->build_array[r_idx].hint;
+			tuple_unref((struct tuple *)hint);
 		}
 	}
 	index->build_array_size = w_idx + 1;
+}
+
+static void
+memtx_sort_thread_init(void *arg)
+{
+	struct tuple_format **formats = (struct tuple_format **)arg;
+	tuple_formats_inherit(formats);
 }
 
 template <bool USE_HINT>
@@ -1517,10 +1947,13 @@ memtx_tree_index_end_build(struct index *base)
 	struct memtx_tree_index<USE_HINT> *index =
 		(struct memtx_tree_index<USE_HINT> *)base;
 	struct key_def *cmp_def = memtx_tree_cmp_def(&index->tree);
-	qsort_arg(index->build_array, index->build_array_size,
-		  sizeof(index->build_array[0]),
-		  memtx_tree_qcompare<USE_HINT>, cmp_def);
-	if (cmp_def->is_multikey) {
+	struct memtx_engine *memtx = (struct memtx_engine *)base->engine;
+	tt_sort(index->build_array, index->build_array_size,
+		sizeof(index->build_array[0]),
+		memtx_tree_qcompare<USE_HINT>, cmp_def,
+		memtx_sort_thread_init, tuple_formats,
+		memtx->sort_threads);
+	if (cmp_def->is_multikey || cmp_def->for_func_index) {
 		/*
 		 * Multikey index may have equal(in terms of
 		 * cmp_def) keys inserted by different multikey
@@ -1528,10 +1961,7 @@ memtx_tree_index_end_build(struct index *base)
 		 * the following memtx_tree_build assumes that
 		 * all keys are unique.
 		 */
-		memtx_tree_index_build_array_deduplicate<USE_HINT>(index, NULL);
-	} else if (cmp_def->for_func_index) {
-		memtx_tree_index_build_array_deduplicate<USE_HINT>(index,
-							 tuple_chunk_delete);
+		memtx_tree_index_build_array_deduplicate<USE_HINT>(index);
 	}
 	memtx_tree_build(&index->tree, index->build_array,
 			 index->build_array_size);
@@ -1542,215 +1972,820 @@ memtx_tree_index_end_build(struct index *base)
 	index->build_array_alloc_size = 0;
 }
 
+/**
+ * Build the index using the O(n) sort algorithm with MemTX sort data.
+ */
+template<bool USE_HINT>
+static int
+memtx_tree_index_build_using_sort_data(
+	struct index *base,
+	struct memtx_sort_data_reader *reader)
+{
+	assert(!base->def->key_def->for_func_index);
+	struct memtx_tree_index<USE_HINT> *index =
+		(struct memtx_tree_index<USE_HINT> *)base;
+
+	/* Check if can use the sort data. */
+	struct key_def *cmp_def = memtx_tree_cmp_def(&index->tree);
+	if (cmp_def->for_func_index)
+		panic("func indexes aren't expected to be presorted");
+
+	/* Load the build array. */
+	size_t build_array_size = memtx_sort_data_reader_get_size(reader);
+	size_t build_array_bsize = build_array_size *
+				   sizeof(struct memtx_tree_data<USE_HINT>);
+	struct memtx_tree_data<USE_HINT> *build_array =
+		(struct memtx_tree_data<USE_HINT> *)xmalloc(build_array_bsize);
+	auto _ = make_scoped_guard([build_array] { free(build_array); });
+	if (memtx_sort_data_reader_get(reader, build_array,
+				       build_array_bsize) != 0)
+		return -1; /* Failed to read sort data (or it's corrupted). */
+
+	/* Fix the tuple pointers. */
+	for (size_t i = 0; i < build_array_size; i++) {
+		struct tuple *old_ptr = build_array[i].tuple;
+		struct tuple *new_ptr =
+			memtx_sort_data_reader_resolve_tuple(reader, old_ptr);
+		if (new_ptr == NULL)
+			return -1; /* Corrupted sort data. */
+		build_array[i].tuple = new_ptr;
+	}
+
+	/* Build the index. */
+	memtx_tree_build(&index->tree, build_array, build_array_size);
+	return 0;
+}
+
+int
+memtx_tree_index_build_using_sort_data(struct index *base,
+				       struct memtx_sort_data_reader *reader)
+{
+	if (memtx_tree_index_uses_hint(base->def)) {
+		return memtx_tree_index_build_using_sort_data<true>(base,
+								    reader);
+	} else {
+		return memtx_tree_index_build_using_sort_data<false>(base,
+								     reader);
+	}
+}
+
+static int
+memtx_tree_disabled_index_build_next(struct index *index, struct tuple *tuple)
+{
+	(void)index;
+	(void)tuple;
+	return 0;
+}
+
+static int
+memtx_tree_disabled_index_replace(struct index *index,
+				  struct tuple *old_tuple,
+				  struct memtx_index_entry new_entry,
+				  enum dup_replace_mode mode,
+				  struct memtx_index_entry *result,
+				  struct memtx_index_entry *successor)
+{
+	(void)index;
+	(void)old_tuple;
+	(void)new_entry;
+	(void)mode;
+	*result = memtx_index_entry_null;
+	*successor = memtx_index_entry_null;
+	return 0;
+}
+
+static int
+memtx_tree_disabled_index_delete(struct index *index,
+				 struct memtx_index_entry entry,
+				 struct memtx_index_entry *result)
+{
+	(void)index;
+	(void)entry;
+	*result = memtx_index_entry_null;
+	return 0;
+}
+
+/** Read view implementation. */
 template <bool USE_HINT>
-struct tree_snapshot_iterator {
-	struct snapshot_iterator base;
+struct tree_read_view {
+	/** Base class. */
+	struct index_read_view base;
+	/** Read view index. Ref counter incremented. */
 	struct memtx_tree_index<USE_HINT> *index;
-	memtx_tree_iterator_t<USE_HINT> tree_iterator;
+	/** BPS tree read view. */
+	memtx_tree_view_t<USE_HINT> tree_view;
+	/** Used for clarifying read view tuples. */
 	struct memtx_tx_snapshot_cleaner cleaner;
+	/** Used for dumping into the sort data file. */
+	memtx_tree_iterator_t<USE_HINT> dump_iterator;
 };
+
+/** Read view iterator implementation. */
+template <bool USE_HINT>
+struct tree_read_view_iterator {
+	/** Base class. */
+	struct index_read_view_iterator_base base;
+	/** Iterator key. */
+	struct memtx_tree_key_data<USE_HINT> key_data;
+	/** BPS tree iterator. */
+	memtx_tree_iterator_t<USE_HINT> tree_iterator;
+	/**
+	 * Data that was fetched last. Is NULL only if there was no data
+	 * fetched. Otherwise, tuple pointer is not NULL, even if iterator
+	 * is exhausted - pagination relies on it.
+	 */
+	struct memtx_tree_data<USE_HINT> *last;
+};
+
+static_assert(sizeof(struct tree_read_view_iterator<false>) <=
+	      INDEX_READ_VIEW_ITERATOR_SIZE,
+	      "sizeof(struct tree_read_view_iterator<false>) must be less than "
+	      "or equal to INDEX_READ_VIEW_ITERATOR_SIZE");
+static_assert(sizeof(struct tree_read_view_iterator<true>) <=
+	      INDEX_READ_VIEW_ITERATOR_SIZE,
+	      "sizeof(struct tree_read_view_iterator<true>) must be less than "
+	      "or equal to INDEX_READ_VIEW_ITERATOR_SIZE");
 
 template <bool USE_HINT>
 static void
-tree_snapshot_iterator_free(struct snapshot_iterator *iterator)
+tree_read_view_free(struct index_read_view *base)
 {
-	assert(iterator->free == &tree_snapshot_iterator_free<USE_HINT>);
-	struct tree_snapshot_iterator<USE_HINT> *it =
-		(struct tree_snapshot_iterator<USE_HINT> *)iterator;
-	memtx_leave_delayed_free_mode((struct memtx_engine *)
-				      it->index->base.engine);
-	memtx_tree_iterator_destroy(&it->index->tree, &it->tree_iterator);
-	index_unref(&it->index->base);
-	memtx_tx_snapshot_cleaner_destroy(&it->cleaner);
-	free(iterator);
+	struct tree_read_view<USE_HINT> *rv =
+		(struct tree_read_view<USE_HINT> *)base;
+	memtx_tree_view_destroy(&rv->tree_view);
+	/* The cleaner uses the index, destroy it before the index is gone. */
+	memtx_tx_snapshot_cleaner_destroy(&rv->cleaner);
+	index_unref(&rv->index->base);
+	TRASH(rv);
+	free(rv);
 }
 
-template <bool USE_HINT>
-static int
-tree_snapshot_iterator_next(struct snapshot_iterator *iterator,
-			    const char **data, uint32_t *size)
+/**
+ * Creates an iterator based on the given key, after data and iterator type.
+ *
+ * @param tree_view - the tree to lookup in;
+ * @param start_data - the key to lookup with, updated if pos != NULL;
+ * @param pos - the after key, can be NULL if not specified;
+ * @param type - the lookup iterator type, may be updated;
+ * @param[out] iterator - the result of the lookup;
+ * @param[out] offset - the offset @a iterator points to;
+ *
+ * @retval true on success;
+ * @retval false if the iteration must be stopped without an error.
+ */
+template<bool USE_HINT>
+static bool
+memtx_tree_view_lookup(memtx_tree_view_t<USE_HINT> *tree_view,
+		       struct memtx_tree_key_data<USE_HINT> *start_data,
+		       const char *pos, enum iterator_type *type,
+		       memtx_tree_iterator_t<USE_HINT> *iterator,
+		       size_t *offset)
 {
-	assert(iterator->free == &tree_snapshot_iterator_free<USE_HINT>);
-	struct tree_snapshot_iterator<USE_HINT> *it =
-		(struct tree_snapshot_iterator<USE_HINT> *)iterator;
-	memtx_tree_t<USE_HINT> *tree = &it->index->tree;
+	struct key_def *cmp_def = tree_view->common.arg;
 
-	while (true) {
-		struct memtx_tree_data<USE_HINT> *res =
-			memtx_tree_iterator_get_elem(tree, &it->tree_iterator);
+	if (pos != NULL) {
+		start_data->key = pos;
+		start_data->part_count = cmp_def->part_count;
+		if (USE_HINT)
+			start_data->set_hint(key_hint(pos, cmp_def->part_count,
+						      cmp_def));
+	}
 
-		if (res == NULL) {
-			*data = NULL;
-			return 0;
+	bool skip_equal_tuple = pos != NULL;
+	if (skip_equal_tuple && *type != ITER_EQ && *type != ITER_REQ)
+		*type = iterator_direction(*type) > 0 ? ITER_GT : ITER_LT;
+
+	if (start_data->key == NULL) {
+		assert(*type == ITER_GE || *type == ITER_LE);
+		invalidate_tree_iterator(iterator);
+		*offset = *type == ITER_GE ? SIZE_MAX /* + 1 == 0 */ :
+					     memtx_tree_view_size(tree_view);
+	} else {
+		bool need_lower_bound = *type == ITER_EQ || *type == ITER_GE ||
+					*type == ITER_LT;
+
+		/*
+		 * If we need to skip first tuple in EQ and REQ iterators, let's
+		 * just change lower_bound to upper_bound or vice-versa.
+		 */
+		if (skip_equal_tuple && (*type == ITER_EQ || *type == ITER_REQ))
+			need_lower_bound = !need_lower_bound;
+
+		bool equals;
+		if (need_lower_bound) {
+			*iterator = memtx_tree_view_lower_bound_get_offset(
+				tree_view, start_data, &equals, offset);
+		} else {
+			*iterator = memtx_tree_view_upper_bound_get_offset(
+				tree_view, start_data, &equals, offset);
 		}
 
-		memtx_tree_iterator_next(tree, &it->tree_iterator);
+		/*
+		 * Equality iterators require exact key match: if the result is
+		 * not equal to the key, iteration ends. If start_data differs
+		 * from passed key (pos != NULL), equals flag is not actual and
+		 * we should not check it. In the case we can simply skip the
+		 * check - equality is checked in `next` method.
+		 */
+		if ((*type == ITER_EQ || *type == ITER_REQ) && !equals &&
+		    pos == NULL)
+			return false;
 
-		struct tuple *tuple = res->tuple;
-		tuple = memtx_tx_snapshot_clarify(&it->cleaner, tuple);
-
-		if (tuple != NULL) {
-			*data = tuple_data_range(tuple, size);
-			return 0;
+		if (!iterator_type_is_reverse(*type)) {
+			/*
+			 * lower_bound and upper_bound position the iterator to
+			 * the key >= and > the target one, respectively, so
+			 * for LT, LE, and REQ the found position is to the
+			 * right of the target key while for GT, GE, and EQ
+			 * it's at the target key. Since the 'next' method
+			 * advances the iterator *before* returning the value,
+			 * we need to take a step back for forward iterators.
+			 */
+			memtx_tree_view_iterator_prev(tree_view, iterator);
+			--*offset;
 		}
 	}
 
+	return true;
+}
+
+/** index_read_view_vtab::count */
+template<bool USE_HINT>
+static ssize_t
+tree_read_view_count(struct index_read_view *base, enum iterator_type type,
+		     const char *key, uint32_t part_count)
+{
+	if (type == ITER_PP || type == ITER_NP) {
+		diag_set(UnsupportedIndexFeature, base->def,
+			 "requested iterator type");
+		return -1;
+	}
+	canonicalize_lookup(&type, &key, part_count);
+
+	/* Perform the lookup. */
+	struct tree_read_view<USE_HINT> *rv =
+		(struct tree_read_view<USE_HINT> *)base;
+	memtx_tree_view_t<USE_HINT> *tree_view = &rv->tree_view;
+	struct key_def *cmp_def = tree_view->common.arg;
+	struct memtx_tree_key_data<USE_HINT> start_data;
+	start_data.key = key;
+	start_data.part_count = part_count;
+	if (USE_HINT)
+		start_data.set_hint(key_hint(key, part_count, cmp_def));
+	memtx_tree_iterator_t<USE_HINT> unused;
+	size_t begin_offset;
+	if (!memtx_tree_view_lookup(tree_view, &start_data, NULL,
+				    &type, &unused, &begin_offset))
+		return 0; /* No match. */
+
+	/*
+	 * Now, when we have the first tuple and its offset, let's find the
+	 * boundary of the iteration.
+	 */
+	size_t end_offset;
+	if (type == ITER_EQ) {
+		memtx_tree_view_upper_bound_get_offset(tree_view, &start_data,
+						       NULL, &end_offset);
+		end_offset--; /* Unsigned underflow possible. */
+	} else if (type == ITER_REQ) {
+		memtx_tree_view_lower_bound_get_offset(tree_view, &start_data,
+						       NULL, &end_offset);
+	} else {
+		end_offset = iterator_type_is_reverse(type) ? 0 :
+			     memtx_tree_view_size(tree_view) - 1;
+	}
+
+	size_t full_count = ((ssize_t)end_offset - begin_offset) *
+			    iterator_direction(type);
+
+	/*
+	 * The view could be created when the index had concurrent transactions
+	 * running, so some tuples in the view may be invisible. Let's count the
+	 * amount of invisible tuples counted.
+	 */
+	size_t invisible_count = memtx_tx_snapshot_invisible_count_matching(
+		&rv->cleaner, base->def, type, key, part_count);
+
+	return full_count - invisible_count;
+}
+
+/** index_read_view_vtab::quantile */
+template<bool USE_HINT>
+static int
+tree_read_view_quantile(struct index_read_view *base, double level,
+			const char *begin_key, uint32_t begin_part_count,
+			const char *end_key, uint32_t end_part_count,
+			const char **quantile_key,
+			uint32_t *quantile_key_size)
+{
+	struct tree_read_view<USE_HINT> *rv =
+		(struct tree_read_view<USE_HINT> *)base;
+	memtx_tree_view_t<USE_HINT> *tree = &rv->tree_view;
+	struct key_def *key_def = base->def->key_def;
+
+	struct memtx_tree_key_data<USE_HINT> begin_data;
+	begin_data.key = begin_key;
+	begin_data.part_count = begin_part_count;
+	if (USE_HINT)
+		begin_data.set_hint(
+			key_hint(begin_key, begin_part_count, key_def));
+
+	struct memtx_tree_key_data<USE_HINT> end_data;
+	end_data.key = end_key;
+	end_data.part_count = end_part_count;
+	if (USE_HINT)
+		end_data.set_hint(
+			key_hint(end_key, end_part_count, key_def));
+
+	size_t begin_offset;
+	memtx_tree_view_lower_bound_get_offset(tree, &begin_data, NULL,
+					       &begin_offset);
+	size_t end_offset;
+	if (end_data.part_count > 0) {
+		memtx_tree_view_lower_bound_get_offset(tree, &end_data, NULL,
+						       &end_offset);
+	} else {
+		end_offset = memtx_tree_view_size(tree);
+	}
+	if (end_offset <= begin_offset) {
+		*quantile_key = NULL;
+		*quantile_key_size = 0;
+		return 0;
+	}
+
+	assert(level > 0 && level < 1);
+	size_t offset = begin_offset + (end_offset - begin_offset) * level;
+	memtx_tree_iterator_t<USE_HINT> itr =
+		memtx_tree_view_iterator_at(tree, offset);
+	assert(!memtx_tree_iterator_is_invalid(&itr));
+	struct memtx_tree_data<USE_HINT> *data =
+		memtx_tree_view_iterator_get_elem(tree, &itr);
+	if (key_def->for_func_index) {
+		*quantile_key = tuple_data_range((struct tuple *)data->hint,
+						 quantile_key_size);
+		void *buf = xregion_alloc(&fiber()->gc, *quantile_key_size);
+		memcpy(buf, *quantile_key, *quantile_key_size);
+		*quantile_key = (const char *)buf;
+	} else {
+		int multikey_idx = key_def->is_multikey ?
+				   (int)data->hint : MULTIKEY_NONE;
+		*quantile_key = tuple_extract_key(data->tuple, key_def,
+						  multikey_idx,
+						  quantile_key_size);
+	}
+	return 0;
+}
+
+/** Implementation of get_raw index_read_view callback. */
+template <bool USE_HINT>
+static int
+tree_read_view_get_raw(struct index_read_view *base,
+		       const char *key, uint32_t part_count,
+		       struct read_view_tuple *result)
+{
+	struct tree_read_view<USE_HINT> *rv =
+		(struct tree_read_view<USE_HINT> *)base;
+	assert(base->def->opts.is_unique);
+	assert(part_count == base->def->key_def->part_count);
+	struct memtx_tree_key_data<USE_HINT> key_data;
+	struct key_def *cmp_def = rv->tree_view.common.arg;
+	key_data.key = key;
+	key_data.part_count = part_count;
+	if (USE_HINT)
+		key_data.set_hint(key_hint(key, part_count, cmp_def));
+	struct memtx_tree_data<USE_HINT> *res =
+		memtx_tree_view_find(&rv->tree_view, &key_data);
+	if (res == NULL) {
+		*result = read_view_tuple_none();
+		return 0;
+	}
+	struct memtx_index_entry entry =
+		memtx_tree_index_entry(&rv->index->base, res);
+	return memtx_prepare_read_view_tuple(entry, &rv->base,
+					     &rv->cleaner, result);
+}
+
+/** EQ iterator step. */
+template <bool USE_HINT>
+struct TreeReadViewIteratorEQ {
+	struct memtx_tree_data<USE_HINT> *
+	operator()(struct tree_read_view_iterator<USE_HINT> *it)
+	{
+		struct tree_read_view<USE_HINT> *rv =
+			(struct tree_read_view<USE_HINT> *)it->base.index;
+		memtx_tree_view_iterator_next(&rv->tree_view,
+					      &it->tree_iterator);
+		struct memtx_tree_data<USE_HINT> *res =
+			memtx_tree_view_iterator_get_elem(&rv->tree_view,
+							  &it->tree_iterator);
+		return res != NULL &&
+		       tuple_compare_with_key(res->tuple, res->hint,
+					      it->key_data.key,
+					      it->key_data.part_count,
+					      it->key_data.hint,
+					      rv->base.def->key_def) == 0 ?
+		       res : NULL;
+	}
+};
+
+/** REQ iterator step. */
+template<bool USE_HINT>
+struct TreeReadViewIteratorREQ {
+	struct memtx_tree_data<USE_HINT> *
+	operator()(struct tree_read_view_iterator<USE_HINT> *it)
+	{
+		struct tree_read_view<USE_HINT> *rv =
+			(struct tree_read_view<USE_HINT> *)it->base.index;
+		memtx_tree_view_iterator_prev(&rv->tree_view,
+					      &it->tree_iterator);
+		struct memtx_tree_data<USE_HINT> *res =
+			memtx_tree_view_iterator_get_elem(&rv->tree_view,
+							  &it->tree_iterator);
+		return res != NULL &&
+		       tuple_compare_with_key(res->tuple, res->hint,
+					      it->key_data.key,
+					      it->key_data.part_count,
+					      it->key_data.hint,
+					      rv->base.def->key_def) == 0 ?
+		       res : NULL;
+	}
+};
+
+/** LE/LT iterator step. */
+template<bool USE_HINT>
+struct TreeReadViewIteratorLE {
+	struct memtx_tree_data<USE_HINT> *
+	operator()(struct tree_read_view_iterator<USE_HINT> *it)
+	{
+		struct tree_read_view<USE_HINT> *rv =
+			(struct tree_read_view<USE_HINT> *)it->base.index;
+		memtx_tree_view_iterator_prev(&rv->tree_view,
+					      &it->tree_iterator);
+		struct memtx_tree_data<USE_HINT> *res =
+			memtx_tree_view_iterator_get_elem(&rv->tree_view,
+							  &it->tree_iterator);
+		return res;
+	}
+};
+
+/** GE/GT iterator step. */
+template<bool USE_HINT>
+struct TreeReadViewIteratorGE {
+	struct memtx_tree_data<USE_HINT> *
+	operator()(struct tree_read_view_iterator<USE_HINT> *it)
+	{
+		struct tree_read_view<USE_HINT> *rv =
+			(struct tree_read_view<USE_HINT> *)it->base.index;
+		memtx_tree_view_iterator_next(&rv->tree_view,
+					      &it->tree_iterator);
+		struct memtx_tree_data<USE_HINT> *res =
+			memtx_tree_view_iterator_get_elem(&rv->tree_view,
+							  &it->tree_iterator);
+		return res;
+	}
+};
+
+/** Wrapper around Next() that skips data invisible from the read view. */
+template<bool USE_HINT, template <bool> class Next>
+static int
+tree_read_view_iterator_next_raw_impl(struct index_read_view_iterator *iterator,
+				      struct read_view_tuple *result)
+{
+	struct tree_read_view_iterator<USE_HINT> *it =
+		(struct tree_read_view_iterator<USE_HINT> *)iterator;
+	struct tree_read_view<USE_HINT> *rv =
+		(struct tree_read_view<USE_HINT> *)it->base.index;
+	while (true) {
+		struct memtx_tree_data<USE_HINT> *tree_data =
+			Next<USE_HINT>()(it);
+		if (tree_data == NULL) {
+			it->base.next_raw =
+				exhausted_index_read_view_iterator_next_raw;
+			*result = read_view_tuple_none();
+			return 0;
+		}
+		it->last = tree_data;
+		struct memtx_index_entry entry =
+			memtx_tree_index_entry(&rv->index->base, tree_data);
+		if (memtx_prepare_read_view_tuple(entry, &rv->base,
+						  &rv->cleaner, result) != 0)
+			return -1;
+		if (result->data != NULL)
+			return 0;
+	}
+}
+
+/**
+ * Positions the iterator to the given key.
+ *
+ * Note, the 'next' iterator method advances the iterator *before* returning
+ * the value so we need to position the iterator to the value *preceding*
+ * the key. We can do that because the BPS tree iterator has an interesting
+ * property: a forward/backward step from an invalid iterator sets its position
+ * to the first/last element.
+ */
+template <bool USE_HINT>
+static int
+tree_read_view_iterator_start(struct tree_read_view_iterator<USE_HINT> *it,
+			      enum iterator_type type,
+			      const char *key, uint32_t part_count,
+			      const char *pos, uint32_t offset)
+{
+	if (type == ITER_PP || type == ITER_NP) {
+		diag_set(UnsupportedIndexFeature, it->base.index->def,
+			 "requested iterator type");
+		return -1;
+	}
+	canonicalize_lookup(&type, &key, part_count);
+
+	/* Exhaust the iterator by default. */
+	it->base.next_raw = exhausted_index_read_view_iterator_next_raw;
+
+	/* Save the original key. */
+	struct tree_read_view<USE_HINT> *rv =
+		(struct tree_read_view<USE_HINT> *)it->base.index;
+	memtx_tree_view_t<USE_HINT> *tree_view = &rv->tree_view;
+	struct key_def *cmp_def = tree_view->common.arg;
+	it->key_data.key = key;
+	it->key_data.part_count = part_count;
+	if (USE_HINT)
+		it->key_data.set_hint(key_hint(key, part_count, cmp_def));
+
+	/* Perform the lookup. */
+	struct memtx_tree_key_data<USE_HINT> start_data = it->key_data;
+	size_t curr_offset;
+	if (!memtx_tree_view_lookup(tree_view, &start_data, pos, &type,
+				    &it->tree_iterator, &curr_offset))
+		return 0; /* The iterator is exhausted. */
+
+	/* Skip the amount of tuples required. */
+	if (offset != 0) {
+		/* Logarithmically skip raw tuples. */
+		bool reverse = iterator_type_is_reverse(type);
+		curr_offset = reverse ? MAX(-1, (ssize_t)curr_offset - offset) :
+					curr_offset + offset;
+		it->tree_iterator = memtx_tree_view_iterator_at(tree_view,
+								curr_offset);
+
+		/* We're potentially at the element prior to the target one. */
+		struct memtx_tree_data<USE_HINT> *prev =
+			memtx_tree_view_iterator_get_elem(tree_view,
+							  &it->tree_iterator);
+
+		/* Check if we've logarithmically skipped too much. */
+		if (prev == NULL)
+			return 0; /* The iterator is exhausted. */
+
+		/*
+		 * Calculate the amount of invisible to the read view tuples
+		 * skipped. The snapshot invisible count function returns the
+		 * amount of tuples matching a key exclusively until the given
+		 * tuple. But the given `until` tuple is the one prior to the
+		 * target (potentially), so it's skipped too and also must be
+		 * checked for visibility so we do it manually.
+		 */
+		struct memtx_index_entry prev_entry =
+				memtx_tree_index_entry(&rv->index->base, prev);
+		size_t skip_more_visible =
+			memtx_tx_snapshot_invisible_count_matching_until(
+				&rv->cleaner, rv->base.def, type,
+				start_data.key, start_data.part_count,
+				prev->tuple, prev->hint) +
+			!memtx_tx_snapshot_entry_is_visible(&rv->cleaner,
+							    prev_entry);
+		memtx_tree_iterator_t<USE_HINT> *iterator = &it->tree_iterator;
+		while (skip_more_visible != 0) {
+			if (iterator_type_is_reverse(type)) {
+				memtx_tree_view_iterator_prev(tree_view,
+							      iterator);
+			} else {
+				memtx_tree_view_iterator_next(tree_view,
+							      iterator);
+			}
+			prev = memtx_tree_view_iterator_get_elem(tree_view,
+								 iterator);
+
+			/* Check if we've skipped too much. */
+			if (prev == NULL)
+				return 0; /* The iterator is exhausted. */
+			prev_entry =
+				memtx_tree_index_entry(&rv->index->base, prev);
+			if (memtx_tx_snapshot_entry_is_visible(&rv->cleaner,
+							       prev_entry))
+				skip_more_visible--;
+		}
+	}
+
+	/* Set the corresponding step method. */
+	switch (type) {
+	case ITER_EQ:
+		it->base.next_raw = tree_read_view_iterator_next_raw_impl<
+				USE_HINT, TreeReadViewIteratorEQ>;
+		break;
+	case ITER_REQ:
+		it->base.next_raw = tree_read_view_iterator_next_raw_impl<
+				USE_HINT, TreeReadViewIteratorREQ>;
+		break;
+	case ITER_LT:
+	case ITER_LE:
+		it->base.next_raw = tree_read_view_iterator_next_raw_impl<
+				USE_HINT, TreeReadViewIteratorLE>;
+		break;
+	case ITER_GE:
+	case ITER_GT:
+		it->base.next_raw = tree_read_view_iterator_next_raw_impl<
+				USE_HINT, TreeReadViewIteratorGE>;
+		break;
+	default:
+		unreachable();
+	}
 	return 0;
 }
 
 /**
- * Create an ALL iterator with personal read view so further
- * index modifications will not affect the iteration results.
- * Must be destroyed by iterator->free after usage.
+ * Sets read view key_def to 'raw' version, which doesn't access tuple format,
+ * because tuples stored in a read view may have no format.
  */
 template <bool USE_HINT>
-static struct snapshot_iterator *
-memtx_tree_index_create_snapshot_iterator(struct index *base)
+static void
+tree_read_view_reset_key_def(struct tree_read_view<USE_HINT> *rv)
 {
-	struct memtx_tree_index<USE_HINT> *index =
-		(struct memtx_tree_index<USE_HINT> *)base;
-	struct tree_snapshot_iterator<USE_HINT> *it =
-		(struct tree_snapshot_iterator<USE_HINT> *)
-		calloc(1, sizeof(*it));
-	if (it == NULL) {
-		diag_set(OutOfMemory,
-			 sizeof(struct tree_snapshot_iterator<USE_HINT>),
-			 "memtx_tree_index", "create_snapshot_iterator");
-		return NULL;
-	}
-
-	struct space *space = space_cache_find(base->def->space_id);
-	memtx_tx_snapshot_cleaner_create(&it->cleaner, space);
-
-	it->base.free = tree_snapshot_iterator_free<USE_HINT>;
-	it->base.next = tree_snapshot_iterator_next<USE_HINT>;
-	it->index = index;
-	index_ref(base);
-	it->tree_iterator = memtx_tree_iterator_first(&index->tree);
-	memtx_tree_iterator_freeze(&index->tree, &it->tree_iterator);
-	memtx_enter_delayed_free_mode((struct memtx_engine *)base->engine);
-	return (struct snapshot_iterator *) it;
+	struct index_def *def = rv->base.def;
+	key_def_set_func_raw(def->key_def);
+	key_def_set_func_raw(def->cmp_def);
+	rv->tree_view.common.arg = def->opts.is_unique &&
+				   !def->key_def->is_nullable ?
+				   def->key_def : def->cmp_def;
 }
 
-static const struct index_vtab memtx_tree_no_hint_index_vtab = {
-	/* .destroy = */ memtx_tree_index_destroy<false>,
-	/* .commit_create = */ generic_index_commit_create,
-	/* .abort_create = */ generic_index_abort_create,
-	/* .commit_modify = */ generic_index_commit_modify,
-	/* .commit_drop = */ generic_index_commit_drop,
-	/* .update_def = */ memtx_tree_index_update_def<false>,
-	/* .depends_on_pk = */ memtx_tree_index_depends_on_pk,
-	/* .def_change_requires_rebuild = */
-		memtx_index_def_change_requires_rebuild,
-	/* .size = */ memtx_tree_index_size<false>,
-	/* .bsize = */ memtx_tree_index_bsize<false>,
-	/* .min = */ generic_index_min,
-	/* .max = */ generic_index_max,
-	/* .random = */ memtx_tree_index_random<false>,
-	/* .count = */ memtx_tree_index_count<false>,
-	/* .get = */ memtx_tree_index_get<false>,
-	/* .replace = */ memtx_tree_index_replace<false>,
-	/* .create_iterator = */ memtx_tree_index_create_iterator<false>,
-	/* .create_snapshot_iterator = */
-		memtx_tree_index_create_snapshot_iterator<false>,
-	/* .stat = */ generic_index_stat,
-	/* .compact = */ generic_index_compact,
-	/* .reset_stat = */ generic_index_reset_stat,
-	/* .begin_build = */ memtx_tree_index_begin_build<false>,
-	/* .reserve = */ memtx_tree_index_reserve<false>,
-	/* .build_next = */ memtx_tree_index_build_next<false>,
-	/* .end_build = */ memtx_tree_index_end_build<false>,
-};
+/**
+ * Implementation of iterator position for general and multikey read views.
+ */
+template <bool USE_HINT, bool IS_MULTIKEY>
+static int
+tree_read_view_iterator_position(struct index_read_view_iterator *it,
+				 const char **pos, uint32_t *size)
+{
+	struct tree_read_view_iterator<USE_HINT> *tree_it =
+		(struct tree_read_view_iterator<USE_HINT> *)it;
+	return tree_iterator_position_impl<USE_HINT, IS_MULTIKEY>(
+		tree_it->last, it->base.index->def, pos, size);
+}
 
-static const struct index_vtab memtx_tree_use_hint_index_vtab = {
-	/* .destroy = */ memtx_tree_index_destroy<true>,
-	/* .commit_create = */ generic_index_commit_create,
-	/* .abort_create = */ generic_index_abort_create,
-	/* .commit_modify = */ generic_index_commit_modify,
-	/* .commit_drop = */ generic_index_commit_drop,
-	/* .update_def = */ memtx_tree_index_update_def<true>,
-	/* .depends_on_pk = */ memtx_tree_index_depends_on_pk,
-	/* .def_change_requires_rebuild = */
-		memtx_index_def_change_requires_rebuild,
-	/* .size = */ memtx_tree_index_size<true>,
-	/* .bsize = */ memtx_tree_index_bsize<true>,
-	/* .min = */ generic_index_min,
-	/* .max = */ generic_index_max,
-	/* .random = */ memtx_tree_index_random<true>,
-	/* .count = */ memtx_tree_index_count<true>,
-	/* .get = */ memtx_tree_index_get<true>,
-	/* .replace = */ memtx_tree_index_replace<true>,
-	/* .create_iterator = */ memtx_tree_index_create_iterator<true>,
-	/* .create_snapshot_iterator = */
-		memtx_tree_index_create_snapshot_iterator<true>,
-	/* .stat = */ generic_index_stat,
-	/* .compact = */ generic_index_compact,
-	/* .reset_stat = */ generic_index_reset_stat,
-	/* .begin_build = */ memtx_tree_index_begin_build<true>,
-	/* .reserve = */ memtx_tree_index_reserve<true>,
-	/* .build_next = */ memtx_tree_index_build_next<true>,
-	/* .end_build = */ memtx_tree_index_end_build<true>,
-};
+/**
+ * Implementation of iterator position for functional index read views.
+ */
+static int
+tree_read_view_iterator_position_func(struct index_read_view_iterator *it,
+				      const char **pos, uint32_t *size)
+{
+	struct tree_read_view_iterator<true> *tree_it =
+		(struct tree_read_view_iterator<true> *)it;
+	return tree_iterator_position_func_impl(tree_it->last,
+						it->base.index->def,
+						pos, size);
+}
 
-static const struct index_vtab memtx_tree_index_multikey_vtab = {
-	/* .destroy = */ memtx_tree_index_destroy<true>,
-	/* .commit_create = */ generic_index_commit_create,
-	/* .abort_create = */ generic_index_abort_create,
-	/* .commit_modify = */ generic_index_commit_modify,
-	/* .commit_drop = */ generic_index_commit_drop,
-	/* .update_def = */ memtx_tree_index_update_def<true>,
-	/* .depends_on_pk = */ memtx_tree_index_depends_on_pk,
-	/* .def_change_requires_rebuild = */
-		memtx_index_def_change_requires_rebuild,
-	/* .size = */ memtx_tree_index_size<true>,
-	/* .bsize = */ memtx_tree_index_bsize<true>,
-	/* .min = */ generic_index_min,
-	/* .max = */ generic_index_max,
-	/* .random = */ memtx_tree_index_random<true>,
-	/* .count = */ memtx_tree_index_count<true>,
-	/* .get = */ memtx_tree_index_get<true>,
-	/* .replace = */ memtx_tree_index_replace_multikey,
-	/* .create_iterator = */ memtx_tree_index_create_iterator<true>,
-	/* .create_snapshot_iterator = */
-		memtx_tree_index_create_snapshot_iterator<true>,
-	/* .stat = */ generic_index_stat,
-	/* .compact = */ generic_index_compact,
-	/* .reset_stat = */ generic_index_reset_stat,
-	/* .begin_build = */ memtx_tree_index_begin_build<true>,
-	/* .reserve = */ memtx_tree_index_reserve<true>,
-	/* .build_next = */ memtx_tree_index_build_next_multikey,
-	/* .end_build = */ memtx_tree_index_end_build<true>,
-};
+/** Implementation of create_iterator_with_offset index_read_view callback. */
+template <bool USE_HINT>
+static int
+tree_read_view_create_iterator_with_offset(
+	struct index_read_view *base, enum iterator_type type, const char *key,
+	uint32_t part_count, const char *pos, uint32_t offset,
+	struct index_read_view_iterator *iterator)
+{
+	struct tree_read_view_iterator<USE_HINT> *it =
+		(struct tree_read_view_iterator<USE_HINT> *)iterator;
+	it->base.index = base;
+	it->base.destroy = generic_index_read_view_iterator_destroy;
+	it->base.next_raw = exhausted_index_read_view_iterator_next_raw;
+	if (it->base.index->def->key_def->for_func_index)
+		it->base.position =
+			tree_read_view_iterator_position_func;
+	else if (it->base.index->def->key_def->is_multikey)
+		it->base.position =
+			tree_read_view_iterator_position<true, true>;
+	else
+		it->base.position =
+			tree_read_view_iterator_position<USE_HINT, false>;
+	it->key_data.key = NULL;
+	it->key_data.part_count = 0;
+	if (USE_HINT)
+		it->key_data.set_hint(HINT_NONE);
+	it->last = NULL;
+	invalidate_tree_iterator(&it->tree_iterator);
+	return tree_read_view_iterator_start(it, type, key, part_count,
+					     pos, offset);
+}
 
-static const struct index_vtab memtx_tree_func_index_vtab = {
-	/* .destroy = */ memtx_tree_index_destroy<true>,
-	/* .commit_create = */ generic_index_commit_create,
-	/* .abort_create = */ generic_index_abort_create,
-	/* .commit_modify = */ generic_index_commit_modify,
-	/* .commit_drop = */ generic_index_commit_drop,
-	/* .update_def = */ memtx_tree_index_update_def<true>,
-	/* .depends_on_pk = */ memtx_tree_index_depends_on_pk,
-	/* .def_change_requires_rebuild = */
-		memtx_index_def_change_requires_rebuild,
-	/* .size = */ memtx_tree_index_size<true>,
-	/* .bsize = */ memtx_tree_index_bsize<true>,
-	/* .min = */ generic_index_min,
-	/* .max = */ generic_index_max,
-	/* .random = */ memtx_tree_index_random<true>,
-	/* .count = */ memtx_tree_index_count<true>,
-	/* .get = */ memtx_tree_index_get<true>,
-	/* .replace = */ memtx_tree_func_index_replace,
-	/* .create_iterator = */ memtx_tree_index_create_iterator<true>,
-	/* .create_snapshot_iterator = */
-		memtx_tree_index_create_snapshot_iterator<true>,
-	/* .stat = */ generic_index_stat,
-	/* .compact = */ generic_index_compact,
-	/* .reset_stat = */ generic_index_reset_stat,
-	/* .begin_build = */ memtx_tree_index_begin_build<true>,
-	/* .reserve = */ memtx_tree_index_reserve<true>,
-	/* .build_next = */ memtx_tree_func_index_build_next,
-	/* .end_build = */ memtx_tree_index_end_build<true>,
-};
+/** Implementation of create_iterator index_read_view callback. */
+template<bool USE_HINT>
+static int
+tree_read_view_create_iterator(struct index_read_view *base,
+			       enum iterator_type type, const char *key,
+			       uint32_t part_count, const char *pos,
+			       struct index_read_view_iterator *iterator)
+{
+	return tree_read_view_create_iterator_with_offset<USE_HINT>(
+		base, type, key, part_count, pos, 0, iterator);
+}
+
+/** Implementation of create_read_view index callback. */
+template <bool USE_HINT>
+static struct index_read_view *
+memtx_tree_index_create_read_view(struct index *base)
+{
+	static const struct index_read_view_vtab vtab = {
+		.free = tree_read_view_free<USE_HINT>,
+		.count = tree_read_view_count<USE_HINT>,
+		.quantile = tree_read_view_quantile<USE_HINT>,
+		.get_raw = tree_read_view_get_raw<USE_HINT>,
+		.create_iterator = tree_read_view_create_iterator<USE_HINT>,
+		.create_iterator_with_offset =
+			tree_read_view_create_iterator_with_offset<USE_HINT>,
+		.create_arrow_stream =
+			generic_index_read_view_create_arrow_stream,
+	};
+	struct memtx_tree_index<USE_HINT> *index =
+		(struct memtx_tree_index<USE_HINT> *)base;
+	struct tree_read_view<USE_HINT> *rv =
+		(struct tree_read_view<USE_HINT> *)xmalloc(sizeof(*rv));
+	index_read_view_create(&rv->base, &vtab, base->def);
+	struct space *space = space_by_id(base->def->space_id);
+	assert(space != NULL);
+	memtx_tx_snapshot_cleaner_create(&rv->cleaner, space, base);
+	invalidate_tree_iterator(&rv->dump_iterator);
+	rv->index = index;
+	index_ref(base);
+	memtx_tree_view_create(&rv->tree_view, &index->tree);
+	tree_read_view_reset_key_def(rv);
+	return (struct index_read_view *)rv;
+}
+
+/** Dump the tree data into the sort data file. */
+template<bool USE_HINT>
+static int
+memtx_tree_index_read_view_dump_sort_data(
+	struct index_read_view *base, int tuple_count,
+	struct memtx_sort_data_writer *sort_data, bool *have_more)
+{
+	assert(!base->def->key_def->for_func_index);
+
+	/* Collect the data to save. */
+	struct tree_read_view<USE_HINT> *rv =
+		(struct tree_read_view<USE_HINT> *)base;
+	struct memtx_tree_data<USE_HINT> *buffer =
+		(struct memtx_tree_data<USE_HINT> *)
+			xmalloc(sizeof(*buffer) * tuple_count);
+	auto _ = make_scoped_guard([buffer] { free(buffer); });
+	int dumped = 0;
+	while (dumped != tuple_count &&
+	       memtx_tree_view_iterator_next(&rv->tree_view,
+					     &rv->dump_iterator)) {
+		struct memtx_tree_data<USE_HINT> *data =
+			memtx_tree_view_iterator_get_elem(
+				&rv->tree_view, &rv->dump_iterator);
+		/* Only dump visible data. */
+		struct memtx_index_entry entry =
+				memtx_tree_index_entry(&rv->index->base, data);
+		struct memtx_index_entry clarified =
+			memtx_tx_snapshot_clarify(&rv->cleaner, entry);
+		if (clarified.tuple == NULL)
+			continue;
+		/*
+		 * Dump clarified tuples with hints (optionally). A multikey
+		 * hint is the position in the tuple, so it is cleaned too.
+		 */
+		buffer[dumped].tuple = clarified.tuple;
+		if (USE_HINT)
+			buffer[dumped].set_hint(
+				base->def->key_def->is_multikey ?
+				clarified.key_data : data->hint);
+		dumped++;
+	}
+
+	/* Write the collected data to the sort data file. */
+	if (memtx_sort_data_writer_put(sort_data, buffer,
+				       sizeof(*buffer), dumped) != 0)
+		return -1;
+
+	*have_more = !memtx_tree_iterator_is_invalid(&rv->dump_iterator);
+	return 0;
+}
+
+int
+memtx_tree_index_read_view_dump_sort_data(
+	struct index_read_view *base, int tuple_count,
+	struct memtx_sort_data_writer *sort_data, bool *have_more)
+{
+	if (memtx_tree_index_uses_hint(base->def)) {
+		return memtx_tree_index_read_view_dump_sort_data<true>(
+			base, tuple_count, sort_data, have_more);
+	} else {
+		return memtx_tree_index_read_view_dump_sort_data<false>(
+			base, tuple_count, sort_data, have_more);
+	}
+}
 
 /**
  * A disabled index vtab provides safe dummy methods for
@@ -1758,7 +2793,7 @@ static const struct index_vtab memtx_tree_func_index_vtab = {
  * recovery from snapshoot in case of func_index (because
  * key defintion is not completely initialized at that moment).
  */
-static const struct index_vtab memtx_tree_disabled_index_vtab = {
+static const struct index_vtab memtx_tree_disabled_index_vtab_base = {
 	/* .destroy = */ memtx_tree_index_destroy<true>,
 	/* .commit_create = */ generic_index_commit_create,
 	/* .abort_create = */ generic_index_abort_create,
@@ -1770,23 +2805,108 @@ static const struct index_vtab memtx_tree_disabled_index_vtab = {
 		generic_index_def_change_requires_rebuild,
 	/* .size = */ generic_index_size,
 	/* .bsize = */ generic_index_bsize,
+	/* .quantile = */ generic_index_quantile,
 	/* .min = */ generic_index_min,
 	/* .max = */ generic_index_max,
 	/* .random = */ generic_index_random,
 	/* .count = */ generic_index_count,
 	/* .get = */ generic_index_get,
-	/* .replace = */ disabled_index_replace,
 	/* .create_iterator = */ generic_index_create_iterator,
-	/* .create_snapshot_iterator = */
-		generic_index_create_snapshot_iterator,
+	/* .create_iterator_with_offset = */
+	generic_index_create_iterator_with_offset,
+	/* .create_arrow_stream = */ generic_index_create_arrow_stream,
+	/* .create_read_view = */ generic_index_create_read_view,
+	/* .info = */ generic_index_info,
 	/* .stat = */ generic_index_stat,
 	/* .compact = */ generic_index_compact,
 	/* .reset_stat = */ generic_index_reset_stat,
-	/* .begin_build = */ generic_index_begin_build,
-	/* .reserve = */ generic_index_reserve,
-	/* .build_next = */ disabled_index_build_next,
-	/* .end_build = */ generic_index_end_build,
 };
+
+static const struct memtx_index_vtab memtx_tree_disabled_index_vtab = {
+	/* .base = */ memtx_tree_disabled_index_vtab_base,
+	/* .get_internal = */ generic_memtx_index_get_internal,
+	/* .replace_entry = */ memtx_tree_disabled_index_replace,
+	/* .delete_entry = */ memtx_tree_disabled_index_delete,
+	/* .begin_build = */ generic_memtx_index_begin_build,
+	/* .reserve = */ generic_memtx_index_reserve,
+	/* .build_next = */ memtx_tree_disabled_index_build_next,
+	/* .end_build = */ generic_memtx_index_end_build,
+};
+
+/** Type of index in terms of different vtabs. */
+enum memtx_tree_vtab_type {
+	/** General index type. */
+	MEMTX_TREE_VTAB_GENERAL,
+	/** Multikey index type. */
+	MEMTX_TREE_VTAB_MULTIKEY,
+	/** Func index type. */
+	MEMTX_TREE_VTAB_FUNC,
+	/** Disabled index type. */
+	MEMTX_TREE_VTAB_DISABLED,
+	/** Count of types. */
+	MEMTX_TREE_VTAB_TYPE_COUNT,
+};
+
+/**
+ * Get index vtab by @a TYPE and @a USE_HINT, template version.
+ * USE_HINT == false is only allowed for general index type.
+ */
+template <memtx_tree_vtab_type TYPE, bool USE_HINT = true>
+static const struct index_vtab *
+get_memtx_tree_index_vtab(void)
+{
+	static_assert(USE_HINT || TYPE == MEMTX_TREE_VTAB_GENERAL,
+		      "Multikey and func indexes must use hints");
+
+	if (TYPE == MEMTX_TREE_VTAB_DISABLED)
+		return (struct index_vtab *)&memtx_tree_disabled_index_vtab;
+
+	const bool is_mk = TYPE == MEMTX_TREE_VTAB_MULTIKEY;
+	const bool is_func = TYPE == MEMTX_TREE_VTAB_FUNC;
+	static const struct index_vtab vtab_base = {
+		/* .destroy = */ memtx_tree_index_destroy<USE_HINT>,
+		/* .commit_create = */ generic_index_commit_create,
+		/* .abort_create = */ generic_index_abort_create,
+		/* .commit_modify = */ generic_index_commit_modify,
+		/* .commit_drop = */ generic_index_commit_drop,
+		/* .update_def = */ memtx_tree_index_update_def<USE_HINT>,
+		/* .depends_on_pk = */ memtx_tree_index_depends_on_pk,
+		/* .def_change_requires_rebuild = */
+			memtx_index_def_change_requires_rebuild,
+		/* .size = */ memtx_tree_index_size<USE_HINT>,
+		/* .bsize = */ memtx_tree_index_bsize<USE_HINT>,
+		/* .quantile = */ memtx_tree_index_quantile<USE_HINT>,
+		/* .min = */ generic_index_min,
+		/* .max = */ generic_index_max,
+		/* .random = */ memtx_tree_index_random<USE_HINT>,
+		/* .count = */ memtx_tree_index_count<USE_HINT>,
+		/* .get = */ memtx_index_get,
+		/* .create_iterator = */
+			memtx_tree_index_create_iterator<USE_HINT>,
+		/* .create_iterator_with_offset = */
+		memtx_tree_index_create_iterator_with_offset<USE_HINT>,
+		/* .create_arrow_stream = */ generic_index_create_arrow_stream,
+		/* .create_read_view = */
+			memtx_tree_index_create_read_view<USE_HINT>,
+		/* .info = */ generic_index_info,
+		/* .stat = */ generic_index_stat,
+		/* .compact = */ generic_index_compact,
+		/* .reset_stat = */ generic_index_reset_stat,
+	};
+	static const struct memtx_index_vtab vtab = {
+		/* .base = */ vtab_base,
+		/* .get_internal = */ memtx_tree_index_get_internal<USE_HINT>,
+		/* .replace_entry = */ memtx_tree_index_replace<USE_HINT>,
+		/* .delete_entry = */ memtx_tree_index_delete<USE_HINT>,
+		/* .begin_build = */ memtx_tree_index_begin_build<USE_HINT>,
+		/* .reserve = */ memtx_tree_index_reserve<USE_HINT>,
+		/* .build_next = */ is_mk ? memtx_tree_index_build_next_multikey :
+				    is_func ? memtx_tree_func_index_build_next :
+				    memtx_tree_index_build_next<USE_HINT>,
+		/* .end_build = */ memtx_tree_index_end_build<USE_HINT>,
+	};
+	return (struct index_vtab *)&vtab;
+}
 
 template <bool USE_HINT>
 static struct index *
@@ -1795,44 +2915,49 @@ memtx_tree_index_new_tpl(struct memtx_engine *memtx, struct index_def *def,
 {
 	struct memtx_tree_index<USE_HINT> *index =
 		(struct memtx_tree_index<USE_HINT> *)
-		calloc(1, sizeof(*index));
-	if (index == NULL) {
-		diag_set(OutOfMemory, sizeof(*index),
-			 "malloc", "struct memtx_tree_index");
-		return NULL;
-	}
-	if (index_create(&index->base, (struct engine *)memtx,
-			 vtab, def) != 0) {
-		free(index);
-		return NULL;
-	}
+		xcalloc(1, sizeof(*index));
+	index_create(&index->base, (struct engine *)memtx, vtab, def);
 
 	/* See comment to memtx_tree_index_update_def(). */
 	struct key_def *cmp_def;
 	cmp_def = def->opts.is_unique && !def->key_def->is_nullable ?
 			index->base.def->key_def : index->base.def->cmp_def;
 
-	memtx_tree_create(&index->tree, cmp_def, memtx_index_extent_alloc,
-			  memtx_index_extent_free, memtx);
+	memtx_tree_create(&index->tree, cmp_def,
+			  &memtx->index_extent_allocator,
+			  &memtx->index_extent_stats);
+	index->is_func = def->key_def->func_index_func != NULL;
 	return &index->base;
 }
 
 struct index *
 memtx_tree_index_new(struct memtx_engine *memtx, struct index_def *def)
 {
+	bool use_hint = memtx_tree_index_uses_hint(def);
 	const struct index_vtab *vtab;
 	if (def->key_def->for_func_index) {
-		if (def->key_def->func_index_func == NULL)
-			vtab = &memtx_tree_disabled_index_vtab;
-		else
-			vtab = &memtx_tree_func_index_vtab;
+		if (def->key_def->func_index_func != NULL) {
+			vtab = get_memtx_tree_index_vtab
+				<MEMTX_TREE_VTAB_FUNC>();
+		} else {
+			vtab = get_memtx_tree_index_vtab
+				<MEMTX_TREE_VTAB_DISABLED>();
+		}
+		assert(use_hint);
 	} else if (def->key_def->is_multikey) {
-		vtab = &memtx_tree_index_multikey_vtab;
-	} else if (def->opts.hint) {
-		vtab = &memtx_tree_use_hint_index_vtab;
+		vtab = get_memtx_tree_index_vtab<MEMTX_TREE_VTAB_MULTIKEY>();
+		assert(use_hint);
+	} else if (def->opts.hint == INDEX_HINT_ON) {
+		vtab = get_memtx_tree_index_vtab
+			<MEMTX_TREE_VTAB_GENERAL, true>();
+		assert(use_hint);
 	} else {
-		vtab = &memtx_tree_no_hint_index_vtab;
-		return memtx_tree_index_new_tpl<false>(memtx, def, vtab);
+		vtab = get_memtx_tree_index_vtab
+			<MEMTX_TREE_VTAB_GENERAL, false>();
+		assert(!use_hint);
 	}
-	return memtx_tree_index_new_tpl<true>(memtx, def, vtab);
+	if (use_hint)
+		return memtx_tree_index_new_tpl<true>(memtx, def, vtab);
+	else
+		return memtx_tree_index_new_tpl<false>(memtx, def, vtab);
 }

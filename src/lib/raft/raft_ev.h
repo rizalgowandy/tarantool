@@ -38,20 +38,33 @@ struct ev_timer;
  * to speed the tests up, and have more control over the event loop.
  */
 
+/** A wrapper around ev_timer_start(). */
 void
 raft_ev_timer_start(struct ev_loop *loop, struct ev_timer *watcher);
 
+/** A wrapper around ev_timer_remaining(). */
 double
 raft_ev_timer_remaining(struct ev_loop *loop, struct ev_timer *watcher);
 
+/** A wrapper around ev_timer_stop(). */
 void
 raft_ev_timer_stop(struct ev_loop *loop, struct ev_timer *watcher);
 
+/** A wrapper around ev_monotonic_now(). */
+double
+raft_ev_monotonic_now(struct ev_loop *loop);
+
+/** A wrapper around loop(), which returns this cord's ev_loop. */
 struct ev_loop *
 raft_loop(void);
 
 #define raft_ev_is_active ev_is_active
 
+#define raft_ev_is_pending ev_is_pending
+
 #define raft_ev_timer_init ev_timer_init
 
 #define raft_ev_timer_set ev_timer_set
+
+#define raft_ev_timer_is_active(w)						\
+	(raft_ev_is_active(w) || raft_ev_is_pending(w))

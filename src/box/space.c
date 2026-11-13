@@ -45,9 +45,59 @@
 #include "xrow.h"
 #include "iproto_constants.h"
 #include "schema.h"
-#include "ck_constraint.h"
 #include "assoc.h"
-#include "constraint_id.h"
+#include "box.h"
+#include "space_upgrade.h"
+#include "tuple_constraint.h"
+#include "tuple_constraint_func.h"
+#include "tuple_constraint_fkey.h"
+#include "field_default_func.h"
+#include "wal_ext.h"
+#include "coll_id_cache.h"
+#include "func_adapter.h"
+#include "lua/utils.h"
+#include "core/mp_ctx.h"
+#include "port.h"
+#include "tweaks.h"
+#include "txn_limbo.h"
+#include "sql.h"
+#include "arrow_ipc.h"
+
+/**
+ * Controls whether to consider system spaces indefinitely synchronous when the
+ * synchronous queue is claimed.
+ */
+bool box_consider_system_spaces_synchronous;
+TWEAK_BOOL(box_consider_system_spaces_synchronous);
+
+/**
+ * Whether space events should be disabled.
+ */
+static bool space_events_enabled = true;
+
+#define SYNC_SYSTEM_SPACE_MEMBER(name, id, is_sync) \
+	is_sync ? BOX_ ## name ## _ID : BOX_ID_NIL,
+
+/*
+ * System spaces for which synchronous replication is enabled when the
+ * synchronous queue is claimed.
+ */
+static uint32_t sync_system_space_ids[] = {
+	SYSTEM_SPACES(SYNC_SYSTEM_SPACE_MEMBER)
+};
+
+static bool
+system_space_is_sync(struct space *space)
+{
+	for (size_t i = 0; i < lengthof(sync_system_space_ids); ++i) {
+		uint32_t sync_system_space_id = sync_system_space_ids[i];
+		if (sync_system_space_id == BOX_ID_NIL)
+			continue;
+		if (sync_system_space_id == space->def->id)
+			return true;
+	}
+	return false;
+}
 
 int
 access_check_space(struct space *space, user_access_t access)
@@ -114,6 +164,404 @@ space_fill_index_map(struct space *space)
 	}
 }
 
+bool
+space_is_system(const struct space *space)
+{
+	return space_id_is_system(space->def->id);
+}
+
+/**
+ * Initialize constraints that are defined in @a space format.
+ * Can return nonzero in case of error (diag is set).
+ */
+static int
+space_init_constraints(struct space *space)
+{
+	assert(space->def != NULL);
+	struct tuple_format *format = space->format;
+	bool has_foreign_keys = false;
+	bool has_func_constraints = false;
+	for (size_t j = 0; j < format->constraint_count; j++) {
+		struct tuple_constraint *constr = &format->constraint[j];
+		has_foreign_keys = has_foreign_keys ||
+				   constr->def.type == CONSTR_FKEY;
+		has_func_constraints = has_func_constraints ||
+				       constr->def.type == CONSTR_FUNC;
+		if (constr->check != tuple_constraint_noop_check)
+			continue;
+		if (constr->def.type == CONSTR_FUNC) {
+			if (tuple_constraint_func_init(constr, space,
+						       false) != 0)
+				return -1;
+		} else {
+			assert(constr->def.type == CONSTR_FKEY);
+			if (tuple_constraint_fkey_init(constr, space, -1) != 0)
+				return -1;
+		}
+	}
+	for (uint32_t i = 0; i < tuple_format_field_count(format); i++) {
+		struct tuple_field *field = tuple_format_field(format, i);
+		for (size_t j = 0; j < field->constraint_count; j++) {
+			struct tuple_constraint *constr = &field->constraint[j];
+			has_foreign_keys = has_foreign_keys ||
+					   constr->def.type == CONSTR_FKEY;
+			has_func_constraints = has_func_constraints ||
+					       constr->def.type == CONSTR_FUNC;
+			if (constr->check != tuple_constraint_noop_check)
+				continue;
+			if (constr->def.type == CONSTR_FUNC) {
+				if (tuple_constraint_func_init(constr,
+							       space,
+							       true) != 0)
+					return -1;
+			} else {
+				assert(constr->def.type == CONSTR_FKEY);
+				if (tuple_constraint_fkey_init(constr,
+							       space, i) != 0)
+					return -1;
+			}
+		}
+	}
+	space->has_foreign_keys = has_foreign_keys;
+	space->has_func_constraints = has_func_constraints;
+	return 0;
+}
+
+/**
+ * Detach constraints that are defined in @a space format.
+ */
+void
+space_detach_constraints(struct space *space)
+{
+	struct tuple_format *format = space->format;
+	for (size_t j = 0; j < format->constraint_count; j++) {
+		struct tuple_constraint *constr = &format->constraint[j];
+		constr->detach(constr);
+	}
+	for (size_t i = 0; i < tuple_format_field_count(format); i++) {
+		struct tuple_field *field = tuple_format_field(format, i);
+		for (size_t j = 0; j < field->constraint_count; j++) {
+			struct tuple_constraint *constr = &field->constraint[j];
+			constr->detach(constr);
+		}
+	}
+}
+
+/**
+ * Reattach constraints that are defined in @a space format.
+ */
+void
+space_reattach_constraints(struct space *space)
+{
+	struct tuple_format *format = space->format;
+	for (size_t j = 0; j < format->constraint_count; j++) {
+		struct tuple_constraint *constr = &format->constraint[j];
+		constr->reattach(constr);
+	}
+	for (size_t i = 0; i < tuple_format_field_count(format); i++) {
+		struct tuple_field *field = tuple_format_field(format, i);
+		for (size_t j = 0; j < field->constraint_count; j++) {
+			struct tuple_constraint *constr = &field->constraint[j];
+			constr->reattach(constr);
+		}
+	}
+}
+
+void
+space_cleanup_constraints(struct space *space)
+{
+	struct tuple_format *format = space->format;
+	for (size_t j = 0; j < format->constraint_count; j++) {
+		struct tuple_constraint *constr = &format->constraint[j];
+		constr->destroy(constr);
+	}
+	for (size_t i = 0; i < tuple_format_field_count(format); i++) {
+		struct tuple_field *field = tuple_format_field(format, i);
+		for (size_t j = 0; j < field->constraint_count; j++) {
+			struct tuple_constraint *constr = &field->constraint[j];
+			constr->destroy(constr);
+		}
+	}
+	return;
+}
+
+/**
+ * Pin collation identifier with `id` in the cache, so that it can't be deleted.
+ */
+static void
+space_pin_collations_helper(struct space *space, uint32_t id,
+			    enum coll_id_holder_type holder_type)
+{
+	if (id == COLL_NONE)
+		return;
+	struct coll_id *coll_id = coll_by_id(id);
+	assert(coll_id != NULL);
+	struct coll_id_cache_holder *h = xmalloc(sizeof(*h));
+	rlist_add_tail_entry(&space->coll_id_holders, h, in_space);
+	coll_id_pin(coll_id, h, holder_type);
+}
+
+void
+space_pin_collations(struct space *space)
+{
+	for (uint32_t i = 0; i < space->def->field_count; i++) {
+		struct field_def *field = &space->def->fields[i];
+		space_pin_collations_helper(space, field->coll_id,
+					    COLL_ID_HOLDER_SPACE_FORMAT);
+	}
+
+	for (uint32_t i = 0; i < space->index_count; i++) {
+		struct key_def *key_def = space->index[i]->def->key_def;
+		for (uint32_t i = 0; i < key_def->part_count; i++) {
+			struct key_part *part = &key_def->parts[i];
+			space_pin_collations_helper(space, part->coll_id,
+						    COLL_ID_HOLDER_INDEX);
+		}
+	}
+}
+
+void
+space_unpin_collations(struct space *space)
+{
+	struct coll_id_cache_holder *h, *tmp;
+	rlist_foreach_entry_safe(h, &space->coll_id_holders, in_space, tmp) {
+		coll_id_unpin(h);
+		free(h);
+	}
+	rlist_create(&space->coll_id_holders);
+}
+
+/**
+ * Initialize functional default field values that are defined in space format.
+ * Can return nonzero in case of error (diag is set).
+ */
+static int
+space_init_defaults(struct space *space)
+{
+	struct tuple_format *format = space->format;
+	for (uint32_t i = 0; i < format->default_field_count; i++) {
+		struct tuple_field *field = tuple_format_field(format, i);
+		if (tuple_field_has_default_func(field) &&
+		    field_default_func_init(&field->default_value.func) != 0)
+			return -1;
+	}
+	return 0;
+}
+
+void
+space_pin_defaults(struct space *space)
+{
+	struct tuple_format *format = space->format;
+	for (uint32_t i = 0; i < format->default_field_count; i++) {
+		struct tuple_field *field = tuple_format_field(format, i);
+		if (tuple_field_has_default_func(field))
+			field_default_func_pin(&field->default_value.func);
+	}
+}
+
+void
+space_unpin_defaults(struct space *space)
+{
+	struct tuple_format *format = space->format;
+	for (uint32_t i = 0; i < format->default_field_count; i++) {
+		struct tuple_field *field = tuple_format_field(format, i);
+		if (tuple_field_has_default_func(field))
+			field_default_func_unpin(&field->default_value.func);
+	}
+}
+
+/**
+ * Setup each event in `events', associated with the `space' by id and by name.
+ */
+static void
+space_set_events_impl(struct space *space, struct space_event *events[],
+		      size_t event_count, const char *const by_id_fmt[],
+		      const char *const by_name_fmt[])
+{
+	size_t space_id_len = snprintf(NULL, 0, "%u", space_id(space));
+	size_t space_name_len = strlen(space_name(space));
+
+	for (size_t i = 0; i < event_count; ++i) {
+		size_t region_svp = region_used(&fiber()->gc);
+
+		/* Set event by id. */
+		size_t buf_size = strlen(by_id_fmt[i]) + space_id_len
+				  - strlen("%u") + 1;
+		char *event_name = xregion_alloc(&fiber()->gc, buf_size);
+		snprintf(event_name, buf_size, by_id_fmt[i], space_id(space));
+		struct event **event = &events[i]->by_id;
+		assert(*event == NULL);
+		*event = event_get(event_name, true);
+		event_ref(*event);
+
+		/* Set event by name. */
+		buf_size = strlen(by_name_fmt[i]) + space_name_len
+			   - strlen("%s") + 1;
+		event_name = xregion_alloc(&fiber()->gc, buf_size);
+		snprintf(event_name, buf_size, by_name_fmt[i],
+			 space_name(space));
+		event = &events[i]->by_name;
+		assert(*event == NULL);
+		*event = event_get(event_name, true);
+		event_ref(*event);
+
+		region_truncate(&fiber()->gc, region_svp);
+	}
+}
+
+/**
+ * Set DML events associated with the space: on_replace and before_replace,
+ * bound by name and by id. If argument is_on_recovery is true, recovery events
+ * are set instead of regular ones.
+ */
+static void
+space_set_dml_events(struct space *space, bool is_on_recovery)
+{
+	assert(space->def != NULL);
+	/*
+	 * Space events - on_replace and before_replace events, associated with
+	 * space by id and by name. All format strings for event names must be
+	 * declared in the same order.
+	 */
+	struct space_event *space_events[] = {
+		&space->on_replace_event,
+		&space->before_replace_event,
+	};
+	/*
+	 * Format strings for names of events associated with the space by id
+	 * and by name. The space has several versions of each replace trigger
+	 * (for example, on_recovery_replace which is fired only on recovery and
+	 * on_replace which is fired after recovery).
+	 */
+	static const char *const event_by_id_recovery_fmt[] = {
+		"box.space[%u].on_recovery_replace",
+		"box.space[%u].before_recovery_replace",
+	};
+	static const char *const event_by_id_fmt[] = {
+		"box.space[%u].on_replace",
+		"box.space[%u].before_replace",
+	};
+	static const char *const event_by_name_recovery_fmt[] = {
+		"box.space.%s.on_recovery_replace",
+		"box.space.%s.before_recovery_replace",
+	};
+	static const char *const event_by_name_fmt[] = {
+		"box.space.%s.on_replace",
+		"box.space.%s.before_replace",
+	};
+	static_assert(lengthof(space_events) ==
+		      lengthof(event_by_id_recovery_fmt),
+		      "Every space event must be covered with name");
+	static_assert(lengthof(space_events) == lengthof(event_by_id_fmt),
+		      "Every space event must be covered with name");
+	static_assert(lengthof(space_events) ==
+		      lengthof(event_by_name_recovery_fmt),
+		      "Every space event must be covered with name");
+	static_assert(lengthof(space_events) == lengthof(event_by_name_fmt),
+		      "Every space event must be covered with name");
+
+	const char *const *by_id_fmt =
+		is_on_recovery ? event_by_id_recovery_fmt : event_by_id_fmt;
+	const char *const *by_name_fmt =
+		is_on_recovery ? event_by_name_recovery_fmt : event_by_name_fmt;
+
+	space->run_recovery_triggers = is_on_recovery;
+
+	space_set_events_impl(space, space_events, lengthof(space_events),
+			      by_id_fmt, by_name_fmt);
+}
+
+/**
+ * Set transactional events associated with the space, bound by space name and
+ * by space id.
+ */
+static void
+space_set_txn_events(struct space *space)
+{
+	assert(space->def != NULL);
+	/*
+	 * Transactional events associated with the space by id and by name. All
+	 * format strings for event names must be declared in the same order.
+	 */
+	struct space_event *txn_events[] = {
+		&space->txn_events[TXN_EVENT_BEFORE_COMMIT],
+		&space->txn_events[TXN_EVENT_ON_COMMIT],
+		&space->txn_events[TXN_EVENT_ON_ROLLBACK],
+	};
+	static_assert(lengthof(space->txn_events) == lengthof(txn_events),
+		      "Every txn event must be present in txn_events");
+	/*
+	 * Format strings for event names.
+	 */
+	static const char *const event_by_id_fmt[] = {
+		"box.before_commit.space[%u]",
+		"box.on_commit.space[%u]",
+		"box.on_rollback.space[%u]",
+	};
+	static const char *const event_by_name_fmt[] = {
+		"box.before_commit.space.%s",
+		"box.on_commit.space.%s",
+		"box.on_rollback.space.%s",
+	};
+	static_assert(lengthof(event_by_id_fmt) == lengthof(txn_events),
+		      "Every txn event must be covered with name");
+	static_assert(lengthof(event_by_name_fmt) == lengthof(txn_events),
+		      "Every txn event must be covered with name");
+
+	space_set_events_impl(space, txn_events, lengthof(txn_events),
+			      event_by_id_fmt, event_by_name_fmt);
+}
+
+/**
+ * Set all events (DML and transactional) associated with the space, bound by
+ * name and by id. If argument is_on_recovery is true, recovery events are set
+ * instead of regular ones (applicable only to DML events).
+ */
+static void
+space_set_events(struct space *space, bool is_on_recovery)
+{
+	space_set_dml_events(space, is_on_recovery);
+	space_set_txn_events(space);
+}
+
+/**
+ * Reset space events.
+ */
+static void
+space_reset_events(struct space *space)
+{
+	struct space_event *space_dml_events[] = {
+		&space->on_replace_event,
+		&space->before_replace_event,
+	};
+	for (size_t i = 0; i < lengthof(space_dml_events); ++i) {
+		event_unref(space_dml_events[i]->by_id);
+		space_dml_events[i]->by_id = NULL;
+		event_unref(space_dml_events[i]->by_name);
+		space_dml_events[i]->by_name = NULL;
+	}
+	for (size_t i = 0; i < lengthof(space->txn_events); ++i) {
+		event_unref(space->txn_events[i].by_id);
+		space->txn_events[i].by_id = NULL;
+		event_unref(space->txn_events[i].by_name);
+		space->txn_events[i].by_name = NULL;
+	}
+	space->run_recovery_triggers = false;
+}
+
+void
+space_remove_temporary_triggers(struct space *space)
+{
+	struct space_event *space_events[] = {
+		&space->on_replace_event,
+		&space->before_replace_event,
+	};
+	for (size_t i = 0; i < lengthof(space_events); ++i) {
+		event_remove_temporary_triggers(space_events[i]->by_id);
+		event_remove_temporary_triggers(space_events[i]->by_name);
+	}
+}
+
 int
 space_create(struct space *space, struct engine *engine,
 	     const struct space_vtab *vtab, struct space_def *def,
@@ -142,15 +590,16 @@ space_create(struct space *space, struct engine *engine,
 	space->index_id_max = index_id_max;
 	rlist_create(&space->before_replace);
 	rlist_create(&space->on_replace);
+	rlist_create(&space->coll_id_holders);
 	space->run_triggers = true;
 
+	assert(format != NULL);
 	space->format = format;
-	if (format != NULL)
-		tuple_format_ref(format);
+	tuple_format_ref(format);
 
 	space->def = space_def_dup(def);
-	if (space->def == NULL)
-		goto fail;
+	bool is_on_recovery = recovery_state < FINISHED_RECOVERY;
+	space_set_events(space, is_on_recovery);
 
 	/* Create indexes and fill the index map. */
 	space->index_map = (struct index **)
@@ -178,9 +627,13 @@ space_create(struct space *space, struct engine *engine,
 				index_def->iid);
 	}
 	space_fill_index_map(space);
-	rlist_create(&space->parent_fk_constraint);
-	rlist_create(&space->child_fk_constraint);
-	rlist_create(&space->ck_constraint);
+
+	rlist_create(&space->space_cache_pin_list);
+	if (space_init_constraints(space) != 0)
+		goto fail_free_indexes;
+	space_pin_collations(space);
+	if (space_init_defaults(space) != 0)
+		goto fail_free_indexes;
 
 	/*
 	 * Check if there are unique indexes that are contained
@@ -206,8 +659,14 @@ space_create(struct space *space, struct engine *engine,
 			}
 		}
 	}
-	space->constraint_ids = mh_strnptr_new();
 	rlist_create(&space->memtx_stories);
+	rlist_create(&space->alter_stmts);
+	space->lua_ref = LUA_NOREF;
+	space->state.is_sync = space->def->opts.is_sync ||
+	                       (box_consider_system_spaces_synchronous &&
+	                        space_is_system(space) &&
+	                        system_space_is_sync(space) &&
+	                        txn_limbo_has_owner(&txn_limbo));
 	return 0;
 
 fail_free_indexes:
@@ -221,9 +680,41 @@ fail:
 	free(space->check_unique_constraint_map);
 	if (space->def != NULL)
 		space_def_delete(space->def);
-	if (space->format != NULL)
-		tuple_format_unref(space->format);
+	space_cleanup_constraints(space);
+	space_unpin_defaults(space);
+	tuple_format_unref(space->format);
+	space_unpin_collations(space);
 	return -1;
+}
+
+int
+space_on_initial_recovery_complete(struct space *space, void *nothing)
+{
+	(void)nothing;
+	if (space_init_constraints(space) != 0)
+		return -1;
+	if (space_init_defaults(space) != 0)
+		return -1;
+	return 0;
+}
+
+int
+space_on_final_recovery_complete(struct space *space, void *nothing)
+{
+	(void)nothing;
+	space_reset_events(space);
+	space_set_events(space, false);
+	space_upgrade_run(space);
+	return 0;
+}
+
+int
+space_on_bootstrap_complete(struct space *space, void *nothing)
+{
+	(void)nothing;
+	space_reset_events(space);
+	space_set_events(space, false);
+	return 0;
 }
 
 struct space *
@@ -238,7 +729,7 @@ space_new(struct space_def *def, struct rlist *key_list)
 struct space *
 space_new_ephemeral(struct space_def *def, struct rlist *key_list)
 {
-	assert(def->opts.is_temporary);
+	assert(space_opts_is_data_temporary(&def->opts));
 	assert(def->opts.is_ephemeral);
 	struct space *space = space_new(def, key_list);
 	if (space == NULL)
@@ -250,8 +741,8 @@ space_new_ephemeral(struct space_def *def, struct rlist *key_list)
 void
 space_delete(struct space *space)
 {
-	memtx_tx_on_space_delete(space);
-	assert(space->ck_constraint_trigger == NULL);
+	assert(rlist_empty(&space->alter_stmts));
+	assert(rlist_empty(&space->memtx_stories));
 	for (uint32_t j = 0; j <= space->index_id_max; j++) {
 		struct index *index = space->index_map[j];
 		if (index != NULL)
@@ -259,23 +750,84 @@ space_delete(struct space *space)
 	}
 	free(space->index_map);
 	free(space->check_unique_constraint_map);
-	if (space->format != NULL)
-		tuple_format_unref(space->format);
+	space_cleanup_constraints(space);
+	space_unpin_defaults(space);
+	tuple_format_unref(space->format);
+	space_unpin_collations(space);
 	trigger_destroy(&space->before_replace);
 	trigger_destroy(&space->on_replace);
+	sql_trigger_delete_all(space->sql_triggers);
+	space_reset_events(space);
+	if (space->upgrade != NULL)
+		space_upgrade_delete(space->upgrade);
+	free(space->sequence_path);
 	space_def_delete(space->def);
-	/*
-	 * SQL triggers and constraints should be deleted with
-	 * on_replace_dd_ triggers on deletion from corresponding
-	 * system space.
-	 */
-	assert(mh_size(space->constraint_ids) == 0);
-	mh_strnptr_delete(space->constraint_ids);
-	assert(space->sql_triggers == NULL);
-	assert(rlist_empty(&space->parent_fk_constraint));
-	assert(rlist_empty(&space->child_fk_constraint));
-	assert(rlist_empty(&space->ck_constraint));
+	assert(rlist_empty(&space->space_cache_pin_list));
+	/* tarantool_L is freed on Tarantool shutdown. */
+	if (tarantool_L != NULL)
+		luaL_unref(tarantool_L, LUA_REGISTRYINDEX, space->lua_ref);
 	space->vtab->destroy(space);
+}
+
+/**
+ * Call a visitor function for spaces with id in the range [id_min..id_max].
+ */
+static int
+space_foreach_helper(uint32_t id_min, uint32_t id_max, struct index *pk,
+		     int (*func)(struct space *sp, void *udata), void *udata)
+{
+	char key[6];
+	assert(mp_sizeof_uint(id_min) <= sizeof(key));
+	mp_encode_uint(key, id_min);
+	struct iterator *it = index_create_iterator(pk, ITER_GE, key, 1);
+	if (it == NULL)
+		return -1;
+	int rc;
+	struct tuple *tuple;
+	while ((rc = iterator_next(it, &tuple)) == 0 && tuple != NULL) {
+		uint32_t id;
+		if (tuple_field_u32(tuple, BOX_SPACE_FIELD_ID, &id) != 0)
+			continue;
+		if (id > id_max)
+			break;
+		struct space *space = space_cache_find(id);
+		if (space == NULL)
+			break;
+		rc = func(space, udata);
+		if (rc != 0)
+			break;
+	}
+	iterator_delete(it);
+	if (rc != 0)
+		return -1;
+	return 0;
+}
+
+int
+space_foreach(int (*func)(struct space *sp, void *udata), void *udata)
+{
+	struct space *space = space_by_id(BOX_SPACE_ID);
+	assert(space != NULL);
+	struct index *pk = space_index(space, 0);
+	assert(pk != NULL);
+	/*
+	 * Iterate over system spaces.
+	 */
+	int rc = space_foreach_helper(BOX_SYSTEM_ID_MIN, BOX_SYSTEM_ID_MAX,
+				      pk, func, udata);
+	if (rc != 0)
+		return -1;
+	/*
+	 * Iterate over non-system spaces.
+	 */
+	rc = space_foreach_helper(0, BOX_SYSTEM_ID_MIN - 1, pk, func, udata);
+	if (rc != 0)
+		return -1;
+	rc = space_foreach_helper(BOX_SYSTEM_ID_MAX + 1, BOX_SPACE_MAX,
+				  pk, func, udata);
+	if (rc != 0)
+		return -1;
+	return 0;
 }
 
 void
@@ -302,6 +854,13 @@ generic_space_swap_index(struct space *old_space, struct space *new_space,
 {
 	SWAP(old_space->index_map[old_index_id],
 	     new_space->index_map[new_index_id]);
+	/*
+	 * Swap read gaps back - they belong to the old space. It is important
+	 * since the old space is going to be invalidated and transactional
+	 * metadata is required to do it correctly.
+	 */
+	rlist_swap(&old_space->index_map[old_index_id]->read_gaps,
+		   &new_space->index_map[new_index_id]->read_gaps);
 }
 
 void
@@ -322,18 +881,213 @@ space_index_def(struct space *space, int n)
 	return space->index[n]->def;
 }
 
-const char *
-index_name_by_id(struct space *space, uint32_t id)
+/**
+ * Pushes arguments for replace triggers (on_replace, before_replace)
+ * to port_c. Transaction mustn't be aborted.
+ */
+static void
+space_push_replace_trigger_arguments(struct port *args, struct txn_stmt *stmt)
 {
-	struct index *index = space_index(space, id);
-	if (index != NULL)
-		return index->def->name;
-	return NULL;
+	if (stmt->old_tuple != NULL)
+		port_c_add_tuple(args, stmt->old_tuple);
+	else
+		port_c_add_null(args);
+	if (stmt->new_tuple != NULL)
+		port_c_add_tuple(args, stmt->new_tuple);
+	else
+		port_c_add_null(args);
+	/* TODO: maybe the space object has to be here */
+	port_c_add_str0(args, space_name(stmt->space));
+	/* Operation type: INSERT/UPDATE/UPSERT/REPLACE/DELETE */
+	port_c_add_str0(args, iproto_type_name(stmt->type));
+	/* Pass xrow header and body to recovery triggers. */
+	if (stmt->space->run_recovery_triggers) {
+		struct mp_ctx mp_ctx;
+		mp_ctx_create_default(&mp_ctx, iproto_key_translation);
+		struct xrow_header *row = stmt->row;
+		assert(row != NULL && row->header != NULL);
+		port_c_add_mp_object(args, row->header, row->header_end,
+				     &mp_ctx);
+		assert(row->bodycnt == 1);
+		const char *body = row->body[0].iov_base;
+		const char *body_end = body + row->body[0].iov_len;
+		port_c_add_mp_object(args, body, body_end,
+				     &mp_ctx);
+	}
 }
 
 /**
- * Run BEFORE triggers registered for a space. If a trigger
- * changes the current statement, this function updates the
+ * Run replace triggers from passed event. If argument update_tuple is true,
+ * new tuple in current statement is updated after each trigger:
+ * 1. the tuple is set to returned tuple,
+ * 2. the tuple is set to NULL if a trigger returned NULL,
+ * 3. the tuple is not updated if a trigger returned nothing,
+ * 4. an error is thrown otherwise.
+ * Updated tuple is validated against the space format.
+ */
+static int
+space_run_replace_triggers(struct event *event, struct txn_stmt *stmt,
+			   bool update_tuple)
+{
+	if (!space_events_enabled)
+		return 0;
+	/** Return early if event has no triggers or if txn can't continue. */
+	if (!event_has_triggers(event))
+		return 0;
+	if (stmt->space->run_recovery_triggers)
+		say_warn_once("space on recovery triggers are deprecated");
+	int rc = txn_check_can_continue(stmt->txn);
+	if (rc != 0)
+		return -1;
+
+	struct event_trigger_iterator it;
+	event_trigger_iterator_create(&it, event);
+	struct func_adapter *trigger = NULL;
+	const char *name = NULL;
+	struct port args, ret;
+	/* Don't pass port for returned values if we don't update tuple. */
+	struct port *ret_ptr = update_tuple ? &ret : NULL;
+	port_c_create(&args);
+	space_push_replace_trigger_arguments(&args, stmt);
+	while (rc == 0 && event_trigger_iterator_next(&it, &trigger, &name)) {
+		bool has_ret = false;
+		uint32_t region_svp = region_used(&fiber()->gc);
+		/*
+		 * The transaction could be aborted while the previous trigger
+		 * was running (e.g. if the trigger callback yielded).
+		 */
+		rc = txn_check_can_continue(stmt->txn);
+		if (rc != 0)
+			goto out;
+		rc = func_adapter_call(trigger, &args, ret_ptr);
+		/*
+		 * We have returned values only if we update tuple and
+		 * the trigger hasn't failed.
+		 */
+		has_ret = update_tuple && rc == 0;
+		if (rc != 0 || !update_tuple)
+			goto out;
+
+		/*
+		 * The transaction could be aborted while the trigger was
+		 * running (e.g. if the trigger callback yielded).
+		 */
+		rc = txn_check_can_continue(stmt->txn);
+		if (rc != 0)
+			goto out;
+		/*
+		 * Pop the returned value.
+		 * See the function description for details.
+		 */
+		struct tuple *result = NULL;
+		const struct port_c_entry *retvals = port_get_c_entries(&ret);
+		if (retvals == NULL) {
+			rc = 0;
+			goto out;
+		} else if (retvals->type == PORT_C_ENTRY_TUPLE) {
+			result = retvals->tuple;
+		} else if (retvals->type != PORT_C_ENTRY_NULL) {
+			diag_set(ClientError, ER_BEFORE_REPLACE_RET);
+			rc = -1;
+			goto out;
+		}
+
+		/*
+		 * Tuple returned by a before_replace trigger callback must
+		 * match the space format.
+		 *
+		 * Since upgrade from pre-1.7.5 versions passes tuple with not
+		 * suitable format to before_recovery_replace triggers,
+		 * we need to disable format validation on recovery triggers.
+		 */
+		if (!stmt->space->run_recovery_triggers &&
+		    result != NULL &&
+		    tuple_validate(stmt->space->format, result) != 0) {
+			rc = -1;
+			goto out;
+		}
+
+		/* Update the new tuple. */
+		if (result != NULL)
+			tuple_ref(result);
+		if (stmt->new_tuple != NULL)
+			tuple_unref(stmt->new_tuple);
+		stmt->new_tuple = result;
+		/* Can't update values in port - destroy it and create again. */
+		port_destroy(&args);
+		port_c_create(&args);
+		space_push_replace_trigger_arguments(&args, stmt);
+out:
+		if (has_ret)
+			port_destroy(&ret);
+		region_truncate(&fiber()->gc, region_svp);
+	}
+	event_trigger_iterator_destroy(&it);
+	port_destroy(&args);
+	return rc;
+}
+
+int
+space_on_replace(struct space *space, struct txn_stmt *stmt)
+{
+	/*
+	 * Since the triggers can yield, a space can be dropped
+	 * while executing one of the trigger lists and all the events will be
+	 * unreferenced - reference them to prevent use-after-free.
+	 */
+	struct event *events[] = {
+		space->on_replace_event.by_id,
+		space->on_replace_event.by_name,
+	};
+	for (size_t i = 0; i < lengthof(events); ++i)
+		event_ref(events[i]);
+	int rc = trigger_run(&space->on_replace, stmt);
+	for (size_t i = 0; i < lengthof(events) && rc == 0; ++i)
+		rc = space_run_replace_triggers(events[i], stmt, false);
+	for (size_t i = 0; i < lengthof(events); ++i)
+		event_unref(events[i]);
+	return rc;
+}
+
+/**
+ * Apply default values from the space format to the null (or absent) fields of
+ * request->tuple.
+ */
+static int
+space_apply_defaults(struct space *space, struct txn *txn,
+		     struct request *request)
+{
+	assert(request->type == IPROTO_INSERT ||
+	       request->type == IPROTO_REPLACE ||
+	       request->type == IPROTO_UPSERT);
+
+	const char *new_data = request->tuple;
+	const char *new_data_end = request->tuple_end;
+	size_t region_svp = region_used(&fiber()->gc);
+
+	if (tuple_format_apply_defaults(space->format, &new_data,
+					&new_data_end) != 0)
+		return -1;
+
+	bool is_tuple_changed = new_data != request->tuple;
+	if (!is_tuple_changed)
+		return 0;
+	/*
+	 * Field defaults changed the resulting tuple.
+	 * Fix the request to conform.
+	 */
+	struct region *txn_region = tx_region_acquire(txn);
+	int rc = request_create_from_tuple(request, space, NULL, 0, new_data,
+					   new_data_end - new_data, txn_region,
+					   true);
+	tx_region_release(txn, TX_ALLOC_SYSTEM);
+	region_truncate(&fiber()->gc, region_svp);
+	return rc;
+}
+
+/**
+ * Run BEFORE triggers and foreign key constraint checks registered for a space.
+ * If a trigger changes the current statement, this function updates the
  * request accordingly.
  */
 static int
@@ -347,6 +1101,7 @@ space_before_replace(struct space *space, struct txn *txn,
 	uint32_t part_count = 0;
 	struct index *index = NULL;
 	struct tuple *old_tuple = NULL;
+	size_t region_svp = region_used(&fiber()->gc);
 
 	/*
 	 * Lookup the old tuple.
@@ -354,7 +1109,7 @@ space_before_replace(struct space *space, struct txn *txn,
 	switch (type) {
 	case IPROTO_UPDATE:
 	case IPROTO_DELETE:
-		index = index_find_unique(space, request->index_id);
+		index = index_find(space, request->index_id);
 		if (index == NULL)
 			return -1;
 		key = request->key;
@@ -363,6 +1118,14 @@ space_before_replace(struct space *space, struct txn *txn,
 	case IPROTO_INSERT:
 	case IPROTO_REPLACE:
 	case IPROTO_UPSERT:
+		/*
+		 * Since upgrade from pre-1.7.5 versions passes tuple with
+		 * not suitable format to before_replace triggers during recovery,
+		 * we need to disable format validation until box is configured.
+		 */
+		if (box_is_configured() && tuple_validate_raw(space->format,
+							      request->tuple) != 0)
+			return -1;
 		if (pk == NULL)
 			goto after_old_tuple_lookup;
 		index = pk;
@@ -378,24 +1141,30 @@ space_before_replace(struct space *space, struct txn *txn,
 		return 0;
 	}
 
-	if (exact_key_validate(index->def->key_def, key, part_count) != 0)
+	if (exact_key_validate(index->def, key, part_count) != 0 ||
+	    index_get(index, key, part_count, &old_tuple) != 0) {
+		region_truncate(&fiber()->gc, region_svp);
 		return -1;
-
-	if (index_get(index, key, part_count, &old_tuple) != 0)
-		return -1;
+	}
+	region_truncate(&fiber()->gc, region_svp);
 
 after_old_tuple_lookup:;
 
 	/*
 	 * Create the new tuple.
 	 */
-	uint32_t new_size, old_size;
+	uint32_t new_size, old_size = 0;
 	const char *new_data, *new_data_end;
-	const char *old_data, *old_data_end;
+	const char *old_data = NULL, *old_data_end;
 
 	switch (request->type) {
 	case IPROTO_INSERT:
+		new_data = request->tuple;
+		new_data_end = request->tuple_end;
+		break;
 	case IPROTO_REPLACE:
+		if (old_tuple != NULL)
+			old_data = tuple_data_range(old_tuple, &old_size);
 		new_data = request->tuple;
 		new_data_end = request->tuple_end;
 		break;
@@ -411,8 +1180,11 @@ after_old_tuple_lookup:;
 					       old_data_end,
 					       space->format, &new_size,
 					       request->index_base, NULL);
-		if (new_data == NULL)
+		if (new_data == NULL) {
+			error_set_index(diag_last_error(diag_get()),
+					index->def);
 			return -1;
+		}
 		new_data_end = new_data + new_size;
 		break;
 	case IPROTO_DELETE:
@@ -420,6 +1192,7 @@ after_old_tuple_lookup:;
 			/* Nothing to delete. */
 			return 0;
 		}
+		old_data = tuple_data_range(old_tuple, &old_size);
 		new_data = new_data_end = NULL;
 		break;
 	case IPROTO_UPSERT:
@@ -433,8 +1206,11 @@ after_old_tuple_lookup:;
 			if (xrow_update_check_ops(request->ops,
 						  request->ops_end,
 						  space->format,
-						  request->index_base) != 0)
+						  request->index_base) != 0) {
+				error_set_space(diag_last_error(diag_get()),
+						space->def);
 				return -1;
+			}
 			break;
 		}
 		old_data = tuple_data_range(old_tuple, &old_size);
@@ -444,6 +1220,11 @@ after_old_tuple_lookup:;
 					       space->format, &new_size,
 					       request->index_base, false,
 					       NULL);
+		if (new_data == NULL) {
+			error_set_space(diag_last_error(diag_get()),
+					space->def);
+			return -1;
+		}
 		new_data_end = new_data + new_size;
 		break;
 	default:
@@ -454,6 +1235,7 @@ after_old_tuple_lookup:;
 	if (new_data != NULL) {
 		new_tuple = tuple_new(tuple_format_runtime,
 				      new_data, new_data_end);
+		region_truncate(&fiber()->gc, region_svp);
 		if (new_tuple == NULL)
 			return -1;
 		tuple_ref(new_tuple);
@@ -461,34 +1243,72 @@ after_old_tuple_lookup:;
 
 	assert(old_tuple != NULL || new_tuple != NULL);
 
+	if (old_tuple != NULL) {
+		/*
+		 * Before deleting we must check that there are no tuples
+		 * in this space or in other spaces that refer to this tuple
+		 * via foreign key constraint.
+		 */
+		struct space_cache_holder *h;
+		rlist_foreach_entry(h, &space->space_cache_pin_list, link) {
+			if (h->type != SPACE_HOLDER_FOREIGN_KEY)
+				continue;
+			struct tuple_constraint *constr =
+				container_of(h, struct tuple_constraint,
+					     space_cache_holder);
+			assert(constr->def.type == CONSTR_FKEY);
+			if (tuple_constraint_fkey_check_delete(
+					constr, old_tuple, new_tuple) != 0) {
+				if (new_tuple != NULL)
+					tuple_unref(new_tuple);
+				return -1;
+			}
+		}
+	}
+
 	/*
 	 * Execute all registered BEFORE triggers.
 	 *
-	 * We pass the old and new tuples to the triggers in
-	 * txn_current_stmt(), which should be empty, because
-	 * the engine method (execute_replace or similar) has
-	 * not been called yet. Triggers may update new_tuple
-	 * in place so the next trigger sees the result of the
-	 * previous one. After we are done, we clear old_tuple
-	 * and new_tuple in txn_current_stmt() to be set by
-	 * the engine.
+	 * We pass the log row, old and new tuples to the triggers
+	 * in a fake statement allocated on stack so as not to mess
+	 * with txn_current_stmt(), which may be updated internally
+	 * by the transaction manager, for example, if the trigger
+	 * yields.
 	 */
-	struct txn_stmt *stmt = txn_current_stmt(txn);
-	assert(stmt->old_tuple == NULL && stmt->new_tuple == NULL);
-	stmt->old_tuple = old_tuple;
-	stmt->new_tuple = new_tuple;
+	struct txn_stmt fake_stmt = {
+		.txn = txn,
+		.space = space,
+		.old_tuple = old_tuple,
+		.new_tuple = new_tuple,
+		.row = request->header,
+		.type = type,
+	};
+	struct txn_stmt *stmt = &fake_stmt;
 
-	int rc = trigger_run(&space->before_replace, txn);
+	struct event *events[] = {
+		space->before_replace_event.by_id,
+		space->before_replace_event.by_name,
+	};
+	/*
+	 * Since the triggers can yield, a space can be dropped
+	 * while executing one of the trigger lists and all the events will be
+	 * unreferenced - reference them to prevent use-after-free.
+	 */
+	for (size_t i = 0; i < lengthof(events); ++i)
+		event_ref(events[i]);
+	int rc = trigger_run(&space->before_replace, stmt);
+	for (size_t i = 0; i < lengthof(events) && rc == 0; ++i)
+		rc = space_run_replace_triggers(events[i], stmt, true);
+	for (size_t i = 0; i < lengthof(events); ++i)
+		event_unref(events[i]);
 
 	/*
-	 * BEFORE riggers cannot change the old tuple,
+	 * BEFORE triggers cannot change the old tuple,
 	 * but they may replace the new tuple.
 	 */
 	bool request_changed = (stmt->new_tuple != new_tuple);
 	new_tuple = stmt->new_tuple;
 	assert(stmt->old_tuple == old_tuple);
-	stmt->old_tuple = NULL;
-	stmt->new_tuple = NULL;
 
 	if (rc != 0)
 		goto out;
@@ -502,7 +1322,8 @@ after_old_tuple_lookup:;
 	    tuple_compare(old_tuple, HINT_NONE, new_tuple, HINT_NONE,
 			  pk->def->key_def) != 0) {
 		diag_set(ClientError, ER_CANT_UPDATE_PRIMARY_KEY,
-			 pk->def->name, space->def->name);
+			 space->def->name, space->def->id, old_tuple, new_tuple,
+			 NULL);
 		rc = -1;
 		goto out;
 	}
@@ -511,12 +1332,75 @@ after_old_tuple_lookup:;
 	 * BEFORE triggers changed the resulting tuple.
 	 * Fix the request to conform.
 	 */
-	if (request_changed)
+	if (request_changed) {
+		new_data = new_tuple == NULL ? NULL :
+			   tuple_data_range(new_tuple, &new_size);
+		struct region *txn_region = tx_region_acquire(txn);
 		rc = request_create_from_tuple(request, space,
-					       old_tuple, new_tuple);
+					       old_data, old_size,
+					       new_data, new_size,
+					       txn_region, false);
+		tx_region_release(txn, TX_ALLOC_SYSTEM);
+		/* on_replace triggers must see the new request type. */
+		if (rc == 0)
+			txn_current_stmt(txn)->type = request->type;
+	}
 out:
 	if (new_tuple != NULL)
 		tuple_unref(new_tuple);
+	return rc;
+}
+
+/**
+ * Executes an IPROTO_INSERT_ARROW request. The request contains the data in
+ * Arrow columnar format that can appear in two guises:
+ *  1. in-memory data structures (arrow_array and arrow_schema);
+ *  2. serialized for interprocess communication (arrow_ipc and arrow_ipc_end).
+ * Can return nonzero in case of error (diag is set).
+ */
+static int
+space_execute_insert_arrow(struct space *space, struct txn *txn,
+			   struct request *request)
+{
+	int rc;
+	struct region *gc = &fiber()->gc;
+	size_t gc_svp = region_used(gc);
+	struct ArrowArray *array = request->arrow_array;
+	struct ArrowSchema *schema = request->arrow_schema;
+
+	if (request->arrow_ipc == NULL) {
+		assert(array != NULL);
+		assert(schema != NULL);
+		assert(request->arrow_ipc_end == NULL);
+		struct region *txn_region = tx_region_acquire(txn);
+		rc = arrow_ipc_encode(array, schema, txn_region,
+				      &request->arrow_ipc,
+				      &request->arrow_ipc_end);
+		tx_region_release(txn, TX_ALLOC_SYSTEM);
+		if (rc != 0)
+			goto eof;
+	} else if (array == NULL) {
+		assert(schema == NULL);
+		assert(request->arrow_ipc_end != NULL);
+		array = xregion_alloc_object(gc, struct ArrowArray);
+		schema = xregion_alloc_object(gc, struct ArrowSchema);
+		rc = arrow_ipc_decode(array, schema, request->arrow_ipc,
+				      request->arrow_ipc_end);
+		if (rc != 0)
+			goto eof;
+	}
+	/*
+	 * In case of replication the request may contain both IPC and in-memory
+	 * versions of the arrow data, which was decoded by the applier thread.
+	 */
+	rc = space->vtab->execute_insert_arrow(space, txn, array, schema);
+
+	if (array->release != NULL)
+		array->release(array);
+	if (schema->release != NULL)
+		schema->release(schema);
+eof:
+	region_truncate(gc, gc_svp);
 	return rc;
 }
 
@@ -533,12 +1417,37 @@ space_execute_dml(struct space *space, struct txn *txn,
 		 * we should replace it with the next sequence
 		 * value.
 		 */
-		if (request_handle_sequence(request, space) != 0)
+		struct region *txn_region = tx_region_acquire(txn);
+		int rc = request_handle_sequence(request, space, txn_region);
+		tx_region_release(txn, TX_ALLOC_SYSTEM);
+		if (rc != 0)
 			return -1;
 	}
 
-	if (unlikely(!rlist_empty(&space->before_replace) &&
-		     space->run_triggers)) {
+	/* Any operation except insert can remove old tuple. */
+	bool need_foreign_key_check = false;
+	if (request->type != IPROTO_INSERT) {
+		struct space_cache_holder *h;
+		rlist_foreach_entry(h, &space->space_cache_pin_list, link) {
+			if (h->type == SPACE_HOLDER_FOREIGN_KEY) {
+				need_foreign_key_check = true;
+				break;
+			}
+		}
+	}
+
+	bool need_defaults_apply = tuple_format_has_defaults(space->format) &&
+				   recovery_state == FINISHED_RECOVERY &&
+				   request->type != IPROTO_UPDATE &&
+				   request->type != IPROTO_DELETE &&
+				   request->type != IPROTO_DELETE_RANGE;
+	if (unlikely(need_defaults_apply)) {
+		if (space_apply_defaults(space, txn, request) != 0)
+			return -1;
+	}
+
+	if (unlikely((space_has_before_replace_triggers(space) &&
+		      space->run_triggers) || need_foreign_key_check)) {
 		/*
 		 * Call BEFORE triggers if any before dispatching
 		 * the request. Note, it may change the request
@@ -565,19 +1474,36 @@ space_execute_dml(struct space *space, struct txn *txn,
 			 * for cases when tuple is NULL, since the leader
 			 * will be unable to certify such updates correctly.
 			 */
-			request_rebind_to_primary_key(request, space, *result);
+			struct region *txn_region = tx_region_acquire(txn);
+			request_rebind_to_primary_key(request, space, *result,
+						      txn_region);
+			tx_region_release(txn, TX_ALLOC_SYSTEM);
 		}
 		break;
 	case IPROTO_DELETE:
 		if (space->vtab->execute_delete(space, txn,
 						request, result) != 0)
 			return -1;
-		if (*result != NULL && request->index_id != 0)
-			request_rebind_to_primary_key(request, space, *result);
+		if (*result != NULL && request->index_id != 0) {
+			struct region *txn_region = tx_region_acquire(txn);
+			request_rebind_to_primary_key(request, space, *result,
+						      txn_region);
+			tx_region_release(txn, TX_ALLOC_SYSTEM);
+		}
 		break;
 	case IPROTO_UPSERT:
 		*result = NULL;
 		if (space->vtab->execute_upsert(space, txn, request) != 0)
+			return -1;
+		break;
+	case IPROTO_INSERT_ARROW:
+		*result = NULL;
+		if (space_execute_insert_arrow(space, txn, request) != 0)
+			return -1;
+		break;
+	case IPROTO_DELETE_RANGE:
+		*result = NULL;
+		if (space->vtab->execute_delete_range(space, txn, request) != 0)
 			return -1;
 		break;
 	default:
@@ -586,71 +1512,52 @@ space_execute_dml(struct space *space, struct txn *txn,
 	return 0;
 }
 
-int
-space_add_ck_constraint(struct space *space, struct ck_constraint *ck)
-{
-	rlist_add_entry(&space->ck_constraint, ck, link);
-	if (space->ck_constraint_trigger == NULL) {
-		struct trigger *ck_trigger =
-			(struct trigger *) malloc(sizeof(*ck_trigger));
-		if (ck_trigger == NULL) {
-			diag_set(OutOfMemory, sizeof(*ck_trigger), "malloc",
-				 "ck_trigger");
-			return -1;
-		}
-		trigger_create(ck_trigger, ck_constraint_on_replace_trigger,
-			       NULL, (trigger_f0) free);
-		trigger_add(&space->on_replace, ck_trigger);
-		space->ck_constraint_trigger = ck_trigger;
-	}
-	return 0;
-}
-
 void
-space_remove_ck_constraint(struct space *space, struct ck_constraint *ck)
+system_spaces_update_is_sync_state(bool is_sync)
 {
-	rlist_del_entry(ck, link);
-	if (rlist_empty(&space->ck_constraint)) {
-		struct trigger *ck_trigger = space->ck_constraint_trigger;
-		trigger_clear(ck_trigger);
-		ck_trigger->destroy(ck_trigger);
-		space->ck_constraint_trigger = NULL;
+	is_sync &= box_consider_system_spaces_synchronous;
+	for (size_t i = 0; i < lengthof(sync_system_space_ids); ++i) {
+		uint32_t space_id = sync_system_space_ids[i];
+		if (space_id == BOX_ID_NIL)
+			continue;
+		struct space *space = space_by_id(space_id);
+		/*
+		 * Some system spaces can be absent in an older version of the
+		 * schema.
+		 */
+		if (space == NULL)
+			continue;
+		assert(space != NULL);
+		space->state.is_sync = space->def->opts.is_sync || is_sync;
+		assert(space->lua_ref != LUA_NOREF);
+		lua_rawgeti(tarantool_L, LUA_REGISTRYINDEX, space->lua_ref);
+		lua_getfield(tarantool_L, -1, "state");
+		lua_pushboolean(tarantool_L, space->state.is_sync);
+		lua_setfield(tarantool_L, -2, "is_sync");
+		lua_pop(tarantool_L, 2);
 	}
 }
 
-struct constraint_id *
-space_find_constraint_id(struct space *space, const char *name)
+/**
+ * Update the state of synchronous replication for system spaces from the
+ * compat action.
+ */
+extern void
+system_spaces_update_is_sync_state_from_compat(void)
 {
-	struct mh_strnptr_t *ids = space->constraint_ids;
-	uint32_t len = strlen(name);
-	mh_int_t pos = mh_strnptr_find_inp(ids, name, len);
-	if (pos == mh_end(ids))
-		return NULL;
-	return (struct constraint_id *) mh_strnptr_node(ids, pos)->val;
+	system_spaces_update_is_sync_state(txn_limbo_has_owner(&txn_limbo));
 }
 
 void
-space_add_constraint_id(struct space *space, struct constraint_id *id)
+space_events_enable(bool value)
 {
-	assert(space_find_constraint_id(space, id->name) == NULL);
-	struct mh_strnptr_t *ids = space->constraint_ids;
-	uint32_t len = strlen(id->name);
-	uint32_t hash = mh_strn_hash(id->name, len);
-	const struct mh_strnptr_node_t name_node = {id->name, len, hash, id};
-	mh_strnptr_put(ids, &name_node, NULL, NULL);
+	space_events_enabled = value;
 }
 
-struct constraint_id *
-space_pop_constraint_id(struct space *space, const char *name)
+bool
+space_events_are_enabled(void)
 {
-	struct mh_strnptr_t *ids = space->constraint_ids;
-	uint32_t len = strlen(name);
-	mh_int_t pos = mh_strnptr_find_inp(ids, name, len);
-	assert(pos != mh_end(ids));
-	struct constraint_id *id = (struct constraint_id *)
-		mh_strnptr_node(ids, pos)->val;
-	mh_strnptr_del(ids, pos, NULL);
-	return id;
+	return space_events_enabled;
 }
 
 /* {{{ Virtual method stubs */
@@ -660,6 +1567,30 @@ generic_space_bsize(struct space *space)
 {
 	(void)space;
 	return 0;
+}
+
+int
+generic_space_execute_insert_arrow(struct space *space, struct txn *txn,
+				   struct ArrowArray *array,
+				   struct ArrowSchema *schema)
+{
+	(void)txn;
+	(void)array;
+	(void)schema;
+	diag_set(ClientError, ER_UNSUPPORTED, space->engine->name,
+		 "arrow format");
+	return -1;
+}
+
+int
+generic_space_execute_delete_range(struct space *space, struct txn *txn,
+				   struct request *request)
+{
+	(void)txn;
+	(void)request;
+	diag_set(ClientError, ER_UNSUPPORTED, space->engine->name,
+		 "range delete");
+	return -1;
 }
 
 int
@@ -749,6 +1680,25 @@ generic_space_prepare_alter(struct space *old_space, struct space *new_space)
 {
 	(void)old_space;
 	(void)new_space;
+	return 0;
+}
+
+void
+generic_space_finish_alter(struct space *old_space, struct space *new_space)
+{
+	(void)old_space;
+	(void)new_space;
+}
+
+int
+generic_space_prepare_upgrade(struct space *old_space, struct space *new_space)
+{
+	(void)old_space;
+	if (new_space->def->opts.upgrade_def != NULL) {
+		diag_set(ClientError, ER_UNSUPPORTED, new_space->engine->name,
+			 "space upgrade");
+		return -1;
+	}
 	return 0;
 }
 

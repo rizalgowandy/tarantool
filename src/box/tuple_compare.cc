@@ -28,36 +28,18 @@
  * THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  */
+#include "core/decimal.h"
 #include "tuple_compare.h"
 #include "tuple.h"
 #include "coll/coll.h"
 #include "trivia/util.h" /* NOINLINE */
 #include <math.h>
-#include "lib/core/decimal.h"
-#include "lib/core/mp_decimal.h"
-#include "uuid/mp_uuid.h"
-#include "lib/core/mp_extension_types.h"
+#include "mp_decimal.h"
+#include "mp_extension_types.h"
+#include "mp_uuid.h"
+#include "mp_datetime.h"
 
 /* {{{ tuple_compare */
-
-/**
- * Compare two tuple hints.
- *
- * Returns:
- *
- *   -1 if the first tuple is less than the second tuple
- *   +1 if the first tuple is greater than the second tuple
- *    0 if the first tuple may be less than, equal to, or
- *      greater than the second tuple, and a full tuple
- *      comparison is needed to determine the order.
- */
-static inline int
-hint_cmp(hint_t hint_a, hint_t hint_b)
-{
-	if (hint_a != HINT_NONE && hint_b != HINT_NONE && hint_a != hint_b)
-		return hint_a < hint_b ? -1 : 1;
-	return 0;
-}
 
 /*
  * Compare two tuple fields.
@@ -66,7 +48,7 @@ hint_cmp(hint_t hint_a, hint_t hint_b)
  * in it can have dramatic impact on the overall
  * performance.
  */
-inline __attribute__((always_inline)) int
+ALWAYS_INLINE int
 mp_compare_uint(const char **data_a, const char **data_b);
 
 enum mp_class {
@@ -76,6 +58,8 @@ enum mp_class {
 	MP_CLASS_STR,
 	MP_CLASS_BIN,
 	MP_CLASS_UUID,
+	MP_CLASS_DATETIME,
+	MP_CLASS_INTERVAL,
 	MP_CLASS_ARRAY,
 	MP_CLASS_MAP,
 	mp_class_max,
@@ -99,6 +83,10 @@ static enum mp_class mp_ext_classes[] = {
 	/* .MP_UNKNOWN_EXTENSION = */ mp_class_max, /* unsupported */
 	/* .MP_DECIMAL		 = */ MP_CLASS_NUMBER,
 	/* .MP_UUID		 = */ MP_CLASS_UUID,
+	/* .MP_ERROR		 = */ mp_class_max,
+	/* .MP_DATETIME		 = */ MP_CLASS_DATETIME,
+	/* .MP_COMPRESSION	 = */ mp_class_max,
+	/* .MP_INTERVAL		 = */ MP_CLASS_INTERVAL,
 };
 
 static enum mp_class
@@ -126,7 +114,15 @@ mp_compare_bool(const char *field_a, const char *field_b)
 }
 
 static int
-mp_compare_double(const char *field_a, const char *field_b)
+mp_compare_float32(const char *field_a, const char *field_b)
+{
+	float a_val = mp_decode_float(&field_a);
+	float b_val = mp_decode_float(&field_b);
+	return COMPARE_RESULT(a_val, b_val);
+}
+
+static int
+mp_compare_float64(const char *field_a, const char *field_b)
 {
 	double a_val = mp_decode_double(&field_a);
 	double b_val = mp_decode_double(&field_b);
@@ -204,8 +200,12 @@ mp_compare_double_any_number(double lhs, const char *rhs,
 	 * Both NaNs. Compare signaling and quiet NaNs by
 	 * 'quiet bit'.
 	 */
-	uint64_t lqbit = *((uint64_t *)&lhs) & (uint64_t)0x8000000000000;
-	uint64_t rqbit = *((uint64_t *)&v) & (uint64_t)0x8000000000000;
+	uint64_t lqbit;
+	memcpy(&lqbit, &lhs, sizeof(lhs));
+	lqbit &= UINT64_C(0x8000000000000);
+	uint64_t rqbit;
+	memcpy(&rqbit, &v, sizeof(v));
+	rqbit &= UINT64_C(0x8000000000000);
 	/*
 	 * Lets consider the quiet NaN (fraction first bit == 1)
 	 * to be bigger than signaling NaN (fraction first
@@ -228,34 +228,54 @@ mp_compare_decimal(const char *lhs, const char *rhs)
 
 }
 
+/**
+ * Compare a decimal to something not representable as decimal. Like NaN, Inf or
+ * just a value outside the (-1e38, 1e38) range. In all these cases the decimal
+ * value doesn't matter.
+ */
+static inline int
+decimal_compare_nan_or_huge(double rhs)
+{
+	/* We assume NaN is less than everything else. */
+	if (isnan(rhs))
+		return 1;
+	assert(fabs(rhs) >= 1e38);
+	return (rhs < 0) - (rhs > 0);
+}
+
 static int
 mp_compare_decimal_any_number(decimal_t *lhs, const char *rhs,
 			      enum mp_type rhs_type, int k)
 {
 	decimal_t rhs_dec;
+	decimal_t *rc;
 	switch (rhs_type) {
 	case MP_FLOAT:
 	{
 		double d = mp_decode_float(&rhs);
-		decimal_from_double(&rhs_dec, d);
+		rc = decimal_from_double(&rhs_dec, d);
+		if (rc == NULL)
+			return decimal_compare_nan_or_huge(d) * k;
 		break;
 	}
 	case MP_DOUBLE:
 	{
 		double d = mp_decode_double(&rhs);
-		decimal_from_double(&rhs_dec, d);
+		rc = decimal_from_double(&rhs_dec, d);
+		if (rc == NULL)
+			return decimal_compare_nan_or_huge(d) * k;
 		break;
 	}
 	case MP_INT:
 	{
 		int64_t num = mp_decode_int(&rhs);
-		decimal_from_int64(&rhs_dec, num);
+		rc = decimal_from_int64(&rhs_dec, num);
 		break;
 	}
 	case MP_UINT:
 	{
 		uint64_t num = mp_decode_uint(&rhs);
-		decimal_from_uint64(&rhs_dec, num);
+		rc = decimal_from_uint64(&rhs_dec, num);
 		break;
 	}
 	case MP_EXT:
@@ -264,7 +284,7 @@ mp_compare_decimal_any_number(decimal_t *lhs, const char *rhs,
 		uint32_t len = mp_decode_extl(&rhs, &ext_type);
 		switch (ext_type) {
 		case MP_DECIMAL:
-			decimal_unpack(&rhs, len, &rhs_dec);
+			rc = decimal_unpack(&rhs, len, &rhs_dec);
 			break;
 		default:
 			unreachable();
@@ -274,6 +294,7 @@ mp_compare_decimal_any_number(decimal_t *lhs, const char *rhs,
 	default:
 		unreachable();
 	}
+	assert(rc != NULL);
 	return k * decimal_compare(lhs, &rhs_dec);
 }
 
@@ -390,6 +411,19 @@ mp_compare_uuid(const char *field_a, const char *field_b)
 	return memcmp(field_a + 2, field_b + 2, UUID_PACKED_LEN);
 }
 
+static int
+mp_compare_datetime(const char *lhs, const char *rhs)
+{
+	struct datetime lhs_dt, rhs_dt;
+	struct datetime *ret;
+	ret = mp_decode_datetime(&lhs, &lhs_dt);
+	assert(ret != NULL);
+	ret = mp_decode_datetime(&rhs, &rhs_dt);
+	assert(ret != NULL);
+	(void)ret;
+	return datetime_compare(&lhs_dt, &rhs_dt);
+}
+
 typedef int (*mp_compare_f)(const char *, const char *);
 static mp_compare_f mp_class_comparators[] = {
 	/* .MP_CLASS_NIL    = */ NULL,
@@ -398,6 +432,8 @@ static mp_compare_f mp_class_comparators[] = {
 	/* .MP_CLASS_STR    = */ mp_compare_str,
 	/* .MP_CLASS_BIN    = */ mp_compare_bin,
 	/* .MP_CLASS_UUID   = */ mp_compare_uuid,
+	/* .MP_CLASS_DATETIME=*/ mp_compare_datetime,
+	/* .MP_CLASS_INTERVAL=*/ NULL,
 	/* .MP_CLASS_ARRAY  = */ NULL,
 	/* .MP_CLASS_MAP    = */ NULL,
 };
@@ -446,26 +482,37 @@ mp_compare_scalar_coll(const char *field_a, const char *field_b,
  * @retval <0 if field_a < field_b
  * @retval >0 if field_a > field_b
  */
-static int
+int
 tuple_compare_field(const char *field_a, const char *field_b,
 		    int8_t type, struct coll *coll)
 {
 	switch (type) {
 	case FIELD_TYPE_UNSIGNED:
+	case FIELD_TYPE_UINT8:
+	case FIELD_TYPE_UINT16:
+	case FIELD_TYPE_UINT32:
+	case FIELD_TYPE_UINT64:
 		return mp_compare_uint(field_a, field_b);
 	case FIELD_TYPE_STRING:
 		return coll != NULL ?
 		       mp_compare_str_coll(field_a, field_b, coll) :
 		       mp_compare_str(field_a, field_b);
 	case FIELD_TYPE_INTEGER:
+	case FIELD_TYPE_INT8:
+	case FIELD_TYPE_INT16:
+	case FIELD_TYPE_INT32:
+	case FIELD_TYPE_INT64:
 		return mp_compare_integer_with_type(field_a,
 						    mp_typeof(*field_a),
 						    field_b,
 						    mp_typeof(*field_b));
 	case FIELD_TYPE_NUMBER:
-		return mp_compare_number(field_a, field_b);
 	case FIELD_TYPE_DOUBLE:
-		return mp_compare_double(field_a, field_b);
+		return mp_compare_number(field_a, field_b);
+	case FIELD_TYPE_FLOAT32:
+		return mp_compare_float32(field_a, field_b);
+	case FIELD_TYPE_FLOAT64:
+		return mp_compare_float64(field_a, field_b);
 	case FIELD_TYPE_BOOLEAN:
 		return mp_compare_bool(field_a, field_b);
 	case FIELD_TYPE_VARBINARY:
@@ -475,9 +522,15 @@ tuple_compare_field(const char *field_a, const char *field_b,
 		       mp_compare_scalar_coll(field_a, field_b, coll) :
 		       mp_compare_scalar(field_a, field_b);
 	case FIELD_TYPE_DECIMAL:
+	case FIELD_TYPE_DECIMAL32:
+	case FIELD_TYPE_DECIMAL64:
+	case FIELD_TYPE_DECIMAL128:
+	case FIELD_TYPE_DECIMAL256:
 		return mp_compare_decimal(field_a, field_b);
 	case FIELD_TYPE_UUID:
 		return mp_compare_uuid(field_a, field_b);
+	case FIELD_TYPE_DATETIME:
+		return mp_compare_datetime(field_a, field_b);
 	default:
 		unreachable();
 		return 0;
@@ -491,19 +544,30 @@ tuple_compare_field_with_type(const char *field_a, enum mp_type a_type,
 {
 	switch (type) {
 	case FIELD_TYPE_UNSIGNED:
+	case FIELD_TYPE_UINT8:
+	case FIELD_TYPE_UINT16:
+	case FIELD_TYPE_UINT32:
+	case FIELD_TYPE_UINT64:
 		return mp_compare_uint(field_a, field_b);
 	case FIELD_TYPE_STRING:
 		return coll != NULL ?
 		       mp_compare_str_coll(field_a, field_b, coll) :
 		       mp_compare_str(field_a, field_b);
 	case FIELD_TYPE_INTEGER:
+	case FIELD_TYPE_INT8:
+	case FIELD_TYPE_INT16:
+	case FIELD_TYPE_INT32:
+	case FIELD_TYPE_INT64:
 		return mp_compare_integer_with_type(field_a, a_type,
 						    field_b, b_type);
 	case FIELD_TYPE_NUMBER:
+	case FIELD_TYPE_DOUBLE:
 		return mp_compare_number_with_type(field_a, a_type,
 						   field_b, b_type);
-	case FIELD_TYPE_DOUBLE:
-		return mp_compare_double(field_a, field_b);
+	case FIELD_TYPE_FLOAT32:
+		return mp_compare_float32(field_a, field_b);
+	case FIELD_TYPE_FLOAT64:
+		return mp_compare_float64(field_a, field_b);
 	case FIELD_TYPE_BOOLEAN:
 		return mp_compare_bool(field_a, field_b);
 	case FIELD_TYPE_VARBINARY:
@@ -514,18 +578,105 @@ tuple_compare_field_with_type(const char *field_a, enum mp_type a_type,
 		       mp_compare_scalar_with_type(field_a, a_type,
 						   field_b, b_type);
 	case FIELD_TYPE_DECIMAL:
+	case FIELD_TYPE_DECIMAL32:
+	case FIELD_TYPE_DECIMAL64:
+	case FIELD_TYPE_DECIMAL128:
+	case FIELD_TYPE_DECIMAL256:
 		return mp_compare_number_with_type(field_a, a_type,
 						   field_b, b_type);
 	case FIELD_TYPE_UUID:
 		return mp_compare_uuid(field_a, field_b);
+	case FIELD_TYPE_DATETIME:
+		return mp_compare_datetime(field_a, field_b);
 	default:
 		unreachable();
 		return 0;
 	}
 }
 
+/*
+ * Reverse the compare result if the key part sort order is descending.
+ */
+template<bool has_desc_parts>
+static inline int
+key_part_compare_result(struct key_part *part, int result)
+{
+	bool is_asc = !has_desc_parts || part->sort_order != SORT_ORDER_DESC;
+	return result * (is_asc ? 1 : -1);
+}
+
+/*
+ * Reverse the hint if the key part sort order is descending.
+ */
+template<bool has_desc_parts>
+static inline hint_t
+key_part_hint(struct key_part *part, hint_t hint)
+{
+	bool is_asc = !has_desc_parts || part->sort_order != SORT_ORDER_DESC;
+	/* HINT_MAX - HINT_NONE underflows to HINT_NONE. */
+	return is_asc ? hint : HINT_MAX - hint;
+}
+
+/*
+ * Implements the field comparison logic. If the key we use is not nullable
+ * then a simple call to tuple_compare_field is used.
+ *
+ * Otherwise one of \p field_a and \p field_b can be NIL: either it's encoded
+ * as MP_NIL or if the field is absent (corresponding field pointer equals to
+ * NULL). In this case we perform comparison so that NIL is lesser than any
+ * value but two NILs are equal.
+ *
+ * The template parameters a_is_optional and b_is_optional specify if the
+ * corresponding field arguments can be absent (equal to NULL).
+ *
+ * If \p was_null_met is not NULL, sets the boolean pointed by it to true if
+ * any of \p field_a and \p field_b is absent or NIL. Othervice the pointed
+ * value is not modified.
+ *
+ * This code had been deduplicated, so made the function always_inline in
+ * order to make sure it's still inlined after refactoring.
+ *
+ * @param part the key part we compare
+ * @param field_a the field to compare
+ * @param field_b the field to compare against
+ * @param was_null_met pointer to the value to set to true if a NIL is met,
+ *                     can be set to NULL if the information isn't required
+ * @retval 0  if field_a == field_b
+ * @retval <0 if field_a < field_b
+ * @retval >0 if field_a > field_b
+ */
+template<bool is_nullable, bool a_is_optional, bool b_is_optional,
+	 bool has_desc_parts>
+static ALWAYS_INLINE int
+key_part_compare_fields(struct key_part *part, const char *field_a,
+			const char *field_b, bool *was_null_met = NULL)
+{
+	int rc;
+	if (!is_nullable) {
+		rc = tuple_compare_field(field_a, field_b,
+					 part->type, part->coll);
+		return key_part_compare_result<has_desc_parts>(part, rc);
+	}
+	enum mp_type a_type = (a_is_optional && field_a == NULL) ?
+			      MP_NIL : mp_typeof(*field_a);
+	enum mp_type b_type = (b_is_optional && field_b == NULL) ?
+			      MP_NIL : mp_typeof(*field_b);
+	bool a_is_value = a_type != MP_NIL;
+	bool b_is_value = b_type != MP_NIL;
+	if (!a_is_value || !b_is_value) {
+		if (was_null_met != NULL)
+			*was_null_met = true;
+		rc = a_is_value - b_is_value;
+	} else {
+		rc = tuple_compare_field_with_type(field_a, a_type,
+						   field_b, b_type,
+						   part->type, part->coll);
+	}
+	return key_part_compare_result<has_desc_parts>(part, rc);
+}
+
 template<bool is_nullable, bool has_optional_parts, bool has_json_paths,
-	 bool is_multikey>
+	 bool is_multikey, bool has_desc_parts>
 static inline int
 tuple_compare_slowpath(struct tuple *tuple_a, hint_t tuple_a_hint,
 		       struct tuple *tuple_b, hint_t tuple_b_hint,
@@ -541,41 +692,16 @@ tuple_compare_slowpath(struct tuple *tuple_a, hint_t tuple_a_hint,
 	int rc = 0;
 	if (!is_multikey && (rc = hint_cmp(tuple_a_hint, tuple_b_hint)) != 0)
 		return rc;
+	bool was_null_met = false;
 	struct key_part *part = key_def->parts;
 	const char *tuple_a_raw = tuple_data(tuple_a);
 	const char *tuple_b_raw = tuple_data(tuple_b);
-	if (key_def->part_count == 1 && part->fieldno == 0 &&
-	    (!has_json_paths || part->path == NULL)) {
-		/*
-		 * First field can not be optional - empty tuples
-		 * can not exist.
-		 */
-		assert(!has_optional_parts);
-		mp_decode_array(&tuple_a_raw);
-		mp_decode_array(&tuple_b_raw);
-		if (! is_nullable) {
-			return tuple_compare_field(tuple_a_raw, tuple_b_raw,
-						   part->type, part->coll);
-		}
-		enum mp_type a_type = mp_typeof(*tuple_a_raw);
-		enum mp_type b_type = mp_typeof(*tuple_b_raw);
-		if (a_type == MP_NIL)
-			return b_type == MP_NIL ? 0 : -1;
-		else if (b_type == MP_NIL)
-			return 1;
-		return tuple_compare_field_with_type(tuple_a_raw,  a_type,
-						     tuple_b_raw, b_type,
-						     part->type, part->coll);
-	}
-
-	bool was_null_met = false;
 	struct tuple_format *format_a = tuple_format(tuple_a);
 	struct tuple_format *format_b = tuple_format(tuple_b);
 	const uint32_t *field_map_a = tuple_field_map(tuple_a);
 	const uint32_t *field_map_b = tuple_field_map(tuple_b);
 	struct key_part *end;
 	const char *field_a, *field_b;
-	enum mp_type a_type, b_type;
 	if (is_nullable)
 		end = part + key_def->unique_part_count;
 	else
@@ -604,35 +730,12 @@ tuple_compare_slowpath(struct tuple *tuple_a, hint_t tuple_a_hint,
 		}
 		assert(has_optional_parts ||
 		       (field_a != NULL && field_b != NULL));
-		if (! is_nullable) {
-			rc = tuple_compare_field(field_a, field_b, part->type,
-						 part->coll);
-			if (rc != 0)
-				return rc;
-			else
-				continue;
-		}
-		if (has_optional_parts) {
-			a_type = field_a != NULL ? mp_typeof(*field_a) : MP_NIL;
-			b_type = field_b != NULL ? mp_typeof(*field_b) : MP_NIL;
-		} else {
-			a_type = mp_typeof(*field_a);
-			b_type = mp_typeof(*field_b);
-		}
-		if (a_type == MP_NIL) {
-			if (b_type != MP_NIL)
-				return -1;
-			was_null_met = true;
-		} else if (b_type == MP_NIL) {
-			return 1;
-		} else {
-			rc = tuple_compare_field_with_type(field_a, a_type,
-							   field_b, b_type,
-							   part->type,
-							   part->coll);
-			if (rc != 0)
-				return rc;
-		}
+		rc = key_part_compare_fields<is_nullable, has_optional_parts,
+					     has_optional_parts,
+					     has_desc_parts>(
+			part, field_a, field_b, &was_null_met);
+		if (rc != 0)
+			return rc;
 	}
 	/*
 	 * Do not use full parts set when no NULLs. It allows to
@@ -643,7 +746,7 @@ tuple_compare_slowpath(struct tuple *tuple_a, hint_t tuple_a_hint,
 	if (!is_nullable || !was_null_met)
 		return 0;
 	/*
-	 * Inxex parts are equal and contain NULLs. So use
+	 * Index parts are equal and contain NULLs. So use
 	 * extended parts only.
 	 */
 	end = key_def->parts + key_def->part_count;
@@ -673,8 +776,9 @@ tuple_compare_slowpath(struct tuple *tuple_a, hint_t tuple_a_hint,
 		 * be absent or be NULLs.
 		 */
 		assert(field_a != NULL && field_b != NULL);
-		rc = tuple_compare_field(field_a, field_b, part->type,
-					 part->coll);
+		rc = key_part_compare_fields<false, false, false,
+					     has_desc_parts>(
+			part, field_a, field_b);
 		if (rc != 0)
 			return rc;
 	}
@@ -682,7 +786,7 @@ tuple_compare_slowpath(struct tuple *tuple_a, hint_t tuple_a_hint,
 }
 
 template<bool is_nullable, bool has_optional_parts, bool has_json_paths,
-	 bool is_multikey>
+	 bool is_multikey, bool has_desc_parts>
 static inline int
 tuple_compare_with_key_slowpath(struct tuple *tuple, hint_t tuple_hint,
 				const char *key, uint32_t part_count,
@@ -704,7 +808,6 @@ tuple_compare_with_key_slowpath(struct tuple *tuple, hint_t tuple_hint,
 	struct tuple_format *format = tuple_format(tuple);
 	const char *tuple_raw = tuple_data(tuple);
 	const uint32_t *field_map = tuple_field_map(tuple);
-	enum mp_type a_type, b_type;
 	if (likely(part_count == 1)) {
 		const char *field;
 		if (is_multikey) {
@@ -719,24 +822,9 @@ tuple_compare_with_key_slowpath(struct tuple *tuple, hint_t tuple_hint,
 			field = tuple_field_raw(format, tuple_raw, field_map,
 						part->fieldno);
 		}
-		if (! is_nullable) {
-			return tuple_compare_field(field, key, part->type,
-						   part->coll);
-		}
-		if (has_optional_parts)
-			a_type = field != NULL ? mp_typeof(*field) : MP_NIL;
-		else
-			a_type = mp_typeof(*field);
-		b_type = mp_typeof(*key);
-		if (a_type == MP_NIL) {
-			return b_type == MP_NIL ? 0 : -1;
-		} else if (b_type == MP_NIL) {
-			return 1;
-		} else {
-			return tuple_compare_field_with_type(field, a_type, key,
-							     b_type, part->type,
-							     part->coll);
-		}
+		return key_part_compare_fields<is_nullable, has_optional_parts,
+					       false, has_desc_parts>(
+			part, field, key);
 	}
 
 	struct key_part *end = part + part_count;
@@ -754,92 +842,68 @@ tuple_compare_with_key_slowpath(struct tuple *tuple, hint_t tuple_hint,
 			field = tuple_field_raw(format, tuple_raw, field_map,
 						part->fieldno);
 		}
-		if (! is_nullable) {
-			rc = tuple_compare_field(field, key, part->type,
-						 part->coll);
-			if (rc != 0)
-				return rc;
-			else
-				continue;
-		}
-		if (has_optional_parts)
-			a_type = field != NULL ? mp_typeof(*field) : MP_NIL;
-		else
-			a_type = mp_typeof(*field);
-		b_type = mp_typeof(*key);
-		if (a_type == MP_NIL) {
-			if (b_type != MP_NIL)
-				return -1;
-		} else if (b_type == MP_NIL) {
-			return 1;
-		} else {
-			rc = tuple_compare_field_with_type(field, a_type, key,
-							   b_type, part->type,
-							   part->coll);
-			if (rc != 0)
-				return rc;
-		}
+		rc = key_part_compare_fields<is_nullable, has_optional_parts,
+					     false, has_desc_parts>(
+			part, field, key);
+		if (rc != 0)
+			return rc;
 	}
 	return 0;
 }
 
-template<bool is_nullable>
+/**
+ * Compare key parts and skip compared equally. After function call, keys
+ * will point to the first field that differ or to the end of key or
+ * part_count + 1 field in order.
+ * Key arguments must not be NULL, allowed to be NULL if dereferenced.
+ * Set was_null_met to true if at least one part is NULL, to false otherwise.
+ */
+template<bool is_nullable, bool has_desc_parts>
 static inline int
-key_compare_parts(const char *key_a, const char *key_b, uint32_t part_count,
-		  struct key_def *key_def)
+key_compare_and_skip_parts(const char **key_a, const char **key_b,
+			   uint32_t part_count, struct key_def *key_def,
+			   bool *was_null_met)
 {
 	assert(is_nullable == key_def->is_nullable);
-	assert((key_a != NULL && key_b != NULL) || part_count == 0);
+	assert(key_a != NULL && key_b != NULL);
+	assert((*key_a != NULL && *key_b != NULL) || part_count == 0);
 	struct key_part *part = key_def->parts;
+	int rc;
+	*was_null_met = false;
+
 	if (likely(part_count == 1)) {
-		if (! is_nullable) {
-			return tuple_compare_field(key_a, key_b, part->type,
-						   part->coll);
+		rc = key_part_compare_fields<is_nullable, false, false,
+					     has_desc_parts>(
+			part, *key_a, *key_b, was_null_met);
+		/* If key parts are equals, we must skip them. */
+		if (rc == 0) {
+			mp_next(key_a);
+			mp_next(key_b);
 		}
-		enum mp_type a_type = mp_typeof(*key_a);
-		enum mp_type b_type = mp_typeof(*key_b);
-		if (a_type == MP_NIL) {
-			return b_type == MP_NIL ? 0 : -1;
-		} else if (b_type == MP_NIL) {
-			return 1;
-		} else {
-			return tuple_compare_field_with_type(key_a, a_type,
-							     key_b, b_type,
-							     part->type,
-							     part->coll);
-		}
+		return rc;
 	}
 
 	struct key_part *end = part + part_count;
-	int rc;
-	for (; part < end; ++part, mp_next(&key_a), mp_next(&key_b)) {
-		if (! is_nullable) {
-			rc = tuple_compare_field(key_a, key_b, part->type,
-						 part->coll);
-			if (rc != 0)
-				return rc;
-			else
-				continue;
-		}
-		enum mp_type a_type = mp_typeof(*key_a);
-		enum mp_type b_type = mp_typeof(*key_b);
-		if (a_type == MP_NIL) {
-			if (b_type != MP_NIL)
-				return -1;
-		} else if (b_type == MP_NIL) {
-			return 1;
-		} else {
-			rc = tuple_compare_field_with_type(key_a, a_type, key_b,
-							   b_type, part->type,
-							   part->coll);
-			if (rc != 0)
-				return rc;
-		}
+	for (; part < end; ++part, mp_next(key_a), mp_next(key_b)) {
+		rc = key_part_compare_fields<is_nullable, false, false,
+					     has_desc_parts>(
+			part, *key_a, *key_b, was_null_met);
+		if (rc != 0)
+			return rc;
 	}
 	return 0;
 }
 
-template<bool is_nullable, bool has_optional_parts>
+template<bool is_nullable, bool has_desc_parts>
+static inline int
+key_compare_parts(const char *key_a, const char *key_b, uint32_t part_count,
+		  struct key_def *key_def, bool *was_null_met)
+{
+	return key_compare_and_skip_parts<is_nullable, has_desc_parts>(
+		&key_a, &key_b, part_count, key_def, was_null_met);
+}
+
+template<bool is_nullable, bool has_optional_parts, bool has_desc_parts>
 static inline int
 tuple_compare_with_key_sequential(struct tuple *tuple, hint_t tuple_hint,
 				  const char *key, uint32_t part_count,
@@ -861,8 +925,9 @@ tuple_compare_with_key_sequential(struct tuple *tuple, hint_t tuple_hint,
 		assert(field_count >= part_count);
 		cmp_part_count = part_count;
 	}
-	rc = key_compare_parts<is_nullable>(tuple_key, key, cmp_part_count,
-					    key_def);
+	bool unused;
+	rc = key_compare_and_skip_parts<is_nullable, has_desc_parts>(
+		&tuple_key, &key, cmp_part_count, key_def, &unused);
 	if (!has_optional_parts || rc != 0)
 		return rc;
 	/*
@@ -870,43 +935,51 @@ tuple_compare_with_key_sequential(struct tuple *tuple, hint_t tuple_hint,
 	 * corresponding key fields to be equal to NULL.
 	 */
 	if (field_count < part_count) {
-		/*
-		 * Key's and tuple's first field_count fields are
-		 * equal, and their bsize too.
-		 */
-		key += tuple_bsize(tuple) - mp_sizeof_array(field_count);
 		for (uint32_t i = field_count; i < part_count;
 		     ++i, mp_next(&key)) {
-			if (mp_typeof(*key) != MP_NIL)
-				return -1;
+			rc = key_part_compare_fields<true, true, false,
+						     has_desc_parts>(
+				&key_def->parts[i], NULL, key);
+			if (rc != 0)
+				return rc;
 		}
 	}
 	return 0;
 }
 
 int
-key_compare(const char *key_a, hint_t key_a_hint,
-	    const char *key_b, hint_t key_b_hint, struct key_def *key_def)
+key_compare(const char *key_a, uint32_t part_count_a, hint_t key_a_hint,
+	    const char *key_b, uint32_t part_count_b, hint_t key_b_hint,
+	    struct key_def *key_def)
 {
 	int rc = hint_cmp(key_a_hint, key_b_hint);
 	if (rc != 0)
 		return rc;
-	uint32_t part_count_a = mp_decode_array(&key_a);
-	uint32_t part_count_b = mp_decode_array(&key_b);
 	assert(part_count_a <= key_def->part_count);
 	assert(part_count_b <= key_def->part_count);
 	uint32_t part_count = MIN(part_count_a, part_count_b);
 	assert(part_count <= key_def->part_count);
+	bool unused;
 	if (! key_def->is_nullable) {
-		return key_compare_parts<false>(key_a, key_b, part_count,
-						key_def);
+		if (key_def_has_desc_parts(key_def)) {
+			return key_compare_parts<false, true>(
+				key_a, key_b, part_count, key_def, &unused);
+		} else {
+			return key_compare_parts<false, false>(
+				key_a, key_b, part_count, key_def, &unused);
+		}
 	} else {
-		return key_compare_parts<true>(key_a, key_b, part_count,
-					       key_def);
+		if (key_def_has_desc_parts(key_def)) {
+			return key_compare_parts<true, true>(
+				key_a, key_b, part_count, key_def, &unused);
+		} else {
+			return key_compare_parts<true, false>(
+				key_a, key_b, part_count, key_def, &unused);
+		}
 	}
 }
 
-template <bool is_nullable, bool has_optional_parts>
+template<bool is_nullable, bool has_optional_parts, bool has_desc_parts>
 static int
 tuple_compare_sequential(struct tuple *tuple_a, hint_t tuple_a_hint,
 			 struct tuple *tuple_b, hint_t tuple_b_hint,
@@ -926,35 +999,23 @@ tuple_compare_sequential(struct tuple *tuple_a, hint_t tuple_a_hint,
 	if (!has_optional_parts && !is_nullable) {
 		assert(fc_a >= key_def->part_count);
 		assert(fc_b >= key_def->part_count);
-		return key_compare_parts<false>(key_a, key_b,
-						key_def->part_count, key_def);
+		bool unused;
+		return key_compare_parts<false, has_desc_parts>(
+			key_a, key_b, key_def->part_count, key_def, &unused);
 	}
 	bool was_null_met = false;
 	struct key_part *part = key_def->parts;
 	struct key_part *end = part + key_def->unique_part_count;
 	uint32_t i = 0;
-	for (; part < end; ++part, ++i) {
-		enum mp_type a_type, b_type;
-		if (has_optional_parts) {
-			a_type = i >= fc_a ? MP_NIL : mp_typeof(*key_a);
-			b_type = i >= fc_b ? MP_NIL : mp_typeof(*key_b);
-		} else {
-			a_type = mp_typeof(*key_a);
-			b_type = mp_typeof(*key_b);
-		}
-		if (a_type == MP_NIL) {
-			if (b_type != MP_NIL)
-				return -1;
-			was_null_met = true;
-		} else if (b_type == MP_NIL) {
-			return 1;
-		} else {
-			rc = tuple_compare_field_with_type(key_a, a_type, key_b,
-							   b_type, part->type,
-							   part->coll);
-			if (rc != 0)
-				return rc;
-		}
+	for (const char *field_a, *field_b; part < end; ++part, ++i) {
+		field_a = (has_optional_parts && i >= fc_a) ? NULL : key_a;
+		field_b = (has_optional_parts && i >= fc_b) ? NULL : key_b;
+		rc = key_part_compare_fields<true, has_optional_parts,
+					     has_optional_parts,
+					     has_desc_parts>(
+			part, field_a, field_b, &was_null_met);
+		if (rc != 0)
+			return rc;
 		if (!has_optional_parts || i < fc_a)
 			mp_next(&key_a);
 		if (!has_optional_parts || i < fc_b)
@@ -970,8 +1031,9 @@ tuple_compare_sequential(struct tuple *tuple_a, hint_t tuple_a_hint,
 		 * not be absent or be null.
 		 */
 		assert(i < fc_a && i < fc_b);
-		rc = tuple_compare_field(key_a, key_b, part->type,
-					 part->coll);
+		rc = key_part_compare_fields<false, false, false,
+					     has_desc_parts>(
+			part, key_a, key_b);
 		if (rc != 0)
 			return rc;
 	}
@@ -1346,17 +1408,23 @@ static const comparator_with_key_signature cmp_wk_arr[] = {
 	KEY_COMPARATOR(1, FIELD_TYPE_STRING  , 2, FIELD_TYPE_STRING)
 };
 
+#undef KEY_COMPARATOR
+
 /**
  * A functional index tuple compare.
- * tuple_a_hint and tuple_b_hint are expected to be valid
- * pointers to functional key memory. These keys have been already
- * validated and are represented as a MsgPack array with exactly
- * func_index_part_count parts. The cmp_def has part_count > func_index_part_count,
- * since it was  produced by key_def_merge() of the functional key part
- * and the primary key. So its tail parts are taken from primary
- * index key definition.
+ * tuple_a_hint and tuple_b_hint are expected to be valid pointers to functional
+ * key memory. These keys are represented as a MsgPack array with the number of
+ * elements equal to the functional index definition part_count (let's denote
+ * it as func_index_part_count). The keys have been already validated by
+ * key_list_iterator_next().
+ *
+ * In case of unique non-nullable index, the non-extended key_def is used as a
+ * cmp_def (see memtx_tree_index_new_tpl()). Otherwise, the extended cmp_def has
+ * part_count > func_index_part_count, since it was produced by key_def_merge()
+ * of the functional key part and the primary key. So its tail parts are taken
+ * from primary index key definition.
  */
-template<bool is_nullable>
+template<bool is_nullable, bool has_desc_parts>
 static inline int
 func_index_compare(struct tuple *tuple_a, hint_t tuple_a_hint,
 		   struct tuple *tuple_b, hint_t tuple_b_hint,
@@ -1365,18 +1433,30 @@ func_index_compare(struct tuple *tuple_a, hint_t tuple_a_hint,
 	assert(cmp_def->for_func_index);
 	assert(is_nullable == cmp_def->is_nullable);
 
-	const char *key_a = (const char *)tuple_a_hint;
-	const char *key_b = (const char *)tuple_b_hint;
+	const char *key_a = tuple_data((struct tuple *)tuple_a_hint);
+	const char *key_b = tuple_data((struct tuple *)tuple_b_hint);
 	assert(mp_typeof(*key_a) == MP_ARRAY);
 	uint32_t part_count_a = mp_decode_array(&key_a);
 	assert(mp_typeof(*key_b) == MP_ARRAY);
 	uint32_t part_count_b = mp_decode_array(&key_b);
+	assert(part_count_a == part_count_b);
+	uint32_t key_part_count = part_count_a;
+	(void)part_count_b;
 
-	uint32_t key_part_count = MIN(part_count_a, part_count_b);
-	int rc = key_compare_parts<is_nullable>(key_a, key_b, key_part_count,
-						cmp_def);
+	bool was_null_met;
+	int rc = key_compare_parts<is_nullable, has_desc_parts>(
+		key_a, key_b, key_part_count, cmp_def, &was_null_met);
 	if (rc != 0)
 		return rc;
+	/*
+	 * Tuples with nullified fields may violate the uniqueness constraint
+	 * so if we encountered a nullified field while comparing the secondary
+	 * key parts we must proceed with comparing the primary key parts even
+	 * if the secondary index is unique.
+	 */
+	if (key_part_count == cmp_def->unique_part_count &&
+	    (!is_nullable || !was_null_met))
+		return 0;
 	/*
 	 * Primary index definition key compare.
 	 * It cannot contain nullable parts so the code is
@@ -1398,12 +1478,11 @@ func_index_compare(struct tuple *tuple_a, hint_t tuple_a_hint,
 						  field_map_b, part,
 						  MULTIKEY_NONE);
 		assert(field_a != NULL && field_b != NULL);
-		rc = tuple_compare_field(field_a, field_b, part->type,
-					 part->coll);
+		rc = key_part_compare_fields<false, false, false,
+					     has_desc_parts>(
+			part, field_a, field_b);
 		if (rc != 0)
 			return rc;
-		else
-			continue;
 	}
 	return 0;
 }
@@ -1414,26 +1493,57 @@ func_index_compare(struct tuple *tuple_a, hint_t tuple_a_hint,
  * functional key memory and is compared with the given key by
  * using the functional index key definition.
  */
-template<bool is_nullable>
+template<bool is_nullable, bool has_desc_parts>
 static inline int
 func_index_compare_with_key(struct tuple *tuple, hint_t tuple_hint,
 			    const char *key, uint32_t part_count,
 			    hint_t key_hint, struct key_def *key_def)
 {
-	(void)tuple; (void)key_hint;
+	(void)key_hint;
 	assert(key_def->for_func_index);
 	assert(is_nullable == key_def->is_nullable);
-	const char *tuple_key = (const char *)tuple_hint;
+	const char *tuple_key = tuple_data((struct tuple *)tuple_hint);
 	assert(mp_typeof(*tuple_key) == MP_ARRAY);
 
 	uint32_t tuple_key_count = mp_decode_array(&tuple_key);
-	part_count = MIN(part_count, tuple_key_count);
+	uint32_t cmp_part_count = MIN(part_count, tuple_key_count);
+	cmp_part_count = MIN(cmp_part_count, key_def->part_count);
+	bool unused;
+	int rc = key_compare_and_skip_parts<is_nullable, has_desc_parts>(
+		&tuple_key, &key, cmp_part_count, key_def, &unused);
+	if (rc != 0)
+		return rc;
+	/* Equals if nothing to compare. */
+	if (part_count == cmp_part_count ||
+	    key_def->part_count == cmp_part_count)
+		return 0;
+	/*
+	 * Now we know that tuple_key count is less than key part_count
+	 * and key_def part_count, so let's keep comparing, but with
+	 * original tuple fields. We will compare parts of primary key,
+	 * it cannot contain nullable parts so the code is simplified
+	 * correspondingly. Also, all the key parts, corresponding to
+	 * func key, were already skipped.
+	 */
+	const char *tuple_raw = tuple_data(tuple);
+	struct tuple_format *format = tuple_format(tuple);
+	const uint32_t *field_map = tuple_field_map(tuple);
+	const char *field;
 	part_count = MIN(part_count, key_def->part_count);
-	return key_compare_parts<is_nullable>(tuple_key, key, part_count,
-					      key_def);
+	for (uint32_t i = cmp_part_count; i < part_count; i++) {
+		struct key_part *part = &key_def->parts[i];
+		field = tuple_field_raw_by_part(format, tuple_raw, field_map,
+						part, MULTIKEY_NONE);
+		assert(field != NULL);
+		rc = key_part_compare_fields<false, false, false,
+					     has_desc_parts>(
+			part, field, key);
+		mp_next(&key);
+		if (rc != 0)
+			return rc;
+	}
+	return 0;
 }
-
-#undef KEY_COMPARATOR
 
 /* }}} tuple_compare_with_key */
 
@@ -1518,6 +1628,21 @@ func_index_compare_with_key(struct tuple *tuple, hint_t tuple_hint,
 #define HINT_VALUE_DOUBLE_MAX	(exp2(HINT_VALUE_BITS - 1) - 1)
 #define HINT_VALUE_DOUBLE_MIN	(-exp2(HINT_VALUE_BITS - 1))
 
+/**
+ * We need to squeeze 64 bits of seconds and 32 bits of nanoseconds
+ * into 60 bits of hint value. The idea is to represent wide enough
+ * years range, and leave the rest of bits occupied from nanoseconds part:
+ * - 36 bits is enough for time range of [-208-05-13..6325-04-08]
+ * - for nanoseconds there is left 24 bits, which are MSB part of
+ *   32-bit value
+ */
+#define HINT_VALUE_SECS_BITS	36
+#define HINT_VALUE_NSEC_BITS	(HINT_VALUE_BITS - HINT_VALUE_SECS_BITS)
+#define HINT_VALUE_SECS_MAX	((1LL << (HINT_VALUE_SECS_BITS - 1)) - 1)
+#define HINT_VALUE_SECS_MIN	(-(1LL << (HINT_VALUE_SECS_BITS - 1)))
+#define HINT_VALUE_NSEC_SHIFT	(sizeof(int32_t) * CHAR_BIT - HINT_VALUE_NSEC_BITS)
+#define HINT_VALUE_NSEC_MAX	((1ULL << HINT_VALUE_NSEC_BITS) - 1)
+
 /*
  * HINT_CLASS_BITS should be big enough to store any mp_class value.
  * Note, ((1 << HINT_CLASS_BITS) - 1) is reserved for HINT_NONE.
@@ -1555,7 +1680,8 @@ hint_uint(uint64_t u)
 static inline hint_t
 hint_int(int64_t i)
 {
-	assert(i < 0);
+	if (i >= 0)
+		return hint_uint((uint64_t)i);
 	uint64_t val = (i <= HINT_VALUE_INT_MIN ? 0 : i - HINT_VALUE_INT_MIN);
 	return hint_create(MP_CLASS_NUMBER, val);
 }
@@ -1608,6 +1734,38 @@ hint_uuid_raw(const char *data)
 	/* Make space for class representation. */
 	val >>= HINT_CLASS_BITS;
 	return hint_create(MP_CLASS_UUID, val);
+}
+
+static inline hint_t
+hint_datetime(struct datetime *date)
+{
+	/*
+	 * Use at most HINT_VALUE_SECS_BITS from datetime
+	 * seconds field as a hint value, and at MSB part
+	 * of HINT_VALUE_NSEC_BITS from nanoseconds.
+	 */
+	int64_t secs = date->epoch;
+	/*
+	 * Both overflow and underflow
+	 */
+	bool is_overflow = false;
+	uint64_t val;
+	if (secs < HINT_VALUE_SECS_MIN) {
+		is_overflow = true;
+		val = 0;
+	} else {
+		val = secs - HINT_VALUE_SECS_MIN;
+	}
+	if (val > HINT_VALUE_SECS_MAX) {
+		is_overflow = true;
+		val = HINT_VALUE_SECS_MAX;
+	}
+	val <<= HINT_VALUE_NSEC_BITS;
+	if (is_overflow == false) {
+		val |= (date->nsec >> HINT_VALUE_NSEC_SHIFT) &
+			HINT_VALUE_NSEC_MAX;
+	}
+	return hint_create(MP_CLASS_DATETIME, val);
 }
 
 static inline uint64_t
@@ -1675,7 +1833,14 @@ field_hint_integer(const char *field)
 }
 
 static inline hint_t
-field_hint_double(const char *field)
+field_hint_float32(const char *field)
+{
+	assert(mp_typeof(*field) == MP_FLOAT);
+	return hint_double(mp_decode_float(&field));
+}
+
+static inline hint_t
+field_hint_float64(const char *field)
 {
 	assert(mp_typeof(*field) == MP_DOUBLE);
 	return hint_double(mp_decode_double(&field));
@@ -1742,6 +1907,17 @@ field_hint_uuid(const char *field)
 }
 
 static inline hint_t
+field_hint_datetime(const char *field)
+{
+	assert(mp_typeof(*field) == MP_EXT);
+	int8_t ext_type;
+	uint32_t len = mp_decode_extl(&field, &ext_type);
+	assert(ext_type == MP_DATETIME);
+	struct datetime date;
+	return hint_datetime(datetime_unpack(&field, len, &date));
+}
+
+static inline hint_t
 field_hint_string(const char *field, struct coll *coll)
 {
 	assert(mp_typeof(*field) == MP_STR);
@@ -1792,6 +1968,11 @@ field_hint_scalar(const char *field, struct coll *coll)
 		}
 		case MP_UUID:
 			return hint_uuid_raw(field);
+		case MP_DATETIME:
+		{
+			struct datetime date;
+			return hint_datetime(datetime_unpack(&field, len, &date));
+		}
 		default:
 			unreachable();
 		}
@@ -1812,13 +1993,24 @@ field_hint(const char *field, struct coll *coll)
 	case FIELD_TYPE_BOOLEAN:
 		return field_hint_boolean(field);
 	case FIELD_TYPE_UNSIGNED:
+	case FIELD_TYPE_UINT8:
+	case FIELD_TYPE_UINT16:
+	case FIELD_TYPE_UINT32:
+	case FIELD_TYPE_UINT64:
 		return field_hint_unsigned(field);
 	case FIELD_TYPE_INTEGER:
+	case FIELD_TYPE_INT8:
+	case FIELD_TYPE_INT16:
+	case FIELD_TYPE_INT32:
+	case FIELD_TYPE_INT64:
 		return field_hint_integer(field);
 	case FIELD_TYPE_NUMBER:
-		return field_hint_number(field);
 	case FIELD_TYPE_DOUBLE:
-		return field_hint_double(field);
+		return field_hint_number(field);
+	case FIELD_TYPE_FLOAT32:
+		return field_hint_float32(field);
+	case FIELD_TYPE_FLOAT64:
+		return field_hint_float64(field);
 	case FIELD_TYPE_STRING:
 		return field_hint_string(field, coll);
 	case FIELD_TYPE_VARBINARY:
@@ -1826,35 +2018,42 @@ field_hint(const char *field, struct coll *coll)
 	case FIELD_TYPE_SCALAR:
 		return field_hint_scalar(field, coll);
 	case FIELD_TYPE_DECIMAL:
+	case FIELD_TYPE_DECIMAL32:
+	case FIELD_TYPE_DECIMAL64:
+	case FIELD_TYPE_DECIMAL128:
+	case FIELD_TYPE_DECIMAL256:
 		return field_hint_decimal(field);
 	case FIELD_TYPE_UUID:
 		return field_hint_uuid(field);
+	case FIELD_TYPE_DATETIME:
+		return field_hint_datetime(field);
 	default:
 		unreachable();
 	}
 	return HINT_NONE;
 }
 
-template <enum field_type type, bool is_nullable>
+template<enum field_type type, bool is_nullable, bool has_desc_parts>
 static hint_t
 key_hint(const char *key, uint32_t part_count, struct key_def *key_def)
 {
 	assert(!key_def->is_multikey);
 	if (part_count == 0)
 		return HINT_NONE;
-	return field_hint<type, is_nullable>(key, key_def->parts->coll);
+	hint_t h = field_hint<type, is_nullable>(key, key_def->parts->coll);
+	return key_part_hint<has_desc_parts>(key_def->parts, h);
 }
 
-template <enum field_type type, bool is_nullable>
+template<enum field_type type, bool is_nullable, bool has_desc_parts>
 static hint_t
 tuple_hint(struct tuple *tuple, struct key_def *key_def)
 {
 	assert(!key_def->is_multikey);
 	const char *field = tuple_field_by_part(tuple, key_def->parts,
 						MULTIKEY_NONE);
-	if (is_nullable && field == NULL)
-		return hint_nil();
-	return field_hint<type, is_nullable>(field, key_def->parts->coll);
+	hint_t h = is_nullable && field == NULL ? hint_nil() :
+		   field_hint<type, is_nullable>(field, key_def->parts->coll);
+	return key_part_hint<has_desc_parts>(key_def->parts, h);
 }
 
 static hint_t
@@ -1878,7 +2077,7 @@ key_hint_stub(const char *key, uint32_t part_count, struct key_def *key_def)
 }
 
 static hint_t
-key_hint_stub(struct tuple *tuple, struct key_def *key_def)
+tuple_hint_stub(struct tuple *tuple, struct key_def *key_def)
 {
 	(void) tuple;
 	(void) key_def;
@@ -1886,12 +2085,22 @@ key_hint_stub(struct tuple *tuple, struct key_def *key_def)
 	return HINT_NONE;
 }
 
+template<enum field_type type, bool is_nullable, bool has_desc_parts>
+static void
+key_def_set_hint_func(struct key_def *def)
+{
+	def->key_hint = key_hint<type, is_nullable, has_desc_parts>;
+	def->tuple_hint = tuple_hint<type, is_nullable, has_desc_parts>;
+}
+
 template<enum field_type type, bool is_nullable>
 static void
 key_def_set_hint_func(struct key_def *def)
 {
-	def->key_hint = key_hint<type, is_nullable>;
-	def->tuple_hint = tuple_hint<type, is_nullable>;
+	if (key_def_has_desc_parts(def))
+		key_def_set_hint_func<type, is_nullable, true>(def);
+	else
+		key_def_set_hint_func<type, is_nullable, false>(def);
 }
 
 template<enum field_type type>
@@ -1909,7 +2118,7 @@ key_def_set_hint_func(struct key_def *def)
 {
 	if (def->is_multikey || def->for_func_index) {
 		def->key_hint = key_hint_stub;
-		def->tuple_hint = key_hint_stub;
+		def->tuple_hint = tuple_hint_stub;
 		return;
 	}
 	switch (def->parts->type) {
@@ -1938,10 +2147,47 @@ key_def_set_hint_func(struct key_def *def)
 		key_def_set_hint_func<FIELD_TYPE_SCALAR>(def);
 		break;
 	case FIELD_TYPE_DECIMAL:
+	case FIELD_TYPE_DECIMAL32:
+	case FIELD_TYPE_DECIMAL64:
+	case FIELD_TYPE_DECIMAL128:
+	case FIELD_TYPE_DECIMAL256:
 		key_def_set_hint_func<FIELD_TYPE_DECIMAL>(def);
 		break;
 	case FIELD_TYPE_UUID:
 		key_def_set_hint_func<FIELD_TYPE_UUID>(def);
+		break;
+	case FIELD_TYPE_DATETIME:
+		key_def_set_hint_func<FIELD_TYPE_DATETIME>(def);
+		break;
+	case FIELD_TYPE_INT8:
+		key_def_set_hint_func<FIELD_TYPE_INT8>(def);
+		break;
+	case FIELD_TYPE_UINT8:
+		key_def_set_hint_func<FIELD_TYPE_UINT8>(def);
+		break;
+	case FIELD_TYPE_INT16:
+		key_def_set_hint_func<FIELD_TYPE_INT16>(def);
+		break;
+	case FIELD_TYPE_UINT16:
+		key_def_set_hint_func<FIELD_TYPE_UINT16>(def);
+		break;
+	case FIELD_TYPE_INT32:
+		key_def_set_hint_func<FIELD_TYPE_INT32>(def);
+		break;
+	case FIELD_TYPE_UINT32:
+		key_def_set_hint_func<FIELD_TYPE_UINT32>(def);
+		break;
+	case FIELD_TYPE_INT64:
+		key_def_set_hint_func<FIELD_TYPE_INT64>(def);
+		break;
+	case FIELD_TYPE_UINT64:
+		key_def_set_hint_func<FIELD_TYPE_UINT64>(def);
+		break;
+	case FIELD_TYPE_FLOAT32:
+		key_def_set_hint_func<FIELD_TYPE_FLOAT32>(def);
+		break;
+	case FIELD_TYPE_FLOAT64:
+		key_def_set_hint_func<FIELD_TYPE_FLOAT64>(def);
 		break;
 	default:
 		/* Invalid key definition. */
@@ -1960,6 +2206,7 @@ key_def_set_compare_func_fast(struct key_def *def)
 	assert(!def->has_optional_parts);
 	assert(!def->has_json_paths);
 	assert(!key_def_has_collation(def));
+	assert(!key_def_has_desc_parts(def));
 
 	tuple_compare_t cmp = NULL;
 	tuple_compare_with_key_t cmp_wk = NULL;
@@ -1994,13 +2241,14 @@ key_def_set_compare_func_fast(struct key_def *def)
 	}
 	if (cmp == NULL) {
 		cmp = is_sequential ?
-			tuple_compare_sequential<false, false> :
-			tuple_compare_slowpath<false, false, false, false>;
+			tuple_compare_sequential<false, false, false> :
+			tuple_compare_slowpath<false, false, false,
+					       false, false>;
 	}
 	if (cmp_wk == NULL) {
 		cmp_wk = is_sequential ?
-			tuple_compare_with_key_sequential<false, false> :
-			tuple_compare_with_key_slowpath<false, false,
+			tuple_compare_with_key_sequential<false, false, false> :
+			tuple_compare_with_key_slowpath<false, false, false,
 							false, false>;
 	}
 
@@ -2008,49 +2256,96 @@ key_def_set_compare_func_fast(struct key_def *def)
 	def->tuple_compare_with_key = cmp_wk;
 }
 
-template<bool is_nullable, bool has_optional_parts>
+template<bool is_nullable, bool has_optional_parts, bool has_desc_parts>
 static void
 key_def_set_compare_func_plain(struct key_def *def)
 {
 	assert(!def->has_json_paths);
 	if (key_def_is_sequential(def)) {
 		def->tuple_compare = tuple_compare_sequential
-					<is_nullable, has_optional_parts>;
+			<is_nullable, has_optional_parts, has_desc_parts>;
 		def->tuple_compare_with_key = tuple_compare_with_key_sequential
-					<is_nullable, has_optional_parts>;
+			<is_nullable, has_optional_parts, has_desc_parts>;
 	} else {
 		def->tuple_compare = tuple_compare_slowpath
-				<is_nullable, has_optional_parts, false, false>;
+				    <is_nullable, has_optional_parts,
+				     false, false, has_desc_parts>;
 		def->tuple_compare_with_key = tuple_compare_with_key_slowpath
-				<is_nullable, has_optional_parts, false, false>;
+					     <is_nullable, has_optional_parts,
+					      false, false, has_desc_parts>;
 	}
 }
 
+/* Proxy-template. */
+template<bool is_nullable, bool has_optional_parts>
+static void
+key_def_set_compare_func_plain(struct key_def *def)
+{
+	assert(!def->has_json_paths);
+	if (key_def_has_desc_parts(def))
+		key_def_set_compare_func_plain
+			<is_nullable, has_optional_parts, true>(def);
+	else
+		key_def_set_compare_func_plain
+			<is_nullable, has_optional_parts, false>(def);
+}
+
+template<bool is_nullable, bool has_optional_parts, bool has_desc_parts>
+static void
+key_def_set_compare_func_json(struct key_def *def)
+{
+	if (def->is_multikey) {
+		def->tuple_compare = tuple_compare_slowpath
+				    <is_nullable, has_optional_parts,
+				     true, true, has_desc_parts>;
+		def->tuple_compare_with_key = tuple_compare_with_key_slowpath
+					     <is_nullable, has_optional_parts,
+					      true, true, has_desc_parts>;
+	} else {
+		def->tuple_compare = tuple_compare_slowpath
+				    <is_nullable, has_optional_parts,
+				     true, false, has_desc_parts>;
+		def->tuple_compare_with_key = tuple_compare_with_key_slowpath
+					     <is_nullable, has_optional_parts,
+					      true, false, has_desc_parts>;
+	}
+}
+
+/* Proxy-template. */
 template<bool is_nullable, bool has_optional_parts>
 static void
 key_def_set_compare_func_json(struct key_def *def)
 {
 	assert(def->has_json_paths);
-	if (def->is_multikey) {
-		def->tuple_compare = tuple_compare_slowpath
-				<is_nullable, has_optional_parts, true, true>;
-		def->tuple_compare_with_key = tuple_compare_with_key_slowpath
-				<is_nullable, has_optional_parts, true, true>;
-	} else {
-		def->tuple_compare = tuple_compare_slowpath
-				<is_nullable, has_optional_parts, true, false>;
-		def->tuple_compare_with_key = tuple_compare_with_key_slowpath
-				<is_nullable, has_optional_parts, true, false>;
-	}
+	if (key_def_has_desc_parts(def))
+		key_def_set_compare_func_json
+			<is_nullable, has_optional_parts, true>(def);
+	else
+		key_def_set_compare_func_json
+			<is_nullable, has_optional_parts, false>(def);
 }
 
-template<bool is_nullable>
+/* Forced non-required comment. */
+template<bool is_nullable, bool has_desc_parts>
 static void
-key_def_set_compare_func_for_func_index(struct key_def *def)
+key_def_set_compare_func_of_func_index(struct key_def *def)
 {
 	assert(def->for_func_index);
-	def->tuple_compare = func_index_compare<is_nullable>;
-	def->tuple_compare_with_key = func_index_compare_with_key<is_nullable>;
+	def->tuple_compare = func_index_compare<is_nullable, has_desc_parts>;
+	def->tuple_compare_with_key = func_index_compare_with_key
+				     <is_nullable, has_desc_parts>;
+}
+
+/* Proxy-template. */
+template<bool is_nullable>
+static void
+key_def_set_compare_func_of_func_index(struct key_def *def)
+{
+	assert(def->for_func_index);
+	if (key_def_has_desc_parts(def))
+		key_def_set_compare_func_of_func_index<is_nullable, true>(def);
+	else
+		key_def_set_compare_func_of_func_index<is_nullable, false>(def);
 }
 
 void
@@ -2058,11 +2353,11 @@ key_def_set_compare_func(struct key_def *def)
 {
 	if (def->for_func_index) {
 		if (def->is_nullable)
-			key_def_set_compare_func_for_func_index<true>(def);
+			key_def_set_compare_func_of_func_index<true>(def);
 		else
-			key_def_set_compare_func_for_func_index<false>(def);
-	} else if (!key_def_has_collation(def) &&
-	    !def->is_nullable && !def->has_json_paths) {
+			key_def_set_compare_func_of_func_index<false>(def);
+	} else if (!def->is_nullable && !def->has_json_paths &&
+	    !key_def_has_collation(def) && !key_def_has_desc_parts(def)) {
 		key_def_set_compare_func_fast(def);
 	} else if (!def->has_json_paths) {
 		if (def->is_nullable && def->has_optional_parts) {

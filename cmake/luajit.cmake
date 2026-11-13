@@ -28,17 +28,33 @@ TestAndAppendFLag(CMAKE_C_FLAGS -Wno-tautological-compare)
 TestAndAppendFLag(CMAKE_C_FLAGS -Wno-misleading-indentation)
 TestAndAppendFLag(CMAKE_C_FLAGS -Wno-varargs)
 TestAndAppendFLag(CMAKE_C_FLAGS -Wno-implicit-fallthrough)
+# Building luzer shared library requires libluajit.a built with
+# -fPIC enabled.
+if(ENABLE_FUZZER)
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC")
+endif()
 
 set(BUILDMODE static CACHE STRING
     "Build mode: build only static lib" FORCE)
 set(LUAJIT_ENABLE_GC64 ${LUAJIT_ENABLE_GC64} CACHE BOOL
     "GC64 mode for x64" FORCE)
+set(LUAJIT_ENABLE_CHECKHOOK ON CACHE BOOL
+    "Check instruction/line hooks for compiled code")
 set(LUAJIT_SMART_STRINGS ON CACHE BOOL
     "Harder string hashing function" FORCE)
 set(LUAJIT_TEST_BINARY $<TARGET_FILE:tarantool> CACHE STRING
     "Lua implementation to be used for tests (tarantool)" FORCE)
-set(LUAJIT_USE_TEST OFF CACHE BOOL
-    "Generate <test> target" FORCE)
+
+if(ENABLE_ASAN)
+  # FIXME: Disabled due to
+  # https://github.com/tarantool/tarantool/issues/10733.
+  set(LUAJIT_USE_TEST OFF CACHE BOOL "Generate <test> target" FORCE)
+else()
+  set(LUAJIT_USE_TEST ON CACHE BOOL "Generate <test> target" FORCE)
+endif()
+
+set(LUAJIT_TEST_DEPS "tarantool" CACHE STRING
+    "A list of target dependencies to be used for tests. (tarantool)" FORCE)
 
 # XXX: There is <strict> module enabled by default in Tarantool
 # built in Debug, so we need to tweak LuaJIT testing environment.
@@ -64,13 +80,28 @@ if(ENABLE_VALGRIND)
         "Valgrind support" FORCE)
 endif()
 
-# FIXME: ASAN support is badly implemented in LuaJIT and there is
-# not a specific build options for this. At the same time there
-# are several places wrapped with LUAJIT_USE_ASAN define.
-# Just enable it here if needed and patiently wait until ASAN
-# support is implemented properly in LuaJIT.
+# Enable LuaJIT ASan support.
 if(ENABLE_ASAN)
-    add_definitions(-DLUAJIT_USE_ASAN=1)
+    if(LUAJIT_ENABLE_GC64)
+        set(LUAJIT_USE_SYSMALLOC ON CACHE BOOL
+            "System provided memory allocator (realloc/malloc)" FORCE)
+    else()
+        message(WARNING
+            "The internal LuaJIT memory allocator is not instrumented yet,"
+            " so to find any memory faults, it's worth building LuaJIT with"
+            " the system provided memory allocator. This requires enabling"
+            " the LUAJIT_ENABLE_GC64 option, as sysmalloc can only be used"
+            " in GC64 mode. Without it, sysmalloc cannot be used due to"
+            " allocator and pointer bitness incompatibility."
+        )
+    endif()
+    set(LUAJIT_USE_ASAN ON CACHE BOOL
+        "Build LuaJIT with AddressSanitizer" FORCE)
+endif()
+
+if(ENABLE_UB_SANITIZER)
+    set(LUAJIT_USE_UBSAN ON CACHE BOOL
+        "Build LuaJIT with UndefinedBehaviourSanitizer" FORCE)
 endif()
 
 if(TARGET_OS_DARWIN AND NOT LUAJIT_ENABLE_GC64)
@@ -96,6 +127,10 @@ set(LUAJIT_SOURCE_ROOT ${PROJECT_SOURCE_DIR}/third_party/luajit)
 set(LUAJIT_BINARY_ROOT ${PROJECT_BINARY_DIR}/third_party/luajit)
 
 add_subdirectory(${LUAJIT_SOURCE_ROOT} ${LUAJIT_BINARY_ROOT} EXCLUDE_FROM_ALL)
+
+# The interpreter used by build-time Lua helpers. BUILDMODE is forced to
+# 'static' above, hence the 'luajit_static' target always exists.
+set(LUAJIT_EXECUTABLE $<TARGET_FILE:luajit_static>)
 
 set(LUAJIT_PREFIX ${LUAJIT_BINARY_ROOT}/src)
 set(LUAJIT_INCLUDE_DIRS ${LUAJIT_PREFIX})

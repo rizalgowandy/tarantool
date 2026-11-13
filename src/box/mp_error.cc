@@ -41,6 +41,8 @@
 #include "msgpuck.h"
 #include "mp_extension_types.h"
 #include "fiber.h"
+#include "ssl_error.h"
+#include "trivia/util.h"
 
 /**
  * MP_ERROR format:
@@ -118,35 +120,31 @@ struct mp_error {
 	const char *type;
 	const char *file;
 	const char *message;
-	const char *custom_type;
-	const char *ad_object_type;
-	const char *ad_object_name;
-	const char *ad_access_type;
+	struct error_payload payload;
 };
 
 static void
 mp_error_create(struct mp_error *mp_error)
 {
 	memset(mp_error, 0, sizeof(*mp_error));
+	error_payload_create(&mp_error->payload);
+}
+
+static void
+mp_error_destroy(struct mp_error *mp_error)
+{
+	error_payload_destroy(&mp_error->payload);
 }
 
 static uint32_t
 mp_sizeof_error_one(const struct error *error)
 {
 	uint32_t errcode = box_error_code(error);
-
-	bool is_custom = false;
-	bool is_access_denied = false;
-
-	if (strcmp(error->type->name, "CustomError") == 0) {
-		is_custom = true;
-	} else if (strcmp(error->type->name, "AccessDeniedError") == 0) {
-		is_access_denied = true;
-	}
-
-	uint32_t details_num = 6;
+	int field_count = error->payload.count;
+	uint32_t map_size = 6 + (field_count > 0);
 	uint32_t data_size = 0;
 
+	data_size += mp_sizeof_map(map_size);
 	data_size += mp_sizeof_uint(MP_ERROR_TYPE);
 	data_size += mp_sizeof_str(strlen(error->type->name));
 	data_size += mp_sizeof_uint(MP_ERROR_LINE);
@@ -160,56 +158,26 @@ mp_sizeof_error_one(const struct error *error)
 	data_size += mp_sizeof_uint(MP_ERROR_CODE);
 	data_size += mp_sizeof_uint(errcode);
 
-	if (is_access_denied) {
-		++details_num;
+	if (field_count > 0) {
 		data_size += mp_sizeof_uint(MP_ERROR_FIELDS);
-		data_size += mp_sizeof_map(3);
-		AccessDeniedError *ad_err = type_cast(AccessDeniedError, error);
-		data_size += mp_sizeof_str(strlen("object_type"));
-		data_size += mp_sizeof_str(strlen(ad_err->object_type()));
-		data_size += mp_sizeof_str(strlen("object_name"));
-		data_size += mp_sizeof_str(strlen(ad_err->object_name()));
-		data_size += mp_sizeof_str(strlen("access_type"));
-		data_size += mp_sizeof_str(strlen(ad_err->access_type()));
-	} else if (is_custom) {
-		++details_num;
-		data_size += mp_sizeof_uint(MP_ERROR_FIELDS);
-		data_size += mp_sizeof_map(1);
-		data_size += mp_sizeof_str(strlen("custom_type"));
-		data_size +=
-			mp_sizeof_str(strlen(box_error_custom_type(error)));
+		data_size += mp_sizeof_map(field_count);
+		for (int i = 0; i < field_count; ++i) {
+			const struct error_field *f = error->payload.fields[i];
+			data_size += mp_sizeof_str(strlen(f->name));
+			data_size += f->size;
+		}
 	}
-
-	data_size += mp_sizeof_map(details_num);
-
 	return data_size;
-}
-
-static inline char *
-mp_encode_str0(char *data, const char *str)
-{
-	return mp_encode_str(data, str, strlen(str));
 }
 
 static char *
 mp_encode_error_one(char *data, const struct error *error)
 {
 	uint32_t errcode = box_error_code(error);
+	int field_count = error->payload.count;
+	uint32_t map_size = 6 + (field_count > 0);
 
-	bool is_custom = false;
-	bool is_access_denied = false;
-
-	if (strcmp(error->type->name, "CustomError") == 0) {
-		is_custom = true;
-	} else if (strcmp(error->type->name, "AccessDeniedError") == 0) {
-		is_access_denied = true;
-	}
-
-	uint32_t details_num = 6;
-	if (is_access_denied || is_custom)
-		++details_num;
-
-	data = mp_encode_map(data, details_num);
+	data = mp_encode_map(data, map_size);
 	data = mp_encode_uint(data, MP_ERROR_TYPE);
 	data = mp_encode_str0(data, error->type->name);
 	data = mp_encode_uint(data, MP_ERROR_LINE);
@@ -223,176 +191,131 @@ mp_encode_error_one(char *data, const struct error *error)
 	data = mp_encode_uint(data, MP_ERROR_CODE);
 	data = mp_encode_uint(data, errcode);
 
-	if (is_access_denied) {
+	if (field_count > 0) {
 		data = mp_encode_uint(data, MP_ERROR_FIELDS);
-		data = mp_encode_map(data, 3);
-		AccessDeniedError *ad_err = type_cast(AccessDeniedError, error);
-		data = mp_encode_str0(data, "object_type");
-		data = mp_encode_str0(data, ad_err->object_type());
-		data = mp_encode_str0(data, "object_name");
-		data = mp_encode_str0(data, ad_err->object_name());
-		data = mp_encode_str0(data, "access_type");
-		data = mp_encode_str0(data, ad_err->access_type());
-	} else if (is_custom) {
-		data = mp_encode_uint(data, MP_ERROR_FIELDS);
-		data = mp_encode_map(data, 1);
-		data = mp_encode_str0(data, "custom_type");
-		data = mp_encode_str0(data, box_error_custom_type(error));
+		data = mp_encode_map(data, field_count);
+		for (int i = 0; i < field_count; ++i) {
+			const struct error_field *f = error->payload.fields[i];
+			data = mp_encode_str0(data, f->name);
+			memcpy(data, f->data, f->size);
+			data += f->size;
+		}
 	}
 	return data;
 }
 
 static struct error *
-error_build_xc(struct mp_error *mp_error)
+error_build(struct mp_error *mp_error)
 {
-	/*
-	 * To create an error the "raw" constructor is used
-	 * because OOM error must be thrown in OOM case.
-	 * Builders returns a pointer to the static OOM error
-	 * in OOM case.
-	 */
 	struct error *err = NULL;
-	if (mp_error->type == NULL || mp_error->message == NULL ||
-	    mp_error->file == NULL) {
-missing_fields:
+	if (mp_error->type == NULL) {
 		diag_set(ClientError, ER_INVALID_MSGPACK,
-			 "Missing mandatory error fields");
+			 "MP_ERROR_TYPE is missing");
 		return NULL;
 	}
-
-	if (strcmp(mp_error->type, "ClientError") == 0) {
-		ClientError *e = new ClientError(mp_error->file, mp_error->line,
-						 ER_UNKNOWN);
-		e->m_errcode = mp_error->code;
-		err = e;
-	} else if (strcmp(mp_error->type, "CustomError") == 0) {
-		if (mp_error->custom_type == NULL)
-			goto missing_fields;
-		err = new CustomError(mp_error->file, mp_error->line,
-				      mp_error->custom_type, mp_error->code);
-	} else if (strcmp(mp_error->type, "AccessDeniedError") == 0) {
-		if (mp_error->ad_access_type == NULL ||
-		    mp_error->ad_object_type == NULL ||
-		    mp_error->ad_object_name == NULL)
-			goto missing_fields;
-		err = new AccessDeniedError(mp_error->file, mp_error->line,
-					    mp_error->ad_access_type,
-					    mp_error->ad_object_type,
-					    mp_error->ad_object_name, "",
-					    false);
-	} else if (strcmp(mp_error->type, "XlogError") == 0) {
-		err = new XlogError(&type_XlogError, mp_error->file,
-				    mp_error->line);
-	} else if (strcmp(mp_error->type, "XlogGapError") == 0) {
-		err = new XlogGapError(mp_error->file, mp_error->line,
-				       mp_error->message);
-	} else if (strcmp(mp_error->type, "SystemError") == 0) {
-		err = new SystemError(mp_error->file, mp_error->line,
-				      "%s", mp_error->message);
-	} else if (strcmp(mp_error->type, "SocketError") == 0) {
-		err = new SocketError(mp_error->file, mp_error->line, "", "");
-		error_format_msg(err, "%s", mp_error->message);
-	} else if (strcmp(mp_error->type, "OutOfMemory") == 0) {
-		err = new OutOfMemory(mp_error->file, mp_error->line,
-				      0, "", "");
-	} else if (strcmp(mp_error->type, "TimedOut") == 0) {
-		err = new TimedOut(mp_error->file, mp_error->line);
-	} else if (strcmp(mp_error->type, "ChannelIsClosed") == 0) {
-		err = new ChannelIsClosed(mp_error->file, mp_error->line);
-	} else if (strcmp(mp_error->type, "FiberIsCancelled") == 0) {
-		err = new FiberIsCancelled(mp_error->file, mp_error->line);
-	} else if (strcmp(mp_error->type, "LuajitError") == 0) {
-		err = new LuajitError(mp_error->file, mp_error->line,
-				      mp_error->message);
-	} else if (strcmp(mp_error->type, "IllegalParams") == 0) {
-		err = new IllegalParams(mp_error->file, mp_error->line,
-					"%s", mp_error->message);
-	} else if (strcmp(mp_error->type, "CollationError") == 0) {
-		err = new CollationError(mp_error->file, mp_error->line,
-					 "%s", mp_error->message);
-	} else if (strcmp(mp_error->type, "SwimError") == 0) {
-		err = new SwimError(mp_error->file, mp_error->line,
-				    "%s", mp_error->message);
-	} else if (strcmp(mp_error->type, "CryptoError") == 0) {
-		err = new CryptoError(mp_error->file, mp_error->line,
-				      "%s", mp_error->message);
-	} else {
-		err = new ClientError(mp_error->file, mp_error->line,
-				      ER_UNKNOWN);
+	if (mp_error->message == NULL) {
+		diag_set(ClientError, ER_INVALID_MSGPACK,
+			 "MP_ERROR_MESSAGE is missing");
+		return NULL;
 	}
+	if (mp_error->file == NULL) {
+		diag_set(ClientError, ER_INVALID_MSGPACK,
+			 "MP_ERROR_FILE is missing");
+		return NULL;
+	}
+	if (strcmp(mp_error->type, "ClientError") == 0) {
+		err = new ClientError();
+	} else if (strcmp(mp_error->type, "CustomError") == 0) {
+		err = new CustomError();
+	} else if (strcmp(mp_error->type, "AccessDeniedError") == 0) {
+		err = new AccessDeniedError();
+	} else if (strcmp(mp_error->type, "XlogError") == 0) {
+		err = new XlogError();
+	} else if (strcmp(mp_error->type, "XlogGapError") == 0) {
+		err = new XlogGapError();
+	} else if (strcmp(mp_error->type, "SystemError") == 0) {
+		err = new SystemError();
+	} else if (strcmp(mp_error->type, "SocketError") == 0) {
+		err = new SocketError();
+	} else if (strcmp(mp_error->type, "OutOfMemory") == 0) {
+		err = new OutOfMemory();
+	} else if (strcmp(mp_error->type, "TimedOut") == 0) {
+		err = new TimedOut();
+	} else if (strcmp(mp_error->type, "ChannelIsClosed") == 0) {
+		err = new ChannelIsClosed();
+	} else if (strcmp(mp_error->type, "FiberIsCancelled") == 0) {
+		err = new FiberIsCancelled();
+	} else if (strcmp(mp_error->type, "LuajitError") == 0) {
+		err = new LuajitError();
+	} else if (strcmp(mp_error->type, "IllegalParams") == 0) {
+		err = new IllegalParams();
+	} else if (strcmp(mp_error->type, "CollationError") == 0) {
+		err = new CollationError();
+	} else if (strcmp(mp_error->type, "SwimError") == 0) {
+		err = new SwimError();
+	} else if (strcmp(mp_error->type, "CryptoError") == 0) {
+		err = new CryptoError();
+	} else if (strcmp(mp_error->type, "SSLError") == 0) {
+		err = new SSLError();
+	} else if (strcmp(mp_error->type, "FileFormatError") == 0) {
+		err = new FileFormatError();
+	} else if (strcmp(mp_error->type, "EncodeError") == 0) {
+		err = new EncodeError();
+	} else if (strcmp(mp_error->type, "DecodeError") == 0) {
+		err = new DecodeError();
+	} else {
+		err = new ClientError();
+	}
+	err->code = mp_error->code;
 	err->saved_errno = mp_error->saved_errno;
+	error_set_location(err, mp_error->file, mp_error->line);
+	error_move_payload(err, &mp_error->payload);
 	error_format_msg(err, "%s", mp_error->message);
 	return err;
 }
 
 static inline const char *
-region_strdup(struct region *region, const char *str, uint32_t len)
-{
-	char *res = (char *)region_alloc(region, len + 1);
-	if (res == NULL) {
-		diag_set(OutOfMemory, len + 1, "region_alloc", "res");
-		return NULL;
-	}
-	memcpy(res, str, len);
-	res[len] = 0;
-	return res;
-}
-
-static inline const char *
 mp_decode_and_copy_str(const char **data, struct region *region)
 {
-	if (mp_typeof(**data) != MP_STR) {
-		diag_set(ClientError, ER_INVALID_MSGPACK,
-			 "Invalid MP_ERROR MsgPack format");
-		return NULL;
-	}
 	uint32_t str_len;
 	const char *str = mp_decode_str(data, &str_len);
-	return region_strdup(region, str, str_len);;
+	char *copy = (char *)xregion_alloc(region, str_len + 1);
+	memcpy(copy, str, str_len);
+	copy[str_len] = '\0';
+	return copy;
 }
 
-static inline bool
-str_nonterm_is_eq(const char *l, const char *r, uint32_t r_len)
-{
-	return r_len == strlen(l) && memcmp(l, r, r_len) == 0;
-}
+/**
+ * Helper macro for checking that MsgPack data has a particular type.
+ * Sets diag and returns -1 on error.
+ */
+#define CHECK_MP_TYPE(data, type, what) ({				\
+	int rc = 0;							\
+	if (mp_typeof(**(data)) != (type)) {				\
+		diag_set(ClientError, ER_INVALID_MSGPACK,		\
+			 what " must be " #type);			\
+		rc = -1;						\
+	}								\
+	rc;								\
+})
 
 static int
 mp_decode_error_fields(const char **data, struct mp_error *mp_err,
 		       struct region *region)
 {
-	if (mp_typeof(**data) != MP_MAP)
+	if (CHECK_MP_TYPE(data, MP_MAP, "MP_ERROR_FIELDS value") != 0)
 		return -1;
 	uint32_t map_sz = mp_decode_map(data);
-	const char *key;
-	uint32_t key_len;
 	for (uint32_t i = 0; i < map_sz; ++i) {
-		if (mp_typeof(**data) != MP_STR)
+		uint32_t svp = region_used(region);
+		if (CHECK_MP_TYPE(data, MP_STR, "error payload field name"))
 			return -1;
-		key = mp_decode_str(data, &key_len);
-		if (str_nonterm_is_eq("object_type", key, key_len)) {
-			mp_err->ad_object_type =
-				mp_decode_and_copy_str(data, region);
-			if (mp_err->ad_object_type == NULL)
-				return -1;
-		} else if (str_nonterm_is_eq("object_name", key, key_len)) {
-			mp_err->ad_object_name =
-				mp_decode_and_copy_str(data, region);
-			if (mp_err->ad_object_name == NULL)
-				return -1;
-		} else if (str_nonterm_is_eq("access_type", key, key_len)) {
-			mp_err->ad_access_type =
-				mp_decode_and_copy_str(data, region);
-			if (mp_err->ad_access_type == NULL)
-				return -1;
-		} else if (str_nonterm_is_eq("custom_type", key, key_len)) {
-			mp_err->custom_type =
-				mp_decode_and_copy_str(data, region);
-			if (mp_err->custom_type == NULL)
-				return -1;
-		} else {
-			mp_next(data);
-		}
+		const char *key = mp_decode_and_copy_str(data, region);
+		const char *value = *data;
+		mp_next(data);
+		uint32_t value_len = *data - value;
+		error_payload_set_mp(&mp_err->payload, key, value, value_len);
+		region_truncate(region, svp);
 	}
 	return 0;
 }
@@ -407,44 +330,48 @@ mp_decode_error_one(const char **data)
 	struct error *err = NULL;
 	uint32_t map_size;
 
-	if (mp_typeof(**data) != MP_MAP)
-		goto error;
-
+	if (CHECK_MP_TYPE(data, MP_MAP, "MP_ERROR_STACK array entry") != 0)
+		goto finish;
 	map_size = mp_decode_map(data);
 	for (uint32_t i = 0; i < map_size; ++i) {
-		if (mp_typeof(**data) != MP_UINT)
-			goto error;
-
+		if (CHECK_MP_TYPE(data, MP_UINT, "error field key") != 0)
+			goto finish;
 		uint64_t key = mp_decode_uint(data);
 		switch(key) {
 		case MP_ERROR_TYPE:
-			mp_err.type = mp_decode_and_copy_str(data, region);
-			if (mp_err.type == NULL)
+			if (CHECK_MP_TYPE(data, MP_STR,
+					  "MP_ERROR_TYPE value") != 0)
 				goto finish;
+			mp_err.type = mp_decode_and_copy_str(data, region);
 			break;
 		case MP_ERROR_FILE:
-			mp_err.file = mp_decode_and_copy_str(data, region);
-			if (mp_err.file == NULL)
+			if (CHECK_MP_TYPE(data, MP_STR,
+					  "MP_ERROR_FILE value") != 0)
 				goto finish;
+			mp_err.file = mp_decode_and_copy_str(data, region);
 			break;
 		case MP_ERROR_LINE:
-			if (mp_typeof(**data) != MP_UINT)
-				goto error;
+			if (CHECK_MP_TYPE(data, MP_UINT,
+					  "MP_ERROR_LINE value") != 0)
+				goto finish;
 			mp_err.line = mp_decode_uint(data);
 			break;
 		case MP_ERROR_MESSAGE:
-			mp_err.message = mp_decode_and_copy_str(data, region);
-			if (mp_err.message == NULL)
+			if (CHECK_MP_TYPE(data, MP_STR,
+					  "MP_ERROR_MESSAGE value") != 0)
 				goto finish;
+			mp_err.message = mp_decode_and_copy_str(data, region);
 			break;
 		case MP_ERROR_ERRNO:
-			if (mp_typeof(**data) != MP_UINT)
-				goto error;
+			if (CHECK_MP_TYPE(data, MP_UINT,
+					  "MP_ERROR_ERRNO value") != 0)
+				goto finish;
 			mp_err.saved_errno = mp_decode_uint(data);
 			break;
 		case MP_ERROR_CODE:
-			if (mp_typeof(**data) != MP_UINT)
-				goto error;
+			if (CHECK_MP_TYPE(data, MP_UINT,
+					  "MP_ERROR_CODE value") != 0)
+				goto finish;
 			mp_err.code = mp_decode_uint(data);
 			break;
 		case MP_ERROR_FIELDS:
@@ -456,19 +383,11 @@ mp_decode_error_one(const char **data)
 		}
 	}
 
-	try {
-		err = error_build_xc(&mp_err);
-	} catch (OutOfMemory *e) {
-		assert(err == NULL && !diag_is_empty(diag_get()));
-	}
+	err = error_build(&mp_err);
 finish:
 	region_truncate(region, region_svp);
+	mp_error_destroy(&mp_err);
 	return err;
-
-error:
-	diag_set(ClientError, ER_INVALID_MSGPACK,
-		 "Invalid MP_ERROR MsgPack format");
-	goto finish;
 }
 
 /**
@@ -552,40 +471,38 @@ error_to_mpstream(const struct error *error, struct mpstream *stream)
 struct error *
 error_unpack_unsafe(const char **data)
 {
+	const char *begin = *data;
 	struct error *err = NULL;
+	uint32_t map_size;
 
-	if (mp_typeof(**data) != MP_MAP) {
-		diag_set(ClientError, ER_INVALID_MSGPACK,
-			 "Invalid MP_ERROR MsgPack format");
-		return NULL;
-	}
-	uint32_t map_size = mp_decode_map(data);
+	if (CHECK_MP_TYPE(data, MP_MAP, "error data") != 0)
+		goto error;
+	map_size = mp_decode_map(data);
 	for (uint32_t i = 0; i < map_size; ++i) {
-		if (mp_typeof(**data) != MP_UINT) {
-			diag_set(ClientError, ER_INVALID_MSGPACK,
-				 "Invalid MP_ERROR MsgPack format");
-			return NULL;
-		}
+		if (CHECK_MP_TYPE(data, MP_UINT, "error data key") != 0)
+			goto error;
 		uint64_t key = mp_decode_uint(data);
 		switch(key) {
 		case MP_ERROR_STACK: {
-			if (mp_typeof(**data) != MP_ARRAY) {
+			if (err != NULL) {
 				diag_set(ClientError, ER_INVALID_MSGPACK,
-					 "Invalid MP_ERROR MsgPack format");
-				return NULL;
+					 "duplicate MP_ERROR_STACK key");
+				goto error;
 			}
+			if (CHECK_MP_TYPE(data, MP_ARRAY,
+					  "MP_ERROR_STACK value") != 0)
+				goto error;
 			uint32_t stack_sz = mp_decode_array(data);
 			struct error *effect = NULL;
 			for (uint32_t i = 0; i < stack_sz; i++) {
 				struct error *cur = mp_decode_error_one(data);
 				if (cur == NULL)
-					return NULL;
+					goto error;
 				if (err == NULL) {
 					err = cur;
 					effect = cur;
 					continue;
 				}
-
 				error_set_prev(effect, cur);
 				effect = cur;
 			}
@@ -595,7 +512,47 @@ error_unpack_unsafe(const char **data)
 			mp_next(data);
 		}
 	}
+	if (err == NULL) {
+		diag_set(ClientError, ER_INVALID_MSGPACK,
+			 "MP_ERROR_STACK is missing");
+		goto error;
+	}
 	return err;
+
+error:
+	if (err != NULL) {
+		/* A hack to delete the error. */
+		error_ref(err);
+		error_unref(err);
+	}
+	err = diag_last_error(diag_get());
+	assert(err != NULL);
+	error_set_uint(err, "offset", *data - begin);
+	return NULL;
+}
+
+struct error *
+error_unpack(const char **data, uint32_t len)
+{
+	const char *end = *data + len;
+	const char *check = *data;
+	if (mp_check_exact(&check, end) != 0)
+		return NULL;
+	return error_unpack_unsafe(data);
+}
+
+int
+mp_validate_error(const char *data, uint32_t len)
+{
+	struct error *err = error_unpack(&data, len);
+	if (err != NULL) {
+		/* A hack to delete the error. */
+		error_ref(err);
+		error_unref(err);
+		return 0;
+	} else {
+		return 1;
+	}
 }
 
 /**

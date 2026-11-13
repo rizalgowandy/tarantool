@@ -115,6 +115,20 @@ int
 sio_getsockname(int fd, struct sockaddr *addr, socklen_t *addrlen);
 
 /**
+ * Return a string representation of sockaddr (a socket of the current node)
+ * which is hidden behind the fd.
+ */
+const char *
+sio_getsockname_str(int fd);
+
+/**
+ * Return a string representation of sockaddr (a socket for the remote node)
+ * which is hidden behind the fd.
+ */
+const char *
+sio_getpeername_str(int fd);
+
+/**
  * Advance write position in the iovec array
  * based on its current value and the number of
  * bytes written.
@@ -178,17 +192,15 @@ sio_getsockopt(int fd, int level, int optname,
  * Connect a client socket to a server.
  * The diagnostics is not set in case of EINPROGRESS.
  */
-int sio_connect(int fd, struct sockaddr *addr, socklen_t addrlen);
+int sio_connect(int fd, const struct sockaddr *addr, socklen_t addrlen);
 
 /**
- * Bind a socket to the given address. The diagnostics is not set
- * in case of EADDRINUSE.
+ * Bind a socket to the given address.
  */
-int sio_bind(int fd, struct sockaddr *addr, socklen_t addrlen);
+int sio_bind(int fd, const struct sockaddr *addr, socklen_t addrlen);
 
 /**
- * Mark a socket as accepting connections. The diagnostics is not
- * set in case of EADDRINUSE.
+ * Mark a socket as accepting connections.
  */
 int sio_listen(int fd);
 
@@ -237,6 +249,31 @@ ssize_t sio_recvfrom(int fd, void *buf, size_t len, int flags,
  */
 int
 sio_uri_to_addr(const char *uri, struct sockaddr *addr, bool *is_host_empty);
+
+/* internals, for unit testing */
+
+/**
+ * Return a string containing fd, base address and peer from arguments.
+ * Used mostly in error messages.
+ */
+const char *
+sio_socketname_addr(int fd, const struct sockaddr *base_addr,
+		    socklen_t addrlen);
+
+/**
+ * Get protocol numeric ID on this system by its name.
+ * Platform-agnostic thread-safe version of getprotobyname().
+ */
+int
+sio_getprotobyname(const char *name);
+
+/**
+ * Get protocol name by its numeric ID on this system. The resulting
+ * buffer needs to be freed with free(), when not NULL.
+ * Platform-agnostic thread-safe version of getprotobynumber().
+ */
+char *
+sio_getprotobynumber(int proto);
 
 #if defined(__cplusplus)
 } /* extern "C" */

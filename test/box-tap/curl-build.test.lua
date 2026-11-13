@@ -56,13 +56,17 @@ ffi.cdef([[
 
 local info = ffi.C.curl_version_info(7)
 local test = tap.test('curl-features')
-test:plan(5)
+test:plan(6)
 
 if test:ok(info.ssl_version ~= nil, 'Curl built with SSL support') then
     test:diag('ssl_version: ' .. ffi.string(info.ssl_version))
 end
 if test:ok(info.libz_version ~= nil, 'Curl built with LIBZ') then
     test:diag('libz_version: ' .. ffi.string(info.libz_version))
+end
+
+if test:ok(info.nghttp2_version ~= nil, 'Curl built with nghttp2') then
+    test:diag('nghttp2_version: ' .. ffi.string(info.nghttp2_version))
 end
 
 local RTLD_DEFAULT
@@ -166,6 +170,9 @@ local curl_symbols = {
     'curl_version',
     'curl_version_info',
 }
+
+-- TODO gh-7640 LuaJIT: ffi.C.dlsym() doesn't work on FreeBSD
+jit.off()
 
 test:test('curl_symbols', function(t)
     t:plan(#curl_symbols)

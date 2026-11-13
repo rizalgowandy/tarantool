@@ -39,9 +39,7 @@
 
 #include "lib/core/decimal.h"
 #include "mp_extension_types.h"
-#include "uuid/tt_uuid.h"
-
-#include "lua-yaml/b64.h"
+#include "tt_uuid.h"
 
 #include "serialize_lua.h"
 
@@ -49,8 +47,10 @@
 # define SERIALIZER_TRACE
 #endif
 
-/* Serializer for Lua output mode */
-static struct luaL_serializer *serializer_lua;
+static_assert(DT_IVAL_TO_STRING_BUFSIZE > FPCONV_G_FMT_BUFSIZE,
+	      "Buffer is too small");
+static_assert(DT_IVAL_TO_STRING_BUFSIZE > DT_TO_STRING_BUFSIZE,
+	      "Buffer is too small");
 
 enum {
 	NODE_NONE_BIT		= 0,
@@ -186,7 +186,7 @@ trace_nd_mask_str(unsigned int nd_mask)
 
 		int nd_len = strlen(nd_type_names[i]);
 		if (left >= nd_len + 1) {
-			strcpy(&mask_str[pos], nd_type_names[i]);
+			strlcpy(&mask_str[pos], nd_type_names[i], left);
 			pos += nd_len;
 			mask_str[pos++] = '|';
 			left = sizeof(mask_str) - pos;
@@ -196,7 +196,7 @@ trace_nd_mask_str(unsigned int nd_mask)
 	if (pos != 0)
 		mask_str[--pos] = '\0';
 	else
-		strcpy(mask_str, "UNKNOWN");
+		strlcpy(mask_str, "UNKNOWN", sizeof(mask_str));
 
 	return mask_str;
 }
@@ -768,7 +768,7 @@ static int
 dump_node(struct lua_dumper *d, struct node *nd, int indent)
 {
 	struct luaL_field *field = &nd->field;
-	char buf[FPCONV_G_FMT_BUFSIZE];
+	char buf[DT_IVAL_TO_STRING_BUFSIZE];
 	int ltype = lua_type(d->L, -1);
 	const char *str = NULL;
 	size_t len = 0;
@@ -809,16 +809,10 @@ dump_node(struct lua_dumper *d, struct node *nd, int indent)
 		str = buf;
 		break;
 	case MP_STR:
-		nd->mask |= NODE_QUOTE;
-		str = lua_tolstring(d->L, -1, &len);
-		if (utf8_check_printable(str, len) == 1)
-			break;
-		/* fallthrough */
 	case MP_BIN:
 		nd->mask |= NODE_QUOTE;
-		tobase64(d->L, -1);
-		str = lua_tolstring(d->L, -1, &len);
-		lua_pop(d->L, 1);
+		str = field->sval.data;
+		len = field->sval.len;
 		break;
 	case MP_ARRAY:
 		dump_array(d, nd, indent);
@@ -860,6 +854,18 @@ dump_node(struct lua_dumper *d, struct node *nd, int indent)
 			nd->mask |= NODE_QUOTE;
 			str = tt_uuid_str(field->uuidval);
 			len = UUID_STR_LEN;
+			break;
+		case MP_DATETIME:
+			nd->mask |= NODE_QUOTE;
+			str = buf;
+			len = datetime_snprint(buf, sizeof(buf),
+					       field->dateval);
+			break;
+		case MP_INTERVAL:
+			nd->mask |= NODE_QUOTE;
+			str = buf;
+			len = interval_snprint(buf, sizeof(buf),
+					       field->interval);
 			break;
 		default:
 			d->err = EINVAL;
@@ -938,7 +944,7 @@ dump_root(struct lua_dumper *d)
 
 	luaL_checkfield(d->L, d->cfg, lua_gettop(d->L), &nd.field);
 
-	if (nd.field.type != MP_ARRAY || nd.field.size != 1) {
+	if (nd.field.type != MP_ARRAY || nd.field.size > 1) {
 		d->err = EINVAL;
 		snprintf(d->err_msg, sizeof(d->err_msg),
 			 "serializer: unexpected data "
@@ -1026,35 +1032,4 @@ lua_parse_opts(lua_State *L, lua_dumper_opts_t *opts)
 	if (lua_isnumber(L, -1))
 		opts->indent_lvl = (int)lua_tonumber(L, -1);
 	lua_pop(L, 1);
-}
-
-/**
- * Initialize Lua serializer.
- */
-void
-lua_serializer_init(struct lua_State *L)
-{
-	/*
-	 * We don't export it as a module
-	 * for a while, so the library
-	 * is kept empty.
-	 */
-	static const luaL_Reg lualib[] = {
-		{
-			.name = NULL,
-		},
-	};
-
-	serializer_lua = luaL_newserializer(L, NULL, lualib);
-	serializer_lua->has_compact		= 1;
-	serializer_lua->encode_invalid_numbers	= 1;
-	serializer_lua->encode_load_metatables	= 1;
-	serializer_lua->encode_use_tostring	= 1;
-	serializer_lua->encode_invalid_as_nil	= 1;
-
-	/*
-	 * Keep a reference to this module so it
-	 * won't be unloaded.
-	 */
-	lua_setfield(L, -2, "formatter_lua");
 }

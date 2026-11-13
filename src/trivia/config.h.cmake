@@ -23,20 +23,25 @@
  * release, e.g. 1.6.6-113-g8399d0e.
  */
 #define PACKAGE_VERSION "@TARANTOOL_VERSION@"
+/**
+ * A string with tag identifier of the tzdata release,
+ * e.g. 2024a.
+ */
+#define TZDATA_VERSION "@TZDATA_VERSION@"
 
 /** \endcond public */
 
 #define PACKAGE "@PACKAGE@"
-/*  Defined if building for Linux */
-#cmakedefine TARGET_OS_LINUX 1
-/*  Defined if building for FreeBSD */
-#cmakedefine TARGET_OS_FREEBSD 1
-/*  Defined if building for NetBSD */
-#cmakedefine TARGET_OS_NETBSD 1
-/*  Defined if building for Darwin */
-#cmakedefine TARGET_OS_DARWIN 1
+/* Defined to 1 if building for Linux, or to 0 otherwise. */
+#cmakedefine01 TARGET_OS_LINUX
+/* Defined to 1 if building for FreeBSD, or to 0 otherwise. */
+#cmakedefine01 TARGET_OS_FREEBSD
+/* Defined to 1 if building for NetBSD, or to 0 otherwise. */
+#cmakedefine01 TARGET_OS_NETBSD
+/* Defined to 1 if building for Darwin, or to 0 otherwise. */
+#cmakedefine01 TARGET_OS_DARWIN
 
-#ifdef TARGET_OS_DARWIN
+#if TARGET_OS_DARWIN
 #define TARANTOOL_LIBEXT "dylib"
 #else
 #define TARANTOOL_LIBEXT "so"
@@ -50,7 +55,17 @@
 /**
  * Defined if strlcpy() string extension helper present.
  */
- #cmakedefine HAVE_STRLCPY 1
+#cmakedefine HAVE_STRLCPY 1
+
+/**
+ * Defined if strlcat() string extension helper present.
+ */
+#cmakedefine HAVE_STRLCAT 1
+
+/**
+ * Defined if this platform has GNU specific strerror_r().
+ */
+#cmakedefine HAVE_STRERROR_R_GNU 1
 
 /*
  * Defined if gcov instrumentation should be enabled.
@@ -61,6 +76,19 @@
  * showing fiber call stack.
  */
 #cmakedefine ENABLE_BACKTRACE 1
+/*
+ * Defined if configured with ABORT_ON_LEAK.
+ */
+#cmakedefine ABORT_ON_LEAK 1
+/*
+ * Defined if configured with JIT engine turned on.
+ */
+#cmakedefine LUAJIT_JIT_STATUS 1
+/*
+ * Defined if configured with FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION.
+ */
+#cmakedefine FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION 1
+
 /*
  * Set if the system has bfd.h header and GNU bfd library.
  */
@@ -90,15 +118,6 @@
  */
 #cmakedefine HAVE_FDATASYNC 1
 
-#ifndef HAVE_FDATASYNC
-#if defined(__APPLE__)
-#include <fcntl.h>
-#define fdatasync(fd) fcntl(fd, F_FULLFSYNC)
-#else
-#define fdatasync fsync
-#endif
-#endif
-
 /*
  * Defined if this platform has GNU specific memmem().
  */
@@ -127,10 +146,6 @@
  * Defined if this is a big-endian system.
  */
 #cmakedefine HAVE_BYTE_ORDER_BIG_ENDIAN 1
-/*
- * Defined if this platform supports openmp and it is enabled
- */
-#cmakedefine HAVE_OPENMP 1
 /*
 *  Defined if compatible with GNU readline installed.
 */
@@ -204,6 +219,9 @@
 #cmakedefine HAVE_SETPROGNAME 1
 #cmakedefine HAVE_GETPROGNAME 1
 
+#cmakedefine HAVE_MALLOC_INFO 1
+#cmakedefine HAVE_MALLOC_TRIM 1
+
 /*
  * Defined if ICU library has ucol_strcollUTF8 method.
  */
@@ -226,8 +244,8 @@
 #define BUILD_INFO "@TARANTOOL_BUILD@"
 /** Command line used to run CMake */
 #define BUILD_OPTIONS "cmake . @TARANTOOL_OPTIONS@"
-/** Pathes to C and CXX compilers */
-#define COMPILER_INFO "@CMAKE_C_COMPILER@ @CMAKE_CXX_COMPILER@"
+/** Compiler ID and version, assuming the C and C++ compiler IDs are equal. */
+#define COMPILER_INFO "@CMAKE_C_COMPILER_ID@-@CMAKE_C_COMPILER_VERSION@"
 /** C compile flags used to build Tarantool */
 #define TARANTOOL_C_FLAGS "@TARANTOOL_C_FLAGS@"
 /** CXX compile flags used to build Tarantool */
@@ -252,13 +270,41 @@
 #define DEFAULT_CFG SYSCONF_DIR "/" DEFAULT_CFG_FILENAME
 
 #cmakedefine ENABLE_ASAN 1
+#cmakedefine ENABLE_UB_SANITIZER 1
 
 /* Cacheline size to calculate alignments */
 #define CACHELINE_SIZE 64
 
+#cmakedefine ENABLE_LUA_EXTRAS 1
+#cmakedefine ENABLE_BOX_LUA_EXTRAS 1
+#cmakedefine ENABLE_ERRINJ_EXTRAS 1
+#cmakedefine ENABLE_FLIGHT_RECORDER 1
+#cmakedefine ENABLE_TUPLE_COMPRESSION 1
+#cmakedefine ENABLE_SPACE_UPGRADE 1
+#cmakedefine ENABLE_AUDIT_LOG 1
 #cmakedefine ENABLE_FEEDBACK_DAEMON 1
+#cmakedefine ENABLE_WAL_EXT 1
+#cmakedefine ENABLE_RETENTION_PERIOD 1
+#cmakedefine ENABLE_RAW_READ_VIEW 1
+#cmakedefine ENABLE_SECURITY 1
+#cmakedefine ENABLE_MEMCS_ENGINE 1
+#cmakedefine ENABLE_QUIVER_ENGINE 1
+#cmakedefine ENABLE_COMPRESS_MODULE 1
+#cmakedefine ENABLE_ETCD_CLIENT 1
+#cmakedefine ENABLE_CONFIG_EXTRAS 1
+#cmakedefine ENABLE_FAILOVER 1
+#cmakedefine ENABLE_INTEGRITY 1
+#cmakedefine ENABLE_FETCH_SNAPSHOT_CURSOR 1
+#cmakedefine ENABLE_ARROW_IPC 1
 
 #cmakedefine EXPORT_LIBCURL_SYMBOLS 1
+
+#cmakedefine BUILD_STATIC 1
+#cmakedefine EMBED_LUAZLIB 1
+#cmakedefine EMBED_LUAZIP 1
+#cmakedefine TEST_BUILD 1
+
+#cmakedefine MIMALLOC_OVERRIDE_CPP 1
 
 /*
  * vim: syntax=c

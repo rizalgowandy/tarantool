@@ -43,143 +43,288 @@ extern "C" {
 enum {
 	/** Maximal iproto package body length (2GiB) */
 	IPROTO_BODY_LEN_MAX = 2147483648UL,
-	/* Maximal length of text handshake (greeting) */
+	/** Size of iproto greeting message. */
 	IPROTO_GREETING_SIZE = 128,
+	/** Size of salt sent in iproto greeting message. */
+	IPROTO_SALT_SIZE = 32,
 	/** marker + len + prev crc32 + cur crc32 + (padding) */
 	XLOG_FIXHEADER_SIZE = 19
 };
 
 /** IPROTO_FLAGS bitfield constants. */
-enum {
-	/** Set for the last xrow in a transaction. */
-	IPROTO_FLAG_COMMIT = 0x01,
-	/** Set for the last row of a tx residing in limbo. */
-	IPROTO_FLAG_WAIT_SYNC = 0x02,
-	/** Set for the last row of a synchronous tx. */
-	IPROTO_FLAG_WAIT_ACK = 0x04,
+#define IPROTO_FLAGS(_)							\
+	/** Set for the last xrow in a transaction. */			\
+	_(COMMIT, 0)							\
+	/** Set for the last row of a tx residing in limbo. */		\
+	_(WAIT_SYNC, 1)							\
+	/** Set for the last row of a synchronous tx. */		\
+	_(WAIT_ACK, 2)							\
+
+#define IPROTO_FLAG_MEMBER(s, v) IPROTO_FLAG_ ## s = 1ULL << (v),
+
+enum iproto_flag {
+	IPROTO_FLAGS(IPROTO_FLAG_MEMBER)
 };
 
-enum iproto_key {
-	IPROTO_REQUEST_TYPE = 0x00,
-	IPROTO_SYNC = 0x01,
+#define IPROTO_FLAG_BIT_MEMBER(s, v) IPROTO_FLAG_BIT_ ## s = v,
 
-	/* Replication keys (header) */
-	IPROTO_REPLICA_ID = 0x02,
-	IPROTO_LSN = 0x03,
-	IPROTO_TIMESTAMP = 0x04,
-	IPROTO_SCHEMA_VERSION = 0x05,
-	IPROTO_SERVER_VERSION = 0x06,
-	IPROTO_GROUP_ID = 0x07,
-	IPROTO_TSN = 0x08,
-	IPROTO_FLAGS = 0x09,
-	IPROTO_STREAM_ID = 0x0a,
-	/* Leave a gap for other keys in the header. */
-	IPROTO_SPACE_ID = 0x10,
-	IPROTO_INDEX_ID = 0x11,
-	IPROTO_LIMIT = 0x12,
-	IPROTO_OFFSET = 0x13,
-	IPROTO_ITERATOR = 0x14,
-	IPROTO_INDEX_BASE = 0x15,
+enum iproto_flag_bit {
+	IPROTO_FLAGS(IPROTO_FLAG_BIT_MEMBER)
+	iproto_flag_bit_MAX,
+};
 
-	/* Leave a gap between integer values and other keys */
-	IPROTO_KEY = 0x20,
-	IPROTO_TUPLE = 0x21,
-	IPROTO_FUNCTION_NAME = 0x22,
-	IPROTO_USER_NAME = 0x23,
+/** IPROTO flag name by bit number. */
+extern const char *iproto_flag_bit_strs[];
 
+/**
+ * IPROTO key name, code, and MsgPack value type.
+ */
+#define IPROTO_KEYS(_)							\
+	_(REQUEST_TYPE, 0x00, MP_UINT)					\
+	_(SYNC, 0x01, MP_UINT)						\
+									\
+	/* Replication keys (header) */					\
+	_(REPLICA_ID, 0x02, MP_UINT)					\
+	_(LSN, 0x03, MP_UINT)						\
+	_(TIMESTAMP, 0x04, MP_DOUBLE)					\
+	_(SCHEMA_VERSION, 0x05, MP_UINT)				\
+	_(SERVER_VERSION, 0x06, MP_UINT)				\
+	_(GROUP_ID, 0x07, MP_UINT)					\
+	_(TSN, 0x08, MP_UINT)						\
+	_(FLAGS, 0x09, MP_UINT)						\
+	_(STREAM_ID, 0x0a, MP_UINT)					\
+	_(THREAD_ID, 0x0b, MP_UINT)					\
+	 /**
+	  * An audit context propagated to all child requests and fibers,
+	  * and printed in the audit log. Tarantool does not parse, validate
+	  * or modify the value.
+	  */								\
+	 _(AUDIT_CONTEXT, 0x0c, MP_STR)					\
+	/* Leave a gap for other keys in the header. */			\
+	_(SPACE_ID, 0x10, MP_UINT)					\
+	_(INDEX_ID, 0x11, MP_UINT)					\
+	_(LIMIT, 0x12, MP_UINT)						\
+	_(OFFSET, 0x13, MP_UINT)					\
+	_(ITERATOR, 0x14, MP_UINT)					\
+	_(INDEX_BASE, 0x15, MP_UINT)					\
+	/* Leave a gap between integer values and other keys */		\
+	/**
+	 * Flag indicating the need to send position of
+	 * last selected tuple in response.
+	 */								\
+	_(FETCH_POSITION, 0x1f, MP_BOOL)				\
+	_(KEY, 0x20, MP_ARRAY)						\
+	_(TUPLE, 0x21, MP_ARRAY)					\
+	_(FUNCTION_NAME, 0x22, MP_STR)					\
+	_(USER_NAME, 0x23, MP_STR)					\
+									\
 	/*
 	 * Replication keys (body).
 	 * Unfortunately, there is no gap between request and
 	 * replication keys (between USER_NAME and INSTANCE_UUID).
 	 * So imagine, that OPS, EXPR and FIELD_NAME keys follows
 	 * the USER_NAME key.
-	 */
-	IPROTO_INSTANCE_UUID = 0x24,
-	IPROTO_CLUSTER_UUID = 0x25,
-	IPROTO_VCLOCK = 0x26,
-
-	/* Also request keys. See the comment above. */
-	IPROTO_EXPR = 0x27, /* EVAL */
-	IPROTO_OPS = 0x28, /* UPSERT but not UPDATE ops, because of legacy */
-	IPROTO_BALLOT = 0x29,
-	IPROTO_TUPLE_META = 0x2a,
-	IPROTO_OPTIONS = 0x2b,
-
-	/* Leave a gap between request keys and response keys */
-	IPROTO_DATA = 0x30,
-	IPROTO_ERROR_24 = 0x31,
+	 */								\
+	_(INSTANCE_UUID, 0x24, MP_STR)					\
+	_(REPLICASET_UUID, 0x25, MP_STR)				\
+	_(VCLOCK, 0x26, MP_MAP)						\
+									\
+	/* Also request keys. See the comment above. */			\
+	_(EXPR,  0x27, MP_STR) /* EVAL */				\
+	/* UPSERT but not UPDATE ops, because of legacy */		\
+	_(OPS, 0x28, MP_ARRAY)						\
+	_(BALLOT, 0x29, MP_MAP)						\
+	_(TUPLE_META, 0x2a, MP_MAP)					\
+	_(OPTIONS, 0x2b, MP_MAP)					\
+	/** Old tuple (i.e. before DML request is applied). */		\
+	_(OLD_TUPLE, 0x2c, MP_ARRAY)					\
+	/** New tuple (i.e. result of DML request). */			\
+	_(NEW_TUPLE, 0x2d, MP_ARRAY)					\
+	/**
+	 * Position of last selected tuple to start iteration after it.
+	 */								\
+	_(AFTER_POSITION, 0x2e, MP_STR)					\
+	/** Last selected tuple to start iteration after it. */		\
+	_(AFTER_TUPLE, 0x2f, MP_ARRAY)					\
+									\
+	/** Response keys. */						\
+	_(DATA, 0x30, MP_ARRAY)						\
+	_(ERROR_24, 0x31, MP_STR)					\
 	/**
 	 * IPROTO_METADATA: [
 	 *      { IPROTO_FIELD_NAME: name },
 	 *      { ... },
 	 *      ...
 	 * ]
-	 */
-	IPROTO_METADATA = 0x32,
-	IPROTO_BIND_METADATA = 0x33,
-	IPROTO_BIND_COUNT = 0x34,
-
-	/* Leave a gap between response keys and SQL keys. */
-	IPROTO_SQL_TEXT = 0x40,
-	IPROTO_SQL_BIND = 0x41,
+	 */								\
+	_(METADATA, 0x32, MP_ARRAY)					\
+	_(BIND_METADATA, 0x33, MP_ARRAY)				\
+	_(BIND_COUNT, 0x34, MP_UINT)					\
+	/** Position of last selected tuple in response. */		\
+	_(POSITION, 0x35, MP_STR)					\
+									\
+	/** Also request keys. See the comment above. */		\
+	/** The data in Arrow format. */				\
+	_(ARROW, 0x36, MP_EXT)						\
+	/** The key to operate from. */				\
+	_(BEGIN_KEY, 0x37, MP_ARRAY)					\
+	/** The key to operate until. */				\
+	_(END_KEY, 0x38, MP_ARRAY)					\
+									\
+	/* Leave a gap between response keys and SQL keys. */		\
+	_(SQL_TEXT, 0x40, MP_STR)					\
+	_(SQL_BIND, 0x41, MP_ARRAY)					\
 	/**
 	 * IPROTO_SQL_INFO: {
-	 *     SQL_INFO_ROW_COUNT: number
+	 *      SQL_INFO_ROW_COUNT: number
 	 * }
-	 */
-	IPROTO_SQL_INFO = 0x42,
-	IPROTO_STMT_ID = 0x43,
-	/* Leave a gap between SQL keys and additional request keys */
-	IPROTO_REPLICA_ANON = 0x50,
-	IPROTO_ID_FILTER = 0x51,
-	IPROTO_ERROR = 0x52,
+	 */								\
+	_(SQL_INFO, 0x42, MP_MAP)					\
+	_(STMT_ID, 0x43, MP_UINT)					\
+	/* Leave a gap between SQL keys and additional request keys */	\
+	_(REPLICA_ANON, 0x50, MP_BOOL)					\
+	_(ID_FILTER, 0x51, MP_ARRAY)					\
+	_(ERROR, 0x52, MP_MAP)						\
 	/**
 	 * Term. Has the same meaning as IPROTO_RAFT_TERM, but is an iproto
 	 * key, rather than a raft key. Used for PROMOTE request, which needs
 	 * both iproto (e.g. REPLICA_ID) and raft (RAFT_TERM) keys.
-	 */
-	IPROTO_TERM = 0x53,
-	/** Protocol version. */
-	IPROTO_VERSION = 0x54,
-	/** Protocol features. */
-	IPROTO_FEATURES = 0x55,
-	/** Operation timeout. Specific to request type. */
-	IPROTO_TIMEOUT = 0x56,
-	/** Key name and data sent to a remote watcher. */
-	IPROTO_EVENT_KEY = 0x57,
-	IPROTO_EVENT_DATA = 0x58,
-	/*
-	 * Be careful to not extend iproto_key values over 0x7f.
-	 * iproto_keys are encoded in msgpack as positive fixnum, which ends at
-	 * 0x7f, and we rely on this in some places by allocating a uint8_t to
-	 * hold a msgpack-encoded key value.
-	 */
-	IPROTO_KEY_MAX
+	 */								\
+	_(TERM, 0x53, MP_UINT)						\
+	/** Protocol version. */					\
+	_(VERSION, 0x54, MP_UINT)					\
+	/** Protocol features. */					\
+	_(FEATURES, 0x55, MP_ARRAY)					\
+	/** Operation timeout. Specific to request type. */		\
+	_(TIMEOUT, 0x56, MP_DOUBLE)					\
+	/** Key name and data sent to a remote watcher. */		\
+	_(EVENT_KEY, 0x57, MP_STR)					\
+	_(EVENT_DATA, 0x58, MP_NIL)					\
+	/** Isolation level, is used only by IPROTO_BEGIN request. */	\
+	_(TXN_ISOLATION, 0x59, MP_UINT)					\
+	/** A vclock synchronisation request identifier. */		\
+	_(VCLOCK_SYNC, 0x5a, MP_UINT)					\
+	/**
+	 * Name of the authentication method that is currently used on
+	 * the server (value of box.cfg.auth_type). It's sent in reply
+	 * to IPROTO_ID request. A client can use it as the default
+	 * authentication method.
+	 */								\
+	_(AUTH_TYPE, 0x5b, MP_STR)					\
+	_(REPLICASET_NAME, 0x5c, MP_STR)				\
+	_(INSTANCE_NAME, 0x5d, MP_STR)					\
+	/**
+	 * Space name used instead of identifier (IPROTO_SPACE_ID) in DML
+	 * requests. Preferred when identifier is present (i.e., the identifier
+	 * is ignored).
+	 */								\
+	_(SPACE_NAME, 0x5e, MP_STR)					\
+	/**
+	 * Index name used instead of identifier (IPROTO_INDEX_ID) in
+	 * IPROTO_SELECT, IPROTO_UPDATE, and IPROTO_DELETE requests. Preferred
+	 * when identifier is present (i.e., the identifier is ignored).
+	 */								\
+	_(INDEX_NAME, 0x5f, MP_STR)					\
+	/**
+	 * Mapping of format identifier to format clause consisting of field
+	 * names and field types.
+	 */								\
+	_(TUPLE_FORMATS, 0x60, MP_MAP)					\
+	/**
+	 * Flag indicating whether the transaction is synchronous.
+	 */								\
+	 _(IS_SYNC, 0x61, MP_BOOL)					\
+	 /**
+	  * Flag indicating whether checkpoint join should be done.
+	  */								\
+	 _(IS_CHECKPOINT_JOIN, 0x62, MP_BOOL)				\
+	 /**
+	  * Shows the signature of the checkpoint to read from.
+	  * Requires CHECKPOINT_JOIN to be true.
+	  */								\
+	 _(CHECKPOINT_VCLOCK, 0x63, MP_MAP)				\
+	 /**
+	  * Shows the lsn to start sending from. Server sends all rows
+	  * >= IPROTO_CHECKPOINT_LSN. Requires CHECKPOINT_JOIN to be
+	  * true and CHECKPOINT_VCLOCK to be set.
+	  */								\
+	 _(CHECKPOINT_LSN, 0x64, MP_UINT)				\
+
+#define IPROTO_KEY_MEMBER(s, v, ...) IPROTO_ ## s = v,
+
+enum iproto_key {
+	IPROTO_KEYS(IPROTO_KEY_MEMBER)
+	iproto_key_MAX
 };
+
+/**
+ * Be careful not to extend iproto_key values over 0x7f.
+ * iproto_keys are encoded in msgpack as positive fixnum, which ends at
+ * 0x7f, and we rely on this in some places by allocating a uint8_t to
+ * hold a msgpack-encoded key value.
+ */
+static_assert(iproto_key_MAX <= 0x80, "iproto_key_MAX must be <= 0x80");
+
+/** IPROTO key name by code. */
+extern const char *iproto_key_strs[];
+
+/** IPROTO key name by code, in lower case. */
+extern char *iproto_key_lower_strs[];
+
+/** MsgPack value type by IPROTO key. */
+extern const unsigned char iproto_key_type[];
+
+/** Translation table for a MsgPack context (mp_ctx). */
+extern struct mh_strnu32_t *iproto_key_translation;
+
+/** Computes a hash of an IPROTO key name. */
+uint32_t
+iproto_key_hash(const char *str, uint32_t len);
 
 /**
  * Keys, stored in IPROTO_METADATA. They can not be received
  * in a request. Only sent as response, so no necessity in _strs
  * or _key_type arrays.
  */
+#define IPROTO_METADATA_KEYS(_)						\
+	_(NAME, 0)							\
+	_(TYPE, 1)							\
+	_(COLL, 2)							\
+	_(IS_NULLABLE, 3)						\
+	_(IS_AUTOINCREMENT, 4)						\
+	_(SPAN, 5)							\
+
+#define IPROTO_METADATA_KEY_MEMBER(s, v) IPROTO_FIELD_ ## s = v,
+
 enum iproto_metadata_key {
-	IPROTO_FIELD_NAME = 0,
-	IPROTO_FIELD_TYPE = 1,
-	IPROTO_FIELD_COLL = 2,
-	IPROTO_FIELD_IS_NULLABLE = 3,
-	IPROTO_FIELD_IS_AUTOINCREMENT = 4,
-	IPROTO_FIELD_SPAN = 5,
+	IPROTO_METADATA_KEYS(IPROTO_METADATA_KEY_MEMBER)
+	iproto_metadata_key_MAX
 };
 
+/** IPROTO metadata key name by code */
+extern const char *iproto_metadata_key_strs[];
+
+#define IPROTO_BALLOT_KEYS(_)						\
+	_(IS_RO_CFG, 0x01)						\
+	_(VCLOCK, 0x02)							\
+	_(GC_VCLOCK, 0x03)						\
+	_(IS_RO, 0x04)							\
+	_(IS_ANON, 0x05)						\
+	_(IS_BOOTED, 0x06)						\
+	_(CAN_LEAD, 0x07)						\
+	_(BOOTSTRAP_LEADER_UUID, 0x08)					\
+	_(REGISTERED_REPLICA_UUIDS, 0x09)				\
+	_(INSTANCE_NAME, 0x0a)						\
+
+#define IPROTO_BALLOT_KEY_MEMBER(s, v) IPROTO_BALLOT_ ## s = v,
+
 enum iproto_ballot_key {
-	IPROTO_BALLOT_IS_RO_CFG = 0x01,
-	IPROTO_BALLOT_VCLOCK = 0x02,
-	IPROTO_BALLOT_GC_VCLOCK = 0x03,
-	IPROTO_BALLOT_IS_RO = 0x04,
-	IPROTO_BALLOT_IS_ANON = 0x05,
-	IPROTO_BALLOT_IS_BOOTED = 0x06,
-	IPROTO_BALLOT_CAN_LEAD = 0x07,
+	IPROTO_BALLOT_KEYS(IPROTO_BALLOT_KEY_MEMBER)
+	iproto_ballot_key_MAX
 };
+
+/** IPROTO ballot key name by code */
+extern const char *iproto_ballot_key_strs[];
 
 static inline uint64_t
 iproto_key_bit(unsigned char key)
@@ -187,79 +332,79 @@ iproto_key_bit(unsigned char key)
 	return 1ULL << key;
 }
 
-extern const unsigned char iproto_key_type[IPROTO_KEY_MAX];
-
-/**
- * IPROTO command codes
- */
-enum iproto_type {
-	/** Acknowledgement that request or command is successful */
-	IPROTO_OK = 0,
-
-	/** SELECT request */
-	IPROTO_SELECT = 1,
-	/** INSERT request */
-	IPROTO_INSERT = 2,
-	/** REPLACE request */
-	IPROTO_REPLACE = 3,
-	/** UPDATE request */
-	IPROTO_UPDATE = 4,
-	/** DELETE request */
-	IPROTO_DELETE = 5,
-	/** CALL request - wraps result into [tuple, tuple, ...] format */
-	IPROTO_CALL_16 = 6,
-	/** AUTH request */
-	IPROTO_AUTH = 7,
-	/** EVAL request */
-	IPROTO_EVAL = 8,
-	/** UPSERT request */
-	IPROTO_UPSERT = 9,
-	/** CALL request - returns arbitrary MessagePack */
-	IPROTO_CALL = 10,
-	/** Execute an SQL statement. */
-	IPROTO_EXECUTE = 11,
-	/** No operation. Treated as DML, used to bump LSN. */
-	IPROTO_NOP = 12,
-	/** Prepare SQL statement. */
-	IPROTO_PREPARE = 13,
-	/* Begin transaction */
-	IPROTO_BEGIN = 14,
-	/* Commit transaction */
-	IPROTO_COMMIT = 15,
-	/* Rollback transaction */
-	IPROTO_ROLLBACK = 16,
-	/** The maximum typecode used for box.stat() */
-	IPROTO_TYPE_STAT_MAX,
-
-	IPROTO_RAFT = 30,
-	/** PROMOTE request. */
-	IPROTO_RAFT_PROMOTE = 31,
-	/** DEMOTE request. */
-	IPROTO_RAFT_DEMOTE = 32,
-
-	/** A confirmation message for synchronous transactions. */
-	IPROTO_RAFT_CONFIRM = 40,
-	/** A rollback message for synchronous transactions. */
-	IPROTO_RAFT_ROLLBACK = 41,
-
-	/** PING request */
-	IPROTO_PING = 64,
-	/** Replication JOIN command */
-	IPROTO_JOIN = 65,
-	/** Replication SUBSCRIBE command */
-	IPROTO_SUBSCRIBE = 66,
-	/** DEPRECATED: use IPROTO_VOTE instead */
-	IPROTO_VOTE_DEPRECATED = 67,
-	/** Vote request command for master election */
-	IPROTO_VOTE = 68,
-	/** Anonymous replication FETCH SNAPSHOT. */
-	IPROTO_FETCH_SNAPSHOT = 69,
-	/** REGISTER request to leave anonymous replication. */
-	IPROTO_REGISTER = 70,
-	IPROTO_JOIN_META = 71,
-	IPROTO_JOIN_SNAPSHOT = 72,
-	/** Protocol features request. */
-	IPROTO_ID = 73,
+/** IPROTO command codes. */
+#define IPROTO_TYPES(_)							\
+	/** Acknowledgement that request or command is successful */	\
+	_(OK, 0)							\
+									\
+	/** SELECT request */						\
+	_(SELECT, 1)							\
+	/** INSERT request */						\
+	_(INSERT, 2)							\
+	/** REPLACE request */						\
+	_(REPLACE, 3)							\
+	/** UPDATE request */						\
+	_(UPDATE, 4)							\
+	/** DELETE request */						\
+	_(DELETE, 5)							\
+	/**
+	 * CALL request - wraps result into [tuple, tuple, ...] format
+	 */								\
+	_(CALL_16, 6)							\
+	/** AUTH request */						\
+	_(AUTH, 7)							\
+	/** EVAL request */						\
+	_(EVAL, 8)							\
+	/** UPSERT request */						\
+	_(UPSERT, 9)							\
+	/** CALL request - returns arbitrary MessagePack */		\
+	_(CALL, 10)							\
+	/** Execute an SQL statement. */				\
+	_(EXECUTE, 11)							\
+	/** No operation. Treated as DML, used to bump LSN. */		\
+	_(NOP, 12)							\
+	/** Prepare SQL statement. */					\
+	_(PREPARE, 13)							\
+	/* Begin transaction */						\
+	_(BEGIN, 14)							\
+	/* Commit transaction */					\
+	_(COMMIT, 15)							\
+	/* Rollback transaction */					\
+	_(ROLLBACK, 16)							\
+	/** INSERT Arrow request. */					\
+	_(INSERT_ARROW, 17)						\
+	/** DELETE range request. */					\
+	_(DELETE_RANGE, 18)						\
+									\
+	_(RAFT, 30)							\
+	/** PROMOTE request. */						\
+	_(RAFT_PROMOTE, 31)						\
+	/** DEMOTE request. */						\
+	_(RAFT_DEMOTE, 32)						\
+									\
+	/** A confirmation message for synchronous transactions. */	\
+	_(RAFT_CONFIRM, 40)						\
+	/** A rollback message for synchronous transactions. */		\
+	_(RAFT_ROLLBACK, 41)						\
+									\
+	/** PING request */						\
+	_(PING, 64)							\
+	/** Replication JOIN command */					\
+	_(JOIN, 65)							\
+	/** Replication SUBSCRIBE command */				\
+	_(SUBSCRIBE, 66)						\
+	/** DEPRECATED: use IPROTO_VOTE instead */			\
+	_(VOTE_DEPRECATED, 67)						\
+	/** Vote request command for master election */			\
+	_(VOTE, 68)							\
+	/** Anonymous replication FETCH SNAPSHOT. */			\
+	_(FETCH_SNAPSHOT, 69)						\
+	/** REGISTER request to leave anonymous replication. */		\
+	_(REGISTER, 70)							\
+	_(JOIN_META, 71)						\
+	_(JOIN_SNAPSHOT, 72)						\
+	/** Protocol features request. */				\
+	_(ID, 73)							\
 	/**
 	 * The following three request types are used by the remote watcher
 	 * protocol (box.watch over network), which operates as follows:
@@ -276,12 +421,44 @@ enum iproto_type {
 	 *     it unsubscribes by sending an IPROTO_UNWATCH packet.
 	 *
 	 * All the three request types are fully asynchronous - a receiving end
-	 * doesn't send a packet in reply to any of them (therefore neither of
-	 * them has a sync number).
-	 */
-	IPROTO_WATCH = 74,
-	IPROTO_UNWATCH = 75,
-	IPROTO_EVENT = 76,
+	 * doesn't send a packet in reply to any of them. Still, the server
+	 * sends the same sync number in an IPROTO_EVENT packet as the one sent
+	 * by the client in the last corresponding IPROTO_WATCH request.
+	 */								\
+	_(WATCH, 74)							\
+	_(UNWATCH, 75)							\
+	_(EVENT, 76)							\
+	/**
+	 * Synchronous request to fetch the data that is currently attached to
+	 * a notification key without subscribing to changes.
+	 */								\
+	_(WATCH_ONCE, 77)						\
+									\
+	/**
+	 * The following three requests are reserved for vinyl types.
+	 *
+	 * VY_INDEX_RUN_INFO = 100
+	 * VY_INDEX_PAGE_INFO = 101
+	 * VY_RUN_ROW_INDEX = 102
+	 */								\
+									\
+	/** Non-final response type. */					\
+	_(CHUNK, 128)							\
+
+#define IPROTO_TYPE_MEMBER(s, v) IPROTO_ ## s = v,
+
+enum iproto_type {
+	IPROTO_TYPES(IPROTO_TYPE_MEMBER)
+	iproto_type_MAX,
+
+	/** Error codes = (IPROTO_TYPE_ERROR | ER_XXX from errcode.h) */
+	IPROTO_TYPE_ERROR = 1 << 15,
+
+	/** Used for overriding the unknown request handler */
+	IPROTO_UNKNOWN = -1,
+
+	/** The maximum typecode used for box.stat() */
+	IPROTO_TYPE_STAT_MAX = IPROTO_DELETE_RANGE + 1,
 
 	/** Vinyl run info stored in .index file */
 	VY_INDEX_RUN_INFO = 100,
@@ -289,25 +466,31 @@ enum iproto_type {
 	VY_INDEX_PAGE_INFO = 101,
 	/** Vinyl row index stored in .run file */
 	VY_RUN_ROW_INDEX = 102,
-
-	/** Non-final response type. */
-	IPROTO_CHUNK = 128,
-
-	/**
-	 * Error codes = (IPROTO_TYPE_ERROR | ER_XXX from errcode.h)
-	 */
-	IPROTO_TYPE_ERROR = 1 << 15
 };
 
 /** IPROTO type name by code */
 extern const char *iproto_type_strs[];
 
-enum iproto_raft_keys {
-	IPROTO_RAFT_TERM = 0,
-	IPROTO_RAFT_VOTE = 1,
-	IPROTO_RAFT_STATE = 2,
-	IPROTO_RAFT_VCLOCK = 3,
+/** IPROTO type name by code, in lower case. */
+extern char *iproto_type_lower_strs[];
+
+#define IPROTO_RAFT_KEYS(_)						\
+	_(TERM, 0)							\
+	_(VOTE, 1)							\
+	_(STATE, 2)							\
+	_(VCLOCK, 3)							\
+	_(LEADER_ID, 4)							\
+	_(IS_LEADER_SEEN, 5)						\
+
+#define IPROTO_RAFT_KEY_MEMBER(s, v) IPROTO_RAFT_ ## s = v,
+
+enum iproto_raft_key {
+	IPROTO_RAFT_KEYS(IPROTO_RAFT_KEY_MEMBER)
+	iproto_raft_key_MAX
 };
+
+/** IPROTO raft key name by code */
+extern const char *iproto_raft_key_strs[];
 
 /**
  * Returns IPROTO type name by @a type code.
@@ -316,27 +499,10 @@ enum iproto_raft_keys {
 static inline const char *
 iproto_type_name(uint16_t type)
 {
-	/*
-	 * Sic: iptoto_type_strs[IPROTO_NOP] is NULL
-	 * to suppress box.stat() output.
-	 */
-	if (type == IPROTO_NOP)
-		return "NOP";
-
-	if (type < IPROTO_TYPE_STAT_MAX)
+	if (type < iproto_type_MAX &&
+	    iproto_type_strs[type] != NULL)
 		return iproto_type_strs[type];
-
 	switch (type) {
-	case IPROTO_RAFT:
-		return "RAFT";
-	case IPROTO_RAFT_PROMOTE:
-		return "PROMOTE";
-	case IPROTO_RAFT_DEMOTE:
-		return "DEMOTE";
-	case IPROTO_RAFT_CONFIRM:
-		return "CONFIRM";
-	case IPROTO_RAFT_ROLLBACK:
-		return "ROLLBACK";
 	case VY_INDEX_RUN_INFO:
 		return "RUNINFO";
 	case VY_INDEX_PAGE_INFO:
@@ -348,6 +514,29 @@ iproto_type_name(uint16_t type)
 	}
 }
 
+/** Returns lowercase IPROTO type name by IPROTO `type'. */
+static inline const char *
+iproto_type_name_lower(uint16_t type)
+{
+	if (type < iproto_type_MAX)
+		return iproto_type_lower_strs[type];
+	return NULL;
+}
+
+/** Predefined replication group identifiers. */
+enum group_id {
+	/**
+	 * Default replication group: changes made to the space
+	 * are replicated throughout the entire cluster.
+	 */
+	GROUP_DEFAULT = 0,
+	/**
+	 * Replica local space: changes made to the space are
+	 * not replicated.
+	 */
+	GROUP_LOCAL = 1,
+};
+
 /**
  * Returns IPROTO key name by @a key code.
  * @param key IPROTO key.
@@ -355,8 +544,7 @@ iproto_type_name(uint16_t type)
 static inline const char *
 iproto_key_name(enum iproto_key key)
 {
-	extern const char *iproto_key_strs[];
-	if (key >= IPROTO_KEY_MAX)
+	if (key >= iproto_key_MAX)
 		return NULL;
 	return iproto_key_strs[key];
 }
@@ -366,7 +554,8 @@ static inline bool
 iproto_type_is_dml(uint16_t type)
 {
 	return (type >= IPROTO_SELECT && type <= IPROTO_DELETE) ||
-		type == IPROTO_UPSERT || type == IPROTO_NOP;
+		type == IPROTO_UPSERT || type == IPROTO_NOP ||
+		type == IPROTO_INSERT_ARROW || type == IPROTO_DELETE_RANGE;
 }
 
 /**
@@ -434,25 +623,31 @@ request_replace_body_create(struct request_replace_body *body,
  * Xrow keys for Vinyl run information.
  * @sa struct vy_run_info.
  */
+#define VY_RUN_INFO_KEYS(_)						\
+	/** Min key in the run. */					\
+	_(MIN_KEY, 1)							\
+	/** Max key in the run. */					\
+	_(MAX_KEY, 2)							\
+	/** Min LSN over all statements in the run. */			\
+	_(MIN_LSN, 3)							\
+	/** Max LSN over all statements in the run. */			\
+	_(MAX_LSN, 4)							\
+	/** Number of pages in the run. */				\
+	_(PAGE_COUNT, 5)						\
+	/** Legacy bloom filter implementation. */			\
+	_(BLOOM_FILTER_LEGACY_V1, 6)					\
+	/** Legacy bloom filter implementation. */			\
+	_(BLOOM_FILTER_LEGACY_V2, 7)					\
+	/** Number of statements of each type (map). */			\
+	_(STMT_STAT, 8)							\
+	/** Bloom filter for keys. */					\
+	_(BLOOM_FILTER, 9)						\
+
+#define VY_RUN_INFO_KEY_MEMBER(s, v) VY_RUN_INFO_ ## s = v,
+
 enum vy_run_info_key {
-	/** Min key in the run. */
-	VY_RUN_INFO_MIN_KEY = 1,
-	/** Max key in the run. */
-	VY_RUN_INFO_MAX_KEY = 2,
-	/** Min LSN over all statements in the run. */
-	VY_RUN_INFO_MIN_LSN = 3,
-	/** Max LSN over all statements in the run. */
-	VY_RUN_INFO_MAX_LSN = 4,
-	/** Number of pages in the run. */
-	VY_RUN_INFO_PAGE_COUNT = 5,
-	/** Legacy bloom filter implementation. */
-	VY_RUN_INFO_BLOOM_LEGACY = 6,
-	/** Bloom filter for keys. */
-	VY_RUN_INFO_BLOOM = 7,
-	/** Number of statements of each type (map). */
-	VY_RUN_INFO_STMT_STAT = 8,
-	/** The last key in this enum + 1 */
-	VY_RUN_INFO_KEY_MAX
+	VY_RUN_INFO_KEYS(VY_RUN_INFO_KEY_MEMBER)
+	vy_run_info_key_MAX
 };
 
 /**
@@ -462,7 +657,7 @@ enum vy_run_info_key {
 static inline const char *
 vy_run_info_key_name(enum vy_run_info_key key)
 {
-	if (key <= 0 || key >= VY_RUN_INFO_KEY_MAX)
+	if (key <= 0 || key >= vy_run_info_key_MAX)
 		return NULL;
 	extern const char *vy_run_info_key_strs[];
 	return vy_run_info_key_strs[key];
@@ -472,21 +667,25 @@ vy_run_info_key_name(enum vy_run_info_key key)
  * Xrow keys for Vinyl page information.
  * @sa struct vy_run_info.
  */
+#define VY_PAGE_INFO_KEYS(_)						\
+	/** Offset of page data in the run file. */			\
+	_(OFFSET, 1)							\
+	/** Size of page data in the run file. */			\
+	_(SIZE, 2)							\
+	/** Size of page data in memory, i.e. unpacked. */		\
+	_(UNPACKED_SIZE, 3)						\
+	/* Number of statements in the page. */				\
+	_(ROW_COUNT, 4)							\
+	/* Minimal key stored in the page. */				\
+	_(MIN_KEY, 5)							\
+	/** Offset of the row index in the page. */			\
+	_(ROW_INDEX_OFFSET, 6)						\
+
+#define VY_PAGE_INFO_KEY_MEMBER(s, v) VY_PAGE_INFO_ ## s = v,
+
 enum vy_page_info_key {
-	/** Offset of page data in the run file. */
-	VY_PAGE_INFO_OFFSET = 1,
-	/** Size of page data in the run file. */
-	VY_PAGE_INFO_SIZE = 2,
-	/** Size of page data in memory, i.e. unpacked. */
-	VY_PAGE_INFO_UNPACKED_SIZE = 3,
-	/* Number of statements in the page. */
-	VY_PAGE_INFO_ROW_COUNT = 4,
-	/* Minimal key stored in the page. */
-	VY_PAGE_INFO_MIN_KEY = 5,
-	/** Offset of the row index in the page. */
-	VY_PAGE_INFO_ROW_INDEX_OFFSET = 6,
-	/** The last key in this enum + 1 */
-	VY_PAGE_INFO_KEY_MAX
+	VY_PAGE_INFO_KEYS(VY_PAGE_INFO_KEY_MEMBER)
+	vy_page_info_key_MAX
 };
 
 /**
@@ -496,7 +695,7 @@ enum vy_page_info_key {
 static inline const char *
 vy_page_info_key_name(enum vy_page_info_key key)
 {
-	if (key <= 0 || key >= VY_PAGE_INFO_KEY_MAX)
+	if (key <= 0 || key >= vy_page_info_key_MAX)
 		return NULL;
 	extern const char *vy_page_info_key_strs[];
 	return vy_page_info_key_strs[key];
@@ -506,11 +705,15 @@ vy_page_info_key_name(enum vy_page_info_key key)
  * Xrow keys for Vinyl row index.
  * @sa struct vy_page_info.
  */
+#define VY_ROW_INDEX_KEYS(_)						\
+	/** Array of row offsets. */					\
+	_(DATA, 1)							\
+
+#define VY_ROW_INDEX_KEY_MEMBER(s, v) VY_ROW_INDEX_ ## s = v,
+
 enum vy_row_index_key {
-	/** Array of row offsets. */
-	VY_ROW_INDEX_DATA = 1,
-	/** The last key in this enum + 1 */
-	VY_ROW_INDEX_KEY_MAX
+	VY_ROW_INDEX_KEYS(VY_ROW_INDEX_KEY_MEMBER)
+	vy_row_index_key_MAX
 };
 
 /**
@@ -520,7 +723,7 @@ enum vy_row_index_key {
 static inline const char *
 vy_row_index_key_name(enum vy_row_index_key key)
 {
-	if (key <= 0 || key >= VY_ROW_INDEX_KEY_MAX)
+	if (key <= 0 || key >= vy_row_index_key_MAX)
 		return NULL;
 	extern const char *vy_row_index_key_strs[];
 	return vy_row_index_key_strs[key];

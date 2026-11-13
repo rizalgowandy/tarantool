@@ -21,6 +21,9 @@ old_replication_timeout = box.cfg.replication_timeout
 old_replication = box.cfg.replication
  | ---
  | ...
+old_synchro_quorum = box.cfg.replication_synchro_quorum
+ | ---
+ | ...
 
 test_run:cmd('create server replica with rpl_master=default,\
               script="replication/replica.lua"')
@@ -114,10 +117,21 @@ test_run:cmd('stop server replica')
  | ---
  | - true
  | ...
--- Will fail - the node is not a leader.
-box.space.test:replace{2}
+test_run:cmd('delete server replica')
  | ---
- | - error: Can't modify data because this instance is in read-only mode.
+ | - true
+ | ...
+-- Will fail - the node is not a leader.
+ok, err = pcall(box.space.test.replace, box.space.test, {2})
+ | ---
+ | ...
+assert(not ok)
+ | ---
+ | - true
+ | ...
+assert(err.code == box.error.READONLY)
+ | ---
+ | - true
  | ...
 
 -- Set synchro timeout to a huge value to ensure, that when a leader is elected,
@@ -135,6 +149,7 @@ box.cfg{                                                                        
     election_mode = 'candidate',                                                \
     election_timeout = 1000000,                                                 \
     replication_timeout = 0.01,                                                 \
+    replication_synchro_quorum = 1,                                             \
 }
  | ---
  | ...
@@ -158,17 +173,17 @@ box.space.test:drop()
  | ---
  | ...
 
-test_run:cmd('delete server replica')
- | ---
- | - true
- | ...
 box.cfg{                                                                        \
     election_mode = old_election_mode,                                          \
     election_timeout = old_election_timeout,                                    \
     replication_timeout = old_replication_timeout,                              \
     replication = old_replication,                                              \
     replication_synchro_timeout = old_replication_synchro_timeout,              \
+    replication_synchro_quorum = old_synchro_quorum,                            \
 }
+ | ---
+ | ...
+box.ctl.promote()
  | ---
  | ...
 box.ctl.demote()

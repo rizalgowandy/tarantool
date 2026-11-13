@@ -42,6 +42,11 @@
 #include "exception.h"
 #include "uri/uri.h"
 #include "errinj.h"
+#include "tt_pthread.h"
+
+#if TARGET_OS_DARWIN
+#include <sys/sysctl.h>
+#endif
 
 static_assert(SMALL_STATIC_SIZE > NI_MAXHOST + NI_MAXSERV,
 	      "static buffer should fit host name");
@@ -51,37 +56,49 @@ static_assert(SMALL_STATIC_SIZE > NI_MAXHOST + NI_MAXSERV,
  * checks and all.
  */
 static int
-sio_socketname_to_buffer(int fd, char *buf, int size)
+sio_socketname_to_buffer(int fd,
+			 const struct sockaddr *base_addr, socklen_t addrlen,
+			 const struct sockaddr *peer_addr, socklen_t peerlen,
+			 char *buf, int size)
 {
 	int n = 0;
+	(void)n;
 	SNPRINT(n, snprintf, buf, size, "fd %d", fd);
 	if (fd < 0)
 		return 0;
-	struct sockaddr_storage addr;
-	socklen_t addrlen = sizeof(addr);
-	struct sockaddr *base_addr = (struct sockaddr *)&addr;
-	int rc = getsockname(fd, base_addr, &addrlen);
-	if (rc == 0) {
+	if (base_addr != NULL) {
 		SNPRINT(n, snprintf, buf, size, ", aka ");
 		SNPRINT(n, sio_addr_snprintf, buf, size, base_addr, addrlen);
 	}
-	addrlen = sizeof(addr);
-	rc = getpeername(fd, (struct sockaddr *) &addr, &addrlen);
-	if (rc == 0) {
+	if (peer_addr != NULL) {
 		SNPRINT(n, snprintf, buf, size, ", peer of ");
-		SNPRINT(n, sio_addr_snprintf, buf, size, base_addr, addrlen);
+		SNPRINT(n, sio_addr_snprintf, buf, size,
+			peer_addr, peerlen);
 	}
 	return 0;
 }
 
 const char *
-sio_socketname(int fd)
+sio_socketname_addr(int fd, const struct sockaddr *base_addr,
+		    socklen_t addrlen)
 {
 	/* Preserve errno */
 	int save_errno = errno;
 	int name_size = SERVICE_NAME_MAXLEN;
 	char *name = static_alloc(name_size);
-	int rc = sio_socketname_to_buffer(fd, name, name_size);
+
+	struct sockaddr_storage peer_addr_storage;
+	socklen_t peerlen = sizeof(peer_addr_storage);
+	struct sockaddr *peer_addr = (struct sockaddr *)&peer_addr_storage;
+	int rcp = getpeername(fd, peer_addr, &peerlen);
+	if (rcp != 0) {
+		peer_addr = NULL;
+	}
+
+	int rc = sio_socketname_to_buffer(fd,
+					  base_addr, addrlen,
+					  peer_addr, peerlen,
+					  name, name_size);
 	/*
 	 * Could fail only because of a bad format in snprintf, but it is not
 	 * bad, so should not fail.
@@ -91,6 +108,29 @@ sio_socketname(int fd)
 	/*
 	 * Restore the original errno, it might have been reset by
 	 * snprintf() or getsockname().
+	 */
+	errno = save_errno;
+	return name;
+}
+
+const char *
+sio_socketname(int fd)
+{
+	/* Preserve errno */
+	int save_errno = errno;
+
+	struct sockaddr_storage addr;
+	socklen_t addrlen = sizeof(addr);
+	struct sockaddr *base_addr = (struct sockaddr *)&addr;
+	int rcb = getsockname(fd, base_addr, &addrlen);
+	if (rcb != 0) {
+		base_addr = NULL;
+	}
+
+	const char *name = sio_socketname_addr(fd, base_addr, addrlen);
+	/*
+	 * Restore the original errno, it might have been reset by
+	 * getsockname().
 	 */
 	errno = save_errno;
 	return name;
@@ -127,7 +167,7 @@ sio_option_name(int option)
 static int
 sio_listen_backlog()
 {
-#ifdef TARGET_OS_LINUX
+#if TARGET_OS_LINUX
 	FILE *proc = fopen("/proc/sys/net/core/somaxconn", "r");
 	if (proc) {
 		int backlog;
@@ -136,7 +176,31 @@ sio_listen_backlog()
 		if (rc == 1)
 			return backlog;
 	}
-#endif /* TARGET_OS_LINUX */
+#elif TARGET_OS_DARWIN
+	int somaxconn = 0;
+	size_t size = sizeof(somaxconn);
+	const char *name = "kern.ipc.somaxconn";
+	int rc = sysctlbyname(name, &somaxconn, &size, NULL, 0);
+	if (rc == 0) {
+		/*
+		 * From tests it appears that values > INT16_MAX
+		 * work strangely. For example, 32768 behaves
+		 * worse than 32767. Like if nothing was changed.
+		 * The suspicion is that listen() on Mac
+		 * internally uses int16_t or 'short' for storing
+		 * the queue size and it simply gets reset to
+		 * default on bigger values.
+		 */
+		if (somaxconn > INT16_MAX) {
+			say_warn("%s is too high (%d), "
+				 "truncated to %d", name,
+				 somaxconn, (int)INT16_MAX);
+			somaxconn = INT16_MAX;
+		}
+		return somaxconn;
+	}
+	say_syserror("couldn't get system's %s setting", name);
+#endif
 	return SOMAXCONN;
 }
 
@@ -200,7 +264,7 @@ sio_getsockopt(int fd, int level, int optname,
 }
 
 int
-sio_connect(int fd, struct sockaddr *addr, socklen_t addrlen)
+sio_connect(int fd, const struct sockaddr *addr, socklen_t addrlen)
 {
 	/* Establish the connection. */
 	int rc = connect(fd, (struct sockaddr *) addr, addrlen);
@@ -212,11 +276,13 @@ sio_connect(int fd, struct sockaddr *addr, socklen_t addrlen)
 }
 
 int
-sio_bind(int fd, struct sockaddr *addr, socklen_t addrlen)
+sio_bind(int fd, const struct sockaddr *addr, socklen_t addrlen)
 {
 	int rc = bind(fd, addr, addrlen);
-	if (rc < 0 && errno != EADDRINUSE)
-		diag_set(SocketError, sio_socketname(fd), "bind");
+	if (rc < 0)
+		diag_set(SocketError,
+			 sio_socketname_addr(fd, addr, addrlen),
+			 "bind");
 	return rc;
 }
 
@@ -224,7 +290,7 @@ int
 sio_listen(int fd)
 {
 	int rc = listen(fd, sio_listen_backlog());
-	if (rc < 0 && errno != EADDRINUSE)
+	if (rc < 0)
 		diag_set(SocketError, sio_socketname(fd), "listen");
 	return rc;
 }
@@ -368,26 +434,25 @@ int
 sio_uri_to_addr(const char *uri, struct sockaddr *addr, bool *is_host_empty)
 {
 	struct uri u;
-	if (uri_parse(&u, uri) != 0 || u.service == NULL)
+	if (uri_create(&u, uri) != 0 || u.service == NULL)
 		goto invalid_uri;
-	*is_host_empty = u.host_len == 0;
-	if (u.host_len == strlen(URI_HOST_UNIX) &&
-	    memcmp(u.host, URI_HOST_UNIX, u.host_len) == 0) {
+	*is_host_empty = u.host == NULL;
+	if (u.host != NULL && strcmp(u.host, URI_HOST_UNIX) == 0) {
 		struct sockaddr_un *un = (struct sockaddr_un *) addr;
-		if (u.service_len + 1 > sizeof(un->sun_path))
+		if (strlen(u.service) + 1 > sizeof(un->sun_path))
 			goto invalid_uri;
-		memcpy(un->sun_path, u.service, u.service_len);
-		un->sun_path[u.service_len] = 0;
+		strlcpy(un->sun_path, u.service, sizeof(un->sun_path));
 		un->sun_family = AF_UNIX;
+		uri_destroy(&u);
 		return 0;
 	}
 	in_addr_t iaddr;
-	if (u.host_len == 0) {
+	if (u.host == NULL) {
 		iaddr = htonl(INADDR_ANY);
-	} else if (u.host_len == 9 && memcmp("localhost", u.host, 9) == 0) {
+	} else if (strcmp("localhost", u.host) == 0) {
 		iaddr = htonl(INADDR_LOOPBACK);
 	} else {
-		iaddr = inet_addr(tt_cstr(u.host, u.host_len));
+		iaddr = inet_addr(u.host);
 		if (iaddr == (in_addr_t) -1)
 			goto invalid_uri;
 	}
@@ -397,9 +462,113 @@ sio_uri_to_addr(const char *uri, struct sockaddr *addr, bool *is_host_empty)
 	in->sin_family = AF_INET;
 	in->sin_addr.s_addr = iaddr;
 	in->sin_port = port;
+	uri_destroy(&u);
 	return 0;
 
 invalid_uri:
+	uri_destroy(&u);
 	diag_set(SocketError, sio_socketname(-1), "invalid uri \"%s\"", uri);
 	return -1;
+}
+
+const char *
+sio_getsockname_str(int fd)
+{
+	struct sockaddr_storage addr;
+	socklen_t addr_len = sizeof(addr);
+	if (sio_getsockname(fd, (struct sockaddr *)&addr, &addr_len) == 0)
+		return sio_strfaddr((struct sockaddr *)&addr, addr_len);
+	/*
+	 * Since only transient ENOBUFS is reachable during
+	 * sio_getsockname, we need to make diag_clear in order to
+	 * avoid spurious setting of SocketError in diag.
+	 */
+	diag_clear(diag_get());
+	return "<unresolved>";
+}
+
+const char *
+sio_getpeername_str(int fd)
+{
+	struct sockaddr_storage addr;
+	socklen_t addr_len = sizeof(addr);
+	if (sio_getpeername(fd, (struct sockaddr *)&addr, &addr_len) == 0)
+		return sio_strfaddr((struct sockaddr *)&addr, addr_len);
+	/** The same as in sio_getsockname_str. */
+	diag_clear(diag_get());
+	return "<unresolved>";
+}
+
+#ifdef __APPLE__
+/**
+ * 'man' on getprotobyname/number() on MacOS locally says "These functions use
+ * a thread-specific data space". But looking it up online tells a different
+ * thing:
+ *
+ * https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/getprotoent.3.html
+ *
+ * This: "These functions use a static data space".
+ *
+ * To be on the safe side, lets just use a mutex here to ensure not more than
+ * one thread will access this theoretical "static data space". Still, it won't
+ * protect if user code will call the raw functions, but Macs are only used for
+ * development, so it won't be a problem.
+ */
+static pthread_mutex_t protomutex = PTHREAD_MUTEX_INITIALIZER;
+#else
+	enum {
+#ifdef NDEBUG
+		PROTO_START_BUF_LEN = 128,
+#else
+		PROTO_START_BUF_LEN = 2,
+#endif
+	};
+#endif
+
+int
+sio_getprotobyname(const char *name)
+{
+#ifdef __APPLE__
+	tt_pthread_mutex_lock(&protomutex);
+	struct protoent *ent = getprotobyname(name);
+	int rc = ent == NULL ? -1 : ent->p_proto;
+	tt_pthread_mutex_unlock(&protomutex);
+	return rc;
+#else
+	struct protoent pbuf, *p;
+	size_t buflen = PROTO_START_BUF_LEN;
+	char *buf = xmalloc(buflen);
+	while (getprotobyname_r(name, &pbuf, buf, buflen, &p) == ERANGE) {
+		buflen *= 2;
+		buf = xrealloc(buf, buflen);
+	}
+	int rc = p != NULL ? p->p_proto : -1;
+	free(buf);
+	return rc;
+#endif
+}
+
+char *
+sio_getprotobynumber(int proto)
+{
+#ifdef __APPLE__
+	tt_pthread_mutex_lock(&protomutex);
+	struct protoent *ent = getprotobynumber(proto);
+	char *res = ent == NULL ? NULL : xstrdup(ent->p_name);
+	tt_pthread_mutex_unlock(&protomutex);
+	return res;
+#else
+	struct protoent pbuf, *p;
+	size_t buflen = PROTO_START_BUF_LEN;
+	char *buf = xmalloc(buflen);
+	while (getprotobynumber_r(proto, &pbuf, buf, buflen, &p) == ERANGE) {
+		buflen *= 2;
+		buf = xrealloc(buf, buflen);
+	}
+	char *res = NULL;
+	if (p != NULL)
+		res = xstrdup(p->p_name);
+	free(buf);
+	return res;
+#endif
 }

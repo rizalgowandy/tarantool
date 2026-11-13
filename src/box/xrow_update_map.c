@@ -53,22 +53,16 @@ struct xrow_update_map_item {
 	struct xrow_update_field field;
 	/** Link in the list of updated map keys. */
 	struct stailq_entry in_items;
-	/**
-	 * Size in bytes of unchanged tail data. It goes right
-	 * after @a field.data.
-	 */
+	/** Pointer to unchanged tail data. */
+	const char *tail_data;
+	/** Size in bytes of unchanged tail data. */
 	uint32_t tail_size;
 };
 
 static inline struct xrow_update_map_item *
 xrow_update_map_item_alloc(void)
 {
-	size_t size;
-	struct xrow_update_map_item *item =
-		region_alloc_object(&fiber()->gc, typeof(*item), &size);
-	if (item == NULL)
-		diag_set(OutOfMemory, size, "region_alloc_object", "item");
-	return item;
+	return xregion_alloc_object(&fiber()->gc, struct xrow_update_map_item);
 }
 
 static void
@@ -83,7 +77,8 @@ xrow_update_map_create_item(struct xrow_update_field *field,
 	item->key_len = key_len;
 	item->field.type = type;
 	item->field.data = data;
-	item->field.size = data_size,
+	item->field.size = data_size;
+	item->tail_data = data + data_size;
 	item->tail_size = tail_size;
 	/*
 	 * Each time a new item it created it is stored in the
@@ -102,10 +97,8 @@ xrow_update_map_new_item(struct xrow_update_field *field,
 			 uint32_t tail_size)
 {
 	struct xrow_update_map_item *item = xrow_update_map_item_alloc();
-	if (item != NULL) {
-		xrow_update_map_create_item(field, item, type, key, key_len,
-					    data, data_size, tail_size);
-	}
+	xrow_update_map_create_item(field, item, type, key, key_len,
+				    data, data_size, tail_size);
 	return item;
 }
 
@@ -150,7 +143,7 @@ xrow_update_map_extract_opt_item(struct xrow_update_field *field,
 	uint32_t key_len, i_tail_size;
 	const char *pos, *key, *end, *tmp, *begin;
 	stailq_foreach_entry(i, items, in_items) {
-		begin = i->field.data + i->field.size;
+		begin = i->tail_data;
 		pos = begin;
 		end = begin + i->tail_size;
 		i_tail_size = 0;
@@ -185,14 +178,13 @@ key_is_found:
 		i->key_len = op->key_len;
 		i->field.data = pos;
 		i->field.size = tmp - pos;
+		i->tail_data = tmp;
 		i->tail_size = end - tmp;
 		new_item = i;
 	} else {
 		new_item = xrow_update_map_new_item(field, XUPDATE_NOP, op->key,
 						    op->key_len, pos, tmp - pos,
 						    end - tmp);
-		if (new_item == NULL)
-			return -1;
 		i->tail_size = i_tail_size;
 	}
 	*res = new_item;
@@ -237,7 +229,7 @@ xrow_update_op_do_map_insert(struct xrow_update_op *op,
 	item = xrow_update_map_new_item(field, XUPDATE_NOP, op->key,
 					op->key_len, op->arg.set.value,
 					op->arg.set.length, 0);
-	return item != NULL ? 0 : -1;
+	return 0;
 }
 
 int
@@ -255,17 +247,16 @@ xrow_update_op_do_map_set(struct xrow_update_op *op,
 		return xrow_update_op_do_field_set(op, &item->field);
 	}
 	if (item != NULL) {
-		op->new_field_len = op->arg.set.length;
-		/* Ignore the previous op, if any. */
-		item->field.type = XUPDATE_SCALAR;
-		item->field.scalar.op = op;
+		item->field.type = XUPDATE_NOP;
+		item->field.data = op->arg.set.value;
+		item->field.size = op->arg.set.length;
 		return 0;
 	}
 	++field->map.size;
 	item = xrow_update_map_new_item(field, XUPDATE_NOP, op->key,
 					op->key_len, op->arg.set.value,
 					op->arg.set.length, 0);
-	return item != NULL ? 0 : -1;
+	return 0;
 }
 
 int
@@ -302,7 +293,6 @@ xrow_update_op_do_map_delete(struct xrow_update_op *op,
 	 */
 	item->key = NULL;
 	item->key_len = 0;
-	item->field.data += item->field.size;
 	item->field.size = 0;
 	item->field.type = XUPDATE_NOP;
 	--field->map.size;
@@ -323,12 +313,18 @@ xrow_update_op_do_map_##op_type(struct xrow_update_op *op,			\
 		op->is_token_consumed = true;					\
 		return xrow_update_op_do_field_##op_type(op, &item->field);	\
 	}									\
-	if (item->field.type != XUPDATE_NOP)					\
-		return xrow_update_err_double(op);				\
-	if (xrow_update_op_do_##op_type(op, item->field.data) != 0)		\
+	struct xrow_update_scalar *scalar = &item->field.scalar;		\
+	/* Just stub for non scalar field. op_do_ * will fail on it. */		\
+	struct xrow_update_scalar na = { .type = XUPDATE_TYPE_NONE };		\
+	if (item->field.type == XUPDATE_NOP) {					\
+		const char *data = item->field.data;				\
+		xrow_update_mp_read_scalar(&data, &item->field.scalar);		\
+	} else if (item->field.type != XUPDATE_SCALAR) {			\
+		scalar = &na;							\
+	}									\
+	if (xrow_update_op_do_##op_type(op, scalar) != 0)			\
 		return -1;							\
 	item->field.type = XUPDATE_SCALAR;					\
-	item->field.scalar.op = op;						\
 	return 0;								\
 }
 
@@ -338,7 +334,7 @@ DO_SCALAR_OP_GENERIC(bit)
 
 DO_SCALAR_OP_GENERIC(splice)
 
-int
+void
 xrow_update_map_create(struct xrow_update_field *field, const char *header,
 		       const char *data, const char *data_end, int field_count)
 {
@@ -348,14 +344,12 @@ xrow_update_map_create(struct xrow_update_field *field, const char *header,
 	field->map.size = field_count;
 	stailq_create(&field->map.items);
 	if (field_count == 0)
-		return 0;
-	struct xrow_update_map_item *first =
-		xrow_update_map_new_item(field, XUPDATE_NOP, NULL, 0, data, 0,
-					 data_end - data);
-	return first != NULL ? 0 : -1;
+		return;
+	xrow_update_map_new_item(field, XUPDATE_NOP, NULL, 0, data, 0,
+				 data_end - data);
 }
 
-int
+void
 xrow_update_map_create_with_child(struct xrow_update_field *field,
 				  const char *header,
 				  const struct xrow_update_field *child,
@@ -381,8 +375,6 @@ xrow_update_map_create_with_child(struct xrow_update_field *field,
 			item = xrow_update_map_new_item(field, XUPDATE_NOP,
 							NULL, 0, begin, 0,
 							before_key - begin);
-			if (item == NULL)
-				return -1;
 			++i;
 			break;
 		}
@@ -402,14 +394,11 @@ xrow_update_map_create_with_child(struct xrow_update_field *field,
 		mp_next(&pos);
 	}
 	item = xrow_update_map_item_alloc();
-	if (item == NULL)
-		return -1;
 	item->field = *child;
 	xrow_update_map_create_item(field, item, child->type, key, key_len,
 				    data, data_size, pos - data - data_size);
 	field->map.size = field_count;
 	field->size = pos - header;
-	return 0;
 }
 
 uint32_t
@@ -470,7 +459,7 @@ xrow_update_map_store(struct xrow_update_field *field,
 		}
 	}
 	stailq_foreach_entry(i, &field->map.items, in_items) {
-		memcpy(out, i->field.data + i->field.size, i->tail_size);
+		memcpy(out, i->tail_data, i->tail_size);
 		out += i->tail_size;
 	}
 	assert(out <= out_end);

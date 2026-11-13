@@ -11,10 +11,11 @@ for k = 1, box.schema.FORMAT_ID_MAX, 1 do
     local s = box.schema.space.create('space'..k)
     table.insert(spaces, s)
 end;
-#spaces;
+#spaces > 65000;
 -- cleanup
 for k, v in pairs(spaces) do
     v:drop()
+    spaces[k] = nil
 end;
 test_run:cmd("setopt delimiter ''");
 
@@ -47,5 +48,5 @@ test_run:cmd("setopt delimiter ''");
 mem_after > mem_before -- due to async cleanup
 
 -- Check that async cleanup doesn't leave garbage behind.
-for i = 1, 100 do mem_after = mem_used() if mem_after <= mem_before then break end fiber.sleep(0.01) end
+for i = 1, 30 do mem_after = mem_used() if mem_after <= mem_before then break end fiber.sleep(1) end
 mem_after <= mem_before

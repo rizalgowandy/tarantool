@@ -71,9 +71,10 @@ vy_mem_env_destroy(struct vy_mem_env *env)
 /** {{{ vy_mem */
 
 static void *
-vy_mem_tree_extent_alloc(void *ctx)
+vy_mem_tree_extent_alloc(struct matras_allocator *allocator)
 {
-	struct vy_mem *mem = (struct vy_mem *) ctx;
+	struct vy_mem *mem = container_of(allocator, struct vy_mem,
+					  matras_allocator);
 	struct vy_mem_env *env = mem->env;
 	void *ret = lsregion_aligned_alloc(&env->allocator,
 					   VY_MEM_TREE_EXTENT_SIZE,
@@ -89,10 +90,10 @@ vy_mem_tree_extent_alloc(void *ctx)
 }
 
 static void
-vy_mem_tree_extent_free(void *ctx, void *p)
+vy_mem_tree_extent_free(struct matras_allocator *allocator, void *p)
 {
 	/* Can't free part of region allocated memory. */
-	(void)ctx;
+	(void)allocator;
 	(void)p;
 }
 
@@ -114,9 +115,12 @@ vy_mem_new(struct vy_mem_env *env, struct key_def *cmp_def,
 	index->space_cache_version = space_cache_version;
 	index->format = format;
 	tuple_format_ref(format);
+	matras_allocator_create(&index->matras_allocator,
+				VY_MEM_TREE_EXTENT_SIZE,
+				vy_mem_tree_extent_alloc,
+				vy_mem_tree_extent_free);
 	vy_mem_tree_create(&index->tree, cmp_def,
-			   vy_mem_tree_extent_alloc,
-			   vy_mem_tree_extent_free, index);
+			   &index->matras_allocator, NULL);
 	rlist_create(&index->in_sealed);
 	fiber_cond_create(&index->pin_cond);
 	return index;
@@ -126,6 +130,13 @@ void
 vy_mem_delete(struct vy_mem *index)
 {
 	index->env->tree_extent_size -= index->tree_extent_size;
+	/*
+	 * It would be expected to destroy the index->matras_allocator and
+	 * the index->tree here, but they simply free allocated and reserved
+	 * memory blocks, and the lsregion used for allocation of the memory
+	 * does not support freeing arbitrary blocks, so they're effectively
+	 * no-ops. Let's omit them.
+	 */
 	tuple_format_unref(index->format);
 	fiber_cond_destroy(&index->pin_cond);
 	TRASH(index);
@@ -153,13 +164,14 @@ vy_mem_older_lsn(struct vy_mem *mem, struct vy_entry entry)
 }
 
 int
-vy_mem_insert_upsert(struct vy_mem *mem, struct vy_entry entry)
+vy_mem_insert_upsert(struct vy_mem *mem, struct vy_entry entry,
+		     struct vy_stmt_counter *count)
 {
 	assert(vy_stmt_type(entry.stmt) == IPROTO_UPSERT);
 	/* Check if the statement can be inserted in the vy_mem. */
 	assert(entry.stmt->format_id == tuple_format_id(mem->format));
 	/* The statement must be from a lsregion. */
-	assert(!vy_stmt_is_refable(entry.stmt));
+	assert(tuple_is_unreferenced(entry.stmt));
 	size_t size = tuple_size(entry.stmt);
 	struct vy_entry replaced = vy_entry_none();
 	struct vy_mem_tree_iterator inserted;
@@ -169,9 +181,12 @@ vy_mem_insert_upsert(struct vy_mem *mem, struct vy_entry entry)
 	assert(! vy_mem_tree_iterator_is_invalid(&inserted));
 	assert(vy_entry_is_equal(entry,
 		*vy_mem_tree_iterator_get_elem(&mem->tree, &inserted)));
-	if (replaced.stmt == NULL)
+	if (replaced.stmt == NULL) {
 		mem->count.rows++;
+		count->rows++;
+	}
 	mem->count.bytes += size;
+	count->bytes += size;
 	/*
 	 * All iterators begin to see the new statement, and
 	 * will be aborted in case of rollback.
@@ -213,21 +228,25 @@ vy_mem_insert_upsert(struct vy_mem *mem, struct vy_entry entry)
 }
 
 int
-vy_mem_insert(struct vy_mem *mem, struct vy_entry entry)
+vy_mem_insert(struct vy_mem *mem, struct vy_entry entry,
+	      struct vy_stmt_counter *count)
 {
 	assert(vy_stmt_type(entry.stmt) != IPROTO_UPSERT);
 	/* Check if the statement can be inserted in the vy_mem. */
 	assert(vy_stmt_is_key(entry.stmt) ||
 	       entry.stmt->format_id == tuple_format_id(mem->format));
 	/* The statement must be from a lsregion. */
-	assert(!vy_stmt_is_refable(entry.stmt));
+	assert(tuple_is_unreferenced(entry.stmt));
 	size_t size = tuple_size(entry.stmt);
 	struct vy_entry replaced = vy_entry_none();
 	if (vy_mem_tree_insert(&mem->tree, entry, &replaced, NULL))
 		return -1;
-	if (replaced.stmt == NULL)
+	if (replaced.stmt == NULL) {
 		mem->count.rows++;
+		count->rows++;
+	}
 	mem->count.bytes += size;
+	count->bytes += size;
 	/*
 	 * All iterators begin to see the new statement, and
 	 * will be aborted in case of rollback.
@@ -240,7 +259,7 @@ void
 vy_mem_commit_stmt(struct vy_mem *mem, struct vy_entry entry)
 {
 	/* The statement must be from a lsregion. */
-	assert(!vy_stmt_is_refable(entry.stmt));
+	assert(tuple_is_unreferenced(entry.stmt));
 	int64_t lsn = vy_stmt_lsn(entry.stmt);
 	/*
 	 * Normally statement LSN grows monotonically,
@@ -259,16 +278,25 @@ vy_mem_commit_stmt(struct vy_mem *mem, struct vy_entry entry)
 }
 
 void
-vy_mem_rollback_stmt(struct vy_mem *mem, struct vy_entry entry)
+vy_mem_rollback_stmt(struct vy_mem *mem, struct vy_entry entry,
+		     struct vy_stmt_counter *count)
 {
-	/* This is the statement we've inserted before. */
-	assert(!vy_stmt_is_refable(entry.stmt));
-	int rc = vy_mem_tree_delete(&mem->tree, entry);
-	assert(rc == 0);
-	(void) rc;
-	/* We can't free memory in case of rollback. */
-	mem->count.rows--;
-	mem->version++;
+	/* The statement must be from a lsregion. */
+	assert(tuple_is_unreferenced(entry.stmt));
+	/*
+	 * The statement isn't present in the memory tree if it was replaced by
+	 * vy_mem_insert(). In this case we must not decrement the row count.
+	 *
+	 * Either way, we don't subtract the statement size because lsregion
+	 * doesn't support freeing memory.
+	 */
+	struct vy_entry deleted = vy_entry_none();
+	VERIFY(vy_mem_tree_delete(&mem->tree, entry, &deleted) == 0);
+	if (deleted.stmt != NULL) {
+		mem->version++;
+		mem->count.rows--;
+		count->rows--;
+	}
 }
 
 /* }}} vy_mem */
@@ -295,6 +323,24 @@ vy_mem_iterator_step(struct vy_mem_iterator *itr)
 }
 
 /**
+ * Return true if the current statement should be skipped.
+ * Note, the function may update min_skipped_plsn.
+ */
+static inline bool
+vy_mem_iterator_should_skip_curr(struct vy_mem_iterator *itr)
+{
+	struct tuple *stmt = itr->curr.stmt;
+	if (vy_stmt_flags(stmt) & VY_STMT_SKIP_READ)
+		return true;
+	if (!itr->is_prepared_ok && vy_stmt_is_prepared(stmt)) {
+		itr->min_skipped_plsn = MIN(itr->min_skipped_plsn,
+					    vy_stmt_lsn(stmt));
+		return true;
+	}
+	return false;
+}
+
+/**
  * Find next record with lsn <= itr->lsn record.
  * Current position must be at the beginning of serie of records with the
  * same key it terms of direction of iterator (i.e. left for GE, right for LE)
@@ -312,7 +358,7 @@ vy_mem_iterator_find_lsn(struct vy_mem_iterator *itr)
 					       &itr->curr_pos)));
 	struct key_def *cmp_def = itr->mem->cmp_def;
 	while (vy_stmt_lsn(itr->curr.stmt) > (**itr->read_view).vlsn ||
-	       vy_stmt_flags(itr->curr.stmt) & VY_STMT_SKIP_READ) {
+	       vy_mem_iterator_should_skip_curr(itr)) {
 		if (vy_mem_iterator_step(itr) != 0 ||
 		    (itr->iterator_type == ITER_EQ &&
 		     vy_entry_compare(itr->key, itr->curr, cmp_def))) {
@@ -358,9 +404,7 @@ vy_mem_iterator_find_lsn(struct vy_mem_iterator *itr)
 	assert(!vy_mem_tree_iterator_is_invalid(&itr->curr_pos));
 	itr->curr = *vy_mem_tree_iterator_get_elem(&itr->mem->tree,
 						   &itr->curr_pos);
-
-	/* Skip VY_STMT_SKIP_READ statements, if any. */
-	while (vy_stmt_flags(itr->curr.stmt) & VY_STMT_SKIP_READ) {
+	while (vy_mem_iterator_should_skip_curr(itr)) {
 		vy_mem_tree_iterator_next(&itr->mem->tree, &itr->curr_pos);
 		assert(!vy_mem_tree_iterator_is_invalid(&itr->curr_pos));
 		itr->curr = *vy_mem_tree_iterator_get_elem(&itr->mem->tree,
@@ -415,7 +459,7 @@ vy_mem_iterator_seek(struct vy_mem_iterator *itr, struct vy_entry last)
 		itr->curr_pos = vy_mem_tree_invalid_iterator();
 	} else {
 		assert(iterator_type == ITER_GE);
-		itr->curr_pos = vy_mem_tree_iterator_first(&itr->mem->tree);
+		itr->curr_pos = vy_mem_tree_first(&itr->mem->tree);
 	}
 
 	if (iterator_type == ITER_LT || iterator_type == ITER_LE)
@@ -441,7 +485,8 @@ vy_mem_iterator_seek(struct vy_mem_iterator *itr, struct vy_entry last)
 void
 vy_mem_iterator_open(struct vy_mem_iterator *itr, struct vy_mem_iterator_stat *stat,
 		     struct vy_mem *mem, enum iterator_type iterator_type,
-		     struct vy_entry key, const struct vy_read_view **rv)
+		     struct vy_entry key, const struct vy_read_view **rv,
+		     bool is_prepared_ok)
 {
 	itr->stat = stat;
 
@@ -456,6 +501,8 @@ vy_mem_iterator_open(struct vy_mem_iterator *itr, struct vy_mem_iterator_stat *s
 	itr->curr = vy_entry_none();
 
 	itr->search_started = false;
+	itr->is_prepared_ok = is_prepared_ok;
+	itr->min_skipped_plsn = INT64_MAX;
 }
 
 /*
@@ -546,7 +593,14 @@ vy_mem_iterator_get_history(struct vy_mem_iterator *itr,
 {
 	do {
 		vy_stmt_counter_acct_tuple(&itr->stat->get, itr->curr.stmt);
-		if (vy_history_append_stmt(history, itr->curr) != 0)
+		struct vy_entry entry;
+		entry.stmt = vy_stmt_dup(itr->curr.stmt);
+		if (entry.stmt == NULL)
+			return -1;
+		entry.hint = itr->curr.hint;
+		int rc = vy_history_append_stmt(history, entry);
+		tuple_unref(entry.stmt);
+		if (rc != 0)
 			return -1;
 		if (vy_history_is_terminal(history))
 			break;
@@ -613,33 +667,54 @@ vy_mem_stream_next(struct vy_stmt_stream *virt_stream, struct vy_entry *ret)
 {
 	assert(virt_stream->iface->next == vy_mem_stream_next);
 	struct vy_mem_stream *stream = (struct vy_mem_stream *)virt_stream;
-
+	if (stream->entry.stmt != NULL)
+		tuple_unref(stream->entry.stmt);
 	struct vy_entry *res =
 		vy_mem_tree_iterator_get_elem(&stream->mem->tree,
 					      &stream->curr_pos);
 	if (res == NULL) {
-		*ret = vy_entry_none();
+		stream->entry = vy_entry_none();
 	} else {
-		*ret = *res;
+		stream->entry.stmt = vy_stmt_new_copy(stream->format,
+						      res->stmt);
+		if (stream->entry.stmt == NULL)
+			return -1;
+		stream->entry.hint = res->hint;
 		vy_mem_tree_iterator_next(&stream->mem->tree,
 					  &stream->curr_pos);
 	}
+	*ret = stream->entry;
 	return 0;
+}
+
+/** Implementation of vy_stmt_stream::stop(). */
+static void
+vy_mem_stream_stop(struct vy_stmt_stream *virt_stream)
+{
+	assert(virt_stream->iface->next == vy_mem_stream_next);
+	struct vy_mem_stream *stream = (struct vy_mem_stream *)virt_stream;
+	if (stream->entry.stmt != NULL) {
+		tuple_unref(stream->entry.stmt);
+		stream->entry = vy_entry_none();
+	}
 }
 
 static const struct vy_stmt_stream_iface vy_mem_stream_iface = {
 	.start = NULL,
 	.next = vy_mem_stream_next,
-	.stop = NULL,
+	.stop = vy_mem_stream_stop,
 	.close = NULL
 };
 
 void
-vy_mem_stream_open(struct vy_mem_stream *stream, struct vy_mem *mem)
+vy_mem_stream_open(struct vy_mem_stream *stream, struct vy_mem *mem,
+		   struct tuple_format *format)
 {
 	stream->base.iface = &vy_mem_stream_iface;
 	stream->mem = mem;
-	stream->curr_pos = vy_mem_tree_iterator_first(&mem->tree);
+	stream->curr_pos = vy_mem_tree_first(&mem->tree);
+	stream->entry = vy_entry_none();
+	stream->format = format;
 }
 
 /* }}} vy_mem_iterator API implementation */

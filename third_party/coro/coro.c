@@ -40,6 +40,8 @@
 
 #include "coro.h"
 
+#include "trivia/config.h"
+
 #include <stddef.h>
 #include <string.h>
 
@@ -103,13 +105,34 @@ coro_init (void)
 
   coro_transfer (new_coro, create_coro);
 
-#if __GCC_HAVE_DWARF2_CFI_ASM && __amd64
-  asm (".cfi_undefined rip");
-#endif
+  __asm__ volatile(
+#ifdef ENABLE_BACKTRACE
+  /*
+   * Call-chain ends here: we need to invalidate this frame's return
+   * address to make unwinding stop here.
+   */
 
-  func ((void *)arg);
-
-  /* the new coro returned. bad. just abort() for now */
+   /* Undefine rip value's location — see: https://github.com/libunwind/libunwind/blob/ec171c9ba7ea3abb2a1383cee2988a7abd483a1f/src/x86_64/Gstep.c#L91-L92 */
+  ".cfi_undefined rip\n"
+  /* Undefine rbp value's location — ibid. */
+  ".cfi_undefined rbp\n"
+  /* Undefine rbp-relative return address location, see: https://github.com/libunwind/libunwind/blob/ec171c9ba7ea3abb2a1383cee2988a7abd483a1f/src/dwarf/Gparser.c#L877 */
+  ".cfi_return_column rbp\n"
+#endif /* ENABLE_BACKTRACE */
+  "\tmovq %0, %%rdi\n"
+  "\tcallq *%1\n"
+  :
+  : "rm" (arg), "rm" (func)
+  : "rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11",
+    "xmm0","xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+    "xmm8","xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15",
+#ifdef __AVX512F__
+    "xmm16", "xmm17", "xmm18", "xmm19", "xmm20", "xmm21", "xmm22",
+    "xmm23", "xmm24", "xmm25", "xmm26", "xmm27", "xmm28", "xmm29",
+    "xmm30", "xmm31", "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+#endif /* __AVX512F__ */
+    "mm0","mm1", "mm2", "mm3", "mm4", "mm5", "mm6", "mm6", "st",
+    "st(1)", "st(2)", "st(3)", "st(4)", "st(5)", "st(6)", "st(7)");
   abort ();
 }
 # endif
@@ -264,7 +287,8 @@ trampoline (int sig)
        #elif __aarch64__
 
          #define NUM_SAVED 20
-         "\tsub x2, sp, #8 * 20\n"
+         "\tsub sp, sp, #8 * 20\n"
+         "\tmov x2, sp\n"
          "\tstp x19, x20, [x2, #16 * 0]\n"
          "\tstp x21, x22, [x2, #16 * 1]\n"
          "\tstp x23, x24, [x2, #16 * 2]\n"
@@ -320,13 +344,21 @@ trampoline (int sig)
          ".fnend\n"
 
        #elif __aarch64__
-
+#ifdef ENABLE_BACKTRACE
          ".cfi_startproc\n"
-         "\tmov x30, #0\n"
-         "\tsub sp, sp, #16\n"
-         "\tstr x30, [sp, #0]\n"
-         ".cfi_def_cfa_offset 16\n"
-         ".cfi_offset 30, -16\n"
+         /*
+          * Call-chain ends here: we need to invalidate this frame's return
+          * address to make unwinding stop here.
+          */
+
+         /*
+          * Detection of call-chain end on AARCH64 ABI inherently relies on CFI,
+          * see: https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst#623the-frame-pointer.
+          * Simply undefine x29 and x30 register values' locations.
+          */
+         ".cfi_undefined x29\n"
+         ".cfi_undefined x30\n"
+#endif /* ENABLE_BACKTRACE */
          "\tmov x0, x20\n"
          "\tblr x19\n"
 # ifdef __APPLE__
@@ -334,8 +366,9 @@ trampoline (int sig)
 # else
          "\tb abort\n"
 # endif
+#ifdef ENABLE_BACKTRACE
          ".cfi_endproc\n"
-
+#endif /* ENABLE_BACKTRACE */
        #else
          #error unsupported architecture
        #endif
@@ -373,7 +406,7 @@ coro_create (coro_context *ctx, coro_func coro, void *arg, void *sptr, size_t ss
 
   sigemptyset (&nsig);
   sigaddset (&nsig, SIGUSR2);
-  sigprocmask (SIG_BLOCK, &nsig, &osig);
+  pthread_sigmask (SIG_BLOCK, &nsig, &osig);
 
   nsa.sa_handler = trampoline;
   sigemptyset (&nsa.sa_mask);
@@ -416,7 +449,7 @@ coro_create (coro_context *ctx, coro_func coro, void *arg, void *sptr, size_t ss
     sigaltstack (&ostk, 0);
 
   sigaction (SIGUSR2, &osa, 0);
-  sigprocmask (SIG_SETMASK, &osig, 0);
+  pthread_sigmask (SIG_SETMASK, &osig, 0);
 
 # elif CORO_LOSER
 

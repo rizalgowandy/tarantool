@@ -12,6 +12,8 @@ _ = s:create_index("pk")
 txn_timeout = 0.5
 box.cfg({ txn_timeout = txn_timeout })
 box.schema.user.grant("guest", "super")
+fiber = require('fiber')
+function sleep_with_timeout(timeout) fiber.sleep(timeout) end
 test_run:switch("default")
 
 -- Checks for remote transactions
@@ -22,7 +24,7 @@ stream = conn:new_stream()
 space = stream.space.test
 
 -- Check invalid timeout for transaction using raw request
-conn:_request(net_box._method.begin, nil, nil, stream._stream_id, -1)
+conn:_request('BEGIN', nil, nil, stream._stream_id, -1)
 
 -- Check arguments for 'stream:begin'
 stream:begin(1)
@@ -35,11 +37,11 @@ stream:begin({timeout = "5"})
 stream:begin()
 space:replace({1})
 space:select({}) -- [1]
-fiber.sleep(txn_timeout + 0.1)
-space:select({}) -- []
+_ = test_run:eval("test", string.format("sleep_with_timeout(%f)", txn_timeout + 0.1))
+space:select({})
 space:replace({2})
 fiber.yield()
-space:select({}) -- []
+space:select({})
 stream:commit() -- transaction was aborted by timeout
 
 -- Check that transaction aborted by timeout, which
@@ -47,11 +49,11 @@ stream:commit() -- transaction was aborted by timeout
 stream:begin({timeout = txn_timeout})
 space:replace({1})
 space:select({}) -- [1]
-fiber.sleep(txn_timeout + 0.1)
-space:select({}) -- []
+_= test_run:eval("test", string.format("sleep_with_timeout(%f)", txn_timeout + 0.1))
+space:select({})
 space:replace({2})
 fiber.yield()
-space:select({}) -- []
+space:select({})
 stream:commit() -- transaction was aborted by timeout
 
 -- Check that transaction is not rollback until timeout expired.

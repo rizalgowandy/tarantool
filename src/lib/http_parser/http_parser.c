@@ -54,11 +54,11 @@ void http_parser_create(struct http_parser *parser)
  * Utility function used in headers parsing
  */
 static int
-http_parse_status_line(struct http_parser *parser, char **bufp,
+http_parse_status_line(struct http_parser *parser, const char **bufp,
 		       const char *end_buf)
 {
 	char ch;
-	char *p = *bufp;
+	const char *p = *bufp;
 	enum {
 		sw_start = 0,
 		sw_H,
@@ -123,6 +123,11 @@ http_parse_status_line(struct http_parser *parser, char **bufp,
 		case sw_major_digit:
 			if (ch == '.') {
 				state = sw_first_minor_digit;
+				break;
+			}
+			if (ch == ' ') {
+				parser->http_minor = 0;
+				state = sw_status;
 				break;
 			}
 			if (ch < '0' || ch > '9') {
@@ -218,13 +223,13 @@ done:
 }
 
 int
-http_parse_header_line(struct http_parser *prsr, char **bufp,
+http_parse_header_line(struct http_parser *prsr, const char **bufp,
 		       const char *end_buf, int max_hname_len)
 {
 	char c;
 	unsigned char ch;
-	char *p = *bufp;
-	char *header_name_start = p;
+	const char *p = *bufp;
+	const char *header_name_start = p;
 	prsr->hdr_name_idx = 0;
 
 	enum {
@@ -422,6 +427,9 @@ http_parse_header_line(struct http_parser *prsr, char **bufp,
 				return HTTP_PARSE_INVALID;
 		}
 	}
+
+	*bufp = p;
+	return HTTP_PARSE_CONTINUE;
 
 skipped_status:
 	*bufp = p + 1;

@@ -1,5 +1,5 @@
 /*
- * Copyright 2010-2021, Tarantool AUTHORS, please see AUTHORS file.
+ * Copyright 2010-2025, Tarantool AUTHORS, please see AUTHORS file.
  *
  * Redistribution and use in source and binary forms, with or
  * without modification, are permitted provided that the following
@@ -29,32 +29,128 @@
  * SUCH DAMAGE.
  */
 #include "memtx_allocator.h"
+#include "trivia/tuple.h"
 
-struct memtx_allocator_set_mode {
-	template<typename Allocator, typename...Arg>
-	void
-	invoke(Arg&&...mode)
-	{
-		Allocator::set_mode(mode...);
+struct memtx_block_rv *
+memtx_block_rv_new(uint32_t version, struct rlist *list)
+{
+	assert(version > 0);
+	int count = 1;
+	struct memtx_block_rv *rv;
+	rlist_foreach_entry(rv, list, link)
+		count++;
+	struct memtx_block_rv *new_rv = (struct memtx_block_rv *)xmalloc(
+			sizeof(*new_rv) + count * sizeof(*new_rv->lists));
+	new_rv->count = count;
+	/* Create one list per each open read view. */
+	struct memtx_block_rv_list *l = &new_rv->lists[0];
+	uint32_t prev_version = 0;
+	rlist_foreach_entry(rv, list, link) {
+		l->version = memtx_block_rv_version(rv);
+		/* List must be sorted by read view version. */
+		assert(l->version > prev_version);
+		stailq_create(&l->blocks);
+		l->mem_used = 0;
+		prev_version = l->version;
+		l++;
 	}
-};
+	/* And one more list for self. */
+	assert(l == &new_rv->lists[count - 1]);
+	l->version = version;
+	assert(l->version > prev_version);
+	(void)prev_version;
+	stailq_create(&l->blocks);
+	l->mem_used = 0;
+	rlist_add_tail_entry(list, new_rv, link);
+	return new_rv;
+}
 
 void
-memtx_allocators_init(struct memtx_engine *memtx,
-		      struct allocator_settings *settings)
+memtx_block_rv_delete(struct memtx_block_rv *rv, struct rlist *list,
+		      struct stailq *blocks_to_free, size_t *mem_freed)
+{
+	*mem_freed = 0;
+	struct memtx_block_rv *prev_rv = rlist_prev_entry_safe(rv, list, link);
+	uint32_t prev_version = prev_rv == nullptr ? 0 :
+				memtx_block_rv_version(prev_rv);
+	/*
+	 * Move blocks from lists with version <= prev_version to the list of
+	 * the previous read view and delete all other blocks.
+	 */
+	int i = 0;
+	int j = 0;
+	while (i < rv->count) {
+		struct memtx_block_rv_list *src = &rv->lists[i];
+		if (src->version <= prev_version) {
+			/*
+			 * The blocks were allocated before the previous read
+			 * view was opened. Move them to the previous read
+			 * view's list.
+			 */
+			assert(prev_rv != nullptr);
+			assert(j < prev_rv->count);
+			struct memtx_block_rv_list *dst = &prev_rv->lists[j];
+			/*
+			 * The previous read view may have more lists, because
+			 * some read views could have been closed by the time
+			 * this read view was open.  Skip them.
+			 */
+			while (dst->version != src->version) {
+				j++;
+				assert(j < prev_rv->count);
+				dst = &prev_rv->lists[j];
+			}
+			stailq_concat(&dst->blocks, &src->blocks);
+			dst->mem_used += src->mem_used;
+			j++;
+		} else {
+			/*
+			 * The blocks were allocated after the previous read
+			 * view was opened and freed before the next read view
+			 * was opened. Free them immediately.
+			 */
+			stailq_concat(blocks_to_free, &src->blocks);
+			*mem_freed += src->mem_used;
+		}
+		i++;
+	}
+	rlist_del_entry(rv, link);
+	free(rv);
+}
+
+void
+memtx_block_rv_add(struct memtx_block_rv *rv, struct memtx_block *block,
+		   size_t mem_used)
+{
+	/*
+	 * Binary search the list with min version such that
+	 * list->version > block->version.
+	 */
+	int begin = 0;
+	int end = rv->count;
+	struct memtx_block_rv_list *found = nullptr;
+	while (begin != end) {
+		int middle = begin + (end - begin) / 2;
+		struct memtx_block_rv_list *l = &rv->lists[middle];
+		if (l->version <= block->version) {
+			begin = middle + 1;
+		} else {
+			found = l;
+			end = middle;
+		}
+	}
+	assert(found != nullptr);
+	stailq_add_entry(&found->blocks, block, in_gc);
+	found->mem_used += mem_used;
+}
+
+void
+memtx_allocators_init(struct allocator_settings *settings)
 {
 	foreach_allocator<allocator_create,
 		struct allocator_settings *&>(settings);
 
-	foreach_memtx_allocator<allocator_create,
-		enum memtx_engine_free_mode &>(memtx->free_mode);
-}
-
-void
-memtx_allocators_set_mode(enum memtx_engine_free_mode mode)
-{
-	foreach_memtx_allocator<memtx_allocator_set_mode,
-		enum memtx_engine_free_mode &>(mode);
+	foreach_memtx_allocator<allocator_create>();
 }
 
 void
@@ -62,4 +158,60 @@ memtx_allocators_destroy()
 {
 	foreach_memtx_allocator<allocator_destroy>();
 	foreach_allocator<allocator_destroy>();
+}
+
+struct memtx_allocator_open_read_view {
+	/** Opens a read view for the specified MemtxAllocator. */
+	template<typename Allocator>
+	void invoke(memtx_allocators_read_view &rv_all,
+		    const struct read_view_opts &opts)
+	{
+		util::get<typename Allocator::ReadView *>(rv_all) =
+			Allocator::open_read_view(&opts);
+	}
+};
+
+memtx_allocators_read_view
+memtx_allocators_open_read_view(const struct read_view_opts *opts)
+{
+	memtx_allocators_read_view rv;
+	foreach_memtx_allocator<memtx_allocator_open_read_view,
+				memtx_allocators_read_view &,
+				const struct read_view_opts &>(rv, *opts);
+	return rv;
+}
+
+struct memtx_allocator_close_read_view {
+	/** Closes a read view and sets the read view ptr to null. */
+	template<typename Allocator>
+	void invoke(memtx_allocators_read_view &rv_all)
+	{
+		typename Allocator::ReadView *&rv =
+			util::get<typename Allocator::ReadView *>(rv_all);
+		Allocator::close_read_view(rv);
+		rv = nullptr;
+	}
+};
+
+void
+memtx_allocators_close_read_view(memtx_allocators_read_view rv)
+{
+	foreach_memtx_allocator<memtx_allocator_close_read_view,
+				memtx_allocators_read_view &>(rv);
+}
+
+/** Sums allocator statistics. */
+struct memtx_allocator_add_stats {
+	template<typename Allocator>
+	void invoke(struct memtx_allocator_stats &stats)
+	{
+		memtx_allocator_stats_add(&stats, &Allocator::stats);
+	}
+};
+
+void
+memtx_allocators_stats(struct memtx_allocator_stats *stats)
+{
+	memtx_allocator_stats_create(stats);
+	foreach_memtx_allocator<memtx_allocator_add_stats>(*stats);
 }

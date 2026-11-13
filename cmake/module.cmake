@@ -21,24 +21,25 @@ function(rebuild_module_api)
     endif()
     add_custom_command(OUTPUT ${dstfile}
         COMMAND cat ${CMAKE_CURRENT_SOURCE_DIR}/module_header.h > ${tmpfile}
-        COMMAND cat ${headers} | ${CMAKE_SOURCE_DIR}/extra/apigen >> ${tmpfile}
+        COMMAND cat ${headers} | ${PROJECT_SOURCE_DIR}/extra/apigen >> ${tmpfile}
         COMMAND ${CMAKE_C_COMPILER}
             ${cflags}
-            -I ${CMAKE_SOURCE_DIR}/src -I ${CMAKE_BINARY_DIR}/src
-            -E ${CMAKE_SOURCE_DIR}/src/box/errcode.h > ${errcodefile}
+            -I ${PROJECT_SOURCE_DIR}/src -I ${PROJECT_BINARY_DIR}/src
+            -E ${PROJECT_SOURCE_DIR}/src/box/errcode.h > ${errcodefile}
         COMMAND
             grep "enum box_error_code" ${errcodefile} >> ${tmpfile}
         COMMAND cat ${CMAKE_CURRENT_SOURCE_DIR}/module_footer.h >> ${tmpfile}
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${tmpfile} ${dstfile}
         COMMAND ${CMAKE_COMMAND} -E remove ${errcodefile} ${tmpfile}
-        DEPENDS ${CMAKE_SOURCE_DIR}/extra/apigen
+        DEPENDS ${PROJECT_SOURCE_DIR}/extra/apigen
                 ${CMAKE_CURRENT_SOURCE_DIR}/module_header.h
                 ${CMAKE_CURRENT_SOURCE_DIR}/module_footer.h
-                ${CMAKE_SOURCE_DIR}/src/box/errcode.h
+                ${PROJECT_SOURCE_DIR}/src/box/errcode.h
                 ${headers}
         )
 
     add_custom_target(api ALL DEPENDS ${dstfile})
     install(FILES ${dstfile} DESTINATION ${MODULE_INCLUDEDIR})
 endfunction()
-set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/module.h" PROPERTIES GENERATED HEADER_FILE_ONLY)
+set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/module.h"
+    PROPERTIES GENERATED TRUE HEADER_FILE_ONLY TRUE)

@@ -44,6 +44,7 @@ extern "C" {
 struct luaL_field;
 struct luaL_serializer;
 struct mpstream;
+struct mp_ctx;
 
 /**
  * Default instance of msgpack serializer (msgpack = require('msgpack')).
@@ -51,7 +52,7 @@ struct mpstream;
  * All changes made by msgpack.cfg{} function are also affect box's bindings
  * (this is a feature).
  */
-extern struct luaL_serializer *luaL_msgpack_default;
+extern __thread struct luaL_serializer *luaL_msgpack_default;
 
 /**
  * luaL_error()
@@ -61,21 +62,90 @@ luamp_error(void *);
 
 enum { LUAMP_ALLOC_FACTOR = 256 };
 
-/* low-level function needed for execute_lua_call() */
-enum mp_type
-luamp_encode_r(struct lua_State *L, struct luaL_serializer *cfg,
-	       struct mpstream *stream, struct luaL_field *field, int level);
-
-enum mp_type
-luamp_encode(struct lua_State *L, struct luaL_serializer *cfg,
-	     struct mpstream *stream, int index);
-
+/**
+ * Pushes a new MsgPack object and stores the given MsgPack data in it.
+ * The new object uses the default serializer for decoding. The MsgPack decoding
+ * context ownership is moved to the new object.
+ */
 void
-luamp_decode(struct lua_State *L, struct luaL_serializer *cfg,
-	     const char **data);
+luamp_push_with_ctx(struct lua_State *L, const char *data, const char *data_end,
+		    struct mp_ctx *ctx);
 
-typedef enum mp_type
-(*luamp_encode_extension_f)(struct lua_State *, int, struct mpstream *);
+static inline void
+luamp_push(struct lua_State *L, const char *data, const char *data_end)
+{
+	luamp_push_with_ctx(L, data, data_end, NULL);
+}
+
+/**
+ * Returns a pointer to the msgpack data and writes the length of the data to
+ * data_len if the object at the given index is a msgpack object. Otherwise
+ * returns NULL.
+ */
+const char *
+luamp_get(struct lua_State *L, int idx, size_t *data_len);
+
+/**
+ * Recursive version of `luamp_encode_with_ctx`.
+ */
+int
+luamp_encode_with_ctx_r(struct lua_State *L,
+			struct luaL_serializer *cfg,
+			struct mpstream *stream,
+			struct luaL_field *field, int level,
+			struct mp_ctx *ctx,
+			enum mp_type *type_out);
+
+static inline int
+luamp_encode_r(struct lua_State *L, struct luaL_serializer *cfg,
+	       struct mpstream *stream, struct luaL_field *field, int level)
+{
+	return luamp_encode_with_ctx_r(L, cfg, stream, field,
+				       level, NULL, NULL);
+}
+
+/**
+ * Recursion base for `luamp_encode_with_ctx_r`: recursively encodes Lua
+ * value at the top of the stack.
+ *
+ * Return:
+ *  0 - on success
+ * -1 - on error (diag is set)
+ */
+int
+luamp_encode_with_ctx(struct lua_State *L, struct luaL_serializer *cfg,
+		      struct mpstream *stream, int index,
+		      struct mp_ctx *ctx, enum mp_type *type);
+
+static inline int
+luamp_encode(struct lua_State *L, struct luaL_serializer *cfg,
+	     struct mpstream *stream, int index)
+{
+	return luamp_encode_with_ctx(L, cfg, stream, index, NULL, NULL);
+}
+
+/**
+ * Decode MsgPack data to Lua stack.
+ * @param level current recursion level (must be 0 for top-level callers).
+ */
+void
+luamp_decode_with_ctx(struct lua_State *L, struct luaL_serializer *cfg,
+		      const char **data, struct mp_ctx *ctx, int level);
+
+static inline void
+luamp_decode(struct lua_State *L, struct luaL_serializer *cfg,
+	     const char **data)
+{
+	luamp_decode_with_ctx(L, cfg, data, NULL, 0);
+}
+
+/**
+ * A MsgPack extensions handler. The return value indicates encoding success.
+ */
+typedef bool
+(*luamp_encode_extension_f)(struct lua_State *L, struct luaL_serializer *cfg,
+			    struct mpstream *stream, int idx,
+			    struct mp_ctx *ctx, enum mp_type *type);
 
 /**
  * @brief Set a callback that executed by encoder on unsupported Lua type
@@ -85,7 +155,8 @@ void
 luamp_set_encode_extension(luamp_encode_extension_f handler);
 
 typedef void
-(*luamp_decode_extension_f)(struct lua_State *L, const char **data);
+(*luamp_decode_extension_f)(struct lua_State *L, struct luaL_serializer *cfg,
+			    const char **data, struct mp_ctx *ctx);
 
 /**
  * @brief Set a callback that executed by decode on unsupported extension

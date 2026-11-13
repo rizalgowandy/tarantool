@@ -36,6 +36,7 @@
 #include <stdbool.h>
 #include "small/rlist.h"
 #include "func_def.h"
+#include "func_cache.h"
 #include "user_def.h"
 #include "module_cache.h"
 
@@ -44,6 +45,7 @@ extern "C" {
 #endif /* defined(__cplusplus) */
 
 struct func;
+struct func_adapter;
 
 /** Virtual method table for func object. */
 struct func_vtab {
@@ -60,6 +62,8 @@ struct func {
 	struct func_def *def;
 	/** Virtual method table. */
 	const struct func_vtab *vtab;
+	/** List of func holders. This member is a property of func cache. */
+	struct rlist func_cache_pin_list;
 	/**
 	 * Authentication id of the owner of the function,
 	 * used for set-user-id functions.
@@ -83,17 +87,42 @@ schema_module_init(void);
 void
 schema_module_free(void);
 
+/**
+ * Allocates and initializes a function, given a function definition.
+ * Returns the new function on success. On error, returns NULL and sets diag.
+ * Note, this function copies the given function definition so it may be safely
+ * freed after calling this function.
+ */
 struct func *
-func_new(struct func_def *def);
+func_new(const struct func_def *def);
 
+/** Frees a function object. */
 void
 func_delete(struct func *func);
 
+/** Check "EXECUTE" permissions for a given function. */
+int
+func_access_check(struct func *func);
+
 /**
- * Call function with arguments represented with given args.
+ * Call function @a func with arguments @a args, put return value to @a ret.
+ * Return 0 on success and nonzero on failure.
+ * The port @a args must be initialized by the caller while @a ret is
+ * initialized by func_call, and only in case of success.
+ * Thus the caller must not initialize @a ret by himself and must destroy it
+ * if and only if func_call returns 0;
  */
 int
-func_call(struct func *func, struct port *args, struct port *ret);
+func_call_no_access_check(struct func *func, struct port *args,
+			  struct port *ret);
+
+static inline int
+func_call(struct func *func, struct port *args, struct port *ret)
+{
+	if (func_access_check(func) != 0)
+		return -1;
+	return func_call_no_access_check(func, args, ret);
+}
 
 /**
  * Reload dynamically loadable schema module.
@@ -105,6 +134,14 @@ func_call(struct func *func, struct port *args, struct port *ret);
  */
 int
 schema_module_reload(const char *package, const char *package_end);
+
+/**
+ * Creates func adapter for persistent function, never fails.
+ * Underlying function is pinned with holder of passed type,
+ * so it must be in func_cache while the func_adapter is alive.
+ */
+struct func_adapter *
+func_adapter_func_create(struct func *func, enum func_holder_type type);
 
 #if defined(__cplusplus)
 } /* extern "C" */

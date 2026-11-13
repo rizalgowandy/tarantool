@@ -25,31 +25,31 @@ function setmap(tab) return setmetatable(tab, { __serialize = 'map' }) end
 datetime = os.date("%Y-%m-%d %H:%M:%S")
 ---
 ...
-box.space._func:replace{id, 1, 'function1', 0, 'LUA', '', 'procedure', {}, 'any', 'none', 'none', false, false, true, {"LUA"}, setmap({}), '', datetime, datetime}
+box.space._func:replace{id, 1, 'function1', 0, 'LUA', '', 'procedure', {}, 'any', 'none', 'none', false, false, true, {"LUA"}, setmap({}), '', datetime, datetime, {}}
 ---
 - error: 'Failed to create function ''function1'': unsupported routine_type value'
 ...
-box.space._func:replace{id, 1, 'function1', 0, 'LUA', '', 'function', {}, 'any', 'none', 'reads', false, false, true, {"LUA"}, setmap({}), '', datetime, datetime}
+box.space._func:replace{id, 1, 'function1', 0, 'LUA', '', 'function', {}, 'any', 'none', 'reads', false, false, true, {"LUA"}, setmap({}), '', datetime, datetime, {}}
 ---
 - error: 'Failed to create function ''function1'': unsupported sql_data_access value'
 ...
-box.space._func:replace{id, 1, 'function1', 0, 'LUA', '', 'function', {}, 'any', 'none', 'none', false, false, false, {"LUA"}, setmap({}), '', datetime, datetime}
+box.space._func:replace{id, 1, 'function1', 0, 'LUA', '', 'function', {}, 'any', 'none', 'none', false, false, false, {"LUA"}, setmap({}), '', datetime, datetime, {}}
 ---
 - error: 'Failed to create function ''function1'': unsupported is_null_call value'
 ...
-box.space._func:replace{id, 1, 'function1', 0, 'LUA', '', 'function', {}, 'data', 'none', 'none', false, false, true, {"LUA"}, setmap({}), '', datetime, datetime}
+box.space._func:replace{id, 1, 'function1', 0, 'LUA', '', 'function', {}, 'data', 'none', 'none', false, false, true, {"LUA"}, setmap({}), '', datetime, datetime, {}}
 ---
 - error: 'Failed to create function ''function1'': invalid returns value'
 ...
-box.space._func:replace{id, 1, 'function1', 0, 'LUA', '', 'function', {}, 'any', 'none', 'none', false, false, true, {"LUA", "C"}, setmap({}), '', datetime, datetime}
+box.space._func:replace{id, 1, 'function1', 0, 'LUA', '', 'function', {}, 'any', 'none', 'none', false, false, true, {"LUA", "C"}, setmap({}), '', datetime, datetime, {}}
 ---
 - error: 'Failed to create function ''function1'': invalid exports value'
 ...
-box.space._func:replace{id, 1, 'function1', 0, 'LUA', '', 'function', {}, 'any', 'aggregate', 'none', false, false, true, {"LUA"}, setmap({}), '', datetime, datetime}
+box.space._func:replace{id, 1, 'function1', 0, 'LUA', '', 'function', {}, 'any', 'aggregate', 'none', false, false, true, {"LUA"}, setmap({}), '', datetime, datetime, {}}
 ---
 - error: 'Failed to create function ''function1'': invalid aggregate value'
 ...
-box.space._func:replace{id, 1, 'function1', 0, 'LUA', '', 'function', {}, 'any', 'none', 'none', false, false, true, {"LUA"}, setmap({}), '', datetime, datetime}
+box.space._func:replace{id, 1, 'function1', 0, 'LUA', '', 'function', {}, 'any', 'none', 'none', false, false, true, {"LUA"}, setmap({}), '', datetime, datetime, {}}
 ---
 - error: function does not support alter
 ...
@@ -67,7 +67,6 @@ box.schema.user.grant('guest', 'read,write', 'space', 'test')
 ...
 c:call('function1')
 ---
-- []
 ...
 box.schema.func.drop("function1")
 ---
@@ -88,7 +87,7 @@ c:call('function1.args', { "xx" })
 ...
 c:call('function1.args', { 15 })
 ---
-- [[15, 'hello']]
+- [15, 'hello']
 ...
 box.func["function1.args"]
 ---
@@ -98,6 +97,7 @@ box.func["function1.args"]
     lua: true
     sql: false
   id: 66
+  takes_raw_args: false
   setuid: false
   is_multikey: false
   is_deterministic: false
@@ -131,7 +131,6 @@ box.schema.user.grant('guest', 'execute', 'function', 'function1.multi_inc')
 ...
 c:call('function1.multi_inc')
 ---
-- []
 ...
 box.space.test:select{}
 ---
@@ -139,7 +138,6 @@ box.space.test:select{}
 ...
 c:call('function1.multi_inc', { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 })
 ---
-- []
 ...
 box.space.test:select{}
 ---
@@ -156,7 +154,6 @@ box.space.test:select{}
 ...
 c:call('function1.multi_inc', { 2, 4, 6, 8, 10 })
 ---
-- []
 ...
 box.space.test:select{}
 ---
@@ -173,7 +170,6 @@ box.space.test:select{}
 ...
 c:call('function1.multi_inc', { 0, 2, 4 })
 ---
-- []
 ...
 box.space.test:select{}
 ---
@@ -524,11 +520,6 @@ box.execute('SELECT lua(\'return 1 + 1\')')
   rows:
   - [2]
 ...
-box.execute('SELECT lua(\'return box.cfg\')')
----
-- null
-- 'Failed to execute SQL statement: Unsupported type passed from Lua'
-...
 box.execute('SELECT lua(\'return box.cfg()\')')
 ---
 - null
@@ -554,11 +545,11 @@ func = box.func.divide
 ...
 func.call({4, 2})
 ---
-- error: 'builtin/box/schema.lua: Use func:call(...) instead of func.call(...)'
+- error: Use func:call(...) instead of func.call(...)
 ...
 func:call(4, 2)
 ---
-- error: 'builtin/box/schema.lua: Use func:call(table)'
+- error: 'Usage: func:call(table)'
 ...
 func:call()
 ---
@@ -594,6 +585,7 @@ func
     lua: true
     sql: false
   id: 66
+  takes_raw_args: false
   setuid: false
   is_multikey: false
   is_deterministic: false
@@ -603,7 +595,7 @@ func
 ...
 func.drop()
 ---
-- error: 'builtin/box/schema.lua: Use func:drop(...) instead of func.drop(...)'
+- error: Use func:drop(...) instead of func.drop(...)
 ...
 box.func.divide
 ---
@@ -629,7 +621,7 @@ func = box.func["function1.divide"]
 ...
 func:call(4, 2)
 ---
-- error: 'builtin/box/schema.lua: Use func:call(table)'
+- error: 'Usage: func:call(table)'
 ...
 func:call()
 ---
@@ -666,6 +658,7 @@ func
     lua: true
     sql: false
   id: 66
+  takes_raw_args: false
   setuid: false
   is_multikey: false
   is_deterministic: false
@@ -811,11 +804,13 @@ box.func[name]:call()
 box.schema.user.grant('guest', 'super')
 ---
 ...
--- Netbox:call() returns not the same as local call for C
--- functions, see #4799.
 net:connect(box.cfg.listen):call(name)
 ---
-- [1, -1, 18446744073709551615, '123456789101112131415', [2]]
+- 1
+- -1
+- 18446744073709551615
+- '123456789101112131415'
+- [2]
 ...
 box.schema.user.revoke('guest', 'super')
 ---

@@ -42,22 +42,56 @@
 #include "raft.h"
 #include "relay.h"
 #include "sio.h"
+#include "tweaks.h"
+#include "txn.h"
 
 uint32_t instance_id = REPLICA_ID_NIL;
 struct tt_uuid INSTANCE_UUID;
-struct tt_uuid REPLICASET_UUID;
+char INSTANCE_NAME[NODE_NAME_SIZE_MAX];
 
+struct tt_uuid REPLICASET_UUID;
+char REPLICASET_NAME[NODE_NAME_SIZE_MAX];
+char CLUSTER_NAME[NODE_NAME_SIZE_MAX];
+
+struct uri_set replication_uris;
 double replication_timeout = 1.0; /* seconds */
+double replication_reconnect_timeout = -1.0; /* seconds */
 double replication_connect_timeout = 30.0; /* seconds */
 int replication_connect_quorum = REPLICATION_CONNECT_QUORUM_ALL;
 double replication_sync_lag = 10.0; /* seconds */
 int replication_synchro_quorum = 1;
+int replication_linearizable_quorum = 1;
 double replication_synchro_timeout = 5.0; /* seconds */
 double replication_sync_timeout = 300.0; /* seconds */
 bool replication_skip_conflict = false;
-bool replication_anon = false;
+int replication_threads = 1;
+
+bool cfg_replication_anon = true;
+struct tt_uuid cfg_bootstrap_leader_uuid;
+struct uri cfg_bootstrap_leader_uri;
+char cfg_bootstrap_leader_name[NODE_NAME_SIZE_MAX];
+bool is_supervised_bootstrap_leader = false;
+bool is_graceful_supervised_bootstrap_requested = false;
+char cfg_instance_name[NODE_NAME_SIZE_MAX];
+
+bool replication_synchro_timeout_rollback_enabled = true;
+TWEAK_BOOL(replication_synchro_timeout_rollback_enabled);
+
+double replication_anon_ttl = 3600;
+struct fiber *replication_anon_gc_fiber;
 
 struct replicaset replicaset;
+
+struct rlist replicaset_on_quorum_change =
+	RLIST_HEAD_INITIALIZER(replicaset_on_quorum_change);
+
+enum bootstrap_strategy bootstrap_strategy = BOOTSTRAP_STRATEGY_INVALID;
+
+enum replicaset_state replicaset_state = REPLICASET_BOOTSTRAP;
+
+/** Free replica resources. */
+static void
+replica_delete(struct replica *replica);
 
 static int
 replica_compare_by_uuid(const struct replica *a, const struct replica *b)
@@ -74,48 +108,385 @@ rb_gen(MAYBE_UNUSED static, replica_hash_, replica_hash_t,
 	     item = next)
 
 /**
+ * The pool is used by replication_cc to allocate sync_trigger_data that is
+ * used in replicaset_collect_confirmed_vclock and relay_get_sync_on_start. We
+ * allocate sync_trigger_data dynamically because these functions are running
+ * in different fibers. The lifetime of sync_trigger_data is not limited by the
+ * execution time of replicaset_collect_confirmed_vclock.
+ */
+static struct mempool sync_trigger_data_pool;
+
+/** A structure holding trigger data to collect syncs. */
+struct sync_trigger_data {
+	/** Syncs to wait for. */
+	uint64_t vclock_syncs[VCLOCK_MAX];
+	/**
+	 * A bitmap holding replica ids whose vclocks were already collected.
+	 */
+	vclock_map_t collected_vclock_map;
+	/** The fiber waiting for vclock. */
+	struct fiber *waiter;
+	/** Collected vclock. */
+	struct vclock *vclock;
+	/** The request deadline. */
+	double deadline;
+	/** Whether the request is timed out. */
+	bool is_timed_out;
+	/** Count of fibers that are using data. */
+	int ref_count;
+};
+
+double
+replication_disconnect_timeout(void)
+{
+	struct raft *raft = box_raft();
+	if (raft != NULL && raft->state == RAFT_STATE_LEADER &&
+	    box_election_fencing_mode == ELECTION_FENCING_MODE_STRICT)
+		return replication_timeout * 2;
+	return replication_timeout * 4;
+}
+
+/**
+ * Effective connect quorum values for bootstrap_strategy = "auto" on various
+ * stages of replicaset life. Regardless of the returned quorum value, instance
+ * mustn't settle with connecting to a quorum, unless it has already tried to
+ * connect to everyone.
+ */
+static int
+replicaset_connect_quorum_auto(int total)
+{
+	switch (replicaset_state) {
+	/**
+	 * When bootstrapping a replica set, fail unless a majority of peers is
+	 * reached.
+	 */
+	case REPLICASET_BOOTSTRAP:
+		return total / 2 + 1;
+	/**
+	 * When joining to an existing replica set, one connection to the
+	 * bootstrap master is enough.
+	 */
+	case REPLICASET_JOIN:
+		return 1;
+	/**
+	 * A recovered instance may be the only one alive. Do not demand any
+	 * connections.
+	 */
+	case REPLICASET_RECOVERY:
+	case REPLICASET_READY:
+		return 0;
+	default:
+		unreachable();
+	}
+}
+
+/** Return the number of replicas that have to be connected. */
+static int
+replicaset_connect_quorum(int total)
+{
+	switch (bootstrap_strategy) {
+	case BOOTSTRAP_STRATEGY_LEGACY:
+		return MIN(total, replication_connect_quorum);
+	case BOOTSTRAP_STRATEGY_AUTO:
+		return replicaset_connect_quorum_auto(total);
+	case BOOTSTRAP_STRATEGY_CONFIG:
+	case BOOTSTRAP_STRATEGY_SUPERVISED:
+		/*
+		 * During the replica set bootstrap and join we don't care about
+		 * connected node count, we only care about reaching the
+		 * configured bootstrap leader, which is checked separately.
+		 *
+		 * When this is recovery or replication reconfiguration, all
+		 * other nodes might be dead, so none of the connections is
+		 * critical.
+		 */
+		return 0;
+	default:
+		unreachable();
+	}
+}
+
+/**
+ * Effective quorum value determining how many nodes to sync with (we sync with
+ * every node to which we connected successfully).
+ * Used for every bootstrap_strategy, except "legacy". "Legacy" simply uses
+ * replication_connect_quorum.
+ */
+static int replication_sync_quorum_auto;
+
+/**
  * Return the number of replicas that have to be synchronized
  * in order to form a quorum in the replica set.
  */
-static inline int
-replicaset_quorum(void)
+static int
+replicaset_sync_quorum(void)
 {
-	return MIN(replication_connect_quorum, replicaset.applier.total);
+	switch (bootstrap_strategy) {
+	case BOOTSTRAP_STRATEGY_LEGACY:
+		return MIN(replication_connect_quorum,
+			   replicaset.applier.total);
+	case BOOTSTRAP_STRATEGY_AUTO:
+	case BOOTSTRAP_STRATEGY_CONFIG:
+	case BOOTSTRAP_STRATEGY_SUPERVISED:
+		return replication_sync_quorum_auto;
+	default:
+		unreachable();
+	}
+}
+
+/**
+ * Replica set configuration state, shared among appliers.
+ */
+struct replicaset_connect_state {
+	/** Number of successfully connected appliers. */
+	int connected;
+	/**
+	 * Number of appliers which were connected to a loading instance. This
+	 * is a subset of \a connected excluded from replicaset_sync_quorum
+	 * calculation.
+	 */
+	int booting;
+	/** Number of appliers that failed to connect. */
+	int failed;
+	/** Signaled when an applier connects or stops. */
+	struct fiber_cond wakeup;
+};
+
+static struct fiber_cond *replicaset_connect_wakeup_cond = NULL;
+
+void
+replicaset_connect_wakeup(void)
+{
+	if (replicaset_connect_wakeup_cond != NULL)
+		fiber_cond_signal(replicaset_connect_wakeup_cond);
+}
+
+static void
+replicaset_set_sync_quorum(const struct replicaset_connect_state *state)
+{
+	replication_sync_quorum_auto = state->connected - state->booting;
+}
+
+/**
+ * Implementation of `replica_gc` that doesn't do any checks.
+ * Mustn't be called inside an active transaction.
+ */
+static int
+replica_gc_impl(struct replica *replica)
+{
+	assert(in_txn() == NULL);
+	if (gc_erase_consumer(&replica->uuid) != 0)
+		return -1;
+	if (replica->gc != NULL) {
+		gc_consumer_unregister(replica->gc);
+		replica->gc = NULL;
+	}
+	if (replica->gc_checkpoint_ref != NULL) {
+		gc_unref_checkpoint(replica->gc_checkpoint_ref);
+		replica->gc_checkpoint_ref = NULL;
+	}
+	/* Delete the replica if it is anonymous. */
+	if (replica->anon) {
+		replica_hash_remove(&replicaset.hash, replica);
+		replicaset.anon_count -= replica->anon;
+		assert(replicaset.anon_count >= 0);
+		replica_delete(replica);
+	}
+	return 0;
+}
+
+int
+replica_gc(const struct tt_uuid *uuid)
+{
+	if (in_txn() != NULL) {
+		diag_set(ClientError, ER_ACTIVE_TRANSACTION);
+		return -1;
+	}
+	if (tt_uuid_is_equal(uuid, &INSTANCE_UUID)) {
+		diag_set(ClientError, ER_REPLICA_GC, tt_uuid_str(uuid),
+			 "Cannot clean up self");
+		return -1;
+	}
+	struct replica *replica = replica_by_uuid(uuid);
+	if (replica == NULL) {
+		diag_set(ClientError, ER_REPLICA_GC, tt_uuid_str(uuid),
+			 "Replica does not exist");
+		return -1;
+	}
+	if (replica->has_incoming_connection) {
+		diag_set(ClientError, ER_REPLICA_GC,
+			 tt_uuid_str(&replica->uuid),
+			 "Replica is connected");
+		return -1;
+	}
+	return replica_gc_impl(replica);
+}
+
+/**
+ * Removes expired anonymous replicas.
+ */
+static int
+replication_anon_gc_fiber_f(va_list ap)
+{
+	(void)ap;
+	while (!fiber_is_cancelled()) {
+		fiber_check_gc();
+
+		double lowest_ttl = replication_anon_ttl;
+		struct replica *expired_replica = NULL;
+		/*
+		 * Search for the first expired replica. Note that we cannot
+		 * just remove it and continue the iteration because a yield
+		 * will happen and the replicaset can be changed significantly.
+		 */
+		replicaset_foreach(replica) {
+			if (!replica->anon || replica_has_connections(replica))
+				continue;
+			double last_seen = relay_last_row_time(replica->relay);
+			double unused = ev_monotonic_now(loop()) - last_seen;
+			double ttl = replication_anon_ttl - unused;
+			if (ttl <= 0) {
+				expired_replica = replica;
+				break;
+			}
+			lowest_ttl = MIN(lowest_ttl, ttl);
+		}
+		/*
+		 * If no expired replicas were found, sleep for lowest TTL
+		 * and continue the process.
+		 */
+		if (expired_replica == NULL) {
+			fiber_sleep(lowest_ttl);
+			continue;
+		}
+		/* Save UUID since the replica will be deleted on success. */
+		struct tt_uuid uuid = expired_replica->uuid;
+		if (replica_gc_impl(expired_replica) != 0) {
+			say_error("Failed to remove expired anonymous "
+				  "replica %s", tt_uuid_str(&uuid));
+			diag_log();
+			/* Sleep for `replication_anon_ttl` on failure. */
+			fiber_sleep(replication_anon_ttl);
+			continue;
+		}
+		/* The replica is expected to be deleted. */
+		assert(replica_by_uuid(&uuid) == NULL);
+		say_info("Anonymous replica %s has not been used for too long "
+			 "so it has been removed", tt_uuid_str(&uuid));
+	}
+	return 0;
 }
 
 void
-replication_init(void)
+replication_init(int num_threads)
 {
 	memset(&replicaset, 0, sizeof(replicaset));
 	replica_hash_new(&replicaset.hash);
 	rlist_create(&replicaset.anon);
-	vclock_create(&replicaset.vclock);
 	fiber_cond_create(&replicaset.applier.cond);
+	fiber_cond_create(&replicaset.option_update_cond);
 	latch_create(&replicaset.applier.order_latch);
 
 	vclock_create(&replicaset.applier.vclock);
-	vclock_copy(&replicaset.applier.vclock, &replicaset.vclock);
+	vclock_copy(&replicaset.applier.vclock, instance_vclock);
 	rlist_create(&replicaset.applier.on_rollback);
 	rlist_create(&replicaset.applier.on_wal_write);
 
 	rlist_create(&replicaset.on_ack);
+	rlist_create(&replicaset.on_relay_thread_start);
 
 	diag_create(&replicaset.applier.diag);
+
+	replication_threads = num_threads;
+
+	/* The local instance is always part of the quorum. */
+	replicaset.healthy_count = 1;
+
+	applier_init();
+	mempool_create(&sync_trigger_data_pool, &cord()->slabc,
+		       sizeof(struct sync_trigger_data));
+}
+
+void
+replication_anon_gc_init(void)
+{
+	/* Register anonymous replicas for all orphan consumers. */
+	struct gc_consumer *consumer;
+	struct gc_consumer_iterator consumers;
+	gc_consumer_iterator_init(&consumers);
+	while ((consumer = gc_consumer_iterator_next(&consumers)) != NULL) {
+		if (consumer->type != GC_CONSUMER_REPLICA)
+			continue;
+		struct replica *replica = replica_by_uuid(&consumer->uuid);
+		if (replica != NULL) {
+			/*
+			 * Since the function is called on configuration, only
+			 * regular replicas can appear here.
+			 */
+			assert(!replica->anon);
+			continue;
+		}
+		/*
+		 * Create an anonymous replica object and register its
+		 * consumer so that it won't be lost.
+		 */
+		replica = replicaset_add_anon(&consumer->uuid);
+		replica->gc = gc_consumer_register(&consumer->vclock,
+						   GC_CONSUMER_REPLICA,
+						   &consumer->uuid);
+	}
+
+	/* Start the garbage collecting fiber. */
+	replication_anon_gc_fiber =
+		fiber_new_system("replication_anon_gc",
+				 replication_anon_gc_fiber_f);
+	fiber_set_joinable(replication_anon_gc_fiber, true);
+	fiber_start(replication_anon_gc_fiber);
+}
+
+void
+replication_shutdown(void)
+{
+	if (replication_anon_gc_fiber != NULL) {
+		fiber_cancel(replication_anon_gc_fiber);
+		fiber_join(replication_anon_gc_fiber);
+		replication_anon_gc_fiber = NULL;
+	}
+	struct replica *replica;
+	rlist_foreach_entry(replica, &replicaset.anon, in_anon)
+		applier_stop(replica->applier);
+	replicaset_foreach(replica) {
+		if (replica->applier != NULL)
+			applier_stop(replica->applier);
+	}
 }
 
 void
 replication_free(void)
 {
-	/*
-	 * Relay threads keep sending messages to tx via
-	 * cbus upon shutdown, which could lead to segfaults.
-	 * So cancel them.
-	 */
-	replicaset_foreach(replica)
-		relay_cancel(replica->relay);
-
+	struct replica *replica, *next;
+	while (!rlist_empty(&replicaset.anon)) {
+		replica = rlist_shift_entry(&replicaset.anon,
+					    typeof(*replica), in_anon);
+		replica_delete(replica);
+	}
+	replica_hash_foreach_safe(&replicaset.hash, replica, next) {
+		replica_hash_remove(&replicaset.hash, replica);
+		replica_delete(replica);
+	}
 	diag_destroy(&replicaset.applier.diag);
 	trigger_destroy(&replicaset.on_ack);
+	trigger_destroy(&replicaset.on_relay_thread_start);
+	fiber_cond_destroy(&replicaset.applier.cond);
+	fiber_cond_destroy(&replicaset.option_update_cond);
+	latch_destroy(&replicaset.applier.order_latch);
+	applier_free();
+
+	if (!uri_is_nil(&cfg_bootstrap_leader_uri))
+		uri_destroy(&cfg_bootstrap_leader_uri);
+
+	TRASH(&replicaset);
+	mempool_destroy(&sync_trigger_data_pool);
 }
 
 int
@@ -131,31 +502,19 @@ replica_check_id(uint32_t replica_id)
 			  (unsigned) replica_id);
 		return -1;
 	}
-	/*
-	 * It's okay to update the instance id while it is joining to
-	 * a cluster as long as the id is set by the time bootstrap is
-	 * complete, which is checked in box_cfg() anyway.
-	 *
-	 * For example, the replica could be deleted from the _cluster
-	 * space on the master manually before rebootstrap, in which
-	 * case it will replay this operation during the final join
-	 * stage.
-	 */
-	if (!replicaset.is_joining && replica_id == instance_id) {
-		diag_set(ClientError, ER_LOCAL_INSTANCE_ID_IS_READ_ONLY,
-			  (unsigned) replica_id);
-		return -1;
-	}
 	return 0;
 }
 
-/* Return true if replica doesn't have id, relay and applier */
+/*
+ * Return true if the replica can be deleted - it doesn't have id or any
+ * connections. Since lifetime of anonymous replicas is different, the
+ * function always returns `false` for them.
+ */
 static bool
 replica_is_orphan(struct replica *replica)
 {
-	assert(replica->relay != NULL);
-	return replica->id == REPLICA_ID_NIL && replica->applier == NULL &&
-	       relay_get_state(replica->relay) != RELAY_FOLLOW;
+	return replica->id == REPLICA_ID_NIL && !replica->anon &&
+	       !replica_has_connections(replica);
 }
 
 static int
@@ -164,27 +523,22 @@ replica_on_applier_state_f(struct trigger *trigger, void *event);
 static struct replica *
 replica_new(void)
 {
-	struct replica *replica = (struct replica *)
-			malloc(sizeof(struct replica));
-	if (replica == NULL) {
-		tnt_raise(OutOfMemory, sizeof(*replica), "malloc",
-			  "struct replica");
-	}
+	struct replica *replica = xalloc_object(struct replica);
 	replica->relay = relay_new(replica);
-	if (replica->relay == NULL) {
-		free(replica);
-		diag_raise();
-	}
 	replica->id = 0;
 	replica->anon = false;
 	replica->uuid = uuid_nil;
+	*replica->name = 0;
 	replica->applier = NULL;
 	replica->gc = NULL;
+	replica->gc_checkpoint_ref = NULL;
+	replica->is_applier_healthy = false;
+	replica->is_relay_healthy = false;
+	replica->has_incoming_connection = false;
 	rlist_create(&replica->in_anon);
 	trigger_create(&replica->on_applier_state,
 		       replica_on_applier_state_f, NULL, NULL);
 	replica->applier_sync_state = APPLIER_DISCONNECTED;
-	replica->applier_txn_last_tm = 0;
 	latch_create(&replica->order_latch);
 	return replica;
 }
@@ -192,11 +546,14 @@ replica_new(void)
 static void
 replica_delete(struct replica *replica)
 {
-	assert(replica_is_orphan(replica));
 	if (replica->relay != NULL)
 		relay_delete(replica->relay);
+	if (replica->applier != NULL)
+		applier_delete(replica->applier);
 	if (replica->gc != NULL)
 		gc_consumer_unregister(replica->gc);
+	if (replica->gc_checkpoint_ref != NULL)
+		gc_unref_checkpoint(replica->gc_checkpoint_ref);
 	TRASH(replica);
 	free(replica);
 }
@@ -240,15 +597,7 @@ replica_set_id(struct replica *replica, uint32_t replica_id)
 		/* Assign local replica id */
 		assert(instance_id == REPLICA_ID_NIL);
 		instance_id = replica_id;
-	} else if (replica->anon) {
-		/*
-		 * Set replica gc on its transition from
-		 * anonymous to a normal one.
-		 */
-		assert(replica->gc == NULL);
-		replica->gc = gc_consumer_register(&replicaset.vclock,
-						   "replica %s",
-						   tt_uuid_str(&replica->uuid));
+		box_broadcast_id();
 	}
 	replicaset.replica_by_id[replica_id] = replica;
 	gc_delay_ref();
@@ -256,7 +605,27 @@ replica_set_id(struct replica *replica, uint32_t replica_id)
 	say_info("assigned id %d to replica %s",
 		 replica->id, tt_uuid_str(&replica->uuid));
 	replica->anon = false;
-	box_update_replication_synchro_quorum();
+	box_broadcast_ballot();
+}
+
+void
+replica_set_name(struct replica *replica, const char *name)
+{
+	if (strcmp(replica->name, name) == 0)
+		return;
+	assert(replica_by_name(name) == NULL);
+	strlcpy(replica->name, name, NODE_NAME_SIZE_MAX);
+	if (tt_uuid_is_equal(&INSTANCE_UUID, &replica->uuid)) {
+		strlcpy(INSTANCE_NAME, name, NODE_NAME_SIZE_MAX);
+		box_broadcast_id();
+	}
+	if (*name != 0) {
+		say_info("assigned name %s to replica %s",
+			 node_name_str(name), tt_uuid_str(&replica->uuid));
+	} else {
+		say_info("removed name from replica %s",
+			 tt_uuid_str(&replica->uuid));
+	}
 }
 
 void
@@ -277,9 +646,10 @@ replica_clear_id(struct replica *replica)
 	--replicaset.registered_count;
 	gc_delay_unref();
 	if (replica->id == instance_id) {
-		/* See replica_check_id(). */
-		assert(replicaset.is_joining);
 		instance_id = REPLICA_ID_NIL;
+		box_broadcast_id();
+	} else {
+		raft_notify_is_leader_seen(box_raft(), false, replica->id);
 	}
 	replica->id = REPLICA_ID_NIL;
 	say_info("removed replica %s", tt_uuid_str(&replica->uuid));
@@ -287,13 +657,12 @@ replica_clear_id(struct replica *replica)
 	/*
 	 * The replica will never resubscribe so we don't need to keep
 	 * WALs for it anymore. Unregister it with the garbage collector
-	 * if the relay thread is stopped. In case the relay thread is
-	 * still running, it may need to access replica->gc so leave the
-	 * job to replica_on_relay_stop, which will be called as soon as
-	 * the relay thread exits.
+	 * if the relay thread is stopped. In case the replica is still
+	 * connected, it may need to access replica->gc so leave the
+	 * job to replica_on_disconnect, which will be called as soon as
+	 * the replica disconnects.
 	 */
-	if (replica->gc != NULL &&
-	    relay_get_state(replica->relay) != RELAY_FOLLOW) {
+	if (replica->gc != NULL && !replica->has_incoming_connection) {
 		gc_consumer_unregister(replica->gc);
 		replica->gc = NULL;
 	}
@@ -306,10 +675,16 @@ replica_clear_id(struct replica *replica)
 		assert(!replica->anon);
 		replica_delete(replica);
 	}
-	box_update_replication_synchro_quorum();
+	box_broadcast_ballot();
 }
 
 void
+replicaset_on_health_change(void)
+{
+	trigger_run(&replicaset_on_quorum_change, NULL);
+}
+
+static void
 replica_set_applier(struct replica *replica, struct applier *applier)
 {
 	assert(replica->applier == NULL);
@@ -318,18 +693,61 @@ replica_set_applier(struct replica *replica, struct applier *applier)
 		    &replica->on_applier_state);
 }
 
-void
+bool
+replica_has_connections(const struct replica *replica)
+{
+	assert(replica->relay != NULL);
+	/* Relay is expected to be active only for connected replicas. */
+	assert(relay_get_state(replica->relay) != RELAY_FOLLOW ||
+	       replica->has_incoming_connection);
+	return replica->has_incoming_connection || replica->applier != NULL;
+}
+
+/** A helper to track applier health on its state change. */
+static void
+replica_update_applier_health(struct replica *replica)
+{
+	struct applier *applier = replica->applier;
+	bool is_healthy = applier != NULL && applier->state == APPLIER_FOLLOW;
+	if (is_healthy == replica->is_applier_healthy)
+		return;
+	replica->is_applier_healthy = is_healthy;
+	if (!replica->is_relay_healthy || replica->anon)
+		return;
+	if (is_healthy)
+		replicaset.healthy_count++;
+	else
+		replicaset.healthy_count--;
+
+	/*
+	 * It is important for Raft to run replicaset_on_health_change() before
+	 * raft_notify_is_leader_seen(). replicaset_on_health_change() executes
+	 * a trigger, updating Raft's is_candidate flag, which shows whether the
+	 * node have enough quorum to start election. It should be done before
+	 * running raft_notify_is_leader_seen, which cleans the flag related to
+	 * corresponding replica->id in leader_witness_map and tries to start
+	 * election. Otherwise, election can be started even if the node doesn't
+	 * have enough quorum to do so.
+	 */
+	replicaset_on_health_change();
+	if (!is_healthy && replica->id != REPLICA_ID_NIL)
+		raft_notify_is_leader_seen(box_raft(), false, replica->id);
+}
+
+static void
 replica_clear_applier(struct replica *replica)
 {
 	assert(replica->applier != NULL);
 	replica->applier = NULL;
 	trigger_clear(&replica->on_applier_state);
+	replica_update_applier_health(replica);
 }
 
 static void
 replica_on_applier_sync(struct replica *replica)
 {
-	assert(replica->applier_sync_state == APPLIER_CONNECTED);
+	if (replica->applier_sync_state == APPLIER_SYNC)
+		return;
 
 	replica->applier_sync_state = APPLIER_SYNC;
 	replicaset.applier.synced++;
@@ -340,7 +758,16 @@ replica_on_applier_sync(struct replica *replica)
 static void
 replica_on_applier_connect(struct replica *replica)
 {
+	if (replica->applier_sync_state == APPLIER_CONNECTED)
+		return;
+
 	struct applier *applier = replica->applier;
+	if (box_is_waiting_for_own_rows()) {
+		auto &t = box_check_waiting_for_own_rows_trigger;
+		int64_t remote_lsn =
+			vclock_get(&applier->ballot.vclock, instance_id);
+		t.target_lsn = MAX(t.target_lsn, remote_lsn);
+	}
 
 	assert(tt_uuid_is_nil(&replica->uuid));
 	assert(!tt_uuid_is_nil(&applier->uuid));
@@ -355,8 +782,9 @@ replica_on_applier_connect(struct replica *replica)
 	if (orig != NULL && orig->applier != NULL) {
 		say_error("duplicate connection to the same replica: "
 			  "instance uuid %s, addr1 %s, addr2 %s",
-			  tt_uuid_str(&orig->uuid), applier->source,
-			  orig->applier->source);
+			  tt_uuid_str(&orig->uuid),
+			  applier_uri_str(applier),
+			  applier_uri_str(orig->applier));
 		fiber_cancel(fiber());
 		/*
 		 * Raise an exception to force the applier
@@ -385,6 +813,8 @@ replica_on_applier_connect(struct replica *replica)
 static void
 replica_on_applier_reconnect(struct replica *replica)
 {
+	if (replica->applier_sync_state == APPLIER_CONNECTED)
+		return;
 	struct applier *applier = replica->applier;
 
 	assert(!tt_uuid_is_nil(&replica->uuid));
@@ -430,6 +860,8 @@ replica_on_applier_reconnect(struct replica *replica)
 static void
 replica_on_applier_disconnect(struct replica *replica)
 {
+	if (replica->applier_sync_state == replica->applier->state)
+		return;
 	switch (replica->applier_sync_state) {
 	case APPLIER_SYNC:
 		assert(replicaset.applier.synced > 0);
@@ -459,13 +891,8 @@ replica_on_applier_state_f(struct trigger *trigger, void *event)
 	(void)event;
 	struct replica *replica = container_of(trigger,
 			struct replica, on_applier_state);
+	replica_update_applier_health(replica);
 	switch (replica->applier->state) {
-	case APPLIER_INITIAL_JOIN:
-		replicaset.is_joining = true;
-		break;
-	case APPLIER_JOINED:
-		replicaset.is_joining = false;
-		break;
 	case APPLIER_CONNECTED:
 		try {
 			if (tt_uuid_is_nil(&replica->uuid))
@@ -524,6 +951,8 @@ replicaset_update(struct applier **appliers, int count, bool keep_connect)
 		}
 	});
 
+	struct tt_uuid registered_uuids[VCLOCK_MAX];
+	int uuid_count = 0;
 	/* Check for duplicate UUID */
 	for (int i = 0; i < count; i++) {
 		applier = appliers[i];
@@ -540,12 +969,14 @@ replicaset_update(struct applier **appliers, int count, bool keep_connect)
 			 * when it is finally connected.
 			 */
 			rlist_add_entry(&anon_replicas, replica, in_anon);
+			replica->applier_sync_state = APPLIER_DISCONNECTED;
 			continue;
 		}
 
 		assert(!tt_uuid_is_nil(&applier->uuid));
 		replica->uuid = applier->uuid;
 		replica->anon = applier->ballot.is_anon;
+		replica->applier_sync_state = APPLIER_CONNECTED;
 
 		if (replica_hash_search(&uniq, replica) != NULL) {
 			replica_clear_applier(replica);
@@ -554,8 +985,46 @@ replicaset_update(struct applier **appliers, int count, bool keep_connect)
 				  "duplicate connection to the same replica");
 		}
 		replica_hash_insert(&uniq, replica);
+		if (replicaset_state != REPLICASET_JOIN)
+			continue;
+		int ballot_size = applier->ballot.registered_replica_uuids_size;
+		struct tt_uuid *uuids =
+			applier->ballot.registered_replica_uuids;
+		for (int i = 0; i < ballot_size; i++) {
+			struct tt_uuid *uuid = &uuids[i];
+			for (int j = 0; j < uuid_count; j++) {
+				if (tt_uuid_compare(uuid, &registered_uuids[j]) == 0)
+					goto next;
+			}
+			registered_uuids[uuid_count++] = *uuid;
+			if (uuid_count >= VCLOCK_MAX) {
+				say_warn("Too many registered replicas discovered");
+				tnt_raise(ClientError,
+					  ER_BOOTSTRAP_CONNECTION_NOT_TO_ALL);
+			}
+next:
+		; /* nop */
+		}
 	}
 
+	if (replicaset_state == REPLICASET_JOIN &&
+	    uuid_count > count) {
+		say_warn("Not all replica set members listed in "
+			 "box.cfg.replication");
+		struct replica key;
+		for (int i = 0; i < uuid_count; i++) {
+			key.uuid = registered_uuids[i];
+			if (replica_hash_search(&uniq, &key) != NULL)
+				continue;
+
+			say_warn("No connection to %s", tt_uuid_str(&key.uuid));
+		}
+		if (bootstrap_strategy == BOOTSTRAP_STRATEGY_AUTO &&
+		    !cfg_replication_anon) {
+			tnt_raise(ClientError,
+				  ER_BOOTSTRAP_CONNECTION_NOT_TO_ALL);
+		}
+	}
 	/*
 	 * All invariants and conditions are checked, now it is safe to
 	 * apply the new configuration. Nothing can fail after this point.
@@ -577,13 +1046,20 @@ replicaset_update(struct applier **appliers, int count, bool keep_connect)
 	replicaset.applier.connected = 0;
 	replicaset.applier.loading = 0;
 	replicaset.applier.synced = 0;
+
+	struct applier *appliers_for_delete[VCLOCK_MAX] = {};
+	int appliers_for_delete_count = 0;
+	int csw = fiber()->csw;
+
 	replicaset_foreach(replica) {
 		if (replica->applier == NULL)
 			continue;
 		struct replica *other = replica_hash_search(&uniq, replica);
 		if (keep_connect && other != NULL &&
 		    (replica->applier->state == APPLIER_FOLLOW ||
-		     replica->applier->state == APPLIER_SYNC)) {
+		     replica->applier->state == APPLIER_SYNC) &&
+		    uri_is_equal(&replica->applier->uri,
+				 &other->applier->uri)) {
 			/*
 			 * Try not to interrupt working appliers upon
 			 * reconfiguration.
@@ -599,6 +1075,15 @@ replicaset_update(struct applier **appliers, int count, bool keep_connect)
 			replica_clear_applier(replica);
 			replica->applier_sync_state = APPLIER_DISCONNECTED;
 		}
+		appliers_for_delete[appliers_for_delete_count++] = applier;
+	}
+
+	/* Above-mentioned replicaset_foreach shouldn't yield. See gh-7590 */
+	assert(csw == fiber()->csw);
+	(void)csw;
+
+	for (int i = 0; i < appliers_for_delete_count; ++i) {
+		applier = appliers_for_delete[i];
 		applier_stop(applier);
 		applier_delete(applier);
 	}
@@ -638,21 +1123,11 @@ replicaset_update(struct applier **appliers, int count, bool keep_connect)
 	}
 }
 
-/**
- * Replica set configuration state, shared among appliers.
- */
-struct replicaset_connect_state {
-	/** Number of successfully connected appliers. */
-	int connected;
-	/** Number of appliers that failed to connect. */
-	int failed;
-	/** Signaled when an applier connects or stops. */
-	struct fiber_cond wakeup;
-};
-
 struct applier_on_connect {
 	struct trigger base;
 	struct replicaset_connect_state *state;
+	/** Previously seen applier state. */
+	enum applier_state seen_state;
 };
 
 static int
@@ -663,37 +1138,205 @@ applier_on_connect_f(struct trigger *trigger, void *event)
 	struct replicaset_connect_state *state = on_connect->state;
 	struct applier *applier = (struct applier *)event;
 
-	switch (applier->state) {
-	case APPLIER_OFF:
-	case APPLIER_STOPPED:
-		state->failed++;
-		break;
-	case APPLIER_CONNECTED:
-		state->connected++;
-		break;
-	default:
+	fiber_cond_signal(&state->wakeup);
+	if (on_connect->seen_state == applier->state)
+		return 0;
+	on_connect->seen_state = applier->state;
+	if (applier->state != APPLIER_OFF &&
+	    applier->state != APPLIER_STOPPED &&
+	    applier->state != APPLIER_CONNECTED) {
 		return 0;
 	}
-	fiber_cond_signal(&state->wakeup);
 	applier_pause(applier);
 	return 0;
 }
 
-void
-replicaset_connect(struct applier **appliers, int count,
-		   bool connect_quorum, bool keep_connect)
+/** Check if the applier is connected to the configured bootstrap leader. */
+static bool
+applier_is_bootstrap_leader(const struct applier *applier)
 {
-	if (count == 0) {
-		/* Cleanup the replica set. */
-		replicaset_update(appliers, 0, false);
-		return;
+	assert(!tt_uuid_is_nil(&applier->uuid));
+	if (bootstrap_strategy == BOOTSTRAP_STRATEGY_CONFIG) {
+		if (*cfg_bootstrap_leader_name != '\0') {
+			return strcmp(applier->ballot.instance_name,
+				      cfg_bootstrap_leader_name) == 0;
+		}
+		if (!tt_uuid_is_nil(&cfg_bootstrap_leader_uuid)) {
+			return tt_uuid_is_equal(&applier->uuid,
+						&cfg_bootstrap_leader_uuid);
+		}
+		if (!uri_is_nil(&cfg_bootstrap_leader_uri)) {
+			return uri_addr_is_equal(&applier->uri,
+						 &cfg_bootstrap_leader_uri);
+		}
+	} else if (bootstrap_strategy == BOOTSTRAP_STRATEGY_SUPERVISED) {
+		return tt_uuid_is_equal(&applier->ballot.bootstrap_leader_uuid,
+					&applier->uuid);
+	}
+	return false;
+}
+
+/**
+ * A helper to determine if the applier to the configured bootstrap leader is
+ * connected.
+ */
+static bool
+bootstrap_leader_is_connected(struct applier **appliers, int count)
+{
+	/*
+	 * In the supervised strategy it is possible that we know
+	 * locally that the given instance is a bootstrap leader.
+	 */
+	if (bootstrap_strategy == BOOTSTRAP_STRATEGY_SUPERVISED &&
+	    is_supervised_bootstrap_leader)
+		return true;
+
+	for (int i = 0; i < count; i++) {
+		struct applier *applier = appliers[i];
+		if (applier->state == APPLIER_CONNECTED &&
+		    applier_is_bootstrap_leader(applier)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/** A helper determining whether any more connection attempts are needed. */
+static bool
+replicaset_is_connected(struct replicaset_connect_state *state,
+			struct applier **appliers, int count,
+			bool wait_all)
+{
+	/* Update connected and failed counters. */
+	state->connected = 0;
+	state->booting = 0;
+	state->failed = 0;
+	for (int i = 0; i < count; i++) {
+		struct applier *applier = appliers[i];
+		if (applier->state == APPLIER_CONNECTED) {
+			state->connected++;
+			if (!applier->ballot.is_booted)
+				state->booting++;
+		} else if (applier->state == APPLIER_STOPPED ||
+				   applier->state == APPLIER_OFF) {
+			state->failed++;
+		}
 	}
 
-	say_info("connecting to %d replicas", count);
+	if (replicaset_state == REPLICASET_BOOTSTRAP ||
+	    replicaset_state == REPLICASET_JOIN) {
+		/*
+		 * With "supervised" strategy we may continue either:
+		 *
+		 * * when the leader appears, or
+		 * * when the graceful bootstrap is requested and
+		 *   all the upstreams are connected
+		 * * when the graceful bootstrap is requested and
+		 *   the connection timeout is exceeded
+		 */
+		if (bootstrap_strategy == BOOTSTRAP_STRATEGY_SUPERVISED) {
+			bool has_leader = bootstrap_leader_is_connected(
+				appliers, count);
+			if (has_leader)
+				/* Has leader -- proceed. */
+				return true;
+			else if (!is_graceful_supervised_bootstrap_requested)
+				/* No leader -- wait. */
+				return false;
+			/*
+			 * At this point there is a graceful
+			 * bootstrap request and no leaders. Let's
+			 * fall down to check if there are
+			 * connections to wait for (similarly to
+			 * the "auto" and "config" strategies).
+			 */
+		}
+		/*
+		 * With "config" strategy we may continue either when the leader
+		 * appears or when there are no more connections to wait for.
+		 * If none of them is the configured bootstrap_leader, there's
+		 * no point to wait for one.
+		 */
+		if (bootstrap_strategy == BOOTSTRAP_STRATEGY_CONFIG &&
+		    bootstrap_leader_is_connected(appliers, count)) {
+			return true;
+		}
+	}
+	if (state->connected == count)
+		return true;
+	/*
+	 * After a quorum is reached, it is considered enough to proceed. Except
+	 * if a connection is critical. Connection *is* critical even with 0
+	 * quorum when the instance starts first time and needs to choose
+	 * replicaset UUID, fill _cluster, etc. If 0 quorum allowed to return
+	 * immediately even at first start, then it would be impossible to
+	 * bootstrap a replicaset - all nodes would start immediately and choose
+	 * different cluster UUIDs.
+	 */
+	if (state->connected >= replicaset_connect_quorum(count) &&
+	    !wait_all) {
+		return true;
+	}
+	if (count - state->failed < replicaset_connect_quorum(count))
+		return true;
+	return false;
+}
 
-	if (!connect_quorum) {
+void
+replicaset_connect(const struct uri_set *uris,
+		   bool demand_quorum, bool keep_connect, bool wait_all)
+{
+	struct replicaset_connect_state state;
+	memset(&state, 0, sizeof(state));
+	fiber_cond_create(&state.wakeup);
+
+	/*
+	 * Return immediately if there are no configured
+	 * upstreams to wait.
+	 *
+	 * The supervised bootstrap strategy has an exception
+	 * here, because it waits not only for replicas, but also
+	 * for local bootstrap leadership flags (it is relevant on
+	 * bootstrap/join and irrelevant on a reconfiguration).
+	 */
+	if (uris->uri_count == 0 &&
+	    (bootstrap_strategy != BOOTSTRAP_STRATEGY_SUPERVISED ||
+	     (replicaset_state != REPLICASET_BOOTSTRAP &&
+	      replicaset_state != REPLICASET_JOIN))) {
+		replicaset_set_sync_quorum(&state);
+		/* Cleanup the replica set. */
+		replicaset_update(NULL, 0, false);
+		uri_set_destroy(&replication_uris);
+		if (uri_set_create(&replication_uris, NULL) != 0)
+			unreachable();
+		return;
+	}
+	if (uris->uri_count >= VCLOCK_MAX) {
+		tnt_raise(ClientError, ER_CFG, "replication",
+			  "too many replicas");
+	}
+	int count = 0;
+	struct applier *appliers[VCLOCK_MAX] = {};
+	auto appliers_guard = make_scoped_guard([&]{
+		for (int i = 0; i < count; i++) {
+			struct applier *applier = appliers[i];
+			applier_stop(applier);
+			applier_delete(applier);
+		}
+	});
+	for (; count < uris->uri_count; count++)
+		appliers[count] = applier_new(&uris->uris[count]);
+
+	if (count == 0)
+		say_info("no upstreams are configured, waiting for the "
+			 "bootstrap command");
+	else
+		say_info("connecting to %d replicas", count);
+
+	if (!demand_quorum) {
 		/*
 		 * Enter orphan mode on configuration change and
+		 *
 		 * only leave it when we manage to sync with
 		 * replicaset_quorum instances. Don't change
 		 * title though, it should be 'loading' during
@@ -720,12 +1363,7 @@ replicaset_connect(struct applier **appliers, int count,
 	/* Memory for on_state triggers registered in appliers */
 	struct applier_on_connect triggers[VCLOCK_MAX];
 
-	struct replicaset_connect_state state;
-	state.connected = state.failed = 0;
-	fiber_cond_create(&state.wakeup);
-
 	double timeout = replication_connect_timeout;
-	int quorum = MIN(count, replication_connect_quorum);
 
 	/* Add triggers and start simulations connection to remote peers */
 	for (int i = 0; i < count; i++) {
@@ -734,41 +1372,44 @@ replicaset_connect(struct applier **appliers, int count,
 		/* Register a trigger to wake us up when peer is connected */
 		trigger_create(&trigger->base, applier_on_connect_f, NULL, NULL);
 		trigger->state = &state;
+		trigger->seen_state = APPLIER_CONNECT;
 		trigger_add(&applier->on_state, &trigger->base);
 		/* Start background connection */
 		applier_start(applier);
 	}
 
-	while (state.connected < count) {
-		/*
-		 * After a quorum is reached, it is considered
-		 * enough to proceed. Except if a connection is
-		 * critical.
-		 * Connection *is* critical even with 0 quorum
-		 * when the instance starts first time and needs
-		 * to choose replicaset UUID, fill _cluster, etc.
-		 * If 0 quorum allowed to return immediately even
-		 * at first start, then it would be impossible to
-		 * bootstrap a replicaset - all nodes would start
-		 * immediately and choose different cluster UUIDs.
-		 */
-		if (state.connected >= quorum && !connect_quorum)
-			break;
+	/*
+	 * Guards are run in the order reverse to the order of their
+	 * initialization. So triggers_guard will run before appliers_guard.
+	 */
+	auto triggers_guard = make_scoped_guard([&]{
+		for (int i = 0; i < count; i++) {
+			struct applier_on_connect *trigger = &triggers[i];
+			trigger_clear(&trigger->base);
+		}
+	});
+	replicaset_connect_wakeup_cond = &state.wakeup;
+	auto cond_guard = make_scoped_guard([&]{
+		replicaset_connect_wakeup_cond = NULL;
+	});
+	while (!replicaset_is_connected(&state, appliers, count, wait_all)) {
 		double wait_start = ev_monotonic_now(loop());
-		if (fiber_cond_wait_timeout(&state.wakeup, timeout) != 0)
+		if (fiber_cond_wait_timeout(&state.wakeup, timeout) != 0) {
+			fiber_testcancel();
 			break;
-		if (count - state.failed < quorum)
-			break;
+		}
 		timeout -= ev_monotonic_now(loop()) - wait_start;
 	}
+	replicaset_connect_wakeup_cond = NULL;
+	cond_guard.is_active = false;
 	if (state.connected < count) {
 		say_crit("failed to connect to %d out of %d replicas",
 			 count - state.connected, count);
 		/* Timeout or connection failure. */
-		if (connect_quorum && state.connected < quorum) {
-			diag_set(ClientError, ER_CFG, "replication",
-				 "failed to connect to one or more replicas");
-			goto error;
+		if (state.connected < replicaset_connect_quorum(count) &&
+		    demand_quorum) {
+			tnt_raise(ClientError, ER_CFG, "replication",
+				  "failed to connect to one or more replicas");
 		}
 	} else {
 		say_info("connected to %d replicas", state.connected);
@@ -786,21 +1427,31 @@ replicaset_connect(struct applier **appliers, int count,
 		if (applier->state != APPLIER_CONNECTED)
 			applier_stop(applier);
 	}
+	triggers_guard.is_active = false;
 
+	/*
+	 * Remember how many appliers are connected to check
+	 * replicaset_sync_quorum later on.
+	 */
+	replicaset_set_sync_quorum(&state);
 	/* Now all the appliers are connected, update the replica set. */
-	try {
-		replicaset_update(appliers, count, keep_connect);
-	} catch (Exception *e) {
-		goto error;
+	replicaset_update(appliers, count, keep_connect);
+	appliers_guard.is_active = false;
+	uri_set_destroy(&replication_uris);
+	uri_set_copy(&replication_uris, uris);
+}
+
+void
+replicaset_reload_uris(void)
+{
+	replicaset_foreach(replica) {
+		struct applier *applier = replica->applier;
+		if (applier != NULL)
+			applier_reload_uri(applier);
 	}
-	return;
-error:
-	/* Destroy appliers */
-	for (int i = 0; i < count; i++) {
-		trigger_clear(&triggers[i].base);
-		applier_stop(appliers[i]);
-	}
-	diag_raise();
+	struct replica *replica;
+	rlist_foreach_entry(replica, &replicaset.anon, in_anon)
+		applier_reload_uri(replica->applier);
 }
 
 bool
@@ -818,8 +1469,7 @@ replicaset_needs_rejoin(struct replica **master)
 			continue;
 
 		const struct ballot *ballot = &applier->ballot;
-		if (vclock_compare(&ballot->gc_vclock,
-				   &replicaset.vclock) <= 0) {
+		if (vclock_compare(&ballot->gc_vclock, instance_vclock) <= 0) {
 			/*
 			 * There's at least one master that still stores
 			 * WALs needed by this instance. Proceed to local
@@ -829,16 +1479,16 @@ replicaset_needs_rejoin(struct replica **master)
 		}
 
 		const char *uuid_str = tt_uuid_str(&replica->uuid);
-		const char *addr_str = sio_strfaddr(&applier->addr,
-						applier->addr_len);
-		const char *local_vclock_str = vclock_to_string(&replicaset.vclock);
+		const char *addr_str = applier_addr_str(applier);
+		const char *local_vclock_str =
+			vclock_to_string(instance_vclock);
 		const char *remote_vclock_str = vclock_to_string(&ballot->vclock);
 		const char *gc_vclock_str = vclock_to_string(&ballot->gc_vclock);
 
 		say_info("can't follow %s at %s: required %s available %s",
 			 uuid_str, addr_str, local_vclock_str, gc_vclock_str);
 
-		if (vclock_compare(&replicaset.vclock, &ballot->vclock) > 0) {
+		if (vclock_compare(instance_vclock, &ballot->vclock) > 0) {
 			/*
 			 * Replica has some rows that are not present on
 			 * the master. Don't rebootstrap as we don't want
@@ -883,7 +1533,7 @@ replicaset_follow(void)
 void
 replicaset_sync(void)
 {
-	int quorum = replicaset_quorum();
+	int quorum = replicaset_sync_quorum();
 
 	if (quorum == 0) {
 		/*
@@ -923,31 +1573,78 @@ replicaset_sync(void)
 		say_info("replica set sync complete");
 		box_set_orphan(false);
 	}
+	/*
+	 * If fiber is cancelled raise error here so that orphan status is
+	 * correct.
+	 */
+	fiber_testcancel();
 }
 
 void
 replicaset_check_quorum(void)
 {
-	if (replicaset.applier.synced >= replicaset_quorum())
+	if (replicaset.applier.synced >= replicaset_sync_quorum())
 		box_set_orphan(false);
+}
+
+int64_t
+replicaset_max_instance_lsn(void)
+{
+	int64_t max_lsn = 0;
+	replicaset_foreach(replica) {
+		if (replica->applier == NULL)
+			continue;
+		struct vclock *remote_vclock = &replica->applier->ballot.vclock;
+		max_lsn = MAX(max_lsn, vclock_get(remote_vclock, instance_id));
+	}
+	return max_lsn;
+}
+
+/** A helper to update relay health on its start/stop. */
+static void
+replica_update_relay_health(struct replica *replica)
+{
+	struct relay *relay = replica->relay;
+	assert(relay != NULL);
+	bool is_healthy = relay_get_state(relay) == RELAY_FOLLOW;
+	if (is_healthy == replica->is_relay_healthy)
+		return;
+	replica->is_relay_healthy = is_healthy;
+	if (!replica->is_applier_healthy || replica->anon)
+		return;
+	if (is_healthy)
+		replicaset.healthy_count++;
+	else
+		replicaset.healthy_count--;
+	replicaset_on_health_change();
+}
+
+void
+replica_on_relay_follow(struct replica *replica)
+{
+	assert(relay_get_state(replica->relay) == RELAY_FOLLOW);
+	assert(!replica->is_relay_healthy);
+	replica_update_relay_health(replica);
 }
 
 void
 replica_on_relay_stop(struct replica *replica)
 {
+	replica_update_relay_health(replica);
+}
+
+void
+replica_on_disconnect(struct replica *replica)
+{
+	assert(!replica->has_incoming_connection);
 	/*
-	 * If the replica was evicted from the cluster, or was not
-	 * even added there (anon replica), we don't need to keep
-	 * WALs for it anymore. Unregister it with the garbage
-	 * collector then. See also replica_clear_id.
+	 * If the replica was evicted from the cluster, we don't need to keep
+	 * WALs for it anymore. Unregister it with the garbage collector then.
+	 * See also replica_clear_id.
 	 */
-	if (replica->id == REPLICA_ID_NIL) {
-		if (!replica->anon) {
-			gc_consumer_unregister(replica->gc);
-			replica->gc = NULL;
-		} else {
-			assert(replica->gc == NULL);
-		}
+	if (!replica->anon && replica->id == REPLICA_ID_NIL) {
+		gc_consumer_unregister(replica->gc);
+		replica->gc = NULL;
 	}
 	if (replica_is_orphan(replica)) {
 		replica_hash_remove(&replicaset.hash, replica);
@@ -969,8 +1666,9 @@ replicaset_next(struct replica *replica)
 	return replica_hash_next(&replicaset.hash, replica);
 }
 
-struct replica *
-replicaset_find_join_master(void)
+/** \sa replicaset_find_join_master. */
+static struct replica *
+replicaset_find_join_master_auto(void)
 {
 	struct replica *leader = NULL;
 	int leader_score = -1;
@@ -1036,6 +1734,113 @@ elect:
 	return leader;
 }
 
+/**
+ * Out of all the replicas find the one which's told to be the bootstrap_leader
+ * by the config.
+ */
+static struct replica *
+replicaset_find_join_master_cfg(void)
+{
+	struct replica *leader = NULL;
+	replicaset_foreach(replica) {
+		struct applier *applier = replica->applier;
+		if (applier == NULL)
+			continue;
+		if (applier_is_bootstrap_leader(applier))
+			leader = replica;
+	}
+	if (leader == NULL &&
+	    !tt_uuid_is_equal(&cfg_bootstrap_leader_uuid, &INSTANCE_UUID) &&
+	    (strcmp(cfg_bootstrap_leader_name, cfg_instance_name) != 0 ||
+	     *cfg_bootstrap_leader_name == '\0')) {
+		tnt_raise(ClientError, ER_CFG, "bootstrap_leader",
+			  "failed to connect to the bootstrap leader");
+	}
+	return leader;
+}
+
+/**
+ * Out of all the replicas find the one which was promoted via
+ * box.ctl.make_bootstrap_leader()
+ */
+static struct replica *
+replicaset_find_join_master_supervised(void)
+{
+	/*
+	 * If we're known as a bootstrap leader, just bootstrap
+	 * the database.
+	 *
+	 * Unlike the 'auto' bootstrap strategy, the 'supervised'
+	 * one has no safety checks with waiting for ballots from
+	 * other replicaset members (except when the graceful
+	 * bootstrap is requested).
+	 *
+	 * NB: It is possible to run the cycle below first and
+	 * verify other members status known at this moment.
+	 * However, since we don't wait for connecting to all the
+	 * instances, it has a low chance to catch a problem.
+	 * As result, it would just make the result of calling
+	 * this function less predictable without visible gains
+	 * for a user.
+	 */
+	if (is_supervised_bootstrap_leader)
+		return NULL;
+
+	struct replica *leader = NULL;
+	replicaset_foreach(replica) {
+		struct applier *applier = replica->applier;
+		if (applier == NULL)
+			continue;
+		if (applier_is_bootstrap_leader(applier))
+			leader = replica;
+	}
+
+	/*
+	 * At this point the waiting logic from
+	 * replicaset_is_connected() is finished. There are the
+	 * following situations, when it is possible:
+	 *
+	 * 1. A bootstrap leader is found.
+	 * 2. All the instances from box.cfg.replication are
+	 *    connected, but no one is a bootstrap leader.
+	 * 3. box.cfg.replication_connect_timeout is reached.
+	 *
+	 * In case of the situation 1 we're going to bootstrap or
+	 * to recovery, depending on whether the leader is the
+	 * current instance.
+	 *
+	 * In the 2 and 3 situations, it depends on the graceful
+	 * bootstrap request. If there is one, we're going to
+	 * bootstrap. Otherwise, an error is reported.
+	 */
+	if (leader == NULL && !is_graceful_supervised_bootstrap_requested) {
+		tnt_raise(ClientError, ER_CFG, "bootstrap_strategy",
+			  "failed to connect to the bootstrap leader");
+	}
+
+	/*
+	 * NULL is possible here and it means to assign the
+	 * current instance as a bootstrap leader.
+	 */
+	return leader;
+}
+
+struct replica *
+replicaset_find_join_master(void)
+{
+	switch (bootstrap_strategy) {
+	case BOOTSTRAP_STRATEGY_LEGACY:
+	case BOOTSTRAP_STRATEGY_AUTO:
+		return replicaset_find_join_master_auto();
+	case BOOTSTRAP_STRATEGY_CONFIG:
+		return replicaset_find_join_master_cfg();
+	case BOOTSTRAP_STRATEGY_SUPERVISED:
+		return replicaset_find_join_master_supervised();
+	default:
+		unreachable();
+	}
+}
+
 struct replica *
 replica_by_uuid(const struct tt_uuid *uuid)
 {
@@ -1045,9 +1850,36 @@ replica_by_uuid(const struct tt_uuid *uuid)
 }
 
 struct replica *
+replica_by_name(const char *name)
+{
+	if (*name == 0)
+		return NULL;
+	replicaset_foreach(replica) {
+		if (strcmp(replica->name, name) == 0)
+			return replica;
+	}
+	return NULL;
+}
+
+struct replica *
 replica_by_id(uint32_t replica_id)
 {
 	return replicaset.replica_by_id[replica_id];
+}
+
+const char *
+replica_to_string(const struct replica *replica, const char *addr)
+{
+	if (replica == NULL)
+		return tt_sprintf("unknown");
+
+	const char *replica_label = *replica->name != 0 ?
+		replica->name : tt_uuid_str(&replica->uuid);
+
+	if (addr != NULL)
+		return tt_sprintf("%s (id = %u, addr: %s)", replica_label,
+				  replica->id, addr);
+	return tt_sprintf("%s (id = %u)", replica_label, replica->id);
 }
 
 int
@@ -1061,4 +1893,161 @@ replica_find_new_id(uint32_t *replica_id)
 	}
 	diag_set(ClientError, ER_REPLICA_MAX, VCLOCK_MAX);
 	return -1;
+}
+
+void
+replicaset_option_update_wakeup(void)
+{
+	fiber_cond_broadcast(&replicaset.option_update_cond);
+}
+
+/** Let others know we need data. */
+void
+sync_trigger_data_ref(struct sync_trigger_data *data)
+{
+	++data->ref_count;
+}
+
+/**
+ * Let others know that we no longer need the data.
+ * If no one else needs the data, free it.
+ */
+void
+sync_trigger_data_unref(struct sync_trigger_data *data)
+{
+	--data->ref_count;
+	assert(data->ref_count >= 0);
+	if (data->ref_count == 0)
+		mempool_free(&sync_trigger_data_pool, data);
+}
+
+/**
+ * A trigger executed on each ack to collect up to date remote node vclocks.
+ * When an ack comes with requested sync for some replica id, ack vclock is
+ * accounted.
+ */
+static int
+check_vclock_sync_on_ack(struct trigger *trigger, void *event)
+{
+	struct replication_ack *ack = (struct replication_ack *)event;
+	struct sync_trigger_data *data =
+		(struct sync_trigger_data *)trigger->data;
+	uint32_t id = ack->source;
+	/*
+	 * Messages from anon replicas are skipped on a lower level, as having
+	 * no weight on any decision making.
+	 */
+	assert(id != REPLICA_ID_NIL);
+	uint64_t sync = data->vclock_syncs[id];
+	int accounted_count = bit_count_u32(data->collected_vclock_map);
+	if (!bit_test(&data->collected_vclock_map, id) && sync > 0 &&
+	    ack->vclock_sync >= sync &&
+	    accounted_count < replication_linearizable_quorum) {
+		vclock_max_ignore0(data->vclock, ack->vclock);
+		bit_set(&data->collected_vclock_map, id);
+		++accounted_count;
+		if (accounted_count >= replication_linearizable_quorum)
+			fiber_wakeup(data->waiter);
+	}
+	return 0;
+}
+
+/** A trigger querying relay's next sync value once it becomes operational. */
+static int
+relay_get_sync_on_start(struct trigger *trigger, void *event)
+{
+	struct replica *replica = (struct replica *)event;
+	if (replica->anon)
+		return 0;
+	struct relay *relay = replica->relay;
+	struct sync_trigger_data *data =
+		(struct sync_trigger_data *)trigger->data;
+	uint32_t id = replica->id;
+	/* Already accounted. */
+	if (bit_test(&data->collected_vclock_map, id))
+		return 0;
+
+	sync_trigger_data_ref(data);
+	if (relay_trigger_vclock_sync(relay, &data->vclock_syncs[id],
+				      data->deadline) != 0) {
+		diag_clear(diag_get());
+		data->is_timed_out = true;
+		fiber_wakeup(data->waiter);
+	}
+	sync_trigger_data_unref(data);
+	return 0;
+}
+
+int
+replicaset_collect_confirmed_vclock(struct vclock *confirmed_vclock,
+				    double deadline)
+{
+	/*
+	 * We should check the vclock on self plus
+	 * replication_linearizable_quorum - 1 remote instances.
+	 */
+	vclock_copy(confirmed_vclock, instance_vclock);
+	if (replication_linearizable_quorum <= 1)
+		return 0;
+
+	struct sync_trigger_data *data = (sync_trigger_data *)
+		xmempool_alloc(&sync_trigger_data_pool);
+	memset(data->vclock_syncs, 0, sizeof(data->vclock_syncs));
+	data->collected_vclock_map = 0;
+	data->waiter = fiber();
+	data->vclock = confirmed_vclock;
+	data->deadline = deadline;
+	data->is_timed_out = false;
+	data->ref_count = 0;
+
+	sync_trigger_data_ref(data);
+	bit_set(&data->collected_vclock_map, instance_id);
+	struct trigger on_relay_thread_start;
+	trigger_create(&on_relay_thread_start, relay_get_sync_on_start, data,
+		       NULL);
+	trigger_add(&replicaset.on_relay_thread_start, &on_relay_thread_start);
+	struct trigger on_ack;
+	trigger_create(&on_ack, check_vclock_sync_on_ack, data, NULL);
+	trigger_add(&replicaset.on_ack, &on_ack);
+
+	auto guard = make_scoped_guard([&] {
+		trigger_clear(&on_ack);
+		trigger_clear(&on_relay_thread_start);
+		sync_trigger_data_unref(data);
+	});
+
+	replicaset_foreach(replica) {
+		if (relay_get_state(replica->relay) != RELAY_FOLLOW ||
+		    replica->anon) {
+			continue;
+		}
+		/* Might be already filled by on_relay_thread_start trigger. */
+		if (data->vclock_syncs[replica->id] != 0)
+			continue;
+		if (relay_trigger_vclock_sync(replica->relay,
+					      &data->vclock_syncs[replica->id],
+					      deadline) != 0) {
+			/* Timed out. */
+			return -1;
+		}
+	}
+
+	struct fiber_cond *cond = &replicaset.option_update_cond;
+	while (bit_count_u32(data->collected_vclock_map) <
+	       replication_linearizable_quorum && !data->is_timed_out &&
+	       !fiber_is_cancelled()) {
+		if (fiber_cond_wait_deadline(cond, deadline) != 0)
+			break;
+	}
+
+	if (fiber_is_cancelled()) {
+		diag_set(FiberIsCancelled);
+		return -1;
+	}
+	if (bit_count_u32(data->collected_vclock_map) <
+	    replication_linearizable_quorum) {
+		diag_set(TimedOut);
+		return -1;
+	}
+	return 0;
 }

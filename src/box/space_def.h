@@ -30,8 +30,8 @@
  * THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  */
-#include "tuple_dictionary.h"
 #include "schema_def.h"
+#include "opt_def.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -40,6 +40,33 @@
 extern "C" {
 #endif /* defined(__cplusplus) */
 
+struct space_upgrade_def;
+
+/** Space type names. */
+extern const char *space_type_strs[];
+
+/** See space_opts::type. */
+enum space_type {
+	/**
+	 * SPACE_TYPE_DEFAULT is a special value which is used when decoding
+	 * space options from a tuple. After the options have been parsed
+	 * SPACE_TYPE_DEFAULT will be replaced with SPACE_TYPE_NORMAL.
+	 * No live space should ever have this type.
+	 */
+	SPACE_TYPE_DEFAULT = -1,
+	SPACE_TYPE_NORMAL = 0,
+	SPACE_TYPE_DATA_TEMPORARY = 1,
+	SPACE_TYPE_TEMPORARY = 2,
+	space_type_MAX,
+};
+
+static inline const char *
+space_type_name(enum space_type space_type)
+{
+	assert(space_type != SPACE_TYPE_DEFAULT);
+	return space_type_strs[space_type];
+}
+
 /** Space options */
 struct space_opts {
 	/**
@@ -47,15 +74,21 @@ struct space_opts {
 	 * made to a space are replicated.
 	 */
 	uint32_t group_id;
-        /**
-	 * The space is a temporary:
+	/**
+	 * If set to SPACE_TYPE_DATA_TEMPORARY:
 	 * - it is empty at server start
 	 * - changes are not written to WAL
 	 * - changes are not part of a snapshot
-         * - in SQL: space_def memory is allocated on region and
-         *   does not require manual release.
+	 * - in SQL: space_def memory is allocated on region and
+	 *   does not require manual release.
+	 *
+	 * If set to SPACE_TYPE_TEMPORARY:
+	 * - all of the above, but
+	 * - metadata is not persisted (doesn't exist at server start)
+	 * - metadata is not replicated (doesn't exist on replicas)
+	 * - this value cannot be changed from or to even for an empty space
 	 */
-	bool is_temporary;
+	enum space_type type;
 	/**
 	 * This flag is set if space is ephemeral and hence
 	 * its format might be re-used.
@@ -73,8 +106,20 @@ struct space_opts {
 	 * until replicated to a quorum of replicas.
 	 */
 	bool is_sync;
+	/**
+	 * Setting this flag for a Vinyl space defers generation of DELETE
+	 * statements for secondary indexes till the primary index compaction,
+	 * which should speed up writes, but may also slow down reads.
+	 */
+	bool defer_deletes;
 	/** SQL statement that produced this space. */
 	char *sql;
+	/** Array of constraints. Can be NULL if constraints_count == 0. */
+	struct tuple_constraint_def *constraint_def;
+	/** Number of constraints. */
+	uint32_t constraint_count;
+	/** Space upgrade definition or NULL. */
+	struct space_upgrade_def *upgrade_def;
 };
 
 extern const struct space_opts space_opts_default;
@@ -91,10 +136,24 @@ space_opts_create(struct space_opts *opts)
 }
 
 /**
- * Destroy space options
+ * Check if the space is data-temporary.
  */
-void
-space_opts_destroy(struct space_opts *opts);
+static inline bool
+space_opts_is_data_temporary(const struct space_opts *opts)
+{
+	assert(opts->type != SPACE_TYPE_DEFAULT);
+	return opts->type != SPACE_TYPE_NORMAL;
+}
+
+/**
+ * Check if the space is temporary.
+ */
+static inline bool
+space_opts_is_temporary(const struct space_opts *opts)
+{
+	assert(opts->type != SPACE_TYPE_DEFAULT);
+	return opts->type == SPACE_TYPE_TEMPORARY;
+}
 
 /** Space metadata. */
 struct space_def {
@@ -110,11 +169,6 @@ struct space_def {
 	 */
 	uint32_t exact_field_count;
 	char engine_name[ENGINE_NAME_MAX + 1];
-	/**
-	 * Tuple field names dictionary, shared with a space's
-	 * tuple format.
-	 */
-	struct tuple_dictionary *dict;
 	/** Space fields, specified by a user. */
 	struct field_def *fields;
 	/** Length of @a fields. */
@@ -122,21 +176,15 @@ struct space_def {
 	/** Number of SQL views which refer to this space. */
 	uint32_t view_ref_count;
 	struct space_opts opts;
+	/**
+	 * Encoding of original (i.e., user-provided) format clause to MsgPack,
+	 * allocated via malloc.
+	 */
+	char *format_data;
+	/** Length of MsgPack encoded format clause. */
+	size_t format_data_len;
 	char name[0];
 };
-
-/*
- * Free a default value syntax trees of @a defs.
- * @param fields Fields array to destroy.
- * @param field_count Length of @a fields.
- * @param extern_alloc Fields expression AST allocated externally.
- *                     (specify false when sql_expr_delete should
- *                      release default_value_expr memory,
- *                      true - when shouldn't)
- */
-void
-space_def_destroy_fields(struct field_def *fields, uint32_t field_count,
-			 bool extern_alloc);
 
 /**
  * Delete the space_def object.
@@ -149,6 +197,8 @@ space_def_delete(struct space_def *def);
  * Duplicate space_def object.
  * @param src Def to duplicate.
  * @retval Copy of the @src.
+ *
+ * The function never fails (never returns NULL).
  */
 struct space_def *
 space_def_dup(const struct space_def *src);
@@ -174,7 +224,8 @@ space_def_new(uint32_t id, uint32_t uid, uint32_t exact_field_count,
 	      const char *name, uint32_t name_len,
 	      const char *engine_name, uint32_t engine_len,
 	      const struct space_opts *opts, const struct field_def *fields,
-	      uint32_t field_count);
+	      uint32_t field_count, const char *format_data,
+	      size_t format_data_len);
 
 /**
  * Create a new ephemeral space definition.
@@ -186,53 +237,33 @@ space_def_new(uint32_t id, uint32_t uid, uint32_t exact_field_count,
 struct space_def *
 space_def_new_ephemeral(uint32_t exact_field_count, struct field_def *fields);
 
+struct tuple_format;
+struct tuple_format_vtab;
+struct key_def;
 /**
- * Size of the space_def.
- * @param name_len Length of the space name.
- * @param fields Fields array of space format.
- * @param field_count Space field count.
- * @param[out] names_offset Offset from the beginning of a def to
- *             a field names memory.
- * @param[out] fields_offset Offset from the beginning of a def to
- *             a fields array.
- * @param[out] def_expr_offset Offset from the beginning of a def
- *             to a def_value_expr array.
- * @retval Size in bytes.
+ * Convenient @sa tuple_format_new helper.
+ * @param vtab Virtual function table for specific engines.
+ * @param engine Pointer to storage engine.
+ * @param keys Array of key_defs of a space.
+ * @param key_count The number of keys in @a keys array.
+ * @param def Source of the rest tuple_format_new arguments
  */
-size_t
-space_def_sizeof(uint32_t name_len, const struct field_def *fields,
-		 uint32_t field_count, uint32_t *names_offset,
-		 uint32_t *fields_offset, uint32_t *def_expr_offset);
+struct tuple_format *
+space_tuple_format_new(struct tuple_format_vtab *vtab, void *engine,
+		       struct key_def *const *keys, uint16_t key_count,
+		       const struct space_def *def);
+
+/**
+ * Check if msgpack array pointed to by @a data represents a space definition
+ * tuple which corresponds to a temporary space.
+ * If @a space_id is not NULL the id of the space will be written into it in
+ * case of success.
+ */
+bool
+space_def_tuple_is_temporary(const char *data, uint32_t *space_id);
 
 #if defined(__cplusplus)
 } /* extern "C" */
-
-#include "diag.h"
-
-static inline struct space_def *
-space_def_dup_xc(const struct space_def *src)
-{
-	struct space_def *ret = space_def_dup(src);
-	if (ret == NULL)
-		diag_raise();
-	return ret;
-}
-
-static inline struct space_def *
-space_def_new_xc(uint32_t id, uint32_t uid, uint32_t exact_field_count,
-		 const char *name, uint32_t name_len,
-		 const char *engine_name, uint32_t engine_len,
-		 const struct space_opts *opts, const struct field_def *fields,
-		 uint32_t field_count)
-{
-	struct space_def *ret = space_def_new(id, uid, exact_field_count, name,
-					      name_len, engine_name, engine_len,
-					      opts, fields, field_count);
-	if (ret == NULL)
-		diag_raise();
-	return ret;
-}
-
 #endif /* __cplusplus */
 
 #endif /* TARANTOOL_BOX_SPACE_DEF_H_INCLUDED */

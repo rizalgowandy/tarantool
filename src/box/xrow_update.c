@@ -101,87 +101,36 @@
  * deleted one.
  */
 
-/** Update internal state */
-struct xrow_update
-{
-	/** Operations array. */
-	struct xrow_update_op *ops;
-	/** Length of ops. */
-	uint32_t op_count;
-	/**
-	 * Index base for MessagePack update operations. If update
-	 * is from Lua, then the base is 1. Otherwise 0. That
-	 * field exists because Lua uses 1-based array indexing,
-	 * and Lua-to-MessagePack encoder keeps this indexing when
-	 * encodes operations array. Index base allows not to
-	 * re-encode each Lua update with 0-based indexes.
-	 */
-	int index_base;
-	/**
-	 * A bitmask of all columns modified by this update. Only
-	 * the first level of a tuple is accounted here. I.e. if
-	 * a field [1][2][3] was updated, then only [1] is
-	 * reflected.
-	 */
-	uint64_t column_mask;
-	/** First level of update tree. It is always array. */
-	struct xrow_update_field root;
-};
-
-/**
- * Read and check update operations and fill column mask.
- *
- * @param[out] update Update meta.
- * @param expr MessagePack array of operations.
- * @param expr_end End of the @expr.
- * @param dict Dictionary to lookup field number by a name.
- * @param field_count_hint Field count in the updated tuple. If
- *        there is no tuple at hand (for example, when we are
- *        reading UPSERT operations), then 0 for field count will
- *        do as a hint: the only effect of a wrong hint is
- *        a possibly incorrect column_mask.
- *        A correct field count results in an accurate
- *        column mask calculation.
- *
- * @retval  0 Success.
- * @retval -1 Error.
- */
-static int
+int
 xrow_update_read_ops(struct xrow_update *update, const char *expr,
 		     const char *expr_end, struct tuple_dictionary *dict,
 		     int32_t field_count_hint)
 {
-	if (mp_typeof(*expr) != MP_ARRAY) {
-		diag_set(ClientError, ER_ILLEGAL_PARAMS,
-			 "update operations must be an "
-			 "array {{op,..}, {op,..}}");
-		return -1;
-	}
+	const char *expr_begin = expr;
 	uint64_t column_mask = 0;
+	assert(mp_typeof(*expr) == MP_ARRAY);
 	/* number of operations */
 	update->op_count = mp_decode_array(&expr);
 
 	if (update->op_count > BOX_UPDATE_OP_CNT_MAX) {
-		diag_set(ClientError, ER_ILLEGAL_PARAMS,
-			 "too many operations for update");
-		return -1;
+		diag_set(IllegalParams, "too many operations for update");
+		goto error;
 	}
 
-	int size = update->op_count * sizeof(update->ops[0]);
-	update->ops = (struct xrow_update_op *)
-		region_aligned_alloc(&fiber()->gc, size,
-				     alignof(struct xrow_update_op));
-	if (update->ops == NULL) {
-		diag_set(OutOfMemory, size, "region_aligned_alloc",
-			 "update->ops");
-		return -1;
+	if (update->op_count > 0) {
+		update->ops = (struct xrow_update_op *)
+			xregion_alloc_array(&fiber()->gc,
+					    typeof(update->ops[0]),
+					    update->op_count);
+	} else {
+		update->ops = NULL;
 	}
 	struct xrow_update_op *op = update->ops;
 	struct xrow_update_op *ops_end = op + update->op_count;
 	for (int i = 1; op < ops_end; op++, i++) {
 		if (xrow_update_op_decode(op, i, update->index_base, dict,
 					  &expr) != 0)
-			return -1;
+			goto error;
 		/*
 		 * Continue collecting the changed columns
 		 * only if there are unset bits in the mask.
@@ -269,14 +218,13 @@ xrow_update_read_ops(struct xrow_update *update, const char *expr,
 		}
 	}
 
-	/* Check the remainder length, the request must be fully read. */
-	if (expr != expr_end) {
-		diag_set(ClientError, ER_ILLEGAL_PARAMS,
-			 "can't unpack update operations");
-		return -1;
-	}
+	assert(expr == expr_end);
 	update->column_mask = column_mask;
 	return 0;
+error:;
+	struct error *e = diag_last_error(diag_get());
+	error_set_mp(e, "ops", expr_begin, expr_end - expr_begin);
+	return -1;
 }
 
 /**
@@ -296,9 +244,8 @@ xrow_update_do_ops(struct xrow_update *update, const char *header,
 		   const char *old_data, const char *old_data_end,
 		   uint32_t part_count)
 {
-	if (xrow_update_array_create(&update->root, header, old_data,
-				     old_data_end, part_count) != 0)
-		return -1;
+	xrow_update_array_create(&update->root, header, old_data,
+				 old_data_end, part_count);
 	struct xrow_update_op *op = update->ops;
 	struct xrow_update_op *ops_end = op + update->op_count;
 	for (; op < ops_end; op++) {
@@ -318,9 +265,8 @@ xrow_upsert_do_ops(struct xrow_update *update, const char *header,
 		   const char *old_data, const char *old_data_end,
 		   uint32_t part_count, bool suppress_error)
 {
-	if (xrow_update_array_create(&update->root, header, old_data,
-				     old_data_end, part_count) != 0)
-		return -1;
+	xrow_update_array_create(&update->root, header, old_data,
+				 old_data_end, part_count);
 	struct xrow_update_op *op = update->ops;
 	struct xrow_update_op *ops_end = op + update->op_count;
 	for (; op < ops_end; op++) {
@@ -337,7 +283,7 @@ xrow_upsert_do_ops(struct xrow_update *update, const char *header,
 	return 0;
 }
 
-static void
+void
 xrow_update_init(struct xrow_update *update, int index_base)
 {
 	memset(update, 0, sizeof(*update));
@@ -349,11 +295,7 @@ xrow_update_finish(struct xrow_update *update, struct tuple_format *format,
 		   uint32_t *p_tuple_len)
 {
 	uint32_t tuple_len = xrow_update_array_sizeof(&update->root);
-	char *buffer = (char *) region_alloc(&fiber()->gc, tuple_len);
-	if (buffer == NULL) {
-		diag_set(OutOfMemory, tuple_len, "region_alloc", "buffer");
-		return NULL;
-	}
+	char *buffer = (char *)xregion_alloc(&fiber()->gc, tuple_len);
 	*p_tuple_len = xrow_update_array_store(&update->root, &format->fields,
 					       &format->fields.root, buffer,
 					       buffer + tuple_len);
@@ -367,7 +309,11 @@ xrow_update_check_ops(const char *expr, const char *expr_end,
 {
 	struct xrow_update update;
 	xrow_update_init(&update, index_base);
-	return xrow_update_read_ops(&update, expr, expr_end, format->dict, 0);
+	size_t region_svp = region_used(&fiber()->gc);
+	int ret = xrow_update_read_ops(&update, expr, expr_end,
+				       format->dict, 0);
+	region_truncate(&fiber()->gc, region_svp);
+	return ret;
 }
 
 const char *
@@ -380,17 +326,26 @@ xrow_update_execute(const char *expr,const char *expr_end,
 	xrow_update_init(&update, index_base);
 	const char *header = old_data;
 	uint32_t field_count = mp_decode_array(&old_data);
+	size_t region_svp = region_used(&fiber()->gc);
 
 	if (xrow_update_read_ops(&update, expr, expr_end, format->dict,
 				 field_count) != 0)
-		return NULL;
+		goto error;
 	if (xrow_update_do_ops(&update, header, old_data, old_data_end,
-			       field_count) != 0)
-		return NULL;
+			       field_count) != 0) {
+		struct error *e = diag_last_error(diag_get());
+		error_set_mp(e, "ops", expr, expr_end - expr);
+		error_set_mp(e, "tuple", header, old_data_end - header);
+		goto error;
+	}
 	if (column_mask)
 		*column_mask = update.column_mask;
 
 	return xrow_update_finish(&update, format, p_tuple_len);
+
+error:
+	region_truncate(&fiber()->gc, region_svp);
+	return NULL;
 }
 
 const char *
@@ -403,15 +358,24 @@ xrow_upsert_execute(const char *expr,const char *expr_end,
 	xrow_update_init(&update, index_base);
 	const char *header = old_data;
 	uint32_t field_count = mp_decode_array(&old_data);
+	size_t region_svp = region_used(&fiber()->gc);
 
 	if (xrow_update_read_ops(&update, expr, expr_end, format->dict,
 				 field_count) != 0)
-		return NULL;
+		goto error;
 	if (xrow_upsert_do_ops(&update, header, old_data, old_data_end,
 			       field_count, suppress_error) != 0)
-		return NULL;
+		goto error;
 	if (column_mask)
 		*column_mask = update.column_mask;
 
-	return xrow_update_finish(&update, format, p_tuple_len);
+	const char *ret = xrow_update_finish(&update, format, p_tuple_len);
+	if (ret == NULL)
+		goto error;
+
+	return ret;
+
+error:
+	region_truncate(&fiber()->gc, region_svp);
+	return NULL;
 }

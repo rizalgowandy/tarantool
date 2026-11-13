@@ -68,8 +68,8 @@ _ = fiber.create(function() ch:put(c:call("reload.test_reload")) end)
 while s:get({1}) == nil do fiber.yield(0.0001) end
 box.schema.func.reload("reload")
 _ = fiber.create(function() ch:put(c:call("reload.test_reload")) end)
-ch:get()
-ch:get()
+_ = ch:get()
+_ = ch:get()
 s:drop()
 
 box.schema.func.create('reload.test_reload_fail', {language = "C"})
@@ -86,7 +86,7 @@ box.schema.func.reload("non-existing")
 -- path for DSO copy
 os.setenv("TMPDIR", "/dev/null")
 _, err = pcall(box.schema.func.reload, "reload")
-tostring(err):gsub(': [/%w]+$', '')
+tostring(err):gsub(': [/%w]+:', ':')
 os.setenv("TMPDIR", nil)
 
 box.schema.func.drop("reload.test_reload")

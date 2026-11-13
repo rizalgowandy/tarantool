@@ -65,7 +65,7 @@ enum swim_gc_mode {
 /**
  * Create a new SWIM instance. Do not bind to a port or set any
  * parameters. Allocation and initialization only. The function
- * yields.
+ * yields. Never fails (never returns NULL).
  */
 struct swim *
 swim_new(uint64_t generation);
@@ -123,6 +123,13 @@ swim_set_payload(struct swim *swim, const char *payload, int payload_size);
 int
 swim_set_codec(struct swim *swim, enum crypto_algo algo, enum crypto_mode mode,
 	       const char *key, int key_size);
+
+/**
+ * Delete asynchronously. Does not yield. Object is invalid after return
+ * from this function and should not be used.
+ */
+void
+swim_gc(struct swim *swim);
 
 /**
  * Stop listening and broadcasting messages, cleanup all internal

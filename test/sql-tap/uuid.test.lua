@@ -3,7 +3,7 @@ local build_path = os.getenv("BUILDDIR")
 package.cpath = build_path..'/test/sql-tap/?.so;'..build_path..'/test/sql-tap/?.dylib;'..package.cpath
 
 local test = require("sqltester")
-test:plan(146)
+test:plan(145)
 
 local uuid = require("uuid")
 local uuid1 = uuid.fromstr("11111111-1111-1111-1111-111111111111")
@@ -19,15 +19,15 @@ test:do_execsql_test(
     ]], {
     })
 
-box.space.T1:insert({1, uuid1})
-box.space.T1:insert({2, uuid2})
-box.space.T1:insert({3, uuid3})
-box.space.T1:insert({4, uuid1})
-box.space.T1:insert({5, uuid1})
-box.space.T1:insert({6, uuid2})
-box.space.T2:insert({uuid1})
-box.space.T2:insert({uuid2})
-box.space.T2:insert({uuid3})
+box.space.t1:insert({1, uuid1})
+box.space.t1:insert({2, uuid2})
+box.space.t1:insert({3, uuid3})
+box.space.t1:insert({4, uuid1})
+box.space.t1:insert({5, uuid1})
+box.space.t1:insert({6, uuid2})
+box.space.t2:insert({uuid1})
+box.space.t2:insert({uuid2})
+box.space.t2:insert({uuid3})
 
 -- Check that SELECT can work with UUID.
 test:do_execsql_test(
@@ -83,7 +83,7 @@ test:do_execsql_test(
 test:do_execsql_test(
     "uuid-2.3.1",
     [[
-        SELECT count(*), u FROM t1 GROUP BY u;
+        SELECT COUNT(*), u FROM t1 GROUP BY u;
     ]], {
         3, uuid1, 1, uuid3, 2, uuid2
     })
@@ -91,7 +91,7 @@ test:do_execsql_test(
 test:do_execsql_test(
     "uuid-2.3.2",
     [[
-        SELECT count(*), u FROM t2 GROUP BY u;
+        SELECT COUNT(*), u FROM t2 GROUP BY u;
     ]], {
         1, uuid1, 1, uuid3, 1, uuid2
     })
@@ -163,13 +163,15 @@ test:do_catchsql_test(
     [[
         INSERT INTO t5f SELECT (SELECT u from t2 LIMIT 1 OFFSET 1), (SELECT u from t2 LIMIT 1);
     ]], {
-        1, "Failed to execute SQL statement: FOREIGN KEY constraint failed"
+        1, "Foreign key constraint 'fk_unnamed_t5f_f_1' failed for field "..
+        "'2 (f)': foreign tuple was not found"
     })
 
 test:do_execsql_test(
     "uuid-5.1.2",
     [[
-        INSERT INTO t5f SELECT u, u from t2 LIMIT 1;
+        INSERT INTO t5f SELECT u, NULL from t2 LIMIT 1;
+        UPDATE t5f SET f = (SELECT u FROM t2 LIMIT 1);
         SELECT * from t5f;
     ]], {
         uuid1, uuid1
@@ -190,7 +192,7 @@ test:do_catchsql_test(
     [[
         INSERT INTO t5c SELECT 1, u FROM t2 LIMIT 1;
     ]], {
-        1, "Check constraint failed 'CK': CAST(f AS STRING) != '11111111-1111-1111-1111-111111111111'"
+        1, "Check constraint 'ck' failed for a tuple"
     })
 
 test:do_execsql_test(
@@ -217,8 +219,8 @@ test:do_catchsql_test(
     [[
         INSERT INTO t5u SELECT 2, u FROM t2 LIMIT 1;
     ]], {
-        1, 'Duplicate key exists in unique index "unique_unnamed_T5U_2" '..
-        'in space "T5U" with old tuple - '..
+        1, 'Duplicate key exists in unique index "unique_unnamed_t5u_2" '..
+        'in space "t5u" with old tuple - '..
         '[1, 11111111-1111-1111-1111-111111111111] and new tuple - '..
         '[2, 11111111-1111-1111-1111-111111111111]'
     })
@@ -493,31 +495,31 @@ test:do_catchsql_test(
     [[
         SELECT u || u from t2;
     ]], {
-        1, "Inconsistent types: expected string or varbinary got uuid('11111111-1111-1111-1111-111111111111')"
+        1, "Inconsistent types: expected string or varbinary got uuid(11111111-1111-1111-1111-111111111111)"
     })
 
 local func = {language = 'Lua', body = 'function(x) return type(x) end',
               returns = 'string', param_list = {'any'}, exports = {'SQL'}}
-box.schema.func.create('RETURN_TYPE', func);
+box.schema.func.create('return_type', func);
 
 -- Check that Lua user-defined functions can accept UUID.
 test:do_execsql_test(
     "uuid-6.2",
     [[
-        SELECT RETURN_TYPE(u) FROM t2;
+        SELECT return_type(u) FROM t2;
     ]], {
         "cdata", "cdata", "cdata"
     })
 
 func = {language = 'Lua', returns = 'uuid', param_list = {}, exports = {'SQL'},
         body = 'function(x) return require("uuid").fromstr("11111111-1111-1111-1111-111111111111") end'}
-box.schema.func.create('GET_UUID', func);
+box.schema.func.create('get_uuid', func);
 
 -- Check that Lua user-defined functions can return UUID.
 test:do_execsql_test(
     "uuid-6.3",
     [[
-        SELECT GET_UUID();
+        SELECT get_uuid();
     ]], {
         uuid1
     })
@@ -552,7 +554,7 @@ test:do_catchsql_test(
     [[
         SELECT cast(u AS UNSIGNED) FROM t2;
     ]], {
-        1, "Type mismatch: can not convert uuid('11111111-1111-1111-1111-111111111111') to unsigned"
+        1, "Type mismatch: can not convert uuid(11111111-1111-1111-1111-111111111111) to unsigned"
     })
 
 test:do_execsql_test(
@@ -570,7 +572,7 @@ test:do_catchsql_test(
     [[
         SELECT cast(u AS NUMBER) FROM t2;
     ]], {
-        1, "Type mismatch: can not convert uuid('11111111-1111-1111-1111-111111111111') to number"
+        1, "Type mismatch: can not convert uuid(11111111-1111-1111-1111-111111111111) to number"
     })
 
 test:do_catchsql_test(
@@ -578,7 +580,7 @@ test:do_catchsql_test(
     [[
         SELECT cast(u AS DOUBLE) FROM t2;
     ]], {
-        1, "Type mismatch: can not convert uuid('11111111-1111-1111-1111-111111111111') to double"
+        1, "Type mismatch: can not convert uuid(11111111-1111-1111-1111-111111111111) to double"
     })
 
 test:do_catchsql_test(
@@ -586,7 +588,7 @@ test:do_catchsql_test(
     [[
         SELECT cast(u AS INTEGER) FROM t2;
     ]], {
-        1, "Type mismatch: can not convert uuid('11111111-1111-1111-1111-111111111111') to integer"
+        1, "Type mismatch: can not convert uuid(11111111-1111-1111-1111-111111111111) to integer"
     })
 
 test:do_catchsql_test(
@@ -594,13 +596,13 @@ test:do_catchsql_test(
     [[
         SELECT cast(u AS BOOLEAN) FROM t2;
     ]], {
-        1, "Type mismatch: can not convert uuid('11111111-1111-1111-1111-111111111111') to boolean"
+        1, "Type mismatch: can not convert uuid(11111111-1111-1111-1111-111111111111) to boolean"
     })
 
 test:do_execsql_test(
     "uuid-7.1.7",
     [[
-        SELECT hex(cast(u AS VARBINARY)) FROM t2;
+        SELECT HEX(cast(u AS VARBINARY)) FROM t2;
     ]], {
         "11111111111111111111111111111111",
         "11111111333311111111111111111111",
@@ -707,7 +709,7 @@ test:do_catchsql_test(
     [[
         INSERT INTO tu(u) SELECT u FROM t2;
     ]], {
-        1, "Type mismatch: can not convert uuid('11111111-1111-1111-1111-111111111111') to unsigned"
+        1, "Type mismatch: can not convert uuid(11111111-1111-1111-1111-111111111111) to unsigned"
     })
 
 test:do_catchsql_test(
@@ -715,7 +717,7 @@ test:do_catchsql_test(
     [[
         INSERT INTO ts(s) SELECT u FROM t2;
     ]], {
-        1, "Type mismatch: can not convert uuid('11111111-1111-1111-1111-111111111111') to string"
+        1, "Type mismatch: can not convert uuid(11111111-1111-1111-1111-111111111111) to string"
     })
 
 test:do_catchsql_test(
@@ -723,7 +725,7 @@ test:do_catchsql_test(
     [[
         INSERT INTO tn(n) SELECT u FROM t2;
     ]], {
-        1, "Type mismatch: can not convert uuid('11111111-1111-1111-1111-111111111111') to number"
+        1, "Type mismatch: can not convert uuid(11111111-1111-1111-1111-111111111111) to number"
     })
 
 test:do_catchsql_test(
@@ -731,7 +733,7 @@ test:do_catchsql_test(
     [[
         INSERT INTO td(d) SELECT u FROM t2;
     ]], {
-        1, "Type mismatch: can not convert uuid('11111111-1111-1111-1111-111111111111') to double"
+        1, "Type mismatch: can not convert uuid(11111111-1111-1111-1111-111111111111) to double"
     })
 
 test:do_catchsql_test(
@@ -739,7 +741,7 @@ test:do_catchsql_test(
     [[
         INSERT INTO ti(i) SELECT u FROM t2;
     ]], {
-        1, "Type mismatch: can not convert uuid('11111111-1111-1111-1111-111111111111') to integer"
+        1, "Type mismatch: can not convert uuid(11111111-1111-1111-1111-111111111111) to integer"
     })
 
 test:do_catchsql_test(
@@ -747,7 +749,7 @@ test:do_catchsql_test(
     [[
         INSERT INTO tb(b) SELECT u FROM t2;
     ]], {
-        1, "Type mismatch: can not convert uuid('11111111-1111-1111-1111-111111111111') to boolean"
+        1, "Type mismatch: can not convert uuid(11111111-1111-1111-1111-111111111111) to boolean"
     })
 
 test:do_catchsql_test(
@@ -755,7 +757,7 @@ test:do_catchsql_test(
     [[
         INSERT INTO tv(v) SELECT u FROM t2;
     ]], {
-        1, "Type mismatch: can not convert uuid('11111111-1111-1111-1111-111111111111') to varbinary"
+        1, "Type mismatch: can not convert uuid(11111111-1111-1111-1111-111111111111) to varbinary"
     })
 
 test:do_execsql_test(
@@ -898,7 +900,7 @@ test:do_execsql_test(
         INSERT INTO t10 VALUES (4, NULL);
         SELECT * FROM t10 WHERE i = 4;
     ]], {
-        4, ''
+        4, uuid1
     })
 
 -- Check that UPDATE of UUID field works.
@@ -945,7 +947,7 @@ test:do_catchsql_test(
     [[
         SELECT -u FROM t2;
     ]], {
-        1, "Type mismatch: can not convert uuid('11111111-1111-1111-1111-111111111111') to integer, decimal or double"
+        1, "Type mismatch: can not convert uuid(11111111-1111-1111-1111-111111111111) to integer, decimal or double"
     })
 
 test:do_catchsql_test(
@@ -953,7 +955,9 @@ test:do_catchsql_test(
     [[
         SELECT u + 1 FROM t2;
     ]], {
-        1, "Type mismatch: can not convert uuid('11111111-1111-1111-1111-111111111111') to integer, decimal or double"
+        1, "Type mismatch: can not convert "..
+           "uuid(11111111-1111-1111-1111-111111111111) to integer, decimal, "..
+           "double, datetime or interval"
     })
 
 test:do_catchsql_test(
@@ -961,7 +965,9 @@ test:do_catchsql_test(
     [[
         SELECT u - 1 FROM t2;
     ]], {
-        1, "Type mismatch: can not convert uuid('11111111-1111-1111-1111-111111111111') to integer, decimal or double"
+        1, "Type mismatch: can not convert "..
+           "uuid(11111111-1111-1111-1111-111111111111) to integer, decimal, "..
+           "double, datetime or interval"
     })
 
 test:do_catchsql_test(
@@ -969,7 +975,7 @@ test:do_catchsql_test(
     [[
         SELECT u * 1 FROM t2;
     ]], {
-        1, "Type mismatch: can not convert uuid('11111111-1111-1111-1111-111111111111') to integer, decimal or double"
+        1, "Type mismatch: can not convert uuid(11111111-1111-1111-1111-111111111111) to integer, decimal or double"
     })
 
 test:do_catchsql_test(
@@ -977,7 +983,7 @@ test:do_catchsql_test(
     [[
         SELECT u / 1 FROM t2;
     ]], {
-        1, "Type mismatch: can not convert uuid('11111111-1111-1111-1111-111111111111') to integer, decimal or double"
+        1, "Type mismatch: can not convert uuid(11111111-1111-1111-1111-111111111111) to integer, decimal or double"
     })
 
 test:do_catchsql_test(
@@ -985,7 +991,7 @@ test:do_catchsql_test(
     [[
         SELECT u % 1 FROM t2;
     ]], {
-        1, "Type mismatch: can not convert uuid('11111111-1111-1111-1111-111111111111') to integer"
+        1, "Type mismatch: can not convert uuid(11111111-1111-1111-1111-111111111111) to integer"
     })
 
 -- Check that bitwise operations work with UUIDs as intended.
@@ -994,7 +1000,7 @@ test:do_catchsql_test(
     [[
         SELECT ~u FROM t2;
     ]], {
-        1, "Type mismatch: can not convert uuid('11111111-1111-1111-1111-111111111111') to unsigned"
+        1, "Type mismatch: can not convert uuid(11111111-1111-1111-1111-111111111111) to unsigned"
     })
 
 test:do_catchsql_test(
@@ -1002,7 +1008,7 @@ test:do_catchsql_test(
     [[
         SELECT u >> 1 FROM t2;
     ]], {
-        1, "Type mismatch: can not convert uuid('11111111-1111-1111-1111-111111111111') to unsigned"
+        1, "Type mismatch: can not convert uuid(11111111-1111-1111-1111-111111111111) to unsigned"
     })
 
 test:do_catchsql_test(
@@ -1010,7 +1016,7 @@ test:do_catchsql_test(
     [[
         SELECT u << 1 FROM t2;
     ]], {
-        1, "Type mismatch: can not convert uuid('11111111-1111-1111-1111-111111111111') to unsigned"
+        1, "Type mismatch: can not convert uuid(11111111-1111-1111-1111-111111111111) to unsigned"
     })
 
 test:do_catchsql_test(
@@ -1018,7 +1024,7 @@ test:do_catchsql_test(
     [[
         SELECT u | 1 FROM t2;
     ]], {
-        1, "Type mismatch: can not convert uuid('11111111-1111-1111-1111-111111111111') to unsigned"
+        1, "Type mismatch: can not convert uuid(11111111-1111-1111-1111-111111111111) to unsigned"
     })
 
 test:do_catchsql_test(
@@ -1026,7 +1032,7 @@ test:do_catchsql_test(
     [[
         SELECT u & 1 FROM t2;
     ]], {
-        1, "Type mismatch: can not convert uuid('11111111-1111-1111-1111-111111111111') to unsigned"
+        1, "Type mismatch: can not convert uuid(11111111-1111-1111-1111-111111111111) to unsigned"
     })
 
 -- Check that logical operations work with UUIDs as intended.
@@ -1035,7 +1041,7 @@ test:do_catchsql_test(
     [[
         SELECT NOT u FROM t2;
     ]], {
-        1, "Type mismatch: can not convert uuid('11111111-1111-1111-1111-111111111111') to boolean"
+        1, "Type mismatch: can not convert uuid(11111111-1111-1111-1111-111111111111) to boolean"
     })
 
 test:do_catchsql_test(
@@ -1043,7 +1049,7 @@ test:do_catchsql_test(
     [[
         SELECT u AND true FROM t2;
     ]], {
-        1, "Type mismatch: can not convert uuid('11111111-1111-1111-1111-111111111111') to boolean"
+        1, "Type mismatch: can not convert uuid(11111111-1111-1111-1111-111111111111) to boolean"
     })
 
 test:do_catchsql_test(
@@ -1051,7 +1057,7 @@ test:do_catchsql_test(
     [[
         SELECT u OR true FROM t2;
     ]], {
-        1, "Type mismatch: can not convert uuid('11111111-1111-1111-1111-111111111111') to boolean"
+        1, "Type mismatch: can not convert uuid(11111111-1111-1111-1111-111111111111) to boolean"
     })
 
 test:do_catchsql_test(
@@ -1059,7 +1065,7 @@ test:do_catchsql_test(
     [[
         SELECT true AND u FROM t2;
     ]], {
-        1, "Type mismatch: can not convert uuid('11111111-1111-1111-1111-111111111111') to boolean"
+        1, "Type mismatch: can not convert uuid(11111111-1111-1111-1111-111111111111) to boolean"
     })
 
 test:do_catchsql_test(
@@ -1067,7 +1073,7 @@ test:do_catchsql_test(
     [[
         SELECT true OR u FROM t2;
     ]], {
-        1, "Type mismatch: can not convert uuid('11111111-1111-1111-1111-111111111111') to boolean"
+        1, "Type mismatch: can not convert uuid(11111111-1111-1111-1111-111111111111) to boolean"
     })
 
 -- Check that comparison with UUID works as intended.
@@ -1211,7 +1217,7 @@ test:do_execsql_test(
         INSERT INTO t14 VALUES (x'11111111111111111111111111111111');
         INSERT INTO t14 VALUES (CAST(x'11111111111111111111111111111111' AS UUID));
         INSERT INTO t14 VALUES ('11111111-1111-1111-1111-111111111111');
-        SELECT typeof(s) FROM t14;
+        SELECT TYPEOF(s) FROM t14;
     ]], {
         "scalar", "scalar", "scalar", "scalar", "scalar", "scalar", "scalar"
     })
@@ -1222,29 +1228,11 @@ s:insert({1, {['1'] = 1, ['2'] = 2, ['3']= 3}, {1,2,3}})
 s:insert({2, {['1'] = 1, ['2'] = 2}, {1,2,3,4}})
 s:insert({3, {['1'] = 1}, {1,2,3,4,5}})
 
--- Make sure that addition of UUID does not change behaviour of MAP and ARRAY.
--- Currently it works wrong, but there should not segmentation faults.
-test:do_execsql_test(
-    "uuid-15.1",
-    [[
-        SELECT i FROM t15 ORDER BY m;
-    ]], {
-        3,2,1
-    })
-
-test:do_execsql_test(
-    "uuid-15.2",
-    [[
-        SELECT i FROM t15 ORDER BY a;
-    ]], {
-        3,2,1
-    })
-
 -- Check function uuid().
 test:do_execsql_test(
     "uuid-16.1",
     [[
-        SELECT typeof(uuid());
+        SELECT TYPEOF(UUID());
     ]], {
         "uuid"
     })
@@ -1252,7 +1240,7 @@ test:do_execsql_test(
 test:do_execsql_test(
     "uuid-16.2",
     [[
-        SELECT typeof(uuid(4));
+        SELECT TYPEOF(UUID(4));
     ]], {
         "uuid"
     })
@@ -1260,7 +1248,7 @@ test:do_execsql_test(
 test:do_catchsql_test(
     "uuid-16.3",
     [[
-        SELECT uuid(1);
+        SELECT UUID(1);
     ]], {
         1, "Function UUID does not support versions other than 4"
     })
@@ -1268,7 +1256,7 @@ test:do_catchsql_test(
 test:do_catchsql_test(
     "uuid-16.4",
     [[
-        SELECT uuid('asd');
+        SELECT UUID('asd');
     ]], {
         1, "Failed to execute SQL statement: wrong arguments for function UUID()"
     })
@@ -1276,7 +1264,7 @@ test:do_catchsql_test(
 test:do_catchsql_test(
     "uuid-16.5",
     [[
-        SELECT uuid(4, 5);
+        SELECT UUID(4, 5);
     ]], {
         1, "Wrong number of arguments is passed to UUID(): expected from 0 to 1, got 2"
     })
@@ -1285,7 +1273,16 @@ test:do_catchsql_test(
 test:do_execsql_test(
     "uuid-16.6",
     [[
-        SELECT uuid() != uuid();
+        SELECT UUID() != UUID();
+    ]], {
+        true
+    })
+
+-- Make sure the uuid(NULL) returns NULL.
+test:do_execsql_test(
+    "uuid-16.7",
+    [[
+        SELECT UUID(NULL) IS NULL;
     ]], {
         true
     })
@@ -1310,7 +1307,7 @@ test:do_catchsql_test(
 test:execsql([[
     DROP TRIGGER t;
     DROP VIEW v;
-    DROP TABLE t15;
+    DROP TABLE T15;
     DROP TABLE t14;
     DROP TABLE t10;
     DROP TABLE t9t;

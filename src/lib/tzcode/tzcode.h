@@ -37,12 +37,12 @@ struct tnt_tm {
 
 	/** Seconds east of UTC. */
 	long int tm_gmtoff;
-	/** Timezone abbreviation. */
-	const char *tm_zone;
 	/** Seconds since Epoch */
 	int64_t tm_epoch;
 	/** nanoseconds */
 	int tm_nsec;
+	/** Timezone index. */
+	int16_t tm_tzindex;
 };
 
 /**
@@ -50,11 +50,32 @@ struct tnt_tm {
  * which has been extended with %f (fractions of second)
  * flag support. In all other aspect it's behaving exactly
  * like standard strftime.
+ * Implements snprintf-style (may be used with SNPRINT macro).
  * @sa strftime()
  */
 size_t
 tnt_strftime(char *s, size_t maxsize, const char *format,
 	     const struct tnt_tm *tm);
+
+/**
+ * tnt_strptime is a Tarantool version of POSIX strptime()
+ * which has been extended with %f (fractions of second)
+ * flag support.
+ * @sa strptime()
+ */
+char *
+tnt_strptime(const char *__restrict buf, const char *__restrict fmt,
+	     struct tnt_tm *__restrict tm);
+
+typedef struct state *timezone_t;
+
+/** Find installed timezone definition and load it to memory */
+timezone_t tzalloc(const char *);
+/** Free loaded timezone definition */
+void tzfree(timezone_t);
+
+struct tnt_tm *
+tnt_localtime_rz(struct state *sp, time_t const *timep, struct tnt_tm *tmp);
 
 #if defined(__cplusplus)
 } /* extern "C" */

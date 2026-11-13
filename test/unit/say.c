@@ -3,6 +3,7 @@
 #include <memory.h>
 #include "unit.h"
 #include "say.h"
+#include "tt_strerror.h"
 #include <pthread.h>
 #include <errinj.h>
 #include <coio_task.h>
@@ -52,12 +53,13 @@ parse_syslog_opts(const char *input)
 
 static int
 format_func_custom(struct log *log, char *buf, int len, int level,
-		   const char *filename, int line, const char *error,
-		   const char *format, va_list ap)
+		   const char *module, const char *filename, int line,
+		   const char *error, const char *format, va_list ap)
 {
 	int total = 0;
 	(void) log;
 	(void) level;
+	(void)module;
 	(void) filename;
 	(void) line;
 	(void) error;
@@ -128,7 +130,7 @@ test_log_rotate()
 	while (created_logs < running)
 		tt_pthread_cond_wait(&cond_sync, &mutex);
 	tt_pthread_mutex_unlock(&mutex);
-	say_logrotate(NULL, NULL, 0);
+	say_logrotate();
 
 	for (int i = 0; i < created_logs; i++) {
 		log_destroy(&loggers[i].logger);
@@ -166,9 +168,9 @@ int main()
 {
 	memory_init();
 	fiber_init(fiber_c_invoke);
-	say_logger_init("/dev/null", S_INFO, 0, "plain", 0);
+	say_logger_init("/dev/null", S_INFO, 0, "plain");
 
-	plan(33);
+	plan(36);
 
 #define PARSE_LOGGER_TYPE(input, rc) \
 	ok(parse_logger_type(input) == rc, "%s", input)
@@ -203,7 +205,8 @@ int main()
 	char template[] = "/tmp/tmpdir.XXXXXX";
 	const char *tmp_dir = mkdtemp(template);
 	if (tmp_dir == NULL) {
-		diag("unit/say: failed to create temp dir: %s", strerror(errno));
+		diag("unit/say: failed to create temp dir: %s",
+		     tt_strerror(errno));
 		return check_plan();
 	}
 	char tmp_filename[30];
@@ -238,10 +241,6 @@ int main()
 	coio_enable();
 
 	struct fiber *test = fiber_new("loggers", main_f);
-	if (test == NULL) {
-		diag_log();
-		return check_plan();
-	}
 	fiber_wakeup(test);
 	ev_run(loop(), 0);
 
@@ -269,6 +268,23 @@ int main()
 		ok(strstr(line, "<131>") != NULL, "syslog line");
 	}
 	log_destroy(&test_log);
+
+	/* Test gh-4450. */
+	log_create(&test_log, tmp_filename, false);
+	say_logrotate();
+	coio_shutdown();
+	log_destroy(&test_log);
+
+	const char *level_str = say_log_level_str(S_DEBUG);
+	ok(strcmp("DEBUG", say_log_level_str(S_DEBUG)) == 0,
+	   "level string is %s", level_str);
+	level_str = say_log_level_str(-1);
+	ok(say_log_level_str(-1) == NULL,
+	   "level string is %s", level_str);
+	level_str = say_log_level_str(1000);
+	ok(say_log_level_str(-1) == NULL,
+	   "level string is %s", level_str);
+
 	fiber_free();
 	memory_free();
 	unlink(tmp_filename);

@@ -12,7 +12,7 @@ test_run:cmd("push filter 'error: Failed to allocate [0-9]+ ' to 'error: Failed 
 space = box.schema.space.create('tweedledum')
 ---
 ...
-index = space:create_index('primary', { type = 'hash' })
+index = space:create_index('primary')
 ---
 ...
 test_run:cmd("setopt delimiter ';'")
@@ -162,6 +162,10 @@ t
   - [48, 'testtesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttest']
   - [49, 'testtesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttest']
 ...
+-- TODO(gh-3807) - may fail to truncate due to memory limit is reached
+box.cfg{memtx_memory = box.cfg.memtx_memory + 1024}
+---
+...
 space:truncate()
 ---
 ...
@@ -241,14 +245,14 @@ str = string.rep('a', 15000) -- about size of index memory block
 space = box.schema.space.create('tweedledum')
 ---
 ...
-index = space:create_index('primary', { type = 'hash' })
+index = space:create_index('primary')
 ---
 ...
 collectgarbage('collect')
 ---
 - 0
 ...
-for i=1,10000 do space:insert{i, str} end
+for i=1,10492 do space:insert{i, str} end
 ---
 - error: Failed to allocate <NUM> bytes in slab allocator for memtx_tuple
 ...
@@ -273,7 +277,7 @@ collectgarbage('collect')
 ---
 - 0
 ...
-for i=1,10000 do space:insert{i, str} end
+for i=1,10492 do space:insert{i, str} end
 ---
 - error: Failed to allocate <NUM> bytes in slab allocator for memtx_tuple
 ...

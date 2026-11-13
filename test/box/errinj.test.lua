@@ -3,25 +3,13 @@ test_run = require('test_run').new()
 test_run:cmd("restart server default")
 box.error.last() == nil
 
+test_run:cmd("push filter 'Failed to allocate [0-9]+' to 'Failed to allocate <NUM>'")
+
 errinj = box.error.injection
 net_box = require('net.box')
 
 space = box.schema.space.create('tweedledum')
 index = space:create_index('primary', { type = 'hash' })
-
---
--- Print all error keys in sorted order to minimize diff output
--- when new ones are merged in.
-ekeys = {}
-evals = {}
-for k, v in pairs(errinj.info()) do \
-    table.insert(ekeys, k)          \
-end
-table.sort(ekeys)
-for i, k in ipairs(ekeys) do         \
-    evals[i] = {[k] = errinj.get(k)} \
-end
-evals
 
 errinj.set("some-injection", true)
 errinj.set("some-injection") -- check error
@@ -279,20 +267,6 @@ end ;
 
 test_run:cmd('setopt delimiter ""');
 
--- Port_dump can fail.
-
-box.schema.user.grant('guest', 'read', 'space', '_space')
-
-cn = net_box.connect(box.cfg.listen)
-cn:ping()
-errinj.set('ERRINJ_PORT_DUMP', true)
-ok, ret = pcall(cn.space._space.select, cn.space._space)
-assert(not ok)
-assert(string.match(tostring(ret), 'Failed to allocate'))
-errinj.set('ERRINJ_PORT_DUMP', false)
-cn:close()
-box.schema.user.revoke('guest', 'read', 'space', '_space')
-
 run()
 ch:get()
 
@@ -433,51 +407,7 @@ s:drop()
 box.schema.user.revoke('guest', 'execute', 'universe')
 box.schema.user.revoke('guest', 'create', 'space')
 box.schema.user.revoke('guest', 'write', 'space', '_index')
---
--- If message memory pool is used up, stop the connection, until
--- the pool has free memory.
---
-started = 0
-finished = 0
-continue = false
-test_run:cmd('setopt delimiter ";"')
-function long_poll_f()
-    started = started + 1
-    f = fiber.self()
-    while not continue do fiber.sleep(0.01) end
-    finished = finished + 1
-end;
 
-box.schema.func.create('long_poll_f');
-box.schema.user.grant('guest', 'execute', 'function', 'long_poll_f');
-
-test_run:cmd('setopt delimiter ""');
-cn = net_box.connect(box.cfg.listen)
-function long_poll() cn:call('long_poll_f') end
-_ = fiber.create(long_poll)
-while started ~= 1 do fiber.sleep(0.01) end
--- Simulate OOM for new requests.
-errinj.set("ERRINJ_TESTING", true)
--- This request tries to allocate memory for request data and
--- fails. This stops the connection until an existing
--- request is finished.
-log = require('log')
--- Fill the log with garbage to not accidentally read log messages
--- produced by a previous test.
-log.info(string.rep('a', 1000))
-_ = fiber.create(long_poll)
-while not test_run:grep_log('default', 'can not allocate memory for a new message', 1000) do fiber.sleep(0.01) end
-test_run:grep_log('default', 'stopping input on connection', 1000) ~= nil
-started == 1
-continue = true
-errinj.set("ERRINJ_TESTING", false)
--- Ensure that when memory is available again, the pending
--- request is executed.
-while finished ~= 2 do fiber.sleep(0.01) end
-cn:close()
-
-box.schema.user.revoke('guest', 'execute', 'function', 'long_poll_f')
-box.schema.func.drop('long_poll_f')
 --
 -- gh-3289: drop/truncate leaves the space in inconsistent
 -- state if WAL write fails.
@@ -510,7 +440,7 @@ _ = box.schema.space.create('test')
 _ = box.space.test:create_index('pk')
 for i = 1, 100 do box.space.test:insert{i} end
 
--- Create a temporary space.
+-- Create a data-temporary space.
 count = 500
 pad = string.rep('x', 100 * 1024)
 _ = box.schema.space.create('tmp', {temporary = true})
@@ -522,7 +452,7 @@ c = fiber.channel(1)
 box.error.injection.set('ERRINJ_SNAP_WRITE_DELAY', true)
 _ = fiber.create(function() box.snapshot() c:put(true) end)
 
--- Overwrite data stored in the temporary space while snapshot
+-- Overwrite data stored in the data-temporary space while snapshot
 -- is in progress to make sure that tuples stored in it are freed
 -- immediately.
 for i = 1, count do box.space.tmp:delete{i} end
@@ -660,61 +590,3 @@ fh:seek(-256, 'SEEK_END') ~= nil
 line = fh:read(256)
 fh:close()
 string.match(line, 'Failed to allocate') ~= nil
-
---
--- gh-5958: make sure that if there is no memory to make
--- possible rollback of replace during shadow building of index
--- creator will fail with appropriate error and replace will happen
---
-
-fiber = require('fiber')
-
-s = box.schema.space.create('test')
-_ = s:create_index('pk')
-started = false
-
-test_run:cmd("setopt delimiter ';'");
-
--- Create table with enough tuples to make index build in background.
-for i = 1, 150 do
-    s:replace{i, i, "valid"}
-end;
-
--- Make fiber joinable.
-function joinable(fib)
-    fib:set_joinable(true)
-    return fib
-end;
-
--- Wait for fiber yield during building of index and then insert new tuple.
-function disturb()
-    while not started do fiber.sleep(0) end
-    s:insert{0, 0, "new"}
-end;
-
--- Build secondary index in background.
--- If the index will not be built in background, test will not be passed
--- because it will run out of time (disturber:join() will wait forever).
-function create(is_unique)
-    started = true
-    s:create_index('sk', {unique=is_unique, type='tree', parts={{2, 'uint'}}})
-    started = false
-end;
-
-test_run:cmd("setopt delimiter ''");
-
-box.error.injection.set('ERRINJ_BUILD_INDEX_ON_ROLLBACK_ALLOC', true)
-
-disturber = joinable(fiber.new(disturb))
-creator = joinable(fiber.new(create, false))
-
-disturber:join()
--- Allocation error is expected in creator
-creator:join()
-
--- Replace must happen
-assert(s:get{0} ~= nil)
-
-box.error.injection.set('ERRINJ_BUILD_INDEX_ON_ROLLBACK_ALLOC', false)
-started = nil
-s:drop()

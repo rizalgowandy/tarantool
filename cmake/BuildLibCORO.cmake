@@ -4,7 +4,6 @@ macro(libcoro_build)
     set(coro_src
         ${PROJECT_SOURCE_DIR}/third_party/coro/coro.c
     )
-
     add_library(coro STATIC ${coro_src})
 
     set(LIBCORO_INCLUDE_DIR ${PROJECT_SOURCE_DIR}/third_party/coro)
@@ -20,4 +19,3 @@ macro(libcoro_build)
 
     unset(coro_src)
 endmacro(libcoro_build)
-

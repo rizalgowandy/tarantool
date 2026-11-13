@@ -69,7 +69,7 @@ curl_multi_process(CURLM *multi, curl_socket_t sockfd, int events)
 	}
 
 	/*
-	 * Check for resuls
+	 * Check for results.
 	 */
 
 	CURLMsg *msg;
@@ -91,6 +91,8 @@ curl_multi_process(CURLM *multi, curl_socket_t sockfd, int events)
 			errinj->bparam = false;
 #endif
 		fiber_cond_signal(&request->cond);
+		if (request->done_handler)
+			request->done_handler(request->done_handler_arg);
 	}
 }
 
@@ -257,11 +259,32 @@ error_exit:
 }
 
 void
+curl_env_finish(struct curl_env *env)
+{
+	assert(env);
+	if (env->multi != NULL) {
+		CURL **list = curl_multi_get_handles(env->multi);
+		if (list) {
+			for (int i = 0; list[i]; i++) {
+				/* We are not interested in mcode and
+				 * setting curl_diag_set_merror, because
+				 * it is a destructor.
+				 */
+				curl_multi_remove_handle(env->multi, list[i]);
+			}
+			curl_free(list);
+		}
+		curl_multi_cleanup(env->multi);
+	}
+}
+
+void
 curl_env_destroy(struct curl_env *env)
 {
 	assert(env);
-	if (env->multi != NULL)
-		curl_multi_cleanup(env->multi);
+
+	assert(mempool_count(&env->sock_pool) == 0);
+	assert(mempool_used(&env->sock_pool) == 0);
 
 	mempool_destroy(&env->sock_pool);
 }
@@ -277,6 +300,8 @@ curl_request_create(struct curl_request *curl_request)
 	curl_request->in_progress = false;
 	curl_request->code = CURLE_OK;
 	fiber_cond_create(&curl_request->cond);
+	curl_request->done_handler = NULL;
+	curl_request->done_handler_arg = NULL;
 	return 0;
 }
 
@@ -288,15 +313,42 @@ curl_request_destroy(struct curl_request *curl_request)
 	fiber_cond_destroy(&curl_request->cond);
 }
 
+/**
+ * Set diag if mcode != CURLM_OK.
+ */
+static inline void
+curl_diag_set_merror(CURLMcode mcode)
+{
+	if (mcode != CURLM_OK) {
+		switch (mcode) {
+		case CURLM_OUT_OF_MEMORY:
+			diag_set(OutOfMemory, 0, "curl", "internal");
+			break;
+		default:
+			errno = EINVAL;
+			diag_set(SystemError, "curl_multi_error: %s",
+				 curl_multi_strerror(mcode));
+		}
+	}
+}
+
 CURLMcode
-curl_execute(struct curl_request *curl_request, struct curl_env *env,
-	     double timeout)
+curl_request_start(struct curl_request *curl_request, struct curl_env *env)
 {
 	CURLMcode mcode;
 	curl_request->in_progress = true;
 	mcode = curl_multi_add_handle(env->multi, curl_request->easy);
-	if (mcode != CURLM_OK)
-		goto curl_merror;
+	curl_diag_set_merror(mcode);
+
+	return mcode;
+}
+
+CURLMcode
+curl_request_finish(struct curl_request *curl_request, struct curl_env *env,
+		    double timeout)
+{
+	CURLMcode mcode;
+
 	ERROR_INJECT_YIELD(ERRINJ_HTTP_RESPONSE_ADD_WAIT);
 	/* Don't wait on a cond if request has already failed or finished. */
 	if (curl_request->code == CURLE_OK && curl_request->in_progress) {
@@ -307,20 +359,8 @@ curl_execute(struct curl_request *curl_request, struct curl_env *env,
 		--env->stat.active_requests;
 	}
 	mcode = curl_multi_remove_handle(env->multi, curl_request->easy);
-	if (mcode != CURLM_OK)
-		goto curl_merror;
+	curl_diag_set_merror(mcode);
+	curl_request->in_progress = false;
 
-	return CURLM_OK;
-
-curl_merror:
-	switch (mcode) {
-	case CURLM_OUT_OF_MEMORY:
-		diag_set(OutOfMemory, 0, "curl", "internal");
-		break;
-	default:
-		errno = EINVAL;
-		diag_set(SystemError, "curl_multi_error: %s",
-			 curl_multi_strerror(mcode));
-	}
 	return mcode;
 }

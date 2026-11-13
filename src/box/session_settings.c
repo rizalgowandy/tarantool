@@ -43,13 +43,13 @@ struct session_setting session_settings[SESSION_SETTING_COUNT] = {};
 /** Corresponding names of session settings. */
 const char *session_setting_strs[SESSION_SETTING_COUNT] = {
 	"sql_default_engine",
-	"sql_defer_foreign_keys",
 	"sql_full_column_names",
 	"sql_full_metadata",
 	"sql_parser_debug",
 	"sql_recursive_triggers",
 	"sql_reverse_unordered_selects",
 	"sql_select_debug",
+	"sql_seq_scan",
 	"sql_vdbe_debug",
 };
 
@@ -187,13 +187,19 @@ session_settings_index_destroy(struct index *index)
 	free(index);
 }
 
+/** Implementation of create_iterator for session_settings. */
 static struct iterator *
 session_settings_index_create_iterator(struct index *base,
-				       enum iterator_type type, const char *key,
-				       uint32_t part_count)
+				       enum iterator_type type,
+				       const char *key, uint32_t part_count,
+				       const char *pos)
 {
 	struct session_settings_index *index =
 		(struct session_settings_index *)base;
+	if (pos != NULL) {
+		diag_set(UnsupportedIndexFeature, base->def, "pagination");
+		return NULL;
+	}
 	char *decoded_key = NULL;
 	if (part_count > 0) {
 		assert(part_count == 1);
@@ -216,6 +222,7 @@ session_settings_index_create_iterator(struct index *base,
 		return NULL;
 	}
 	iterator_create(&it->base, base);
+	it->base.position = generic_iterator_position;
 	it->base.free = session_settings_iterator_free;
 	it->key = decoded_key;
 	it->is_eq = type == ITER_EQ || type == ITER_REQ;
@@ -267,22 +274,21 @@ static const struct index_vtab session_settings_index_vtab = {
 		generic_index_def_change_requires_rebuild,
 	/* .size = */ generic_index_size,
 	/* .bsize = */ generic_index_bsize,
+	/* .quantile = */ generic_index_quantile,
 	/* .min = */ generic_index_min,
 	/* .max = */ generic_index_max,
 	/* .random = */ generic_index_random,
 	/* .count = */ generic_index_count,
 	/* .get = */ session_settings_index_get,
-	/* .replace = */ generic_index_replace,
 	/* .create_iterator = */ session_settings_index_create_iterator,
-	/* .create_snapshot_iterator = */
-		generic_index_create_snapshot_iterator,
+	/* .create_iterator_with_offset = */
+	generic_index_create_iterator_with_offset,
+	/* .create_arrow_stream = */ generic_index_create_arrow_stream,
+	/* .create_read_view = */ generic_index_create_read_view,
+	/* .info = */ generic_index_info,
 	/* .stat = */ generic_index_stat,
 	/* .compact = */ generic_index_compact,
 	/* .reset_stat = */ generic_index_reset_stat,
-	/* .begin_build = */ generic_index_begin_build,
-	/* .reserve = */ generic_index_reserve,
-	/* .build_next = */ generic_index_build_next,
-	/* .end_build = */ generic_index_end_build,
 };
 
 static void
@@ -335,14 +341,8 @@ session_settings_space_execute_update(struct space *space, struct txn *txn,
 
 	const char *new_key, *key = request->key;
 	uint32_t new_size, new_key_len, key_len = mp_decode_array(&key);
-	if (key_len == 0) {
-		diag_set(ClientError, ER_EXACT_MATCH, 1, 0);
+	if (exact_key_validate(pk_def, key, key_len) != 0)
 		return -1;
-	}
-	if (key_len > 1 || mp_typeof(*key) != MP_STR) {
-		diag_set(ClientError, ER_KEY_PART_TYPE, 0, "string");
-		return -1;
-	}
 	key = mp_decode_str(&key, &key_len);
 	key = tt_cstr(key, key_len);
 	sid = session_setting_find(key);
@@ -355,8 +355,10 @@ session_settings_space_execute_update(struct space *space, struct txn *txn,
 				       old_data, old_data_end, format,
 				       &new_size, request->index_base,
 				       &column_mask);
-	if (new_data == NULL)
+	if (new_data == NULL) {
+		error_set_index(diag_last_error(diag_get()), pk_def);
 		goto finish;
+	}
 	*result = box_tuple_new(format, new_data, new_data + new_size);
 	if (*result == NULL)
 		goto finish;
@@ -367,8 +369,13 @@ session_settings_space_execute_update(struct space *space, struct txn *txn,
 				       column_mask)) {
 		if (key_len != new_key_len ||
 		    memcmp(key, new_key, key_len) != 0) {
+			struct tuple *old_tuple =
+				tuple_new(format, old_data, old_data_end);
 			diag_set(ClientError, ER_CANT_UPDATE_PRIMARY_KEY,
-				 pk_def->name, space_name(space));
+				 space_name(space), space_id(space),
+				 old_tuple, *result,
+				 NULL);
+			tuple_delete(old_tuple);
 			goto finish;
 		}
 	}
@@ -402,17 +409,9 @@ session_settings_space_create_index(struct space *space, struct index_def *def)
 		return NULL;
 	}
 
-	struct session_settings_index *index =
-		(struct session_settings_index *)calloc(1, sizeof(*index));
-	if (index == NULL) {
-		diag_set(OutOfMemory, sizeof(*index), "calloc", "index");
-		return NULL;
-	}
-	if (index_create(&index->base, space->engine,
-			 &session_settings_index_vtab, def) != 0) {
-		free(index);
-		return NULL;
-	}
+	struct session_settings_index *index = xcalloc(1, sizeof(*index));
+	index_create(&index->base, space->engine, &session_settings_index_vtab,
+		     def);
 
 	index->format = space->format;
 	return &index->base;
@@ -425,6 +424,8 @@ const struct space_vtab session_settings_space_vtab = {
 	/* .execute_delete = */ session_settings_space_execute_delete,
 	/* .execute_update = */ session_settings_space_execute_update,
 	/* .execute_upsert = */ session_settings_space_execute_upsert,
+	/* .execute_insert_arrow = */ generic_space_execute_insert_arrow,
+	/* .execute_delete_range = */ generic_space_execute_delete_range,
 	/* .ephemeral_replace = */ generic_space_ephemeral_replace,
 	/* .ephemeral_delete = */ generic_space_ephemeral_delete,
 	/* .ephemeral_rowid_next = */ generic_space_ephemeral_rowid_next,
@@ -438,6 +439,8 @@ const struct space_vtab session_settings_space_vtab = {
 	/* .build_index = */ generic_space_build_index,
 	/* .swap_index = */ generic_space_swap_index,
 	/* .prepare_alter = */ generic_space_prepare_alter,
+	/* .finish_alter = */ generic_space_finish_alter,
+	/* .prepare_upgrade = */ generic_space_prepare_upgrade,
 	/* .invalidate = */ generic_space_invalidate,
 };
 

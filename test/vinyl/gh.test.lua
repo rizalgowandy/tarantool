@@ -29,7 +29,7 @@ s:insert{'a'}
 s:drop()
 
 
--- gh-436: No error when creating temporary vinyl space
+-- gh-436: No error when creating data-temporary vinyl space
 s = box.schema.space.create('tester',{engine='vinyl', temporary=true})
 
 
@@ -297,7 +297,7 @@ end);
 
 _ = fiber.create(function()
     while cont do
-        box.snapshot()
+        pcall(box.snapshot)
         fiber.sleep(0.01)
     end
     finished = finished + 1

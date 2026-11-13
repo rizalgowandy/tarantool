@@ -33,20 +33,55 @@
 
 #include <stddef.h>
 
+#include "small/region.h"
+
 #if defined(__cplusplus)
 extern "C" {
 #endif /* defined(__cplusplus) */
 
+#include "lua/msgpack.h"
+
 struct lua_State;
+struct key_def;
+struct port;
 
 char *
 lbox_encode_tuple_on_gc(struct lua_State *L, int idx, size_t *p_len);
 
+/**
+ * Convert packed position, tuple or table from Lua to C packed position.
+ * Returned position is allocated on the fiber region.
+ */
+int
+lbox_normalize_position(lua_State *L, int idx, struct key_def *cmp_def,
+			const char **packed_pos, const char **packed_pos_end);
+
+/** Specialization of lbox_normalize_position for indexes. */
+int
+lbox_index_normalize_position(lua_State *L, int idx, int space_id,
+			      int index_id, const char **packed_pos,
+			      const char **packed_pos_end);
+
 void
 box_lua_misc_init(struct lua_State *L);
 
-struct tuple_format *
-lbox_check_tuple_format(struct lua_State *L, int narg);
+/**
+ * Helper function for dumping port contents to lua in the
+ * `PORT_DUMP_LUA_MODE_MP_OBJECT` mode, which handles the case when the port is
+ * not a MsgPack port and requires converting the contents of the port to
+ * Msgpack.
+ */
+static inline void
+port_dump_lua_mp_object_mode_slow(
+	struct port *port, struct lua_State *L, struct region *region,
+	const char *(*get_msgpack)(struct port *, uint32_t *))
+{
+	uint32_t region_svp = region_used(region);
+	uint32_t size;
+	const char *data = get_msgpack(port, &size);
+	luamp_push(L, data, data + size);
+	region_truncate(region, region_svp);
+}
 
 #if defined(__cplusplus)
 } /* extern "C" */

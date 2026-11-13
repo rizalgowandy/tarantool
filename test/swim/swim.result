@@ -4,6 +4,9 @@ fiber = require('fiber')
 swim = require('swim')
 ---
 ...
+uri_lib = require('uri')
+---
+...
 test_run = require('test_run').new()
 ---
 ...
@@ -218,6 +221,12 @@ s1 = swim.new({uuid = uuid(1), uri = uri(), heartbeat_rate = 0.01, generation = 
 ---
 ...
 s2 = swim.new({uuid = uuid(2), uri = listen_uri, heartbeat_rate = 0.01, generation = 0})
+---
+...
+listen_uri = s2:self():uri()
+---
+...
+listen_port = uri_lib.parse(listen_uri).service
 ---
 ...
 s1.broadcast()
@@ -575,7 +584,7 @@ p = self:payload_str()
 ...
 p
 ---
-- !!binary wg==
+- "\xC2"
 ...
 (msgpack.decode(p))
 ---
@@ -1331,16 +1340,13 @@ m_list
     incarnation: cdata {generation = 0ULL, version = 1ULL}
     uuid: 00000000-0000-1000-8000-000000000002
     payload_size: 0
-  - uri: 127.0.0.1:<port>
+  - &0
+    uri: 127.0.0.1:<port>
     status: alive
     incarnation: cdata {generation = 0ULL, version = 2ULL}
     uuid: 00000000-0000-1000-8000-000000000001
     payload_size: 8
-  - uri: 127.0.0.1:<port>
-    status: alive
-    incarnation: cdata {generation = 0ULL, version = 2ULL}
-    uuid: 00000000-0000-1000-8000-000000000001
-    payload_size: 8
+  - *0
 ...
 e_list
 ---
@@ -1383,16 +1389,13 @@ fiber.sleep(0)
 -- Two events - status update to 'left', and 'drop'.
 m_list
 ---
-- - uri: 127.0.0.1:<port>
+- - &0
+    uri: 127.0.0.1:<port>
     status: left
     incarnation: cdata {generation = 0ULL, version = 1ULL}
     uuid: 00000000-0000-1000-8000-000000000002
     payload_size: 0
-  - uri: 127.0.0.1:<port>
-    status: left
-    incarnation: cdata {generation = 0ULL, version = 1ULL}
-    uuid: 00000000-0000-1000-8000-000000000002
-    payload_size: 0
+  - *0
 ...
 e_list
 ---

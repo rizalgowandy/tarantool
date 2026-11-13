@@ -1,6 +1,12 @@
 -- error.lua (internal file)
 
 local ffi = require('ffi')
+local msgpack = require('msgpack')
+local buffer = require('buffer')
+local tweaks = require('internal.tweaks')
+
+local mp_decode = msgpack.decode_unchecked
+
 ffi.cdef[[
 struct type_info;
 
@@ -11,27 +17,38 @@ enum {
 
 typedef void (*error_f)(struct error *e);
 
+struct error_field {
+    char *_data;
+    uint32_t _size;
+    char *_name;
+};
+
+struct error_payload {
+    int _count;
+    struct error_field **_fields;
+};
+
 struct error {
     error_f _destroy;
     error_f _raise;
-    error_f _log;
     const struct type_info *_type;
     int64_t _refs;
     int _saved_errno;
+    int code;
+    struct error_payload _payload;
     /** Line number. */
     unsigned _line;
-    /* Source file name. */
+    /** Source file name. */
     char _file[DIAG_FILENAME_MAX];
-    /* Error description. */
-    char _errmsg[DIAG_ERRMSG_MAX];
+    /**
+     * Error description. Points to the static buffer `_errmsg_buf' if the
+     * message fits into it, or to the dynamic buffer otherwise.
+     */
+    char *_errmsg;
+    char _errmsg_buf[DIAG_ERRMSG_MAX];
     struct error *_cause;
     struct error *_effect;
 };
-
-char *
-exception_get_string(struct error *e, const struct method_info *method);
-int
-exception_get_int(struct error *e, const struct method_info *method);
 
 int
 error_set_prev(struct error *e, struct error *prev);
@@ -44,45 +61,13 @@ error_ref(struct error *e);
 
 void
 error_unref(struct error *e);
+
+const struct error_field *
+error_find_field(const struct error *e, const char *name);
+
+int
+error_to_string(const struct error *e, char *buf, int size);
 ]]
-
-local REFLECTION_CACHE = {}
-
-local function reflection_enumerate(err)
-    local key = tostring(err._type)
-    local result = REFLECTION_CACHE[key]
-    if result ~= nil then
-        return result
-    end
-    result = {}
-    -- See type_foreach_method() in reflection.h
-    local t = err._type
-    while t ~= nil do
-        local m = t.methods
-        while m.name ~= nil do
-            result[ffi.string(m.name)] = m
-            m = m + 1
-        end
-        t = t.parent
-    end
-    REFLECTION_CACHE[key] = result
-    return result
-end
-
-local function reflection_get(err, method)
-    if method.nargs ~= 0 then
-        return nil -- NYI
-    end
-    if method.rtype == ffi.C.CTYPE_INT then
-        return tonumber(ffi.C.exception_get_int(err, method))
-    elseif method.rtype == ffi.C.CTYPE_CONST_CHAR_PTR then
-        local str = ffi.C.exception_get_string(err, method)
-        if str == nil then
-            return nil
-        end
-        return ffi.string(str)
-    end
-end
 
 local function error_base_type(err)
     return ffi.string(err._type.name)
@@ -131,18 +116,16 @@ end
 local function error_set_prev(err, prev)
     -- First argument must be error.
     if not ffi.istype('struct error', err) then
-        error("Usage: error1:set_prev(error2)")
+        box.error(box.error.ILLEGAL_PARAMS,"Usage: error1:set_prev(error2)", 2)
     end
     -- Second argument must be error or nil.
     if not ffi.istype('struct error', prev) and prev ~= nil then
-        error("Usage: error1:set_prev(error2)")
+        box.error(box.error.ILLEGAL_PARAMS, "Usage: error1:set_prev(error2)", 2)
     end
-    ffi.C.error_ref(err)
     local ok = ffi.C.error_set_prev(err, prev);
     if ok ~= 0 then
-        error("Cycles are not allowed")
+        box.error(box.error.ILLEGAL_PARAMS, "Cycles are not allowed", 2)
     end
-
 end
 
 local error_fields = {
@@ -156,16 +139,24 @@ local error_fields = {
 
 local function error_unpack(err)
     if not ffi.istype('struct error', err) then
-        error("Usage: error:unpack()")
+        box.error(box.error.ILLEGAL_PARAMS, "Usage: error:unpack()", 2)
     end
-    local result = {}
+    local result = {code = err.code}
     for key, getter in pairs(error_fields)  do
         result[key] = getter(err)
     end
-    for key, getter in pairs(reflection_enumerate(err)) do
-        local value = reflection_get(err, getter)
-        if value ~= nil then
-            result[key] = value
+    local payload = err._payload
+    local fields = payload._fields
+    for i = 0, payload._count - 1 do
+        local f = fields[i]
+        result[ffi.string(f._name)] = mp_decode(f._data)
+    end
+    -- Hide redundant fields from unpack output (gh-9101).
+    if not tweaks.box_error_unpack_type_and_code then
+        result.custom_type = nil
+        result.base_type = nil
+        if result.code == 0 then
+            result.code = nil
         end
     end
     return result
@@ -173,44 +164,87 @@ end
 
 local function error_raise(err)
     if not ffi.istype('struct error', err) then
-        error("Usage: error:raise()")
+        box.error(box.error.ILLEGAL_PARAMS, "Usage: error:raise()", 2)
     end
     error(err)
 end
 
 local function error_match(err, ...)
     if not ffi.istype('struct error', err) then
-        error("Usage: error:match()")
+        box.error(box.error.ILLEGAL_PARAMS, "Usage: error:match()", 2)
     end
     return string.match(error_message(err), ...)
 end
 
+--
+-- Serialize an error (including the whole error stack) to its table
+-- representation.
+-- @param err error object
+-- @return error converted to table representation
 local function error_serialize(err)
-    -- Return an error message only in admin console to keep compatibility
-    return error_message(err)
+    if tweaks.box_error_serialize_verbose then
+        local res = error_unpack(err)
+        local cur = res
+        while cur.prev ~= nil do
+            cur.prev = error_unpack(cur.prev)
+            cur = cur.prev
+        end
+        return res
+    else
+        return error_message(err)
+    end
 end
 
-local error_methods = {
+local error_methods
+
+local function error_autocomplete(err)
+    local err_unpacked = {}
+
+    local cur_err = err
+    while cur_err ~= nil do
+        for key, val in pairs(cur_err:unpack()) do
+            if err_unpacked[key] == nil then
+                err_unpacked[key] = val
+            end
+        end
+        cur_err = cur_err.prev
+    end
+
+    for key, method in pairs(error_methods) do
+        if not key:startswith('__') then
+            err_unpacked[key] = method
+        end
+    end
+    return err_unpacked
+end
+
+error_methods = {
     ["unpack"] = error_unpack;
     ["raise"] = error_raise;
     ["match"] = error_match; -- Tarantool 1.6 backward compatibility
     ["__serialize"] = error_serialize;
     ["set_prev"] = error_set_prev;
+    ["__autocomplete"] = error_autocomplete;
 }
 
 local function error_index(err, key)
+    local method = error_methods[key]
+    if method ~= nil then
+        return method
+    end
     local getter = error_fields[key]
     if getter ~= nil then
         return getter(err)
     end
-    getter = reflection_enumerate(err)[key]
-    if getter ~= nil and getter.nargs == 0 then
-        local val = reflection_get(err, getter)
-        if val ~= nil then
-            return val
+    -- Look for a payload field, starting from the topmost error in the stack.
+    local cur_err = err
+    while cur_err ~= nil do
+        local f = ffi.C.error_find_field(cur_err, key)
+        if f ~= nil then
+            return mp_decode(f._data)
         end
+        cur_err = cur_err.prev
     end
-    return error_methods[key]
 end
 
 local function error_concat(lhs, rhs)
@@ -219,13 +253,37 @@ local function error_concat(lhs, rhs)
     elseif ffi.istype('struct error', rhs) then
         return lhs .. tostring(rhs)
     else
-       error('error_mt.__concat(): neither of args is an error')
+       box.error(box.error.ILLEGAL_PARAMS,
+                 'error_mt.__concat(): neither of args is an error', 2)
     end
+end
+
+--
+-- Convert an error to its string representation accounting for the whole error
+-- stack.
+-- @param err error object
+-- @return error's string representation
+local function error_to_string(err)
+    if not tweaks.box_error_serialize_verbose then
+        return error_message(err)
+    end
+
+    local ibuf = buffer.internal.cord_ibuf_take()
+    ibuf:reserve(ibuf:capacity())
+    local len = ffi.C.error_to_string(err, ibuf.wpos, ibuf:capacity())
+    if len + 1 > ibuf:capacity() then
+        ibuf:reserve(len + 1)
+        len = ffi.C.error_to_string(err, ibuf.wpos, ibuf:capacity())
+        assert(len + 1 <= ibuf:capacity())
+    end
+    local str = ffi.string(ibuf.rpos, len)
+    buffer.internal.cord_ibuf_put(ibuf)
+    return str
 end
 
 local error_mt = {
     __index = error_index;
-    __tostring = error_message;
+    __tostring = error_to_string;
     __concat = error_concat;
 };
 

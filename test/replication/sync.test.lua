@@ -1,6 +1,8 @@
 fiber = require('fiber')
 test_run = require('test_run').new()
 engine = test_run:get_cfg('engine')
+tweaks = require('internal.tweaks')
+tweaks_xrow_stream_flush_size_default = tweaks.xrow_stream_flush_size
 
 test_run:cleanup_cluster()
 
@@ -31,6 +33,7 @@ function fill()
     end
     fiber.create(function()
         box.error.injection.set('ERRINJ_RELAY_TIMEOUT', 0.0025)
+        tweaks.xrow_stream_flush_size = 1
         test_run:wait_cond(function()
             local r = box.info.replication[2]
             return r ~= nil and r.downstream ~= nil and
@@ -63,7 +66,7 @@ test_run:cmd("switch replica")
 -- Since max allowed lag is small, all records should arrive
 -- by the time box.cfg() returns.
 --
-box.cfg{replication_sync_lag = 0.001}
+box.cfg{replication_sync_lag = 0.001, replication_sync_timeout = 300}
 box.cfg{replication = replication}
 box.space.test:count()
 box.info.status -- running
@@ -135,17 +138,7 @@ box.cfg{replication_sync_lag = 1}
 box.cfg{replication_sync_timeout = 10}
 
 test_run:cmd("switch default")
-box.error.injection.set('ERRINJ_RELAY_TIMEOUT', 0)
-box.error.injection.set('ERRINJ_WAL_DELAY', true)
-test_run:cmd("setopt delimiter ';'")
-_ = fiber.create(function()
-    box.space.test:replace{123456789}
-end);
-_ = fiber.create(function()
-    fiber.sleep(0.1)
-    box.error.injection.set('ERRINJ_WAL_DELAY', false)
-end);
-test_run:cmd("setopt delimiter ''");
+box.error.injection.set('ERRINJ_RELAY_EXIT_DELAY', 5)
 test_run:cmd("switch replica")
 
 replication = box.cfg.replication
@@ -154,9 +147,14 @@ box.cfg{replication = replication}
 box.info.status -- running
 box.info.ro -- false
 box.info.replication[1].upstream.status -- follow
-test_run:wait_log("replica", "ER_CFG.*", nil, 200)
+test_run:cmd("setopt delimiter ';'")
+test_run:wait_log("replica",
+                  "Incorrect value for option 'replication': " ..
+                  "duplicate connection with the same replica UUID", nil, 200);
+test_run:cmd("setopt delimiter ''");
 
 test_run:cmd("switch default")
+box.error.injection.set('ERRINJ_RELAY_EXIT_DELAY', 0)
 test_run:cmd("stop server replica")
 
 -- gh-3830: Sync fails if there's a gap at the end of the master's WAL.

@@ -131,7 +131,7 @@ et_getdigit(LONGDOUBLE_TYPE * val, int *cnt)
 static void
 setStrAccumError(StrAccum * p, u8 eError)
 {
-	assert(eError == STRACCUM_NOMEM || eError == STRACCUM_TOOBIG);
+	assert(eError == STRACCUM_TOOBIG);
 	p->accError = eError;
 	p->nAlloc = 0;
 }
@@ -144,7 +144,7 @@ getIntArg(PrintfArguments * p)
 {
 	if (p->nArg <= p->nUsed)
 		return 0;
-	return mem_get_int_unsafe(p->apArg[p->nUsed++]);
+	return mem_get_int_unsafe(&p->apArg[p->nUsed++]);
 }
 
 static double
@@ -152,7 +152,7 @@ getDoubleArg(PrintfArguments * p)
 {
 	if (p->nArg <= p->nUsed)
 		return 0.0;
-	return mem_get_double_unsafe(p->apArg[p->nUsed++]);
+	return mem_get_double_unsafe(&p->apArg[p->nUsed++]);
 }
 
 static char *
@@ -160,8 +160,7 @@ getTextArg(PrintfArguments * p)
 {
 	if (p->nArg <= p->nUsed)
 		return 0;
-	struct Mem *mem = p->apArg[p->nUsed++];
-	return (char *)mem_as_str0(mem);
+	return mem_strdup(&p->apArg[p->nUsed++]);
 }
 
 /*
@@ -184,7 +183,8 @@ sqlVXPrintf(StrAccum * pAccum,	/* Accumulate results here */
 {
 	int c;			/* Next character in the format string */
 	char *bufpt;		/* Pointer to the conversion buffer */
-	int precision;		/* Precision of the current field */
+	/* Precision of the current field. */
+	int64_t precision;
 	int length;		/* Length of the field */
 	int idx;		/* A general purpose loop counter */
 	int width;		/* Width of the current field */
@@ -205,7 +205,8 @@ sqlVXPrintf(StrAccum * pAccum,	/* Accumulate results here */
 	LONGDOUBLE_TYPE realvalue;	/* Value for real types */
 	const et_info *infop;	/* Pointer to the appropriate info structure */
 	char *zOut;		/* Rendering buffer */
-	int nOut;		/* Size of the rendering buffer */
+	/* Size of the rendering buffer. */
+	size_t nOut;
 	char *zExtra = 0;	/* Malloced memory used by some conversion */
 	int exp, e2;		/* exponent of real numbers */
 	int nsd;		/* Number of significant digits returned */
@@ -288,11 +289,19 @@ sqlVXPrintf(StrAccum * pAccum,	/* Accumulate results here */
 		} else {
 			unsigned wx = 0;
 			while (c >= '0' && c <= '9') {
-				wx = wx * 10 + c - '0';
+				/*
+				 * If we know that we will get a value greater
+				 * than SQL_MAX_LENGTH, we replace it with
+				 * SQL_MAX_LENGTH + 1. This is done to prevent
+				 * integer overflow.
+				 */
+				if (wx > 0 && SQL_MAX_LENGTH / wx < 10)
+					wx = SQL_MAX_LENGTH + 1;
+				else
+					wx = wx * 10 + c - '0';
 				c = *++fmt;
 			}
-			testcase(wx > 0x7fffffff);
-			width = wx & 0x7fffffff;
+			width = wx;
 		}
 		assert(width >= 0);
 
@@ -317,7 +326,6 @@ sqlVXPrintf(StrAccum * pAccum,	/* Accumulate results here */
 					px = px * 10 + c - '0';
 					c = *++fmt;
 				}
-				testcase(px > 0x7fffffff);
 				precision = px & 0x7fffffff;
 			}
 		} else {
@@ -433,12 +441,8 @@ sqlVXPrintf(StrAccum * pAccum,	/* Accumulate results here */
 				zOut = buf;
 			} else {
 				nOut = precision + 10;
-				zOut = zExtra = sqlMalloc(nOut);
-				if (zOut == 0) {
-					setStrAccumError(pAccum,
-							 STRACCUM_NOMEM);
-					return;
-				}
+				zExtra = sql_xmalloc(nOut);
+				zOut = zExtra;
 			}
 			bufpt = &zOut[nOut - 1];
 			if (xtype == etORDINAL) {
@@ -496,7 +500,6 @@ sqlVXPrintf(StrAccum * pAccum,	/* Accumulate results here */
 			}
 			if (xtype == etGENERIC && precision > 0)
 				precision--;
-			testcase(precision > 0xfff);
 			for (idx = precision & 0xfff, rounder = 0.5; idx > 0;
 			     idx--, rounder *= 0.1) {
 			}
@@ -570,14 +573,10 @@ sqlVXPrintf(StrAccum * pAccum,	/* Accumulate results here */
 			}
 			if (MAX(e2, 0) + (i64) precision + (i64) width >
 			    etBUFSIZE - 15) {
-				bufpt = zExtra =
-				    sqlMalloc(MAX(e2, 0) + (i64) precision +
-						  (i64) width + 15);
-				if (bufpt == 0) {
-					setStrAccumError(pAccum,
-							 STRACCUM_NOMEM);
-					return;
-				}
+				zExtra = sql_xmalloc(MAX(e2, 0) +
+						     (int64_t)precision +
+						     (int64_t)width + 15);
+				bufpt = zExtra;
 			}
 			zOut = bufpt;
 			nsd = 16 + flag_altform2 * 10;
@@ -677,6 +676,7 @@ sqlVXPrintf(StrAccum * pAccum,	/* Accumulate results here */
 			if (bArgList) {
 				bufpt = getTextArg(pArgList);
 				c = bufpt ? bufpt[0] : 0;
+				zExtra = bufpt;
 			} else {
 				c = va_arg(ap, int);
 			}
@@ -697,7 +697,7 @@ sqlVXPrintf(StrAccum * pAccum,	/* Accumulate results here */
 		case etDYNSTRING:
 			if (bArgList) {
 				bufpt = getTextArg(pArgList);
-				xtype = etSTRING;
+				xtype = etDYNSTRING;
 			} else {
 				bufpt = va_arg(ap, char *);
 			}
@@ -727,6 +727,7 @@ sqlVXPrintf(StrAccum * pAccum,	/* Accumulate results here */
 
 				if (bArgList) {
 					escarg = getTextArg(pArgList);
+					zExtra = escarg;
 				} else {
 					escarg = va_arg(ap, char *);
 				}
@@ -744,12 +745,8 @@ sqlVXPrintf(StrAccum * pAccum,	/* Accumulate results here */
 				needQuote = !isnull && xtype == etSQLESCAPE2;
 				n += i + 3;
 				if (n > etBUFSIZE) {
-					bufpt = zExtra = sqlMalloc(n);
-					if (bufpt == 0) {
-						setStrAccumError(pAccum,
-								 STRACCUM_NOMEM);
-						return;
-					}
+					zExtra = sql_xmalloc(n);
+					bufpt = zExtra;
 				} else {
 					bufpt = buf;
 				}
@@ -811,7 +808,7 @@ sqlVXPrintf(StrAccum * pAccum,	/* Accumulate results here */
 			sqlAppendChar(pAccum, width, ' ');
 
 		if (zExtra) {
-			sqlDbFree(pAccum->db, zExtra);
+			sql_xfree(zExtra);
 			zExtra = 0;
 		}
 	}			/* End for loop over the format string */
@@ -830,8 +827,6 @@ sqlStrAccumEnlarge(StrAccum * p, int N)
 	char *zNew;
 	assert(p->nChar + (i64) N >= p->nAlloc);	/* Only called if really needed */
 	if (p->accError) {
-		testcase(p->accError == STRACCUM_TOOBIG);
-		testcase(p->accError == STRACCUM_NOMEM);
 		return 0;
 	}
 	if (p->mxAlloc == 0) {
@@ -843,7 +838,7 @@ sqlStrAccumEnlarge(StrAccum * p, int N)
 		i64 szNew = p->nChar;
 		assert((p->zText == 0
 			|| p->zText == p->zBase) == !isMalloced(p));
-		szNew += N + 1;
+		szNew += (i64)N + 1;
 		if (szNew + p->nChar <= p->mxAlloc) {
 			/* Force exponential buffer size growth as long as it does not overflow,
 			 ** to avoid having to call this routine too often */
@@ -856,23 +851,12 @@ sqlStrAccumEnlarge(StrAccum * p, int N)
 		} else {
 			p->nAlloc = (int)szNew;
 		}
-		if (p->db) {
-			zNew = sqlDbRealloc(p->db, zOld, p->nAlloc);
-		} else {
-			zNew = sql_realloc64(zOld, p->nAlloc);
-		}
-		if (zNew) {
-			assert(p->zText != 0 || p->nChar == 0);
-			if (!isMalloced(p) && p->nChar > 0)
-				memcpy(zNew, p->zText, p->nChar);
-			p->zText = zNew;
-			p->nAlloc = sqlDbMallocSize(p->db, zNew);
-			p->printfFlags |= SQL_PRINTF_MALLOCED;
-		} else {
-			sqlStrAccumReset(p);
-			setStrAccumError(p, STRACCUM_NOMEM);
-			return 0;
-		}
+		zNew = sql_xrealloc(zOld, p->nAlloc);
+		assert(p->zText != 0 || p->nChar == 0);
+		if (!isMalloced(p) && p->nChar > 0)
+			memcpy(zNew, p->zText, p->nChar);
+		p->zText = zNew;
+		p->printfFlags |= SQL_PRINTF_MALLOCED;
 	}
 	return N;
 }
@@ -883,7 +867,6 @@ sqlStrAccumEnlarge(StrAccum * p, int N)
 void
 sqlAppendChar(StrAccum * p, int N, char c)
 {
-	testcase(p->nChar + (i64) N > 0x7fffffff);
 	if (p->nChar + (i64) N >= p->nAlloc
 	    && (N = sqlStrAccumEnlarge(p, N)) <= 0) {
 		return;
@@ -950,13 +933,9 @@ static SQL_NOINLINE char *
 strAccumFinishRealloc(StrAccum * p)
 {
 	assert(p->mxAlloc > 0 && !isMalloced(p));
-	p->zText = sqlDbMallocRaw(p->db, p->nChar + 1);
-	if (p->zText) {
-		memcpy(p->zText, p->zBase, p->nChar + 1);
-		p->printfFlags |= SQL_PRINTF_MALLOCED;
-	} else {
-		setStrAccumError(p, STRACCUM_NOMEM);
-	}
+	p->zText = sql_xmalloc(p->nChar + 1);
+	memcpy(p->zText, p->zBase, p->nChar + 1);
+	p->printfFlags |= SQL_PRINTF_MALLOCED;
 	return p->zText;
 }
 
@@ -981,31 +960,16 @@ sqlStrAccumReset(StrAccum * p)
 {
 	assert((p->zText == 0 || p->zText == p->zBase) == !isMalloced(p));
 	if (isMalloced(p)) {
-		sqlDbFree(p->db, p->zText);
+		sql_xfree(p->zText);
 		p->printfFlags &= ~SQL_PRINTF_MALLOCED;
 	}
 	p->zText = 0;
 }
 
-/*
- * Initialize a string accumulator.
- *
- * p:     The accumulator to be initialized.
- * db:    Pointer to a database connection.  May be NULL.  Lookaside
- *        memory is used if not NULL. db->mallocFailed is set appropriately
- *        when not NULL.
- * zBase: An initial buffer.  May be NULL in which case the initial buffer
- *        is malloced.
- * n:     Size of zBase in bytes.  If total space requirements never exceed
- *        n then no memory allocations ever occur.
- * mx:    Maximum number of bytes to accumulate.  If mx==0 then no memory
- *        allocations will ever occur.
- */
 void
-sqlStrAccumInit(StrAccum * p, sql * db, char *zBase, int n, int mx)
+sqlStrAccumInit(struct StrAccum *p, char *zBase, int n, int mx)
 {
 	p->zText = p->zBase = zBase;
-	p->db = db;
 	p->nChar = 0;
 	p->nAlloc = n;
 	p->mxAlloc = mx;
@@ -1013,45 +977,32 @@ sqlStrAccumInit(StrAccum * p, sql * db, char *zBase, int n, int mx)
 	p->printfFlags = 0;
 }
 
-/*
- * Print into memory obtained from sqlMalloc().  Use the internal
- * %-conversion extensions.
- */
 char *
-sqlVMPrintf(sql * db, const char *zFormat, va_list ap)
+sqlVMPrintf(const char *zFormat, va_list ap)
 {
 	char *z;
 	char zBase[SQL_PRINT_BUF_SIZE];
 	StrAccum acc;
-	assert(db != 0);
-	sqlStrAccumInit(&acc, db, zBase, sizeof(zBase),
-			    db->aLimit[SQL_LIMIT_LENGTH]);
+	sqlStrAccumInit(&acc, zBase, sizeof(zBase), SQL_MAX_LENGTH);
 	acc.printfFlags = SQL_PRINTF_INTERNAL;
 	sqlVXPrintf(&acc, zFormat, ap);
 	z = sqlStrAccumFinish(&acc);
-	if (acc.accError == STRACCUM_NOMEM) {
-		sqlOomFault(db);
-	}
 	return z;
 }
 
-/*
- * Print into memory obtained from sqlMalloc().  Use the internal
- * %-conversion extensions.
- */
 char *
-sqlMPrintf(sql * db, const char *zFormat, ...)
+sqlMPrintf(const char *zFormat, ...)
 {
 	va_list ap;
 	char *z;
 	va_start(ap, zFormat);
-	z = sqlVMPrintf(db, zFormat, ap);
+	z = sqlVMPrintf(zFormat, ap);
 	va_end(ap);
 	return z;
 }
 
 /*
- * Print into memory obtained from sql_malloc().  Omit the internal
+ * Print into memory obtained from malloc().  Omit the internal
  * %-conversion extensions.
  */
 char *
@@ -1060,14 +1011,14 @@ sql_vmprintf(const char *zFormat, va_list ap)
 	char *z;
 	char zBase[SQL_PRINT_BUF_SIZE];
 	StrAccum acc;
-	sqlStrAccumInit(&acc, 0, zBase, sizeof(zBase), SQL_MAX_LENGTH);
+	sqlStrAccumInit(&acc, zBase, sizeof(zBase), SQL_MAX_LENGTH);
 	sqlVXPrintf(&acc, zFormat, ap);
 	z = sqlStrAccumFinish(&acc);
 	return z;
 }
 
 /*
- * Print into memory obtained from sql_malloc()().  Omit the internal
+ * Print into memory obtained from malloc().  Omit the internal
  * %-conversion extensions.
  */
 char *
@@ -1100,7 +1051,7 @@ sql_vsnprintf(int n, char *zBuf, const char *zFormat, va_list ap)
 	StrAccum acc;
 	if (n <= 0)
 		return zBuf;
-	sqlStrAccumInit(&acc, 0, zBuf, n, 0);
+	sqlStrAccumInit(&acc, zBuf, n, 0);
 	sqlVXPrintf(&acc, zFormat, ap);
 	zBuf[acc.nChar] = 0;
 	return zBuf;
@@ -1127,7 +1078,7 @@ sqlDebugPrintf(const char *zFormat, ...)
 	va_list ap;
 	StrAccum acc;
 	char zBuf[500];
-	sqlStrAccumInit(&acc, 0, zBuf, sizeof(zBuf), 0);
+	sqlStrAccumInit(&acc, zBuf, sizeof(zBuf), 0);
 	va_start(ap, zFormat);
 	sqlVXPrintf(&acc, zFormat, ap);
 	va_end(ap);

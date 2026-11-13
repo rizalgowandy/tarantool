@@ -1,21 +1,35 @@
 #include "trivia/util.h"
-#include "unit.h"
 #include "vy_lsm.h"
 #include "vy_cache.h"
 #include "vy_run.h"
 #include "fiber.h"
 #include <bit/bit.h>
+#include <small/rlist.h>
 #include <crc32.h>
 #include <box/vy_point_lookup.h>
 #include "vy_iterators_helper.h"
 #include "vy_write_iterator.h"
 #include "identifier.h"
+#include "space_def.h"
 
-uint32_t schema_version;
+uint64_t schema_version;
 uint32_t space_cache_version;
-struct space *space_by_id(uint32_t id) { return NULL; }
+uint32_t prev_space_cache_version;
+struct space *prev_space;
+struct space *
+space_by_id_slow(uint32_t id) { return NULL; }
 struct vy_lsm *vy_lsm(struct index *index) { return NULL; }
 void index_delete(struct index *index) { unreachable(); }
+struct space_def *
+space_def_dup(const struct space_def *space_def) { return NULL; }
+void
+space_def_delete(struct space_def *space_def) {}
+struct txn;
+RLIST_HEAD(txns);
+void
+txn_send_to_read_view(struct txn *txn, int64_t psn) {}
+void
+txn_abort_with_conflict(struct txn *txn) {}
 
 static int
 write_run(struct vy_run *run, const char *dir_name,
@@ -56,7 +70,7 @@ static void
 test_basic()
 {
 	header();
-	plan(15);
+	plan(14);
 
 	/** Suppress info messages from vy_run_writer. */
 	say_set_log_level(S_WARN);
@@ -65,11 +79,8 @@ test_basic()
 	int64_t generation = 0;
 	struct slab_cache *slab_cache = cord_slab_cache();
 
-	int rc;
 	struct vy_lsm_env lsm_env;
-	rc = vy_lsm_env_create(&lsm_env, ".", &generation,
-			       stmt_env.key_format, NULL, NULL);
-	is(rc, 0, "vy_lsm_env_create");
+	vy_lsm_env_create(&lsm_env, ".", &generation, key_format, NULL, NULL);
 
 	struct vy_run_env run_env;
 	vy_run_env_create(&run_env, 0);
@@ -85,35 +96,36 @@ test_basic()
 	isnt(key_def, NULL, "key_def is not NULL");
 
 	vy_cache_create(&cache, &cache_env, key_def, true);
-	struct tuple_format *format = vy_stmt_format_new(&stmt_env, &key_def, 1,
-							 NULL, 0, 0, NULL);
+	struct tuple_format
+		*format = vy_simple_stmt_format_new(&stmt_env, &key_def, 1);
 	isnt(format, NULL, "tuple_format_new is not NULL");
 	tuple_format_ref(format);
 
 	struct index_opts index_opts = index_opts_default;
 	struct index_def *index_def =
-		index_def_new(512, 0, "primary", sizeof("primary") - 1, TREE,
+		index_def_new(512, 0, "primary", sizeof("primary") - 1,
+			      NULL, NULL, TREE,
 			      &index_opts, key_def, NULL);
 
+	struct space_def space_def;
+	memset(&space_def, 0, sizeof(space_def));
 	struct vy_lsm *pk = vy_lsm_new(&lsm_env, &cache_env, &mem_env,
-				       index_def, format, NULL, 0);
-	isnt(pk, NULL, "lsm is not NULL")
+				       index_def, &space_def, format, NULL);
+	isnt(pk, NULL, "lsm is not NULL");
 
 	struct vy_range *range = vy_range_new(1, vy_entry_none(),
 					      vy_entry_none(), pk->cmp_def);
 
-	isnt(pk, NULL, "range is not NULL")
+	isnt(pk, NULL, "range is not NULL");
 	vy_lsm_add_range(pk, range);
-
-	struct rlist read_views = RLIST_HEAD_INITIALIZER(read_views);
 
 	char dir_tmpl[] = "./vy_point_test.XXXXXX";
 	char *dir_name = mkdtemp(dir_tmpl);
-	isnt(dir_name, NULL, "temp dir name is not NULL")
+	isnt(dir_name, NULL, "temp dir name is not NULL");
 	char path[PATH_MAX];
 	strcpy(path, dir_name);
 	strcat(path, "/512");
-	rc = mkdir(path, 0777);
+	int rc = mkdir(path, 0777);
 	is(rc, 0, "temp dir create (2)");
 	strcat(path, "/0");
 	rc = mkdir(path, 0777);
@@ -181,7 +193,7 @@ test_basic()
 
 	/* create second run */
 	struct vy_mem *run_mem =
-		vy_mem_new(pk->mem->env, pk->cmp_def, pk->mem_format,
+		vy_mem_new(pk->mem->env, pk->cmp_def, pk->format,
 			   *pk->env->p_generation, 0);
 
 	for (size_t i = 0; i < num_of_keys; i++) {
@@ -195,8 +207,8 @@ test_basic()
 	}
 	struct vy_stmt_stream *write_stream;
 	write_stream = vy_write_iterator_new(pk->cmp_def, true, true,
-					     &read_views, NULL);
-	vy_write_iterator_new_mem(write_stream, run_mem);
+					     NULL, 0, NULL);
+	vy_write_iterator_new_mem(write_stream, run_mem, run_mem->format);
 	struct vy_run *run = vy_run_new(&run_env, 1);
 	isnt(run, NULL, "vy_run_new");
 
@@ -213,7 +225,7 @@ test_basic()
 	vy_run_unref(run);
 
 	/* create first run */
-	run_mem = vy_mem_new(pk->mem->env, pk->cmp_def, pk->mem_format,
+	run_mem = vy_mem_new(pk->mem->env, pk->cmp_def, pk->format,
 			     *pk->env->p_generation, 0);
 
 	for (size_t i = 0; i < num_of_keys; i++) {
@@ -226,8 +238,8 @@ test_basic()
 		vy_mem_insert_template(run_mem, &tmpl_val);
 	}
 	write_stream = vy_write_iterator_new(pk->cmp_def, true, true,
-					     &read_views, NULL);
-	vy_write_iterator_new_mem(write_stream, run_mem);
+					     NULL, 0, NULL);
+	vy_write_iterator_new_mem(write_stream, run_mem, run_mem->format);
 	run = vy_run_new(&run_env, 2);
 	isnt(run, NULL, "vy_run_new");
 
@@ -276,7 +288,8 @@ test_basic()
 			struct vy_entry key = vy_new_simple_stmt(format, key_def,
 								 &tmpl_key);
 			struct vy_entry res;
-			rc = vy_point_lookup(pk, NULL, &prv, key, &res);
+			rc = vy_point_lookup(pk, /*tx=*/NULL, &prv, key,
+					     /*keep_delete=*/false, &res);
 			tuple_unref(key.stmt);
 			if (rc != 0) {
 				has_errors = true;

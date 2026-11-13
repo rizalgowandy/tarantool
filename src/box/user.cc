@@ -30,15 +30,19 @@
  */
 #include "user.h"
 #include "assoc.h"
+#include "error.h"
 #include "schema.h"
 #include "space.h"
 #include "func.h"
 #include "index.h"
 #include "bit/bit.h"
 #include "fiber.h"
+#include "salad/grp_alloc.h"
 #include "scoped_guard.h"
 #include "sequence.h"
+#include "trivia/util.h"
 #include "tt_static.h"
+#include "txn.h"
 
 struct universe universe;
 static struct user users[BOX_USER_MAX];
@@ -146,6 +150,12 @@ priv_def_compare(const struct priv_def *lhs, const struct priv_def *rhs)
 		return lhs->object_type > rhs->object_type ? 1 : -1;
 	if (lhs->object_id != rhs->object_id)
 		return lhs->object_id > rhs->object_id ? 1 : -1;
+	int cmp = memcmp(lhs->object_name, rhs->object_name,
+			 MIN(lhs->object_name_len, rhs->object_name_len));
+	if (cmp != 0)
+		return cmp;
+	if (lhs->object_name_len != rhs->object_name_len)
+		return lhs->object_name_len > rhs->object_name_len ? 1 : -1;
 	return 0;
 }
 
@@ -179,7 +189,7 @@ user_destroy(struct user *user)
 	 * all privileges from them first.
 	 */
 	region_destroy(&user->pool);
-	free(user->def);
+	user_def_delete(user->def);
 	memset(user, 0, sizeof(*user));
 }
 
@@ -187,106 +197,189 @@ user_destroy(struct user *user)
  * Add a privilege definition to the list
  * of effective privileges of a user.
  */
-int
-user_grant_priv(struct user *user, struct priv_def *def)
+void
+user_grant_priv(struct user *user, const struct priv_def *def)
 {
 	struct priv_def *old = privset_search(&user->privs, def);
 	if (old == NULL) {
-		size_t size;
-		old = region_alloc_object(&user->pool, typeof(*old), &size);
-		if (old == NULL) {
-			diag_set(OutOfMemory, size, "region_alloc_object",
-				 "old");
-			return -1;
-		}
+		old = xregion_alloc_object(&user->pool, typeof(*old));
 		*old = *def;
+		if (def->object_name != NULL) {
+			char *object_name = (char *)xregion_alloc(
+					&user->pool, def->object_name_len);
+			memcpy(object_name, def->object_name,
+			       def->object_name_len);
+			old->object_name = object_name;
+		}
 		privset_insert(&user->privs, old);
 	} else {
 		old->access |= def->access;
 	}
-	return 0;
 }
 
 /**
- * Find the corresponding access structure
- * given object type and object id.
+ * Stores cached runtime access information for global Lua functions.
+ * Nodes are created on demand and removed if empty.
  */
+static mh_strnptr_t *access_lua_call_registry;
+
+/** Node in access_lua_call_registry. */
+struct access_lua_call_node {
+	/** Name of the global Lua function this node is for. */
+	const char *name;
+	/** Length of the name string. */
+	uint32_t name_len;
+	/** Cached runtime access information. */
+	struct access access[BOX_USER_MAX];
+};
+
 struct access *
-access_find(enum schema_object_type object_type, uint32_t object_id)
+access_lua_call_find(const char *name, uint32_t name_len)
 {
-	struct access *access = NULL;
-	switch (object_type) {
+	struct mh_strnptr_t *h = access_lua_call_registry;
+	mh_int_t i = mh_strnptr_find_str(h, name, name_len);
+	if (i != mh_end(h)) {
+		struct access_lua_call_node *node =
+			(typeof(node))mh_strnptr_node(h, i)->val;
+		return node->access;
+	}
+	return NULL;
+}
+
+/**
+ * Returns cached runtime access information for the given Lua function name.
+ * Creates one if it doesn't exist.
+ */
+static struct access *
+access_lua_call_find_or_create(const char *name, uint32_t name_len)
+{
+	uint32_t name_hash = mh_strn_hash(name, name_len);
+	struct mh_strnptr_t *h = access_lua_call_registry;
+	struct mh_strnptr_key_t k = {name, name_len, name_hash};
+	mh_int_t i = mh_strnptr_find(h, &k, NULL);
+	if (i != mh_end(h)) {
+		struct access_lua_call_node *node =
+			(typeof(node))mh_strnptr_node(h, i)->val;
+		return node->access;
+	}
+	struct access_lua_call_node *node;
+	grp_alloc all = grp_alloc_initializer();
+	grp_alloc_reserve_data(&all, sizeof(*node));
+	grp_alloc_reserve_str(&all, name_len);
+	grp_alloc_use(&all, xmalloc(grp_alloc_size(&all)));
+	node = (typeof(node))grp_alloc_create_data(&all, sizeof(*node));
+	node->name = grp_alloc_create_str(&all, name, name_len);
+	node->name_len = name_len;
+	memset(node->access, 0, sizeof(node->access));
+	assert(grp_alloc_size(&all) == 0);
+	mh_strnptr_node_t n = {node->name, name_len, name_hash, node};
+	mh_strnptr_put(h, &n, NULL, NULL);
+	return node->access;
+}
+
+/**
+ * Deletes cached runtime access information for a Lua function if it's empty
+ * (i.e. grants no access to any user).
+ */
+static void
+access_lua_call_delete_if_empty(struct access *object)
+{
+	for (int i = 0; i < BOX_USER_MAX; ++i) {
+		struct access *access = &object[i];
+		if (access->granted != 0 || access->effective != 0)
+			return;
+	}
+	struct mh_strnptr_t *h = access_lua_call_registry;
+	struct access_lua_call_node *node = (typeof(node))(
+		(char *)object - offsetof(typeof(*node), access));
+	mh_int_t i = mh_strnptr_find_str(h, node->name, node->name_len);
+	assert(i != mh_end(h));
+	assert(mh_strnptr_node(h, i)->val == node);
+	mh_strnptr_del(h, i, NULL);
+	free(node);
+}
+
+/**
+ * Find the corresponding access structure for the given privilege.
+ * Must be released with access_put() after use.
+ */
+static struct access *
+access_get(const struct priv_def *priv)
+{
+	switch (priv->object_type) {
 	case SC_UNIVERSE:
-	{
-		access = universe.access;
-		break;
-	}
-	case SC_ENTITY_SPACE:
-	{
-		access = entity_access.space;
-		break;
-	}
-	case SC_ENTITY_FUNCTION:
-	{
-		access = entity_access.function;
-		break;
-	}
-	case SC_ENTITY_USER:
-	{
-		access = entity_access.user;
-		break;
-	}
-	case SC_ENTITY_ROLE:
-	{
-		access = entity_access.role;
-		break;
-	}
-	case SC_ENTITY_SEQUENCE:
-	{
-		access = entity_access.sequence;
-		break;
-	}
+		return universe.access;
+	case SC_LUA_CALL:
+		if (priv->is_entity_access)
+			return universe.access_lua_call;
+		/*
+		 * lua_call objects aren't persisted in the database so
+		 * we create an access struct on demand and delete it in
+		 * access_put() if it's empty.
+		 */
+		return access_lua_call_find_or_create(priv->object_name,
+						      priv->object_name_len);
+	case SC_LUA_EVAL:
+		return universe.access_lua_eval;
+	case SC_SQL:
+		return universe.access_sql;
 	case SC_SPACE:
 	{
-		struct space *space = space_by_id(object_id);
-		if (space)
-			access = space->access;
-		break;
+		if (priv->is_entity_access)
+			return entity_access.space;
+		struct space *space = space_by_id(priv->object_id);
+		return space != NULL ? space->access : NULL;
 	}
 	case SC_FUNCTION:
 	{
-		struct func *func = func_by_id(object_id);
-		if (func)
-			access = func->access;
-		break;
+		if (priv->is_entity_access)
+			return entity_access.function;
+		struct func *func = func_by_id(priv->object_id);
+		return func != NULL ? func->access : NULL;
 	}
 	case SC_USER:
 	{
-		struct user *user = user_by_id(object_id);
-		if (user)
-			access = user->access;
-		break;
+		if (priv->is_entity_access)
+			return entity_access.user;
+		struct user *user = user_by_id(priv->object_id);
+		return user != NULL ? user->access : NULL;
 	}
 	case SC_ROLE:
 	{
-		struct user *role = user_by_id(object_id);
-		if (role)
-			access = role->access;
-		break;
+		if (priv->is_entity_access)
+			return entity_access.role;
+		struct user *role = user_by_id(priv->object_id);
+		return role != NULL ? role->access : NULL;
 	}
 	case SC_SEQUENCE:
 	{
-		struct sequence *seq = sequence_by_id(object_id);
-		if (seq)
-			access = seq->access;
-		break;
+		if (priv->is_entity_access)
+			return entity_access.sequence;
+		struct sequence *seq = sequence_by_id(priv->object_id);
+		return seq != NULL ? seq->access : NULL;
 	}
+	default:
+		return NULL;
+	}
+}
+
+/** Releases an object returned by access_get(). */
+static void
+access_put(const struct priv_def *priv, struct access *object)
+{
+	switch (priv->object_type) {
+	case SC_LUA_CALL:
+		/*
+		 * lua_call objects aren't persisted in the database so
+		 * we don't need to keep an access struct if it's empty.
+		 */
+		if (!priv->is_entity_access)
+			access_lua_call_delete_if_empty(object);
+		break;
 	default:
 		break;
 	}
-	return access;
 }
-
 
 /**
  * Reset effective access of the user in the
@@ -299,21 +392,42 @@ user_set_effective_access(struct user *user)
 	privset_ifirst(&user->privs, &it);
 	struct priv_def *priv;
 	while ((priv = privset_inext(&it)) != NULL) {
-		struct access *object = access_find(priv->object_type,
-						    priv->object_id);
+		struct access *object = access_get(priv);
 		 /* Protect against a concurrent drop. */
 		if (object == NULL)
 			continue;
 		struct access *access = &object[user->auth_token];
 		access->effective = access->granted | priv->access;
+		access_put(priv, object);
 	}
 }
 
 /**
- * Reload user privileges and re-grant them.
+ * Reload a single user privilege from a privilege tuple.
  */
 static int
-user_reload_privs(struct user *user)
+user_reload_priv(struct user *user, struct tuple *tuple)
+{
+	struct priv_def priv;
+	if (priv_def_create_from_tuple(&priv, tuple) != 0)
+		return -1;
+	/* Skip role grants, we're only interested in real objects. */
+	if (priv.object_type == SC_ROLE && priv.access & PRIV_X)
+		priv.access &= ~PRIV_X;
+	/* Assign the rest of privileges if any. */
+	if (priv.access != 0)
+		user_grant_priv(user, &priv);
+	return 0;
+}
+
+/**
+ * Reload user privileges and re-grant them. If a rolled back statement is
+ * passed, the privileges are reloaded as part of the rollback process, so we
+ * must account for the changes made by the statement and use the old data
+ * (which will be the actual data after rollback).
+ */
+static int
+user_reload_privs(struct user *user, struct txn_stmt *rolled_back_stmt)
 {
 	if (user->is_dirty == false)
 		return 0;
@@ -353,24 +467,42 @@ user_reload_privs(struct user *user)
 		if (it == NULL)
 			return -1;
 		IteratorGuard iter_guard(it);
-
+		bool in_rollback = rolled_back_stmt != NULL;
+		struct tuple *old_tuple = in_rollback ?
+			rolled_back_stmt->old_tuple : NULL;
+		struct tuple *new_tuple = in_rollback ?
+			rolled_back_stmt->new_tuple : NULL;
+		assert(!in_rollback || old_tuple != NULL || new_tuple != NULL);
+		struct key_def *key_def = index->def->key_def;
+		int cmp_old = old_tuple != NULL ?
+			      tuple_compare_with_key(old_tuple, HINT_NONE, key,
+						     1, HINT_NONE, key_def) : 0;
+		int cmp_new = new_tuple != NULL && old_tuple == NULL ?
+			      tuple_compare_with_key(new_tuple, HINT_NONE, key,
+						     1, HINT_NONE, key_def) : 0;
+		if (cmp_old != 0 || cmp_new != 0)
+			in_rollback = false;
+		assert(old_tuple == NULL || new_tuple == NULL ||
+		       tuple_compare(new_tuple, HINT_NONE, old_tuple, HINT_NONE,
+				     key_def) == 0);
 		struct tuple *tuple;
 		if (iterator_next(it, &tuple) != 0)
 			return -1;
 		while (tuple != NULL) {
-			struct priv_def priv;
-			if (priv_def_create_from_tuple(&priv, tuple) != 0)
+			if (in_rollback && tuple == new_tuple) {
+				tuple = old_tuple;
+				if (tuple == NULL)
+					goto next_tuple;
+			}
+			if (user_reload_priv(user, tuple) != 0)
 				return -1;
-			/**
-			 * Skip role grants, we're only
-			 * interested in real objects.
-			 */
-			if (priv.object_type != SC_ROLE || !(priv.access & PRIV_X))
-				if (user_grant_priv(user, &priv) != 0)
-					return -1;
+next_tuple:
 			if (iterator_next(it, &tuple) != 0)
 				return -1;
 		}
+		if (in_rollback && new_tuple == NULL &&
+		    user_reload_priv(user, old_tuple) != 0)
+			return -1;
 	}
 	{
 		/* Take into account privs granted through roles. */
@@ -381,10 +513,8 @@ user_reload_privs(struct user *user)
 			struct privset_iterator it;
 			privset_ifirst(&role->privs, &it);
 			struct priv_def *def;
-			while ((def = privset_inext(&it))) {
-				if (user_grant_priv(user, def) != 0)
-					return -1;
-			}
+			while ((def = privset_inext(&it)))
+				user_grant_priv(user, def);
 		}
 	}
 	user_set_effective_access(user);
@@ -428,7 +558,9 @@ auth_token_get(void)
 		 * Check for BOX_USER_MAX to cover case when
 		 * USER_MAP_BITS > BOX_USER_MAX.
 		 */
-		tnt_raise(LoggedError, ER_USER_MAX, BOX_USER_MAX);
+		diag_set(ClientError, ER_USER_MAX, BOX_USER_MAX);
+		diag_log();
+		diag_raise();
 	}
         /*
          * find-first-set returns bit index starting from 1,
@@ -470,7 +602,7 @@ user_cache_replace(struct user_def *def)
 		struct mh_i32ptr_node_t node = { def->uid, user };
 		mh_i32ptr_put(user_registry, &node, NULL, NULL);
 	} else {
-		free(user->def);
+		user_def_delete(user->def);
 	}
 	user->def = def;
 	return user;
@@ -544,9 +676,11 @@ user_find_by_name(const char *name, uint32_t len)
 void
 user_cache_init(void)
 {
+	memset(users, 0, sizeof(users));
 	/** Mark all tokens as unused. */
 	memset(tokens, 0xFF, sizeof(tokens));
 	user_registry = mh_i32ptr_new();
+	access_lua_call_registry = mh_strnptr_new();
 	/*
 	 * Solve a chicken-egg problem:
 	 * we need a functional user cache entry for superuser to
@@ -555,16 +689,11 @@ user_cache_init(void)
 	 * for 'guest' and 'admin' users here, they will be
 	 * updated with snapshot contents during recovery.
 	 */
-	size_t name_len = strlen("guest");
-	size_t sz = user_def_sizeof(name_len);
-	struct user_def *def = (struct user_def *) calloc(1, sz);
-	if (def == NULL)
-		tnt_raise(OutOfMemory, sz, "malloc", "def");
+	const char *name = "guest";
+	struct user_def *def = user_def_new(GUEST, ADMIN, SC_USER,
+					    name, strlen(name));
 	/* Free def in a case of exception. */
-	auto guest_def_guard = make_scoped_guard([=] { free(def); });
-	memcpy(def->name, "guest", name_len);
-	def->owner = ADMIN;
-	def->type = SC_USER;
+	auto guest_def_guard = make_scoped_guard([=] { user_def_delete(def); });
 	struct user *user = user_cache_replace(def);
 	/* Now the user cache owns the def. */
 	guest_def_guard.is_active = false;
@@ -572,15 +701,9 @@ user_cache_init(void)
 	assert(user->def->uid == GUEST && user->auth_token == GUEST);
 	(void) user;
 
-	name_len = strlen("admin");
-	sz = user_def_sizeof(name_len);
-	def = (struct user_def *) calloc(1, sz);
-	if (def == NULL)
-		tnt_raise(OutOfMemory, sz, "malloc", "def");
-	auto admin_def_guard = make_scoped_guard([=] { free(def); });
-	memcpy(def->name, "admin", name_len);
-	def->uid = def->owner = ADMIN;
-	def->type = SC_USER;
+	name = "admin";
+	def = user_def_new(ADMIN, ADMIN, SC_USER, name, strlen(name));
+	auto admin_def_guard = make_scoped_guard([=] { user_def_delete(def); });
 	user = user_cache_replace(def);
 	admin_def_guard.is_active = false;
 	/*
@@ -608,8 +731,24 @@ user_cache_init(void)
 void
 user_cache_free(void)
 {
-	if (user_registry)
+	if (user_registry != NULL) {
+		mh_int_t i;
+		mh_foreach(user_registry, i) {
+			struct user *user = (struct user *)
+				mh_i32ptr_node(user_registry, i)->val;
+			user_destroy(user);
+		}
 		mh_i32ptr_delete(user_registry);
+		user_registry = NULL;
+	}
+	if (access_lua_call_registry != NULL) {
+		struct mh_strnptr_t *h = access_lua_call_registry;
+		mh_int_t i;
+		mh_foreach(h, i)
+			free(mh_strnptr_node(h, i)->val);
+		mh_strnptr_delete(h);
+		access_lua_call_registry = NULL;
+	}
 }
 
 /* }}} user cache */
@@ -657,11 +796,13 @@ role_check(struct user *grantee, struct user *role)
 }
 
 /**
- * Re-calculate effective grants of the linked subgraph
- * this user/role is a part of.
+ * Re-calculate effective grants of the linked subgraph this user/role is a
+ * part of. For the purpose of the rolled back statement, please refer to
+ * `user_reload_privs`.
  */
-int
-rebuild_effective_grants(struct user *grantee)
+void
+rebuild_effective_grants(struct user *grantee,
+			 struct txn_stmt *rolled_back_stmt)
 {
 	/*
 	 * Recurse over all roles to which grantee is granted
@@ -712,8 +853,11 @@ rebuild_effective_grants(struct user *grantee)
 			struct user_map indirect_edges = user->roles;
 			user_map_minus(&indirect_edges, &transitive_closure);
 			if (user_map_is_empty(&indirect_edges)) {
-				if (user_reload_privs(user) != 0)
-					return -1;
+				if (user_reload_privs(user,
+						      rolled_back_stmt) != 0) {
+					diag_log();
+					panic("Failed to reload privileges");
+				}
 				user_map_union(&next_layer, &user->users);
 			} else {
 				/*
@@ -734,56 +878,77 @@ rebuild_effective_grants(struct user *grantee)
 		user_map_union(&transitive_closure, &current_layer);
 		current_layer = next_layer;
 	}
-	return 0;
 }
 
 
 /**
  * Update verges in the graph of dependencies.
- * Grant all effective privileges of the role to whoever
+ *
+ * Warning: must call `rebuild_effective_grants` after this
+ * to grant all effective privileges of the role to whoever
  * this role was granted to.
  */
-int
+void
 role_grant(struct user *grantee, struct user *role)
 {
 	user_map_set(&role->users, grantee->auth_token);
 	user_map_set(&grantee->roles, role->auth_token);
-	if (rebuild_effective_grants(grantee) != 0)
-		return -1;
-	return 0;
 }
 
 /**
  * Update the role dependencies graph.
- * Rebuild effective privileges of the grantee.
+ *
+ * Warning: must call `rebuild_effective_grants` after
+ * this to rebuild effective privileges of the grantee.
  */
-int
+void
 role_revoke(struct user *grantee, struct user *role)
 {
 	user_map_clear(&role->users, grantee->auth_token);
 	user_map_clear(&grantee->roles, role->auth_token);
-	if (rebuild_effective_grants(grantee) != 0)
-		return -1;
-	return 0;
 }
 
-int
+/**
+ * Check if a role is granted to a user or role with the given auth token.
+ */
+bool
+role_is_granted(struct user *role, uint8_t auth_token)
+{
+	/* Check if the role is granted directly. */
+	if (user_map_is_set(&role->users, auth_token))
+		return true;
+
+	/* Check if the role is granted transitively. */
+	struct user_map transitive_closure = user_map_nil;
+	struct user_map current_layer = user_map_nil;
+	user_map_union(&current_layer, &role->users);
+	while (!user_map_is_empty(&current_layer)) {
+		/*
+		 * There's no loops in the role graph (this is guaranteed
+		 * by the role_check), so we're are bound to end at some
+		 * point in a layer with no incoming edges.
+		 */
+		struct user_map next_layer = user_map_nil;
+		struct user_map_iterator it;
+		user_map_iterator_init(&it, &current_layer);
+		struct user *transitive_role;
+		while ((transitive_role = user_map_iterator_next(&it)))
+			user_map_union(&next_layer, &transitive_role->users);
+		user_map_union(&transitive_closure, &next_layer);
+		current_layer = next_layer;
+	}
+	return user_map_is_set(&transitive_closure, auth_token);
+}
+
+void
 priv_grant(struct user *grantee, struct priv_def *priv)
 {
-	struct access *object = access_find(priv->object_type, priv->object_id);
+	struct access *object = access_get(priv);
 	if (object == NULL)
-		return 0;
-	if (grantee->auth_token == ADMIN && priv->object_type == SC_UNIVERSE &&
-	    priv->access != USER_ACCESS_FULL) {
-		diag_set(ClientError, ER_GRANT,
-			 "can't revoke universe from the admin user");
-		return -1;
-	}
+		return;
 	struct access *access = &object[grantee->auth_token];
 	access->granted = priv->access;
-	if (rebuild_effective_grants(grantee) != 0)
-		return -1;
-	return 0;
+	access_put(priv, object);
 }
 
 /** }}} */

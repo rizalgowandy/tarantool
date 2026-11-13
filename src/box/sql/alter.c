@@ -38,112 +38,33 @@
 #include "box/schema.h"
 
 void
-sql_alter_table_rename(struct Parse *parse)
+sql_alter_table_rename(struct Parse *parse, struct Token *old_name,
+		       struct Token *new_name)
 {
-	struct rename_entity_def *rename_def = &parse->rename_entity_def;
-	struct SrcList *src_tab = rename_def->base.entity_name;
-	assert(rename_def->base.entity_type == ENTITY_TYPE_TABLE);
-	assert(rename_def->base.alter_action == ALTER_ACTION_RENAME);
-	assert(src_tab->nSrc == 1);
-	struct sql *db = parse->db;
-	char *new_name = sql_name_from_token(db, &rename_def->new_name);
-	if (new_name == NULL)
-		goto tnt_error;
+	char *new_name_str = sql_name_from_token(new_name);
 	/* Check that new name isn't occupied by another table. */
-	if (space_by_name(new_name) != NULL) {
-		diag_set(ClientError, ER_SPACE_EXISTS, new_name);
+	if (space_by_name0(new_name_str) != NULL) {
+		diag_set(ClientError, ER_SPACE_EXISTS, new_name_str);
 		goto tnt_error;
 	}
-	const char *tbl_name = src_tab->a[0].zName;
-	struct space *space = space_by_name(tbl_name);
+	const struct space *space = sql_space_by_token(old_name);
 	if (space == NULL) {
-		diag_set(ClientError, ER_NO_SUCH_SPACE, tbl_name);
+		diag_set(ClientError, ER_NO_SUCH_SPACE,
+			 sql_tt_name_from_token(old_name));
 		goto tnt_error;
 	}
-	sql_set_multi_write(parse, false);
 	/* Drop and reload the internal table schema. */
 	struct Vdbe *v = sqlGetVdbe(parse);
-	sqlVdbeAddOp4(v, OP_RenameTable, space->def->id, 0, 0, new_name,
-			  P4_DYNAMIC);
-exit_rename_table:
-	sqlSrcListDelete(db, src_tab);
+	sqlVdbeAddOp4(v, OP_RenameTable, space->def->id, 0, 0, new_name_str,
+		      P4_DYNAMIC);
 	return;
 tnt_error:
-	sqlDbFree(db, new_name);
+	sql_xfree(new_name_str);
 	parse->is_aborted = true;
-	goto exit_rename_table;
 }
 
-void
-sql_alter_ck_constraint_enable(struct Parse *parse)
-{
-	struct enable_entity_def *enable_def = &parse->enable_entity_def;
-	struct SrcList *src_tab = enable_def->base.entity_name;
-	assert(enable_def->base.entity_type == ENTITY_TYPE_CK);
-	assert(enable_def->base.alter_action == ALTER_ACTION_ENABLE);
-	assert(src_tab->nSrc == 1);
-	struct sql *db = parse->db;
-
-	char *constraint_name = NULL;
-	const char *tbl_name = src_tab->a[0].zName;
-	struct space *space = space_by_name(tbl_name);
-	if (space == NULL) {
-		diag_set(ClientError, ER_NO_SUCH_SPACE, tbl_name);
-		parse->is_aborted = true;
-		goto exit_alter_ck_constraint;
-	}
-
-	constraint_name = sql_name_from_token(db, &enable_def->name);
-	if (constraint_name == NULL) {
-		parse->is_aborted = true;
-		goto exit_alter_ck_constraint;
-	}
-
-	struct Vdbe *v = sqlGetVdbe(parse);
-	if (v == NULL)
-		goto exit_alter_ck_constraint;
-
-	struct space *ck_space = space_by_id(BOX_CK_CONSTRAINT_ID);
-	assert(ck_space != NULL);
-	int cursor = parse->nTab++;
-	vdbe_emit_open_cursor(parse, cursor, 0, ck_space);
-	sqlVdbeChangeP5(v, OPFLAG_SYSTEMSP);
-
-	int key_reg = sqlGetTempRange(parse, 2);
-	sqlVdbeAddOp2(v, OP_Integer, space->def->id, key_reg);
-	sqlVdbeAddOp4(v, OP_String8, 0, key_reg + 1, 0,
-		      sqlDbStrDup(db, constraint_name), P4_DYNAMIC);
-	int addr = sqlVdbeAddOp4Int(v, OP_Found, cursor, 0, key_reg, 2);
-	sqlVdbeAddOp4(v, OP_SetDiag, ER_NO_SUCH_CONSTRAINT, 0, 0,
-		      sqlMPrintf(db, tnt_errcode_desc(ER_NO_SUCH_CONSTRAINT),
-				 constraint_name, tbl_name), P4_DYNAMIC);
-	sqlVdbeAddOp2(v, OP_Halt, -1, ON_CONFLICT_ACTION_ABORT);
-	sqlVdbeJumpHere(v, addr);
-
-	const int field_count = 6;
-	int tuple_reg = sqlGetTempRange(parse, field_count + 1);
-	for (int i = 0; i < field_count - 1; ++i)
-		sqlVdbeAddOp3(v, OP_Column, cursor, i, tuple_reg + i);
-	sqlVdbeAddOp1(v, OP_Close, cursor);
-	sqlVdbeAddOp2(v, OP_Bool, enable_def->is_enabled,
-		      tuple_reg + field_count - 1);
-	sqlVdbeAddOp3(v, OP_MakeRecord, tuple_reg, field_count,
-		      tuple_reg + field_count);
-	sqlVdbeAddOp4(v, OP_IdxReplace, tuple_reg + field_count, 0, 0,
-		      (char *)ck_space, P4_SPACEPTR);
-exit_alter_ck_constraint:
-	sqlDbFree(db, constraint_name);
-	sqlSrcListDelete(db, src_tab);
-}
-
-/* This function is used to implement the ALTER TABLE command.
- * The table name in the CREATE TRIGGER statement is replaced with the third
- * argument and the result returned. This is analagous to rename_table()
- * above, except for CREATE TRIGGER, not CREATE INDEX and CREATE TABLE.
- */
-char*
-rename_trigger(sql *db, char const *sql_stmt, char const *table_name,
-	       bool *is_quoted)
+char *
+rename_trigger(char const *sql_stmt, char const *table_name, bool *is_quoted)
 {
 	assert(sql_stmt);
 	assert(table_name);
@@ -154,7 +75,6 @@ rename_trigger(sql *db, char const *sql_stmt, char const *table_name,
 	int dist = 3;
 	char const *csr = (char const*)sql_stmt;
 	int len = 0;
-	char *new_sql_stmt;
 	bool unused;
 
 	/* The principle used to locate the table name in the CREATE TRIGGER
@@ -199,8 +119,6 @@ rename_trigger(sql *db, char const *sql_stmt, char const *table_name,
 	/* Variable tname now contains the token that is the old table-name
 	 * in the CREATE TRIGGER statement.
 	 */
-	new_sql_stmt = sqlMPrintf(db, "%.*s\"%w\"%s",
-				      (int)((tname.z) - sql_stmt), sql_stmt,
-				      table_name, tname.z + tname.n);
-	return new_sql_stmt;
+	return sqlMPrintf("%.*s\"%w\"%s", (int)((tname.z) - sql_stmt), sql_stmt,
+			  table_name, tname.z + tname.n);
 }

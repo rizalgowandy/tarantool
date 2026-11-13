@@ -31,6 +31,7 @@
 #include "xrow_update_field.h"
 #include "msgpuck.h"
 #include "fiber.h"
+#include "schema_def.h"
 #include "tuple_format.h"
 
 /**
@@ -83,6 +84,8 @@ xrow_update_op_adjust_field_no(struct xrow_update_op *op, int32_t field_count)
 struct xrow_update_array_item {
 	/** First field in the range, contains an update. */
 	struct xrow_update_field field;
+	/** Pointer to other fields in the range. */
+	const char *tail_data;
 	/** Size of other fields in the range. */
 	uint32_t tail_size;
 };
@@ -96,19 +99,8 @@ xrow_update_array_item_create(struct xrow_update_array_item *item,
 	item->field.type = type;
 	item->field.data = data;
 	item->field.size = size;
+	item->tail_data = data + size;
 	item->tail_size = tail_size;
-}
-
-/** Rope allocator for nodes, paths, items etc. */
-static inline void *
-xrow_update_alloc(struct region *region, size_t size)
-{
-	void *ptr = region_aligned_alloc(region, size, alignof(uint64_t));
-	if (ptr == NULL) {
-		diag_set(OutOfMemory, size, "region_aligned_alloc",
-			 "xrow update internals");
-	}
-	return ptr;
 }
 
 /** Split a range of fields in two. */
@@ -120,18 +112,15 @@ xrow_update_array_item_split(struct region *region,
 	(void) size;
 	struct xrow_update_array_item *next = (struct xrow_update_array_item *)
 		xrow_update_alloc(region, sizeof(*next));
-	if (next == NULL)
-		return NULL;
 	assert(offset > 0 && prev->tail_size > 0);
 
-	const char *tail = prev->field.data + prev->field.size;
-	const char *field = tail;
-	const char *range_end = tail + prev->tail_size;
+	const char *field = prev->tail_data;
+	const char *range_end = prev->tail_data + prev->tail_size;
 
 	for (uint32_t i = 1; i < offset; ++i)
 		mp_next(&field);
 
-	prev->tail_size = field - tail;
+	prev->tail_size = field - prev->tail_data;
 	const char *field_end = field;
 	mp_next(&field_end);
 	xrow_update_array_item_create(next, XUPDATE_NOP, field,
@@ -163,7 +152,7 @@ xrow_update_array_extract_item(struct xrow_update_field *field,
 	return NULL;
 }
 
-int
+void
 xrow_update_array_create(struct xrow_update_field *field, const char *header,
 			 const char *data, const char *data_end,
 			 uint32_t field_count)
@@ -173,14 +162,11 @@ xrow_update_array_create(struct xrow_update_field *field, const char *header,
 	field->size = data_end - header;
 	struct region *region = &fiber()->gc;
 	field->array.rope = xrow_update_rope_new(region);
-	if (field->array.rope == NULL)
-		return -1;
+	assert(field->array.rope != NULL);
 	struct xrow_update_array_item *item = (struct xrow_update_array_item *)
 		xrow_update_alloc(region, sizeof(*item));
-	if (item == NULL)
-		return -1;
 	if (data == data_end)
-		return 0;
+		return;
 	/*
 	 * Initial item consists of one range - the whole array.
 	 */
@@ -188,10 +174,12 @@ xrow_update_array_create(struct xrow_update_field *field, const char *header,
 	mp_next(&data);
 	xrow_update_array_item_create(item, XUPDATE_NOP, begin, data - begin,
 				      data_end - data);
-	return xrow_update_rope_append(field->array.rope, item, field_count);
+	int rc = xrow_update_rope_append(field->array.rope, item, field_count);
+	assert(rc == 0);
+	(void)rc;
 }
 
-int
+void
 xrow_update_array_create_with_child(struct xrow_update_field *field,
 				    const char *header,
 				    const struct xrow_update_field *child,
@@ -204,12 +192,9 @@ xrow_update_array_create_with_child(struct xrow_update_field *field,
 	mp_next(&first_field_end);
 	struct region *region = &fiber()->gc;
 	struct xrow_update_rope *rope = xrow_update_rope_new(region);
-	if (rope == NULL)
-		return -1;
+	assert(rope != NULL);
 	struct xrow_update_array_item *item = (struct xrow_update_array_item *)
 		xrow_update_alloc(region, sizeof(*item));
-	if (item == NULL)
-		return -1;
 	const char *end = first_field_end;
 	if (field_no > 0) {
 		for (int32_t i = 1; i < field_no; ++i)
@@ -217,12 +202,11 @@ xrow_update_array_create_with_child(struct xrow_update_field *field,
 		xrow_update_array_item_create(item, XUPDATE_NOP, first_field,
 					      first_field_end - first_field,
 					      end - first_field_end);
-		if (xrow_update_rope_append(rope, item, field_no) != 0)
-			return -1;
+		int rc = xrow_update_rope_append(rope, item, field_no);
+		assert(rc == 0);
+		(void)rc;
 		item = (struct xrow_update_array_item *)
 			xrow_update_alloc(region, sizeof(*item));
-		if (item == NULL)
-			return -1;
 		first_field = end;
 		first_field_end = first_field;
 		mp_next(&first_field_end);
@@ -238,7 +222,9 @@ xrow_update_array_create_with_child(struct xrow_update_field *field,
 	field->data = header;
 	field->size = end - header;
 	field->array.rope = rope;
-	return xrow_update_rope_append(rope, item, field_count - field_no);
+	int rc = xrow_update_rope_append(rope, item, field_count - field_no);
+	assert(rc == 0);
+	(void)rc;
 }
 
 uint32_t
@@ -250,7 +236,8 @@ xrow_update_array_sizeof(struct xrow_update_field *field)
 
 	uint32_t size = xrow_update_rope_size(field->array.rope);
 	uint32_t res = mp_sizeof_array(size);
-	struct xrow_update_rope_node *node = xrow_update_rope_iter_start(&it);
+	const struct xrow_update_rope_node *node =
+					xrow_update_rope_iter_start(&it);
 	for (; node != NULL; node = xrow_update_rope_iter_next(&it)) {
 		struct xrow_update_array_item *item =
 			xrow_update_rope_leaf_data(node);
@@ -269,7 +256,8 @@ xrow_update_array_store(struct xrow_update_field *field,
 	out = mp_encode_array(out, xrow_update_rope_size(field->array.rope));
 	struct xrow_update_rope_iter it;
 	xrow_update_rope_iter_create(&it, field->array.rope);
-	struct xrow_update_rope_node *node = xrow_update_rope_iter_start(&it);
+	const struct xrow_update_rope_node *node =
+					xrow_update_rope_iter_start(&it);
 	uint32_t total_field_count = 0;
 	if (this_node == NULL) {
 		for (; node != NULL; node = xrow_update_rope_iter_next(&it)) {
@@ -279,8 +267,7 @@ xrow_update_array_store(struct xrow_update_field *field,
 			out += xrow_update_field_store(&item->field, NULL, NULL,
 						       out, out_end);
 			assert(item->tail_size == 0 || field_count > 1);
-			memcpy(out, item->field.data + item->field.size,
-			       item->tail_size);
+			memcpy(out, item->tail_data, item->tail_size);
 			out += item->tail_size;
 			total_field_count += field_count;
 		}
@@ -297,8 +284,7 @@ xrow_update_array_store(struct xrow_update_field *field,
 			out += xrow_update_field_store(&item->field, format_tree,
 						       next_node, out, out_end);
 			assert(item->tail_size == 0 || field_count > 1);
-			memcpy(out, item->field.data + item->field.size,
-			       item->tail_size);
+			memcpy(out, item->tail_data, item->tail_size);
 			out += item->tail_size;
 			token.num += field_count;
 			total_field_count += field_count;
@@ -314,37 +300,33 @@ xrow_update_array_store(struct xrow_update_field *field,
  * Helper function that appends nils in the end so that op will insert
  * without gaps
  */
-static int
+static void
 xrow_update_array_append_nils(struct xrow_update_field *field,
 			      struct xrow_update_op *op)
 {
 	struct xrow_update_rope *rope = field->array.rope;
 	uint32_t size = xrow_update_rope_size(rope);
 	if (op->field_no < 0 || (uint32_t)op->field_no <= size)
-		return 0;
+		return;
 	/*
 	 * Do not allow autofill of nested arrays with nulls. It is not
 	 * supported only because there is no an easy way how to apply that to
 	 * bar updates which can also affect arrays.
 	 */
 	if (!op->is_for_root)
-		return 0;
+		return;
 	uint32_t nil_count = op->field_no - size;
 	struct xrow_update_array_item *item =
 		(struct xrow_update_array_item *)
 		xrow_update_alloc(rope->ctx, sizeof(*item));
-	if (item == NULL)
-		return -1;
 	assert(mp_sizeof_nil() == 1);
-	char *item_data = (char *)region_alloc(rope->ctx, nil_count);
-	if (item_data == NULL) {
-		diag_set(OutOfMemory, nil_count, "region", "item_data");
-		return -1;
-	}
+	char *item_data = (char *)xregion_alloc(rope->ctx, nil_count);
 	memset(item_data, 0xc0, nil_count);
 	xrow_update_array_item_create(item, XUPDATE_NOP, item_data, 1,
 				      nil_count - 1);
-	return xrow_update_rope_insert(rope, op->field_no, item, nil_count);
+	int rc = xrow_update_rope_insert(rope, op->field_no, item, nil_count);
+	assert(rc == 0);
+	(void)rc;
 }
 
 int
@@ -364,21 +346,31 @@ xrow_update_op_do_array_insert(struct xrow_update_op *op,
 		return xrow_update_op_do_field_insert(op, &item->field);
 	}
 
-	if (xrow_update_array_append_nils(field, op) != 0)
-		return -1;
+	xrow_update_array_append_nils(field, op);
 
 	struct xrow_update_rope *rope = field->array.rope;
 	uint32_t size = xrow_update_rope_size(rope);
+	int64_t tuple_field_cnt_lim = BOX_FIELD_MAX;
+	struct errinj *err_inj =
+		errinj(ERRINJ_TUPLE_FIELD_COUNT_LIMIT, ERRINJ_INT);
+	if (err_inj != NULL && err_inj->iparam > 0) {
+		tuple_field_cnt_lim = err_inj->iparam;
+	}
+	if (size >= tuple_field_cnt_lim) {
+		diag_set(ClientError, ER_TUPLE_FIELD_COUNT_LIMIT);
+		return -1;
+	}
 	if (xrow_update_op_adjust_field_no(op, size + 1) != 0)
 		return -1;
 
 	item = (struct xrow_update_array_item *)
 		xrow_update_alloc(rope->ctx, sizeof(*item));
-	if (item == NULL)
-		return -1;
 	xrow_update_array_item_create(item, XUPDATE_NOP, op->arg.set.value,
 				      op->arg.set.length, 0);
-	return xrow_update_rope_insert(rope, op->field_no, item, 1);
+	int rc = xrow_update_rope_insert(rope, op->field_no, item, 1);
+	assert(rc == 0);
+	(void)rc;
+	return 0;
 }
 
 int
@@ -402,15 +394,9 @@ xrow_update_op_do_array_set(struct xrow_update_op *op,
 		op->is_token_consumed = true;
 		return xrow_update_op_do_field_set(op, &item->field);
 	}
-	op->new_field_len = op->arg.set.length;
-	/*
-	 * Ignore the previous op, if any. It is not correct,
-	 * strictly speaking, since only one update is allowed per
-	 * field. But it was allowed since the beginning, and
-	 * should be supported now for compatibility.
-	 */
-	item->field.type = XUPDATE_SCALAR;
-	item->field.scalar.op = op;
+	item->field.type = XUPDATE_NOP;
+	item->field.data = op->arg.set.value;
+	item->field.size = op->arg.set.length;
 	return 0;
 }
 
@@ -442,8 +428,7 @@ xrow_update_op_do_array_delete(struct xrow_update_op *op,
 	if ((uint64_t) op->field_no + delete_count > size)
 		delete_count = size - op->field_no;
 	assert(delete_count > 0);
-	for (uint32_t u = delete_count; u != 0; --u)
-		xrow_update_rope_erase(rope, op->field_no);
+	xrow_update_rope_erase(rope, op->field_no, delete_count);
 	return 0;
 }
 
@@ -462,12 +447,18 @@ xrow_update_op_do_array_##op_type(struct xrow_update_op *op,			\
 		op->is_token_consumed = true;					\
 		return xrow_update_op_do_field_##op_type(op, &item->field);	\
 	}									\
-	if (item->field.type != XUPDATE_NOP)					\
-		return xrow_update_err_double(op);				\
-	if (xrow_update_op_do_##op_type(op, item->field.data) != 0)		\
+	struct xrow_update_scalar *scalar = &item->field.scalar;		\
+	/* Just stub for non scalar field. op_do_ * will fail on it. */		\
+	struct xrow_update_scalar na = { .type = XUPDATE_TYPE_NONE };		\
+	if (item->field.type == XUPDATE_NOP) {					\
+		const char *data = item->field.data;				\
+		xrow_update_mp_read_scalar(&data, &item->field.scalar);		\
+	} else if (item->field.type != XUPDATE_SCALAR) {			\
+		scalar = &na;							\
+	}									\
+	if (xrow_update_op_do_##op_type(op, scalar) != 0)			\
 		return -1;							\
 	item->field.type = XUPDATE_SCALAR;					\
-	item->field.scalar.op = op;						\
 	return 0;								\
 }
 

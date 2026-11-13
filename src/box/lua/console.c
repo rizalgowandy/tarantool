@@ -38,9 +38,12 @@
 #include "lua/fiber.h"
 #include "fiber.h"
 #include "coio.h"
+#include "iostream.h"
 #include "lua/msgpack.h"
 #include "lua-yaml/lyaml.h"
+#include "main.h"
 #include "serialize_lua.h"
+#include "say.h"
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
@@ -48,6 +51,12 @@
 #include <readline/history.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <string.h>
+#include <strings.h>
+
+bool is_console_exited;
+
+struct rlist on_console_eval = RLIST_HEAD_INITIALIZER(on_console_eval);
 
 static struct luaL_serializer *serializer_yaml;
 static struct luaL_serializer *serializer_lua;
@@ -114,7 +123,17 @@ lbox_console_format_lua(struct lua_State *L)
 
 	lua_replace(L, 1);
 	lua_settop(L, 1);
-	return lua_encode(L, serializer_lua, &opts);
+	int ret = lua_encode(L, serializer_lua, &opts);
+	if (ret == 2) {
+		/*
+		 * Nil and error object are pushed onto the stack.
+		 */
+		assert(lua_isnil(L, -2));
+		assert(lua_isstring(L, -1));
+		return luaL_error(L, lua_tostring(L, -1));
+	}
+	assert(ret == 1);
+	return ret;
 }
 
 /*
@@ -204,6 +223,8 @@ done:
  *
  * The callback creates a copy of the line on the Lua stack; this copy
  * becomes the lbox_console_readline()'s ultimate result.
+ *
+ * The second return value is boolean, which means 'discard the line'.
  */
 static void
 console_push_line(char *line)
@@ -214,6 +235,7 @@ console_push_line(char *line)
 	else
 		lua_pushstring(readline_L, line);
 
+	lua_pushboolean(readline_L, false);
 #ifdef HAVE_GNU_READLINE
 	/*
 	 * This is to avoid a stray prompt on the next line with GNU
@@ -222,7 +244,237 @@ console_push_line(char *line)
 	 */
 	rl_callback_handler_install(NULL, NULL);
 #endif
+	free(line);
 }
+
+/*
+ * The flag indicates if sigint was sent.
+ */
+static bool sigint_called;
+/*
+ * The pointer to interactive fiber is needed to wake it up
+ * when SIGINT handler is called.
+ */
+static struct fiber *interactive_fb;
+
+/*
+ * The sigint callback for console mode.
+ */
+static void
+console_sigint_handler(ev_loop *loop, struct ev_signal *w, int revents)
+{
+	(void)loop;
+	(void)w;
+	(void)revents;
+
+	sigint_called = true;
+	fiber_wakeup(interactive_fb);
+}
+
+/* {{{ Show/hide prompt */
+
+/*
+ * The idea is borrowed from
+ * https://metacpan.org/dist/AnyEvent-ReadLine-Gnu/source/Gnu.pm
+ *
+ * Since this feature is not thread-safe, it will work only when logging occurs
+ * from main (transaction) thread.
+ */
+
+static char *saved_prompt = NULL;
+static char *saved_line_buffer = NULL;
+static int saved_line_buffer_len = 0;
+static int saved_point = 0;
+
+static int console_hide_prompt_ref = LUA_NOREF;
+static int console_show_prompt_ref = LUA_NOREF;
+static int gettable_ref = LUA_NOREF;
+
+/**
+ * Don't attempt to hide/show prompt in certain readline states.
+ *
+ * There are readline states, where rl_message() is called
+ * internally. In this case an actual readline's line on the
+ * screen is not prompt + line buffer. Current code can't properly
+ * save and restore the line.
+ */
+static bool
+console_can_hide_show_prompt(void)
+{
+	if (RL_ISSTATE(RL_STATE_NSEARCH))
+		return false;
+	if (RL_ISSTATE(RL_STATE_ISEARCH))
+		return false;
+	if (RL_ISSTATE(RL_STATE_NUMERICARG))
+		return false;
+	return true;
+}
+
+/**
+ * Save and hide readline's output (prompt and current user
+ * input).
+ */
+static void
+console_hide_prompt(void)
+{
+	if (!console_can_hide_show_prompt() || !cord_is_main())
+		return;
+
+	if (rl_prompt == NULL) {
+		saved_prompt = NULL;
+	} else {
+		saved_prompt = xstrdup(rl_prompt);
+	}
+	rl_set_prompt("");
+
+	saved_point = rl_point;
+
+	if (rl_line_buffer == NULL) {
+		saved_line_buffer = NULL;
+		saved_line_buffer_len = 0;
+	} else {
+		saved_line_buffer = xmalloc(rl_end + 1);
+		memcpy(saved_line_buffer, rl_line_buffer, rl_end);
+		saved_line_buffer[rl_end] = '\0';
+		saved_line_buffer_len = rl_end;
+	}
+	rl_replace_line("", 0);
+
+	rl_redisplay();
+}
+
+/**
+ * Show saved readline's output and free saved strings.
+ */
+static void
+console_show_prompt(void)
+{
+	if (!console_can_hide_show_prompt() || !cord_is_main())
+		return;
+
+	rl_set_prompt(saved_prompt);
+	free(saved_prompt);
+	saved_prompt = NULL;
+
+	if (saved_line_buffer == NULL) {
+		rl_replace_line("", 0);
+	} else {
+		rl_replace_line(saved_line_buffer, saved_line_buffer_len);
+	}
+	free(saved_line_buffer);
+	saved_line_buffer = NULL;
+	saved_line_buffer_len = 0;
+
+	rl_point = saved_point;
+	saved_point = 0;
+
+	rl_redisplay();
+}
+
+static int
+lbox_console_hide_prompt(struct lua_State *L)
+{
+	(void)L;
+	console_hide_prompt();
+	return 0;
+}
+
+static int
+lbox_console_show_prompt(struct lua_State *L)
+{
+	(void)L;
+	console_show_prompt();
+	return 0;
+}
+
+/**
+ * Allow to disable hide/show prompt actions using an environment
+ * variable.
+ *
+ * It is not supposed to be a documented variable, but rather just
+ * a way to turn off the feature if something goes wrong.
+ */
+static bool
+console_hide_show_prompt_is_enabled(void)
+{
+	char var_buf[10];
+	const char *envvar = getenv_safe("TT_CONSOLE_HIDE_SHOW_PROMPT", var_buf,
+					 sizeof(var_buf));
+
+	/* Enabled by default. */
+	if (envvar == NULL || *envvar == '\0')
+		return true;
+
+	/* Explicitly enabled or disabled. */
+	if (strcasecmp(envvar, "false") == 0)
+		return false;
+	if (strcasecmp(envvar, "true") == 0)
+		return true;
+
+	/* Accept 0/1 as boolean values. */
+	if (strcmp(envvar, "0") == 0)
+		return false;
+	if (strcmp(envvar, "1") == 0)
+		return true;
+
+	/* Can't parse the value, let's use the default. */
+	return true;
+}
+
+static void
+luaT_console_setup_write_cb(struct lua_State *L)
+{
+	if (!console_hide_show_prompt_is_enabled())
+		return;
+
+	/*
+	 * Set the print callback first, because technically
+	 * luaT_call() may fail, and then set the logger callback.
+	 * If the former will fail, things will be consistent:
+	 * no callbacks are set.
+	 *
+	 * In fact, the require call may fail only if a user
+	 * removes the internal module from package.loaded
+	 * manually. A user shouldn't do that.
+	 */
+	lua_getfield(L, LUA_GLOBALSINDEX, "require");
+	lua_pushstring(L, "internal.print");
+	if (luaT_call(L, 1, 1) != 0)
+		return;
+
+	lua_rawgeti(L, LUA_REGISTRYINDEX, console_hide_prompt_ref);
+	lua_setfield(L, -2, "before_cb");
+	lua_rawgeti(L, LUA_REGISTRYINDEX, console_show_prompt_ref);
+	lua_setfield(L, -2, "after_cb");
+
+	lua_pop(L, 1);
+
+	say_set_stderr_callback(console_hide_prompt, console_show_prompt);
+}
+
+static void
+luaT_console_cleanup_write_cb(struct lua_State *L)
+{
+	if (!console_hide_show_prompt_is_enabled())
+		return;
+
+	/* See a comment in luaT_console_setup_write_cb(). */
+	lua_getfield(L, LUA_GLOBALSINDEX, "require");
+	lua_pushstring(L, "internal.print");
+	if (luaT_call(L, 1, 1) != 0)
+		return;
+
+	lua_pushnil(L);
+	lua_setfield(L, -2, "before_cb");
+	lua_pushnil(L);
+	lua_setfield(L, -2, "after_cb");
+
+	lua_pop(L, 1);
+
+	say_set_stderr_callback(NULL, NULL);
+}
+
+/* }}} Show/hide prompt */
 
 /* implements readline() Lua API */
 static int
@@ -231,6 +483,9 @@ lbox_console_readline(struct lua_State *L)
 	const char *prompt = NULL;
 	int top;
 	int completion = 0;
+	interactive_fb = fiber();
+	sigint_cb_t old_cb = set_sigint_cb(console_sigint_handler);
+	sigint_called = false;
 
 	if (lua_gettop(L) > 0) {
 		switch (lua_type(L, 1)) {
@@ -257,6 +512,8 @@ lbox_console_readline(struct lua_State *L)
 	if (readline_L != NULL)
 		luaL_error(L, "readline(): earlier call didn't complete yet");
 
+	luaT_console_setup_write_cb(L);
+
 	readline_L = L;
 
 	if (completion) {
@@ -282,12 +539,40 @@ lbox_console_readline(struct lua_State *L)
 	while (top == lua_gettop(L)) {
 		while (coio_wait(STDIN_FILENO, COIO_READ,
 				 TIMEOUT_INFINITY) == 0) {
+			if (sigint_called) {
+				const char *line_end = "^C\n";
+				ssize_t rc = write(STDOUT_FILENO, line_end,
+						   strlen(line_end));
+				(void)rc;
+				/*
+				 * Discard current input and disable search
+				 * mode.
+				 */
+				RL_UNSETSTATE(RL_STATE_ISEARCH |
+					      RL_STATE_NSEARCH |
+					      RL_STATE_SEARCH);
+				rl_on_new_line();
+				rl_replace_line("", 0);
+				lua_pushstring(L, "");
+				lua_pushboolean(L, sigint_called);
+
+				luaT_console_cleanup_write_cb(L);
+
+				readline_L = NULL;
+				sigint_called = false;
+				set_sigint_cb(old_cb);
+				return 2;
+			}
 			/*
 			 * Make sure the user of interactive
 			 * console has not hanged us, otherwise
 			 * we might spin here forever eating
 			 * the whole cpu time.
 			 */
+			if (fiber_is_cancelled()) {
+				luaT_console_cleanup_write_cb(L);
+				set_sigint_cb(old_cb);
+			}
 			luaL_testcancel(L);
 		}
 		rl_callback_read_char();
@@ -297,8 +582,10 @@ lbox_console_readline(struct lua_State *L)
 	/* Incidents happen. */
 #pragma GCC poison readline_L
 	rl_attempted_completion_function = NULL;
+	luaT_console_cleanup_write_cb(L);
+	set_sigint_cb(old_cb);
 	luaL_testcancel(L);
-	return 1;
+	return 2;
 }
 
 /* C string array to lua table converter */
@@ -418,7 +705,39 @@ lbox_console_format_yaml(struct lua_State *L)
 	}
 	lua_replace(L, 1);
 	lua_settop(L, 1);
-	return lua_yaml_encode(L, serializer_yaml, NULL, NULL);
+	int ret = lua_yaml_encode(L, serializer_yaml, NULL, NULL);
+	if (ret == 2) {
+		/*
+		 * Nil and error object are pushed onto the stack.
+		 */
+		assert(lua_isnil(L, -2));
+		assert(lua_isstring(L, -1));
+		return luaL_error(L, lua_tostring(L, -1));
+	}
+	assert(ret == 1);
+	return ret;
+}
+
+/**
+ * Runs registered on_console_eval triggers.
+ * Takes eval expression string, which is passed to trigger callback.
+ */
+static int
+lbox_console_run_on_eval(struct lua_State *L)
+{
+	const char *expr = lua_tostring(L, 1);
+	trigger_run(&on_console_eval, (void *)expr);
+	return 0;
+}
+
+/**
+ * Sets `is_console_exited' to true.
+ */
+static int
+lbox_console_console_exited(MAYBE_UNUSED struct lua_State *L)
+{
+	is_console_exited = true;
+	return 0;
 }
 
 int
@@ -573,8 +892,11 @@ console_session_push(struct session *session, struct port *port)
 	const char *text = port_dump_plain(port, &text_len);
 	if (text == NULL)
 		return -1;
-	return coio_write_fd_timeout(session_fd(session), text, text_len,
-				     TIMEOUT_INFINITY);
+	struct iostream io;
+	plain_iostream_create(&io, session_fd(session));
+	int ret = coio_write_timeout(&io, text, text_len, TIMEOUT_INFINITY);
+	iostream_destroy(&io);
+	return ret >= 0 ? 0 : -1;
 }
 
 void
@@ -587,14 +909,27 @@ tarantool_lua_console_init(struct lua_State *L)
 		{"completion_handler",	lbox_console_completion_handler},
 		{"format_yaml",		lbox_console_format_yaml},
 		{"format_lua",		lbox_console_format_lua},
+		{"run_on_eval",		lbox_console_run_on_eval},
+		{"console_exited",	lbox_console_console_exited},
 		{NULL, NULL}
 	};
-	luaL_register_module(L, "console", consolelib);
+	luaT_newmodule(L, "console.lib", consolelib);
 
 	/* readline() func needs a ref to completion_handler (in upvalue) */
 	lua_getfield(L, -1, "completion_handler");
 	lua_pushcclosure(L, lbox_console_readline, 1);
 	lua_setfield(L, -2, "readline");
+
+	/* Readline setup that provides timestamps and multiline history. */
+	history_comment_char = '#';
+	history_write_timestamps = 1;
+
+	/*
+	 * Force disable readline bracketed paste in console, even if it's
+	 * set in the inputrc, is enabled by default (eg GNU Readline 8.1),
+	 * or by user.
+	 */
+	rl_variable_bind("enable-bracketed-paste", "off");
 
 	serializer_yaml = lua_yaml_new_serializer(L);
 	serializer_yaml->encode_invalid_numbers = 1;
@@ -634,9 +969,6 @@ tarantool_lua_console_init(struct lua_State *L)
 	 */
 	lua_setfield(L, -2, "formatter_lua");
 
-	/* Output formatter in Lua mode */
-	lua_serializer_init(L);
-
 	struct session_vtab console_session_vtab = {
 		.push	= console_session_push,
 		.fd	= console_session_fd,
@@ -644,6 +976,18 @@ tarantool_lua_console_init(struct lua_State *L)
 	};
 	session_vtab_registry[SESSION_TYPE_CONSOLE] = console_session_vtab;
 	session_vtab_registry[SESSION_TYPE_REPL] = console_session_vtab;
+
+	lua_pushcfunction(L, lbox_console_hide_prompt);
+	console_hide_prompt_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+	lua_pushcfunction(L, lbox_console_show_prompt);
+	console_show_prompt_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
+	/*
+	 * Compile a Lua wrapper for table indexation. For sanity, verify that
+	 * it compiles successfully.
+	 */
+	VERIFY(luaT_dostring(L, "return function(t, k) return t[k] end") == 0);
+	gettable_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 }
 
 /*
@@ -755,13 +1099,49 @@ lua_rl_dmadd(dmlist *ml, const char *p, size_t pn, const char *s, int suf)
 	return 0;
 }
 
-/* Get __index field of metatable of object on top of stack. */
+/*
+ * Get table from __autocomplete function if it's present
+ * Use __index field of metatable of object as a fallback
+ */
 static int
-lua_rl_getmetaindex(lua_State *L)
+lua_rl_getcompletion(lua_State *L)
 {
 	if (!lua_getmetatable(L, -1)) {
 		lua_pop(L, 1);
 		return 0;
+	}
+	/* use __autocomplete metamethod if it's present */
+	lua_pushstring(L, "__autocomplete");
+	lua_rawget(L, -2);
+	if (lua_isnil(L, -1)) {
+		lua_pop(L, 1);
+		/*
+		 * __autocomplete may not always be part of the metatable (e.g.,
+		 * in case of cdata), so we also want to trigger the __index
+		 * metamethod instead of simply doing a raw lookup in the
+		 * metatable.
+		 */
+		lua_rawgeti(L, LUA_REGISTRYINDEX, gettable_ref);
+		lua_pushvalue(L, -3);
+		lua_pushstring(L, "__autocomplete");
+		if (lua_pcall(L, 2, 1, 0) != 0) {
+			/* pcall returns an error to the stack */
+			lua_pop(L, 1);
+			return 0;
+		}
+	}
+	if (lua_isfunction(L, -1)) {
+		lua_replace(L, -2);
+		lua_insert(L, -2);
+		if (lua_pcall(L, 1, 1, 0) != 0) {
+			/* pcall returns an error to the stack */
+			lua_pop(L, 1);
+			return 0;
+		} else {
+			return 1;
+		}
+	} else {
+		lua_pop(L, 1);
 	}
 	lua_pushstring(L, "__index");
 	lua_rawget(L, -2);
@@ -793,7 +1173,7 @@ lua_rl_getfield(lua_State *L, const char *s, size_t n)
 			lua_pop(L, 1);
 			return 0;
 		}
-	} while (lua_rl_getmetaindex(L));
+	} while (lua_rl_getcompletion(L));
 	return 0;
 }	 /* 1: obj -- val, 0: obj -- */
 
@@ -899,7 +1279,7 @@ lua_rl_complete(lua_State *L, const char *text, int start, int end)
 					goto error;
 			}
 		}
-	} while (++loop < METATABLE_RECURSION_MAX && lua_rl_getmetaindex(L));
+	} while (++loop < METATABLE_RECURSION_MAX && lua_rl_getcompletion(L));
 
 	lua_pop(L, 1);
 

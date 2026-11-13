@@ -87,95 +87,133 @@ incrAggFunctionDepth(Expr * pExpr, int N)
  * zero but it might be more if the alias is contained within a subquery
  * of the original expression.  The Expr.op2 field of TK_AGG_FUNCTION
  * structures must be increased by the nSubquery amount.
+ *
+ * @param pEList A result set.
+ * @param iCol A column in the result set.  0..pEList->nExpr-1.
+ * @param pExpr Transform this into an alias to the result set.
+ * @param zType "GROUP" or "ORDER" or "".
+ * @param nSubquery Number of subqueries that the label is moving.
  */
 static void
-resolveAlias(Parse * pParse,	/* Parsing context */
-	     ExprList * pEList,	/* A result set */
-	     int iCol,		/* A column in the result set.  0..pEList->nExpr-1 */
-	     Expr * pExpr,	/* Transform this into an alias to the result set */
-	     const char *zType,	/* "GROUP" or "ORDER" or "" */
-	     int nSubquery	/* Number of subqueries that the label is moving */
-    )
+resolveAlias(struct ExprList *pEList, int iCol, struct Expr *pExpr,
+	     const char *zType, int nSubquery)
 {
 	Expr *pOrig;		/* The iCol-th column of the result set */
 	Expr *pDup;		/* Copy of pOrig */
-	sql *db;		/* The database connection */
 
 	assert(iCol >= 0 && iCol < pEList->nExpr);
 	pOrig = pEList->a[iCol].pExpr;
 	assert(pOrig != 0);
-	db = pParse->db;
-	pDup = sqlExprDup(db, pOrig, 0);
+	pDup = sqlExprDup(pOrig, 0);
 	if (pDup == 0)
 		return;
 	if (zType[0] != 'G')
 		incrAggFunctionDepth(pDup, nSubquery);
-	if (pExpr->op == TK_COLLATE) {
-		pDup =
-		    sqlExprAddCollateString(pParse, pDup, pExpr->u.zToken);
-	}
-	ExprSetProperty(pDup, EP_Alias);
+	if (pExpr->op == TK_COLLATE)
+		pDup = sqlExprAddCollateString(pDup, pExpr->u.zToken);
 
 	/* Before calling sql_expr_delete(), set the EP_Static flag. This
 	 * prevents ExprDelete() from deleting the Expr structure itself,
 	 * allowing it to be repopulated by the memcpy() on the following line.
 	 * The pExpr->u.zToken might point into memory that will be freed by the
-	 * sqlDbFree(db, pDup) on the last line of this block, so be sure to
-	 * make a copy of the token before doing the sqlDbFree().
+	 * sql_xfree(pDup) on the last line of this block, so be sure to
+	 * make a copy of the token before doing the sql_xfree().
 	 */
 	ExprSetProperty(pExpr, EP_Static);
-	sql_expr_delete(db, pExpr, false);
+	sql_expr_delete(pExpr);
 	memcpy(pExpr, pDup, sizeof(*pExpr));
 	if (!ExprHasProperty(pExpr, EP_IntValue) && pExpr->u.zToken != 0) {
 		assert((pExpr->flags & (EP_Reduced | EP_TokenOnly)) == 0);
-		pExpr->u.zToken = sqlDbStrDup(db, pExpr->u.zToken);
+		pExpr->u.zToken = sql_xstrdup(pExpr->u.zToken);
 		pExpr->flags |= EP_MemToken;
 	}
-	sqlDbFree(db, pDup);
+	sql_xfree(pDup);
 }
 
-/*
- * Return TRUE if the name zCol occurs anywhere in the USING clause.
- *
- * Return FALSE if the USING clause is NULL or if it does not contain
- * zCol.
+/**
+ * Return TRUE if the name occurs anywhere in the USING clause.
+ * Return FALSE if the USING clause is NULL or if it does not contain the name.
+ */
+static bool
+nameInUsingClause(struct IdList *pUsing, const char *zCol, const char *old_col)
+{
+	if (pUsing == NULL)
+		return false;
+	for (int k = 0; k < pUsing->nId; k++) {
+		if (strcmp(pUsing->a[k].zName, zCol) == 0)
+			return true;
+	}
+	if (old_col == NULL)
+		return false;
+	for (int i = 0; i < pUsing->nId; i++) {
+		if (strcmp(pUsing->a[i].zName, old_col) == 0)
+			return true;
+	}
+	return false;
+}
+
+bool
+sqlMatchSpanName(const char *span, const char *col, const char *tab,
+		 const char *old_col, const char *old_tab)
+{
+	size_t n;
+	const char *name = span;
+	size_t len = strlen(span);
+	for (n = 0; n < len && span[n] != '.'; n++) {
+	}
+	if (tab != NULL) {
+		if ((strlen(tab) != n || strncmp(name, tab, n) != 0) &&
+		    (old_tab == NULL || strlen(old_tab) != n ||
+		     strncmp(name, old_tab, n) != 0))
+			return false;
+		name += n + 1;
+		len -= n + 1;
+	}
+	if (col == NULL)
+		return true;
+	if ((strlen(col) != len || strncmp(name, col, len) != 0) &&
+	    (old_col == NULL || strlen(old_col) != len ||
+	     strncmp(name, old_col, len) != 0))
+		return false;
+	return true;
+}
+
+/**
+ * Match spans for all expressions of the list with the table name and the
+ * column name.
  */
 static int
-nameInUsingClause(IdList * pUsing, const char *zCol)
+sql_find_column_expr(const struct ExprList *list, const char *tab_name,
+		     const char *col_name, const char *old_tab,
+		     const char *old_col)
 {
-	if (pUsing) {
-		int k;
-		for (k = 0; k < pUsing->nId; k++) {
-			if (strcmp(pUsing->a[k].zName, zCol) == 0)
-				return 1;
-		}
+	for (int j = 0; j < list->nExpr; j++) {
+		if (sqlMatchSpanName(list->a[j].zSpan, col_name, tab_name,
+				     old_col, old_tab))
+			return j;
 	}
-	return 0;
+	return -1;
 }
 
-/*
- * Subqueries stores the original database, table and column names for their
- * result sets in ExprList.a[].zSpan, in the form "DATABASE.TABLE.COLUMN".
- * Check to see if the zSpan given to this routine matches the zTab,
- * and zCol.  If any of zTab, and zCol are NULL then those fields will
- * match anything.
+/**
+ * This function counts the number of occurrences of name in space.
  */
-int
-sqlMatchSpanName(const char *zSpan,
-		     const char *zCol, const char *zTab
-	)
+static int
+sql_count_column_in_space_def(const struct space_def *space_def,
+			      const char *name, const char *old_name)
 {
-	int n;
-	for (n = 0; ALWAYS(zSpan[n]) && zSpan[n] != '.'; n++) {
+	int count = 0;
+	for (uint32_t i = 0; i < space_def->field_count; ++i) {
+		if (strcmp(space_def->fields[i].name, name) == 0)
+			count++;
 	}
-	if (zTab && (sqlStrNICmp(zSpan, zTab, n) != 0 || zTab[n] != 0)) {
-		return 0;
+	if (count == 0 && old_name != NULL) {
+		for (uint32_t i = 0; i < space_def->field_count; ++i) {
+			if (strcmp(space_def->fields[i].name, old_name) == 0)
+				count++;
+		}
 	}
-	zSpan += n + 1;
-	if (zCol && strcmp(zSpan, zCol) != 0) {
-		return 0;
-	}
-	return 1;
+	return count;
 }
 
 /*
@@ -203,18 +241,34 @@ sqlMatchSpanName(const char *zSpan,
  * in pParse and return WRC_Abort.  Return WRC_Prune on success.
  */
 static int
-lookupName(Parse * pParse,	/* The parsing context */
-	   const char *zTab,	/* Name of table containing column, or NULL */
-	   const char *zCol,	/* Name of the column. */
-	   NameContext * pNC,	/* The name context used to resolve the name */
-	   Expr * pExpr		/* Make this EXPR node point to the selected column */
-    )
+lookupName(struct Parse *pParse, struct Expr *pExpr, struct NameContext *pNC)
 {
+	const char *zTab = NULL;
+	const char *zCol = NULL;
+	char *old_tab = NULL;
+	char *old_col = NULL;
+	const struct Expr *col = NULL;
+	if (pExpr->op == TK_DOT) {
+		assert(pExpr->pLeft->op == TK_ID && pExpr->pRight->op == TK_ID);
+		zTab = pExpr->pLeft->u.zToken;
+		if ((pExpr->pLeft->flags & EP_Lookup2) != 0)
+			old_tab = sql_legacy_name_new0(zTab);
+		zCol = pExpr->pRight->u.zToken;
+		if ((pExpr->pRight->flags & EP_Lookup2) != 0)
+			old_col = sql_legacy_name_new0(zCol);
+		col = pExpr->pRight;
+	} else {
+		assert(pExpr->op == TK_ID);
+		zCol = pExpr->u.zToken;
+		if ((pExpr->flags & EP_Lookup2) != 0)
+			old_col = sql_legacy_name_new0(zCol);
+		col = pExpr;
+	}
+
 	int i, j;		/* Loop counters */
 	int cnt = 0;		/* Number of matching column names */
 	int cntTab = 0;		/* Number of matching table names */
 	int nSubquery = 0;	/* How many levels of subquery */
-	sql *db = pParse->db;	/* The database connection */
 	struct SrcList_item *pItem;	/* Use for looping over pSrcList items */
 	struct SrcList_item *pMatch = 0;	/* The matching pSrcList item */
 	NameContext *pTopNC = pNC;	/* First namecontext in the list */
@@ -246,16 +300,14 @@ lookupName(Parse * pParse,	/* The parsing context */
 					selFlags & SF_NestedFrom) != 0) {
 					int hit = 0;
 					pEList = pItem->pSelect->pEList;
-					for (j = 0; j < pEList->nExpr; j++) {
-						if (sqlMatchSpanName
-						    (pEList->a[j].zSpan, zCol,
-						     zTab)) {
-							cnt++;
-							cntTab = 2;
-							pMatch = pItem;
-							pExpr->iColumn = j;
-							hit = 1;
-						}
+					j = sql_find_column_expr(pEList, zTab,
+								 zCol, old_tab,
+								 old_col);
+					if (j >= 0) {
+						cnt++;
+						cntTab = 2;
+						pMatch = pItem;
+						pExpr->iColumn = j;
 					}
 					if (hit || zTab == 0)
 						continue;
@@ -265,37 +317,37 @@ lookupName(Parse * pParse,	/* The parsing context */
 					    pItem->zAlias ? pItem->
 					    zAlias : space_def->name;
 					assert(zTabName != 0);
-					if (strcmp(zTabName, zTab) != 0) {
+					if (strcmp(zTabName, zTab) != 0 &&
+					    (old_tab == NULL ||
+					     strcmp(zTabName, old_tab) != 0))
 						continue;
-					}
 				}
 				if (0 == (cntTab++)) {
 					pMatch = pItem;
 				}
-				for (j = 0; j < (int)space_def->field_count;
-				     j++) {
-					if (strcmp(space_def->fields[j].name,
-						   zCol) == 0) {
-						/* If there has been exactly one prior match and this match
-						 * is for the right-hand table of a NATURAL JOIN or is in a
-						 * USING clause, then skip this match.
-						 */
-						if (cnt == 1) {
-							if (pItem->fg.
-							    jointype &
-							    JT_NATURAL)
-								continue;
-							if (nameInUsingClause
-							    (pItem->pUsing,
-							     zCol))
-								continue;
-						}
-						cnt++;
-						pMatch = pItem;
-						pExpr->iColumn = (i16) j;
-						break;
-					}
-				}
+				uint32_t fieldno =
+					sql_fieldno_by_expr(pItem->space, col);
+				if (fieldno == UINT32_MAX)
+					continue;
+				j = fieldno;
+				/*
+				 * If there has been exactly one prior match and
+				 * this match is for the right-hand table of a
+				 * NATURAL JOIN or is in a USING clause, then
+				 * skip this match.
+				 */
+				if (cnt == 1 &&
+				    ((pItem->fg.jointype & JT_NATURAL) != 0 ||
+				     nameInUsingClause(pItem->pUsing, zCol,
+						       old_col)))
+					continue;
+				int count =
+					sql_count_column_in_space_def(space_def,
+								      zCol,
+								      old_col);
+				cnt = cnt + count;
+				pMatch = pItem;
+				pExpr->iColumn = (i16) j;
 			}
 			if (pMatch) {
 				pExpr->iTable = pMatch->iCursor;
@@ -331,10 +383,12 @@ lookupName(Parse * pParse,	/* The parsing context */
 				cntTab++;
 				for (iCol = 0; iCol <
 				     (int)space_def->field_count; iCol++) {
-					if (strcmp(space_def->fields[iCol].name,
-						   zCol) == 0) {
+					const char *name =
+						space_def->fields[iCol].name;
+					if (strcmp(name, zCol) == 0 ||
+					    (old_col != NULL &&
+					     strcmp(name, old_col) == 0))
 						break;
-					}
 				}
 				if (iCol < (int)space_def->field_count) {
 					cnt++;
@@ -369,7 +423,9 @@ lookupName(Parse * pParse,	/* The parsing context */
 		if ((pEList = pNC->pEList) != 0 && zTab == 0 && cnt == 0) {
 			for (j = 0; j < pEList->nExpr; j++) {
 				char *zAs = pEList->a[j].zName;
-				if (zAs != 0 && strcmp(zAs, zCol) == 0) {
+				if (zAs != 0 && (strcmp(zAs, zCol) == 0 ||
+						 (old_col != NULL &&
+						  strcmp(zAs, old_col) == 0))) {
 					Expr *pOrig;
 					assert(pExpr->pLeft == 0
 					       && pExpr->pRight == 0);
@@ -384,17 +440,17 @@ lookupName(Parse * pParse,	/* The parsing context */
 							 ER_SQL_PARSER_GENERIC,
 							 tt_sprintf(err, zAs));
 						pParse->is_aborted = true;
-						return WRC_Abort;
+						goto lookupname_end;
 					}
 					if (sqlExprVectorSize(pOrig) != 1) {
 						diag_set(ClientError,
 							 ER_SQL_PARSER_GENERIC,
 							 "row value misused");
 						pParse->is_aborted = true;
-						return WRC_Abort;
+						goto lookupname_end;
 					}
-					resolveAlias(pParse, pEList, j, pExpr,
-						     "", nSubquery);
+					resolveAlias(pEList, j, pExpr, "",
+						     nSubquery);
 					cnt = 1;
 					pMatch = 0;
 					assert(zTab == 0);
@@ -447,7 +503,6 @@ lookupName(Parse * pParse,	/* The parsing context */
 	 */
 	if (pExpr->iColumn >= 0 && pMatch != 0) {
 		int n = pExpr->iColumn;
-		testcase(n == BMS - 1);
 		if (n >= BMS) {
 			n = BMS - 1;
 		}
@@ -457,13 +512,15 @@ lookupName(Parse * pParse,	/* The parsing context */
 
 	/* Clean up and return
 	 */
-	sql_expr_delete(db, pExpr->pLeft, false);
+	sql_expr_delete(pExpr->pLeft);
 	pExpr->pLeft = 0;
-	sql_expr_delete(db, pExpr->pRight, false);
+	sql_expr_delete(pExpr->pRight);
 	pExpr->pRight = 0;
 	pExpr->op = (isTrigger ? TK_TRIGGER : TK_COLUMN_REF);
  lookupname_end:
-	if (cnt == 1) {
+	sql_xfree(old_tab);
+	sql_xfree(old_col);
+	if (cnt == 1 && !pParse->is_aborted) {
 		assert(pNC != 0);
 		/* Increment the nRef value on all name contexts from TopNC up to
 		 * the point where the name matched.
@@ -482,12 +539,9 @@ lookupName(Parse * pParse,	/* The parsing context */
 }
 
 struct Expr *
-sql_expr_new_column(struct sql *db, struct SrcList *src_list, int src_idx,
-		    int column)
+sql_expr_new_column(struct SrcList *src_list, int src_idx, int column)
 {
-	struct Expr *expr = sql_expr_new_anon(db, TK_COLUMN_REF);
-	if (expr == NULL)
-		return NULL;
+	struct Expr *expr = sql_expr_new_anon(TK_COLUMN_REF);
 	struct SrcList_item *item = &src_list->a[src_idx];
 	expr->space_def = item->space->def;
 	expr->iTable = item->iCursor;
@@ -550,42 +604,20 @@ resolveExprStep(Walker * pWalker, Expr * pExpr)
 		}
 	}
 #endif
+	assert((pNC->ncFlags & NC_IdxExpr) == 0 ||
+	       sqlExprSkipCollate(pExpr)->op == TK_ID);
 	switch (pExpr->op) {
 		/* A lone identifier is the name of a column.
 		 */
 	case TK_ID:{
 			if ((pNC->ncFlags & NC_AllowAgg) != 0)
 				pNC->ncFlags |= NC_HasUnaggregatedId;
-			return lookupName(pParse, 0, pExpr->u.zToken, pNC,
-					  pExpr);
+			return lookupName(pParse, pExpr, pNC);
 		}
 
-		/* A table name and column name:     ID.ID
-		 * Or a database, table and column:  ID.ID.ID
-		 */
-	case TK_DOT:{
-			const char *zColumn;
-			const char *zTable;
-			Expr *pRight;
-
-			/* if( pSrcList==0 ) break; */
-			if (pNC->ncFlags & NC_IdxExpr) {
-				diag_set(ClientError, ER_INDEX_DEF_UNSUPPORTED,
-					 "Expressions");
-				pParse->is_aborted = true;
-			}
-			pRight = pExpr->pRight;
-			if (pRight->op == TK_ID) {
-				zTable = pExpr->pLeft->u.zToken;
-				zColumn = pRight->u.zToken;
-			} else {
-				assert(pRight->op == TK_DOT);
-				zTable = pRight->pLeft->u.zToken;
-				zColumn = pRight->pRight->u.zToken;
-			}
-			return lookupName(pParse, zTable, zColumn, pNC,
-					  pExpr);
-		}
+	/* A table name and column name: ID.ID. */
+	case TK_DOT:
+		return lookupName(pParse, pExpr, pNC);
 
 		/* Resolve function names
 		 */
@@ -598,17 +630,18 @@ resolveExprStep(Walker * pWalker, Expr * pExpr)
 			assert(!ExprHasProperty(pExpr, EP_xIsSelect));
 			zId = pExpr->u.zToken;
 			nId = sqlStrlen30(zId);
-			uint32_t flags = sql_func_flags(zId);
+			uint32_t flags = sql_func_flags(pExpr);
 			bool is_agg = (flags & SQL_FUNC_AGG) != 0;
 			if ((flags & SQL_FUNC_UNLIKELY) != 0 && n == 2) {
 				ExprSetProperty(pExpr, EP_Unlikely | EP_Skip);
 				pExpr->iTable =
 					exprProbability(pList->a[1].pExpr);
 				if (pExpr->iTable < 0) {
-					diag_set(ClientError, ER_ILLEGAL_PARAMS,
-						"second argument to "
-						"likelihood() must be a "
-						"constant between 0.0 and 1.0");
+					diag_set(IllegalParams,
+						 "second argument to "
+						 "LIKELIHOOD() must be a "
+						 "constant between 0.0 and "
+						 "1.0");
 					pParse->is_aborted = true;
 					pNC->nErr++;
 					return WRC_Abort;
@@ -619,7 +652,7 @@ resolveExprStep(Walker * pWalker, Expr * pExpr)
 				 * unlikely() probability is
 				 * 0.0625, likely() is 0.9375
 				 */
-				pExpr->iTable = zId[0] == 'u' ?
+				pExpr->iTable = zId[0] == 'u' || zId[0] == 'U' ?
 						8388608 : 125829120;
 			}
 			if (is_agg && (pNC->ncFlags & NC_AllowAgg) == 0) {
@@ -663,41 +696,33 @@ resolveExprStep(Walker * pWalker, Expr * pExpr)
 				return WRC_Abort;
 			}
 			pExpr->type = func->def->returns;
-			assert(!func->def->is_deterministic ||
-			       (pNC->ncFlags & NC_IdxExpr) == 0);
+			/*
+			 * In case a user-defined aggregate function was called,
+			 * the result type will be the result type of the
+			 * FINALIZE part of the function.
+			 */
+			if (func->def->language != FUNC_LANGUAGE_SQL_BUILTIN &&
+			    func->def->aggregate == FUNC_AGGREGATE_GROUP) {
+				const char *name = pExpr->u.zToken;
+				struct func *finalize = sql_func_finalize(name);
+				if (finalize != NULL)
+					pExpr->type = finalize->def->returns;
+			}
 			if (func->def->is_deterministic)
 				ExprSetProperty(pExpr, EP_ConstFunc);
 			return WRC_Prune;
 		}
 	case TK_SELECT:
 	case TK_EXISTS:
-		testcase(pExpr->op == TK_EXISTS);
 	case TK_IN:{
-			testcase(pExpr->op == TK_IN);
 			if (ExprHasProperty(pExpr, EP_xIsSelect)) {
 				int nRef = pNC->nRef;
-				assert((pNC->ncFlags & NC_IdxExpr) == 0);
-				if (pNC->ncFlags & NC_IsCheck) {
-					diag_set(ClientError,
-						 ER_CK_DEF_UNSUPPORTED,
-						 "Subqueries");
-					pParse->is_aborted = true;
-				}
 				sqlWalkSelect(pWalker, pExpr->x.pSelect);
 				assert(pNC->nRef >= nRef);
 				if (nRef != pNC->nRef) {
 					ExprSetProperty(pExpr, EP_VarSelect);
 					pNC->ncFlags |= NC_VarSelect;
 				}
-			}
-			break;
-		}
-	case TK_VARIABLE:{
-			assert((pNC->ncFlags & NC_IsCheck) == 0);
-			if (pNC->ncFlags & NC_IdxExpr) {
-				diag_set(ClientError, ER_INDEX_DEF_UNSUPPORTED,
-					 "Parameter markers");
-				pParse->is_aborted = true;
 			}
 			break;
 		}
@@ -709,8 +734,6 @@ resolveExprStep(Walker * pWalker, Expr * pExpr)
 	case TK_GT:
 	case TK_GE:{
 			int nLeft, nRight;
-			if (pParse->db->mallocFailed)
-				break;
 			assert(pExpr->pLeft != 0);
 			nLeft = sqlExprVectorSize(pExpr->pLeft);
 			if (pExpr->op == TK_BETWEEN) {
@@ -735,8 +758,7 @@ resolveExprStep(Walker * pWalker, Expr * pExpr)
 			break;
 		}
 	}
-	return (pParse->is_aborted
-		|| pParse->db->mallocFailed) ? WRC_Abort : WRC_Continue;
+	return pParse->is_aborted ? WRC_Abort : WRC_Continue;
 }
 
 /*
@@ -854,22 +876,18 @@ resolveCompoundOrderBy(Parse * pParse,	/* Parsing context.  Leave error messages
 	int i;
 	ExprList *pOrderBy;
 	ExprList *pEList;
-	sql *db;
 	int moreToDo = 1;
 
 	pOrderBy = pSelect->pOrderBy;
 	if (pOrderBy == 0)
 		return 0;
-	db = pParse->db;
-#if SQL_MAX_COLUMN
-	if (pOrderBy->nExpr > db->aLimit[SQL_LIMIT_COLUMN]) {
+	if (pOrderBy->nExpr > SQL_MAX_COLUMN) {
 		diag_set(ClientError, ER_SQL_PARSER_LIMIT,
 			 "The number of terms in ORDER BY clause",
-			 pOrderBy->nExpr, db->aLimit[SQL_LIMIT_COLUMN]);
+			 pOrderBy->nExpr, SQL_MAX_COLUMN);
 		pParse->is_aborted = true;
 		return 1;
 	}
-#endif
 	for (i = 0; i < pOrderBy->nExpr; i++) {
 		pOrderBy->a[i].done = 0;
 	}
@@ -906,14 +924,11 @@ resolveCompoundOrderBy(Parse * pParse,	/* Parsing context.  Leave error messages
 			} else {
 				iCol = resolveAsName(pParse, pEList, pE);
 				if (iCol == 0) {
-					pDup = sqlExprDup(db, pE, 0);
-					if (!db->mallocFailed) {
-						assert(pDup);
-						iCol =
-						    resolveOrderByTermToExprList
-						    (pParse, pSelect, pDup);
-					}
-					sql_expr_delete(db, pDup, false);
+					pDup = sqlExprDup(pE, 0);
+					assert(pDup != NULL);
+					iCol = resolveOrderByTermToExprList(
+						pParse, pSelect, pDup);
+					sql_expr_delete(pDup);
 				}
 			}
 			if (iCol > 0) {
@@ -921,13 +936,10 @@ resolveCompoundOrderBy(Parse * pParse,	/* Parsing context.  Leave error messages
 				 * taking care to preserve the COLLATE clause if it exists
 				 */
 				struct Expr *pNew =
-					sql_expr_new_anon(db, TK_INTEGER);
-				if (pNew == NULL) {
-					pParse->is_aborted = true;
-					return 1;
-				}
+					sql_expr_new_anon(TK_INTEGER);
 				pNew->flags |= EP_IntValue;
 				pNew->u.iValue = iCol;
+				pNew->type = FIELD_TYPE_INTEGER;
 				if (pItem->pExpr == pE) {
 					pItem->pExpr = pNew;
 				} else {
@@ -938,7 +950,7 @@ resolveCompoundOrderBy(Parse * pParse,	/* Parsing context.  Leave error messages
 					assert(pParent->pLeft == pE);
 					pParent->pLeft = pNew;
 				}
-				sql_expr_delete(db, pE, false);
+				sql_expr_delete(pE);
 				pItem->u.x.iOrderByCol = (u16) iCol;
 				pItem->done = 1;
 			} else {
@@ -978,22 +990,19 @@ sqlResolveOrderGroupBy(Parse * pParse,	/* Parsing context.  Leave error messages
     )
 {
 	int i;
-	sql *db = pParse->db;
 	ExprList *pEList;
 	struct ExprList_item *pItem;
 
-	if (pOrderBy == 0 || pParse->db->mallocFailed)
+	if (pOrderBy == NULL)
 		return 0;
-#if SQL_MAX_COLUMN
-	if (pOrderBy->nExpr > db->aLimit[SQL_LIMIT_COLUMN]) {
+	if (pOrderBy->nExpr > SQL_MAX_COLUMN) {
 		const char *err = tt_sprintf("The number of terms in %s BY "\
 					     "clause", zType);
 		diag_set(ClientError, ER_SQL_PARSER_LIMIT, err,
-			 pOrderBy->nExpr, db->aLimit[SQL_LIMIT_COLUMN]);
+			 pOrderBy->nExpr, SQL_MAX_COLUMN);
 		pParse->is_aborted = true;
 		return 1;
 	}
-#endif
 	pEList = pSelect->pEList;
 	assert(pEList != 0);	/* sqlSelectNew() guarantees this */
 	for (i = 0, pItem = pOrderBy->a; i < pOrderBy->nExpr; i++, pItem++) {
@@ -1009,8 +1018,21 @@ sqlResolveOrderGroupBy(Parse * pParse,	/* Parsing context.  Leave error messages
 				pParse->is_aborted = true;
 				return 1;
 			}
-			resolveAlias(pParse, pEList, pItem->u.x.iOrderByCol - 1,
+			resolveAlias(pEList, pItem->u.x.iOrderByCol - 1,
 				     pItem->pExpr, zType, 0);
+		}
+		/*
+		 * Currently, we cannot disallow ANY here, as values of ANY type
+		 * may be resolved later.
+		 */
+		enum field_type type = sql_expr_type(pItem->pExpr);
+		if (!field_type1_contains_type2(FIELD_TYPE_SCALAR, NULL,
+						type, NULL) &&
+		    type != FIELD_TYPE_ANY) {
+			diag_set(ClientError, ER_SQL_TYPE_MISMATCH,
+				 field_type_strs[type], "comparable type");
+			pParse->is_aborted = true;
+			return -1;
 		}
 	}
 	return 0;
@@ -1112,7 +1134,6 @@ resolveSelectStep(Walker * pWalker, Select * p)
 	int i;			/* Loop counter */
 	ExprList *pGroupBy;	/* The GROUP BY clause */
 	Select *pLeftmost;	/* Left-most of SELECT of a compound */
-	sql *db;		/* Database connection */
 
 	assert(p != 0);
 	if (p->selFlags & SF_Resolved) {
@@ -1120,7 +1141,6 @@ resolveSelectStep(Walker * pWalker, Select * p)
 	}
 	pOuterNC = pWalker->u.pNC;
 	pParse = pWalker->pParse;
-	db = pParse->db;
 
 	/* Normally sqlSelectExpand() will be called first and will have
 	 * already expanded this SELECT.  However, if this is a subquery within
@@ -1132,8 +1152,7 @@ resolveSelectStep(Walker * pWalker, Select * p)
 	 */
 	if ((p->selFlags & SF_Expanded) == 0) {
 		sqlSelectPrep(pParse, p, pOuterNC);
-		return (pParse->is_aborted
-			|| db->mallocFailed) ? WRC_Abort : WRC_Prune;
+		return pParse->is_aborted ? WRC_Abort : WRC_Prune;
 	}
 
 	isCompound = p->pPrior != 0;
@@ -1189,7 +1208,7 @@ resolveSelectStep(Walker * pWalker, Select * p)
 				sqlResolveSelectNames(pParse,
 							  pItem->pSelect,
 							  pOuterNC);
-				if (pParse->is_aborted || db->mallocFailed)
+				if (pParse->is_aborted)
 					return WRC_Abort;
 
 				for (pNC = pOuterNC; pNC; pNC = pNC->pNext)
@@ -1215,7 +1234,7 @@ resolveSelectStep(Walker * pWalker, Select * p)
 			if (sqlResolveExprNames(&sNC, item->pExpr) != 0)
 				return WRC_Abort;
 			if ((sNC.ncFlags & NC_HasAgg) == 0 &&
-			    !sqlExprIsConstantOrFunction(item->pExpr, 0)) {
+			    !sqlExprIsConstantOrFunction(item->pExpr)) {
 				is_all_select_agg = false;
 				sNC.ncFlags |= has_agg_flag;
 				break;
@@ -1287,28 +1306,14 @@ resolveSelectStep(Walker * pWalker, Select * p)
 			 * LIMIT but there is no reason to
 			 * restrict it directly).
 			 */
-			sql_expr_delete(db, p->pLimit, false);
-			p->pLimit = sql_expr_new(db, TK_INTEGER,
-						 &sqlIntTokens[1]);
-			if (p->pLimit == NULL)
-				pParse->is_aborted = true;
+			sql_expr_delete(p->pLimit);
+			p->pLimit = sql_expr_new(TK_INTEGER, &sqlIntTokens[1]);
 		} else {
 			if (sqlResolveExprNames(&sNC, p->pHaving))
 				return WRC_Abort;
 		}
 		if (sqlResolveExprNames(&sNC, p->pWhere))
 			return WRC_Abort;
-
-		/* Resolve names in table-valued-function arguments */
-		for (i = 0; i < p->pSrc->nSrc; i++) {
-			struct SrcList_item *pItem = &p->pSrc->a[i];
-			if (pItem->fg.isTabFunc
-			    && sqlResolveExprListNames(&sNC,
-							   pItem->u1.pFuncArg)
-			    ) {
-				return WRC_Abort;
-			}
-		}
 
 		/* The ORDER BY and GROUP BY clauses may not refer to terms in
 		 * outer queries
@@ -1343,9 +1348,6 @@ resolveSelectStep(Walker * pWalker, Select * p)
 		    ) {
 			return WRC_Abort;
 		}
-		if (db->mallocFailed) {
-			return WRC_Abort;
-		}
 
 		/* Resolve the GROUP BY clause.  At the same time, make sure
 		 * the GROUP BY clause does not contain aggregate functions.
@@ -1353,10 +1355,9 @@ resolveSelectStep(Walker * pWalker, Select * p)
 		if (pGroupBy) {
 			struct ExprList_item *pItem;
 
-			if (resolveOrderGroupBy(&sNC, p, pGroupBy, "GROUP")
-			    || db->mallocFailed) {
+			if (resolveOrderGroupBy(&sNC, p, pGroupBy,
+						"GROUP") != 0)
 				return WRC_Abort;
-			}
 			const char *err_msg = "aggregate functions are not "\
 					      "allowed in the GROUP BY clause";
 			for (i = 0, pItem = pGroupBy->a; i < pGroupBy->nExpr;
@@ -1466,7 +1467,6 @@ sqlResolveExprNames(NameContext * pNC,	/* Namespace to resolve expressions in. *
 
 	if (pExpr == 0)
 		return 0;
-#if SQL_MAX_EXPR_DEPTH>0
 	{
 		Parse *pParse = pNC->pParse;
 		if (sqlExprCheckHeight
@@ -1475,7 +1475,6 @@ sqlResolveExprNames(NameContext * pNC,	/* Namespace to resolve expressions in. *
 		}
 		pParse->nHeight += pExpr->nHeight;
 	}
-#endif
 	savedHasAgg = pNC->ncFlags & (NC_HasAgg | NC_MinMaxAgg);
 	pNC->ncFlags &= ~(NC_HasAgg | NC_MinMaxAgg);
 	w.pParse = pNC->pParse;
@@ -1486,9 +1485,7 @@ sqlResolveExprNames(NameContext * pNC,	/* Namespace to resolve expressions in. *
 	w.eCode = 0;
 	w.u.pNC = pNC;
 	sqlWalkExpr(&w, pExpr);
-#if SQL_MAX_EXPR_DEPTH>0
 	pNC->pParse->nHeight -= pExpr->nHeight;
-#endif
 	if (pNC->nErr > 0 || w.pParse->is_aborted) {
 		ExprSetProperty(pExpr, EP_Error);
 	}
@@ -1550,14 +1547,19 @@ sqlResolveSelectNames(Parse * pParse,	/* The parser context */
 
 void
 sql_resolve_self_reference(struct Parse *parser, struct space_def *def,
-			   int type, struct Expr *expr)
+			   struct Expr *expr)
 {
-	/* Fake SrcList for parser->create_table_def */
+	if (sqlExprSkipCollate(expr)->op != TK_ID) {
+		diag_set(ClientError, ER_INDEX_DEF_UNSUPPORTED, "Expressions");
+		parser->is_aborted = true;
+		return;
+	}
+
+	/* Fake SrcList for parser->new_space */
 	SrcList sSrc;
-	/* Name context for parser->create_table_def  */
+	/* Name context for parser->new_space  */
 	NameContext sNC;
 
-	assert(type == NC_IsCheck || type == NC_IdxExpr);
 	memset(&sNC, 0, sizeof(sNC));
 	memset(&sSrc, 0, sizeof(sSrc));
 	sSrc.nSrc = 1;
@@ -1569,6 +1571,6 @@ sql_resolve_self_reference(struct Parse *parser, struct space_def *def,
 	sSrc.a[0].iCursor = -1;
 	sNC.pParse = parser;
 	sNC.pSrcList = &sSrc;
-	sNC.ncFlags = type;
+	sNC.ncFlags = NC_IdxExpr;
 	sqlResolveExprNames(&sNC, expr);
 }

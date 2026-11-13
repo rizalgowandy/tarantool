@@ -4,7 +4,7 @@ test_run:cmd('restart server default with cleanup=1')
 test_run:cmd("push filter 'error: Failed to allocate [0-9]+ ' to 'error: Failed to allocate <NUM> '")
 
 space = box.schema.space.create('tweedledum')
-index = space:create_index('primary', { type = 'hash' })
+index = space:create_index('primary')
 test_run:cmd("setopt delimiter ';'")
 i = 1;
 while true do
@@ -43,6 +43,9 @@ for state, v in space:pairs() do
 end;
 test_run:cmd("setopt delimiter ''");
 t
+
+-- TODO(gh-3807) - may fail to truncate due to memory limit is reached
+box.cfg{memtx_memory = box.cfg.memtx_memory + 1024}
 space:truncate()
 space:insert{0, 'test'}
 space.index['primary']:get{0}
@@ -85,10 +88,10 @@ arena_bytes = box.cfg.memtx_memory
 str = string.rep('a', 15000) -- about size of index memory block
 
 space = box.schema.space.create('tweedledum')
-index = space:create_index('primary', { type = 'hash' })
+index = space:create_index('primary')
 
 collectgarbage('collect')
-for i=1,10000 do space:insert{i, str} end
+for i=1,10492 do space:insert{i, str} end
 definitely_used = index:count() * 16 * 1024
 2 * definitely_used > arena_bytes -- at least half memory used
 to_del = index:count()
@@ -96,7 +99,7 @@ for i=1,to_del do space:delete{i} end
 index:count()
 
 collectgarbage('collect')
-for i=1,10000 do space:insert{i, str} end
+for i=1,10492 do space:insert{i, str} end
 definitely_used = index:count() * 16 * 1024
 2 * definitely_used > arena_bytes -- at least half memory used
 space:truncate()

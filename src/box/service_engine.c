@@ -31,11 +31,13 @@
 #include "service_engine.h"
 #include "tuple.h"
 #include "schema.h"
+#include "small/region.h"
+#include "fiber.h"
 
 extern const struct space_vtab session_settings_space_vtab;
 
 static void
-service_engine_shutdown(struct engine *engine)
+service_engine_free(struct engine *engine)
 {
 	free(engine);
 }
@@ -61,17 +63,12 @@ service_engine_create_space(struct engine *engine, struct space_def *def,
 		return NULL;
 	}
 	int key_count = 0;
+	size_t region_svp = region_used(&fiber()->gc);
 	struct key_def **keys = index_def_to_key_def(key_list, &key_count);
-	if (keys == NULL) {
-		free(space);
-		return NULL;
-	}
 	struct tuple_format *format =
-		tuple_format_new(&tuple_format_runtime->vtab, NULL, keys,
-				 key_count, def->fields, def->field_count,
-				 def->exact_field_count, def->dict,
-				 def->opts.is_temporary,
-				 def->opts.is_ephemeral);
+		space_tuple_format_new(&tuple_format_runtime->vtab,
+				       NULL, keys, key_count, def);
+	region_truncate(&fiber()->gc, region_svp);
 	if (format == NULL) {
 		free(space);
 		return NULL;
@@ -91,8 +88,10 @@ service_engine_create_space(struct engine *engine, struct space_def *def,
 }
 
 static const struct engine_vtab service_engine_vtab = {
-	/* .shutdown = */ service_engine_shutdown,
+	/* .free = */ service_engine_free,
+	/* .shutdown = */ generic_engine_shutdown,
 	/* .create_space = */ service_engine_create_space,
+	/* .create_read_view = */ generic_engine_create_read_view,
 	/* .prepare_join = */ generic_engine_prepare_join,
 	/* .join = */ generic_engine_join,
 	/* .complete_join = */ generic_engine_complete_join,
@@ -102,7 +101,9 @@ static const struct engine_vtab service_engine_vtab = {
 	/* .commit = */ generic_engine_commit,
 	/* .rollback_statement = */ generic_engine_rollback_statement,
 	/* .rollback = */ generic_engine_rollback,
-	/* .switch_to_ro = */ generic_engine_switch_to_ro,
+	/* .destroy_savepoint = */ generic_engine_destroy_savepoint,
+	/* .send_to_read_view = */ generic_engine_send_to_read_view,
+	/* .abort_with_conflict = */ generic_engine_abort_with_conflict,
 	/* .bootstrap = */ generic_engine_bootstrap,
 	/* .begin_initial_recovery = */ generic_engine_begin_initial_recovery,
 	/* .begin_final_recovery = */ generic_engine_begin_final_recovery,

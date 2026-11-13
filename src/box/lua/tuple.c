@@ -29,6 +29,7 @@
  * SUCH DAMAGE.
  */
 #include "box/lua/tuple.h"
+#include "box/lua/tuple_format.h"
 #include "box/xrow_update.h"
 
 #include "lua/utils.h" /* luaT_error() */
@@ -39,6 +40,7 @@
 #include <small/region.h>
 #include "cord_buf.h"
 #include <fiber.h>
+#include "tweaks.h"
 
 #include "box/tuple.h"
 #include "box/tuple_convert.h"
@@ -65,11 +67,9 @@ static const char *tuple_iteratorlib_name = "box.tuple.iterator";
  * optimization for excessively sparse arrays as a tuple always
  * must be regular MP_ARRAY.
  */
-static struct luaL_serializer tuple_serializer;
+static __thread struct luaL_serializer tuple_serializer;
 
-extern char tuple_lua[]; /* Lua source */
-
-uint32_t CTID_STRUCT_TUPLE_REF;
+__thread uint32_t CTID_STRUCT_TUPLE_REF;
 
 /**
  * <luaT_tuple_encode_table>() reference in the Lua registry.
@@ -79,7 +79,26 @@ uint32_t CTID_STRUCT_TUPLE_REF;
  * It reduces Lua GC pressure in comparison with calling of
  * <lua_cpcall>() or <lua_pushcfunction>() on each invocation.
  */
-static int luaT_tuple_encode_table_ref = LUA_NOREF;
+static __thread int luaT_tuple_encode_table_ref = LUA_NOREF;
+/**
+ * <lbox_tuple_gc> reference in the Lua registry.
+ *
+ * There is no need to create a new GCfunc object each time
+ * <luaT_pushtuple> is called, since there are no upvalues passed
+ * to <lua_pushcfunction> (i.e. macro to <lua_pushcclosure>).
+ * Hence, to reduce Lua GC pressure when tuple object is created
+ * for Lua world, the common tuple __gc finalizer can be easily
+ * obtained from the Lua registry via this reference.
+ */
+static __thread int luaT_tuple_gc_ref = LUA_NOREF;
+
+/**
+ * If set, box.tuple.new() will interpret the argument list as an array
+ * of tuple fields. This does not allow passing a tuple format as a second
+ * argument.
+ */
+static bool box_tuple_new_vararg = false;
+TWEAK_BOOL(box_tuple_new_vararg);
 
 box_tuple_t *
 luaT_checktuple(struct lua_State *L, int idx)
@@ -129,28 +148,6 @@ luaT_istuple(struct lua_State *L, int narg)
  *    (because it is usual for the module API).
  */
 
-/**
- * Encode a Lua values on a Lua stack as an MsgPack array.
- *
- * Raise a Lua error when encoding fails.
- *
- * Helper for <lbox_tuple_new>().
- */
-static int
-luaT_tuple_encode_values(struct lua_State *L, struct ibuf *buf)
-{
-	struct mpstream stream;
-	mpstream_init(&stream, buf, ibuf_reserve_cb, ibuf_alloc_cb, luamp_error,
-		      L);
-	int argc = lua_gettop(L);
-	mpstream_encode_array(&stream, argc);
-	for (int k = 1; k <= argc; ++k) {
-		luamp_encode(L, luaL_msgpack_default, &stream, k);
-	}
-	mpstream_flush(&stream);
-	return 0;
-}
-
 typedef void luaT_mpstream_init_f(struct mpstream *stream, struct lua_State *L,
 				  void *buffer);
 
@@ -189,7 +186,8 @@ luaT_tuple_encode_table(struct lua_State *L)
 	struct mpstream stream;
 	const struct luaT_tuple_encode_ctx *ctx = lua_topointer(L, 1);
 	ctx->mpstream_init_f(&stream, L, ctx->buffer);
-	luamp_encode_tuple(L, &tuple_serializer, &stream, 2);
+	if (luamp_encode_tuple(L, &tuple_serializer, &stream, 2) != 0)
+		luaT_error(L);
 	mpstream_flush(&stream);
 	return 0;
 }
@@ -301,33 +299,16 @@ static int
 lbox_tuple_new(lua_State *L)
 {
 	int argc = lua_gettop(L);
-	if (argc < 1) {
-		lua_newtable(L); /* create an empty tuple */
-		++argc;
-	}
-
-	/*
-	 * Use backward-compatible parameters format:
-	 * box.tuple.new(1, 2, 3).
-	 */
-	box_tuple_format_t *fmt = box_tuple_format_default();
-	if (argc != 1 || (!lua_istable(L, 1) && !luaT_istuple(L, 1))) {
-		struct ibuf *buf = cord_ibuf_take();
-		luaT_tuple_encode_values(L, buf); /* may raise */
-		struct tuple *tuple = box_tuple_new(fmt, buf->buf,
-						    buf->buf + ibuf_used(buf));
-		cord_ibuf_drop(buf);
-		if (tuple == NULL)
-			return luaT_error(L);
-		luaT_pushtuple(L, tuple);
-		return 1;
-	}
-
 	/*
 	 * Use the new parameters format:
-	 * box.tuple.new({1, 2, 3}).
+	 * box.tuple.new({tuple_field1, tuple_field2, tuple_field3}, [options]).
 	 */
-	struct tuple *tuple = luaT_tuple_new(L, 1, fmt);
+	struct tuple_format *format;
+	if (argc == 2)
+		format = luaT_check_tuple_format(L, -1);
+	else
+		format = box_tuple_format_default();
+	struct tuple *tuple = luaT_tuple_new(L, 1, format);
 	if (tuple == NULL)
 		return luaT_error(L);
 	/* box_tuple_new() doesn't leak on exception, see public API doc */
@@ -417,44 +398,100 @@ lbox_tuple_slice(struct lua_State *L)
 	return end - start;
 }
 
-void
+int
 luamp_convert_key(struct lua_State *L, struct luaL_serializer *cfg,
 		  struct mpstream *stream, int index)
 {
 	/* Performs keyfy() logic */
 
 	struct tuple *tuple = luaT_istuple(L, index);
-	if (tuple != NULL)
-		return tuple_to_mpstream(tuple, stream);
+	if (tuple != NULL) {
+		tuple_to_mpstream(tuple, stream);
+		return 0;
+	}
+
+	size_t data_len;
+	const char *data = luamp_get(L, index, &data_len);
+	if (data != NULL) {
+		mpstream_memcpy(stream, data, data_len);
+		return 0;
+	}
 
 	struct luaL_field field;
 	if (luaL_tofield(L, cfg, index, &field) < 0)
-		luaT_error(L);
+		return -1;
+	int rc = -1;
 	if (field.type == MP_ARRAY) {
 		lua_pushvalue(L, index);
-		luamp_encode_r(L, cfg, stream, &field, 0);
+		rc = luamp_encode_r(L, cfg, stream, &field, 0);
 		lua_pop(L, 1);
 	} else if (field.type == MP_NIL) {
 		mpstream_encode_array(stream, 0);
+		rc = 0;
 	} else {
 		mpstream_encode_array(stream, 1);
 		lua_pushvalue(L, index);
-		luamp_encode_r(L, cfg, stream, &field, 0);
+		rc = luamp_encode_r(L, cfg, stream, &field, 0);
 		lua_pop(L, 1);
 	}
+	return rc;
 }
 
-void
-luamp_encode_tuple(struct lua_State *L, struct luaL_serializer *cfg,
-		   struct mpstream *stream, int index)
+int
+luamp_encode_tuple_with_ctx(struct lua_State *L, struct luaL_serializer *cfg,
+			    struct mpstream *stream, int index,
+			    struct mp_ctx *ctx)
 {
 	struct tuple *tuple = luaT_istuple(L, index);
 	if (tuple != NULL) {
-		return tuple_to_mpstream(tuple, stream);
-	} else if (luamp_encode(L, cfg, stream, index) != MP_ARRAY) {
-		diag_set(ClientError, ER_TUPLE_NOT_ARRAY);
-		luaT_error(L);
+		tuple_to_mpstream(tuple, stream);
+		return 0;
 	}
+
+	/*
+	 * This snippet handles a special when a box tuple is sent over IPROTO
+	 * as MP_TUPLE and is decoded by net.box using the `return_raw` option,
+	 * which return a MsgPack object. This case is semantically equivalent
+	 * to the case above where the MP_TUPLE should have been decoded as a
+	 * box tuple. While we expect the encoded MsgPack to be an MP_ARRAY, the
+	 * Lua MsgPack encoder below encodes MsgPack objects by simply copying
+	 * their contents to the MsgPack stream, so we would get MP_TUPLE as the
+	 * returned type.
+	 *
+	 * To overcome this limitation, we convert the top-level MP_TUPLE to a
+	 * MsgPack array by skipping the extension header and format identifier
+	 * and copying the tuple data to the MsgPack stream.
+	 */
+	size_t data_len;
+	const char *data = luamp_get(L, index, &data_len);
+	if (data != NULL) {
+		if (mp_typeof(*data) == MP_EXT) {
+			const char *tuple_data = data;
+			int8_t ext_type;
+			uint32_t tuple_data_len =
+				mp_decode_extl(&tuple_data, &ext_type);
+			if (ext_type == MP_TUPLE) {
+				/* Skip the tuple format identifier. */
+				assert(mp_typeof(*tuple_data) == MP_UINT);
+				uint64_t format_id =
+					mp_decode_uint(&tuple_data);
+				tuple_data_len -= mp_sizeof_uint(format_id);
+				mpstream_memcpy(stream, tuple_data,
+						tuple_data_len);
+				return 0;
+			}
+		}
+	}
+
+	enum mp_type type;
+	if (luamp_encode_with_ctx(L, cfg, stream, index, ctx, &type) != 0)
+		return -1;
+	if (type != MP_ARRAY) {
+		diag_set(ClientError, ER_TUPLE_NOT_ARRAY);
+		return -1;
+	}
+
+	return 0;
 }
 
 void
@@ -576,6 +613,7 @@ lbox_tuple_transform(struct lua_State *L)
 		return 1;
 	}
 
+	struct tuple *new_tuple = NULL;
 	struct ibuf *buf = cord_ibuf_take();
 	struct mpstream stream;
 	mpstream_init(&stream, buf, ibuf_reserve_cb, ibuf_alloc_cb,
@@ -596,7 +634,8 @@ lbox_tuple_transform(struct lua_State *L)
 		mpstream_encode_array(&stream, 3);
 		mpstream_encode_str(&stream, "!");
 		mpstream_encode_uint(&stream, offset);
-		luamp_encode(L, luaL_msgpack_default, &stream, i);
+		if (luamp_encode(L, luaL_msgpack_default, &stream, i) != 0)
+			goto cleanup;
 	}
 	mpstream_flush(&stream);
 
@@ -605,7 +644,6 @@ lbox_tuple_transform(struct lua_State *L)
 	struct region *region = &fiber()->gc;
 	size_t used = region_used(region);
 	struct tuple_format *format = tuple_format(tuple);
-	struct tuple *new_tuple = NULL;
 	/*
 	 * Can't use box_tuple_update() since transform must reset
 	 * the tuple format to default. The new tuple most likely
@@ -621,45 +659,12 @@ lbox_tuple_transform(struct lua_State *L)
 		new_tuple = tuple_new(box_tuple_format_default(),
 				      new_data, new_data + new_size);
 	region_truncate(region, used);
+cleanup:
 	cord_ibuf_put(buf);
 	if (new_tuple == NULL)
 		luaT_error(L);
 
 	luaT_pushtuple(L, new_tuple);
-	return 1;
-}
-
-/**
- * Find a tuple field by JSON path. If a field was not found and a
- * path contains JSON syntax errors, then an exception is raised.
- * @param L Lua state.
- * @param tuple 1-th argument on a lua stack, tuple to get field
- *        from.
- * @param path 2-th argument on lua stack. Can be field name or a
- *        JSON path to a field.
- *
- * @retval not nil Found field value.
- * @retval     nil A field is NULL or does not exist.
- */
-static int
-lbox_tuple_field_by_path(struct lua_State *L)
-{
-	struct tuple *tuple = luaT_istuple(L, 1);
-	/* Is checked in Lua wrapper. */
-	assert(tuple != NULL);
-	assert(lua_isstring(L, 2));
-	size_t len;
-	const char *field = NULL, *path = lua_tolstring(L, 2, &len);
-	if (len == 0)
-		return 0;
-	field = tuple_field_raw_by_full_path(tuple_format(tuple),
-					     tuple_data(tuple),
-					     tuple_field_map(tuple),
-					     path, (uint32_t)len,
-					     lua_hashstring(L, 2));
-	if (field == NULL)
-		return 0;
-	luamp_decode(L, luaL_msgpack_default, &field);
 	return 1;
 }
 
@@ -687,8 +692,61 @@ luaT_pushtuple(struct lua_State *L, box_tuple_t *tuple)
 	*ptr = tuple;
 	/* The order is important - first reference tuple, next set gc */
 	box_tuple_ref(tuple);
-	lua_pushcfunction(L, lbox_tuple_gc);
+	assert(luaT_tuple_gc_ref != LUA_NOREF);
+	lua_rawgeti(L, LUA_REGISTRYINDEX, luaT_tuple_gc_ref);
 	luaL_setcdatagc(L, -2);
+}
+
+/**
+ * Push to Lua stack a table with the information about a tuple, located on top
+ * of the stack.
+ */
+static int
+lbox_tuple_info(lua_State *L)
+{
+	int argc = lua_gettop(L);
+	if (argc != 1)
+		luaL_error(L, "Usage: tuple:info()");
+
+	struct tuple *tuple = luaT_checktuple(L, 1);
+	struct tuple_info info;
+	tuple_info(tuple, &info);
+
+	lua_newtable(L);
+
+	lua_pushnumber(L, info.data_size);
+	lua_setfield(L, -2, "data_size");
+
+	lua_pushnumber(L, info.header_size);
+	lua_setfield(L, -2, "header_size");
+
+	lua_pushnumber(L, info.field_map_size);
+	lua_setfield(L, -2, "field_map_size");
+
+	lua_pushnumber(L, info.waste_size);
+	lua_setfield(L, -2, "waste_size");
+
+	lua_pushstring(L, tuple_arena_type_strs[info.arena_type]);
+	lua_setfield(L, -2, "arena");
+
+	return 1;
+}
+
+/**
+ * Push to Lua stack an array with the information about a format of a tuple.
+ * Elements of the array are maps
+ * {'name' = 'field_name', 'type' = 'field_type'}.
+ */
+static int
+lbox_tuple_get_format(lua_State *L)
+{
+	int argc = lua_gettop(L);
+	if (argc != 1)
+		luaL_error(L, "Usage: tuple:format()");
+
+	struct tuple *tuple = luaT_checktuple(L, 1);
+	struct tuple_format *format = tuple_format(tuple);
+	return box_tuple_format_serialize_impl(L, format);
 }
 
 static const struct luaL_Reg lbox_tuple_meta[] = {
@@ -697,12 +755,9 @@ static const struct luaL_Reg lbox_tuple_meta[] = {
 	{"slice", lbox_tuple_slice},
 	{"transform", lbox_tuple_transform},
 	{"tuple_to_map", lbox_tuple_to_map},
-	{"tuple_field_by_path", lbox_tuple_field_by_path},
-	{NULL, NULL}
-};
-
-static const struct luaL_Reg lbox_tuplelib[] = {
 	{"new", lbox_tuple_new},
+	{"info", lbox_tuple_info},
+	{"tuple_get_format", lbox_tuple_get_format},
 	{NULL, NULL}
 };
 
@@ -734,13 +789,11 @@ box_lua_tuple_init(struct lua_State *L)
 	/* export C functions to Lua */
 	luaL_findtable(L, LUA_GLOBALSINDEX, "box.internal", 1);
 	luaL_newmetatable(L, tuplelib_name);
-	luaL_register(L, NULL, lbox_tuple_meta);
+	luaL_setfuncs(L, lbox_tuple_meta, 0);
 	lua_setfield(L, -2, "tuple");
 	lua_pop(L, 1); /* box.internal */
 	luaL_register_type(L, tuple_iteratorlib_name,
 			   lbox_tuple_iterator_meta);
-	luaL_register_module(L, tuplelib_name, lbox_tuplelib);
-	lua_pop(L, 1);
 
 	tuple_serializer_update_options();
 	trigger_create(&tuple_serializer.update_trigger,
@@ -757,4 +810,7 @@ box_lua_tuple_init(struct lua_State *L)
 
 	lua_pushcfunction(L, luaT_tuple_encode_table);
 	luaT_tuple_encode_table_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
+	lua_pushcfunction(L, lbox_tuple_gc);
+	luaT_tuple_gc_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 }

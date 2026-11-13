@@ -1,37 +1,13 @@
-#ifndef TARANTOOL_BOX_USER_DEF_H_INCLUDED
-#define TARANTOOL_BOX_USER_DEF_H_INCLUDED
 /*
- * Copyright 2010-2016, Tarantool AUTHORS, please see AUTHORS file.
+ * SPDX-License-Identifier: BSD-2-Clause
  *
- * Redistribution and use in source and binary forms, with or
- * without modification, are permitted provided that the following
- * conditions are met:
- *
- * 1. Redistributions of source code must retain the above
- *    copyright notice, this list of conditions and the
- *    following disclaimer.
- *
- * 2. Redistributions in binary form must reproduce the above
- *    copyright notice, this list of conditions and the following
- *    disclaimer in the documentation and/or other materials
- *    provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY <COPYRIGHT HOLDER> ``AS IS'' AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
- * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
- * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL
- * <COPYRIGHT HOLDER> OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT,
- * INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR
- * BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
- * LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
- * THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
- * SUCH DAMAGE.
+ * Copyright 2010-2022, Tarantool AUTHORS, please see AUTHORS file.
  */
+#pragma once
+
+#include <stdint.h>
+
 #include "schema_def.h" /* for SCHEMA_OBJECT_TYPE */
-#include "scramble.h" /* for SCRAMBLE_SIZE */
 #define RB_COMPACT 1
 #include "small/rb.h"
 #include "small/rlist.h"
@@ -40,10 +16,7 @@
 extern "C" {
 #endif /* defined(__cplusplus) */
 
-/**
- * chap-sha1 of empty string, i.e. base64_encode(sha1(sha1(""), 0)
- */
-extern const char *CHAP_SHA1_EMPTY_PASSWORD;
+struct authenticator;
 
 typedef uint16_t user_access_t;
 /**
@@ -97,10 +70,10 @@ enum priv_type {
 	PRIV_UPDATE = 2048,
 	/* DELETE - required by ANSI - not implemented */
 	PRIV_DELETE = 4096,
-	/* This is never granted, but used internally. */
+	/* Can grant all accesses excepting "grant" and "metagrant".*/
 	PRIV_GRANT = 8192,
-	/* Never granted, but used internally. */
-	PRIV_REVOKE = 16384,
+	/* Can grant "grant" and "metagrant" accesses. */
+	PRIV_METAGRANT = 16384,
 	/* all bits */
 	PRIV_ALL  = ~((user_access_t) 0),
 };
@@ -115,6 +88,19 @@ struct priv_def {
 	uint32_t grantee_id;
 	/* Object id - is only defined for object type */
 	uint32_t object_id;
+	/**
+	 * Object name if the object is identified by a string name,
+	 * not by a numeric id. The object id is set to 0 in this case.
+	 * NOTE: This string isn't null-terminated.
+	 */
+	const char *object_name;
+	/** Length of the object_name string. */
+	uint32_t object_name_len;
+	/**
+	 * If this flag is set, the object id is unused and the privilege
+	 * should be applied to the whole object class.
+	 */
+	bool is_entity_access;
 	/* Object type - function, space, universe */
 	enum schema_object_type object_type;
 	/**
@@ -164,30 +150,47 @@ struct user_def {
 	uint32_t owner;
 	/** 'user' or 'role' */
 	enum schema_object_type type;
-	/** User password - hash2 */
-	char hash2[SCRAMBLE_SIZE];
+	/**
+	 * Authentication data or NULL if auth method is unset.
+	 *
+	 * XXX: Strictly speaking, this doesn't belong here.
+	 * Ideally, we should store raw authentication data in
+	 * the user_def struct while the authenticator should
+	 * reside in the user struct.
+	 */
+	struct authenticator *auth;
+	/**
+	 * Last modification timestamp (seconds since UNIX epoch)
+	 * or 0 if unknown.
+	 */
+	uint64_t last_modified;
 	/** User name - for error messages and debugging */
-	char name[0];
+	char *name;
 };
 
-static inline size_t
-user_def_sizeof(uint32_t name_len)
-{
-	return sizeof(struct user_def) + name_len + 1;
-}
+/**
+ * Allocates and initializes a new user definition.
+ * This function never fails.
+ */
+struct user_def *
+user_def_new(uint32_t uid, uint32_t owner, enum schema_object_type type,
+	     const char *name, uint32_t name_len);
+
+/** Destroys and frees a user definition. */
+void
+user_def_delete(struct user_def *def);
 
 /** Predefined user ids. */
 enum {
 	BOX_SYSTEM_USER_ID_MIN = 0,
 	GUEST = 0,
 	ADMIN =  1,
-	PUBLIC = 2, /* role */
-	SUPER = 31, /* role */
-	BOX_SYSTEM_USER_ID_MAX = PUBLIC
+	PUBLIC = 2,      /* role */
+	REPLICATION = 3, /* role */
+	SUPER = 31,      /* role */
+	BOX_SYSTEM_USER_ID_MAX = REPLICATION
 };
 
 #if defined(__cplusplus)
 } /* extern "C" */
 #endif /* defined(__cplusplus) */
-
-#endif /* TARANTOOL_BOX_USER_DEF_H_INCLUDED */

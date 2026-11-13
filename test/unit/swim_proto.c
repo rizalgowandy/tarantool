@@ -31,10 +31,9 @@
 
 #include "memory.h"
 #include "fiber.h"
-#include "uuid/tt_uuid.h"
+#include "tt_uuid.h"
 #include "version.h"
 #include "msgpuck.h"
-#include "unit.h"
 #include "swim/swim_proto.h"
 #include "swim_test_utils.h"
 #include <fcntl.h>
@@ -45,7 +44,7 @@ static void
 swim_test_member_def(void)
 {
 	header();
-	plan(12);
+	plan(13);
 
 	struct swim_member_def mdef;
 	const char *pos = buffer;
@@ -128,6 +127,12 @@ swim_test_member_def(void)
 	end = mp_encode_uint(end, 0);
 	is(swim_member_def_decode(&mdef, &pos, end, "test"), 0,
 	   "normal member def");
+
+	pos = buffer;
+	end = mp_encode_bin(buffer, (const char *) &uuid, sizeof(uuid));
+	end = buffer + 1;
+	is(swim_decode_uuid(&uuid, &pos, end, "test", "test"), -1,
+	   "zero length bin");
 
 	check_plan();
 	footer();
@@ -252,7 +257,7 @@ main()
 	int fd = open("log.txt", O_TRUNC);
 	if (fd != -1)
 		close(fd);
-	say_logger_init("log.txt", 6, 1, "plain", 0);
+	say_logger_init("log.txt", 6, 1, "plain");
 
 	swim_test_member_def();
 	swim_test_meta();

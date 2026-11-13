@@ -1,3 +1,5 @@
+SET SESSION "sql_seq_scan" = true;
+
 -- Create table for tests
 CREATE TABLE t (a BOOLEAN PRIMARY KEY);
 INSERT INTO t VALUES (true), (false);
@@ -6,12 +8,12 @@ INSERT INTO t VALUES (true), (false);
 \set language lua
 test_run = require('test_run').new()
 test_run:cmd("setopt delimiter ';'")
-box.schema.func.create('RETURN_TYPE', {language = 'Lua',
+box.schema.func.create('return_type', {language = 'Lua',
 		       is_deterministic = true,
 		       body = 'function(x) return type(x) end',
 		       returns = 'string', param_list = {'any'},
 		       exports = {'LUA', 'SQL'}});
-box.schema.func.create('IS_BOOLEAN', {language = 'Lua',
+box.schema.func.create('is_boolean', {language = 'Lua',
 		       is_deterministic = true,
 		       body = "function(x) return type(x) == 'boolean' end",
 		       returns = 'boolean', param_list = {'any'},
@@ -24,13 +26,16 @@ SELECT a FROM t WHERE a;
 SELECT a FROM t WHERE a != true;
 
 -- Check DEFAULT values for boolean.
-CREATE TABLE t0 (i INT PRIMARY KEY, a BOOLEAN DEFAULT true);
-INSERT INTO t0 VALUES (1, false);
-INSERT INTO t0(i) VALUES (2);
-INSERT INTO t0 VALUES (3, NULL);
-SELECT * FROM t0;
+CREATE TABLE t0def (i INT PRIMARY KEY, a BOOLEAN DEFAULT true);
+INSERT INTO t0def(i) VALUES (1);
+SELECT * FROM t0def;
+DROP TABLE t0def;
 
 -- Check UNKNOWN value for boolean.
+CREATE TABLE t0 (i INT PRIMARY KEY, a BOOLEAN);
+INSERT INTO t0 VALUES (1, false);
+INSERT INTO t0 VALUES (2, true);
+INSERT INTO t0 VALUES (3, NULL);
 INSERT INTO t0 VALUES (4, UNKNOWN);
 SELECT * FROM t0;
 
@@ -78,13 +83,13 @@ SELECT is_boolean(a) FROM t LIMIT 1;
 SELECT is_boolean('true');
 
 -- Check BOOLEAN as argument of scalar function.
-SELECT abs(a) FROM t0;
-SELECT lower(a) FROM t0;
-SELECT upper(a) FROM t0;
-SELECT quote(a) FROM t0;
+SELECT ABS(a) FROM t0;
+SELECT LOWER(a) FROM t0;
+SELECT UPPER(a) FROM t0;
+SELECT QUOTE(a) FROM t0;
 -- gh-4462: LENGTH didn't take BOOLEAN arguments.
-SELECT length(a) FROM t0;
-SELECT typeof(a) FROM t0;
+SELECT LENGTH(a) FROM t0;
+SELECT TYPEOF(a) FROM t0;
 
 -- Check BOOLEAN as argument of aggregate function.
 SELECT AVG(a) FROM t0;
@@ -97,7 +102,7 @@ SELECT GROUP_CONCAT(a, ' +++ ') FROM t0;
 
 -- Check BOOLEAN as binding parameter.
 \set language lua
-box.execute('SELECT ?, ?, return_type($1), typeof($2);', {true, false})
+box.execute('SELECT ?, ?, return_type($1), TYPEOF($2);', {true, false})
 
 parameters = {}
 parameters[1] = {}
@@ -116,7 +121,7 @@ INSERT INTO t1 VALUES (2, true);
 CREATE TABLE t2 (a BOOLEAN PRIMARY KEY, b BOOLEAN REFERENCES t2(a));
 INSERT INTO t2 VALUES (false, true)
 INSERT INTO t2 VALUES (true, false)
-INSERT INTO t2 VALUES (true, true)
+INSERT INTO t2 VALUES (true, NULL)
 INSERT INTO t2 VALUES (false, true)
 
 -- Check interactions with UNIQUE constraint.
@@ -145,8 +150,8 @@ SELECT cast('true' AS BOOLEAN), cast('false' AS BOOLEAN);
 SELECT cast('TRUE' AS BOOLEAN), cast('FALSE' AS BOOLEAN);
 
 -- Check usage in trigger.
-CREATE TABLE t4 (i INT PRIMARY KEY, a BOOLEAN);
-CREATE TABLE t5 (i INT PRIMARY KEY AUTOINCREMENT, b BOOLEAN);
+CREATE TABLE t4 (i4 INT PRIMARY KEY, a BOOLEAN);
+CREATE TABLE t5 (i5 INT PRIMARY KEY AUTOINCREMENT, b BOOLEAN);
 CREATE TRIGGER r AFTER INSERT ON t4 FOR EACH ROW BEGIN INSERT INTO t5(b) VALUES(true); END;
 INSERT INTO t4 VALUES (100, false);
 DROP TRIGGER r;
@@ -163,7 +168,7 @@ SELECT * FROM t4 INTERSECT SELECT * FROM t5;
 INSERT INTO t5(b) SELECT a FROM t4;
 SELECT * FROM t5;
 
-SELECT * FROM (SELECT t4.i, t5.i, a, b FROM t4, t5 WHERE a = false OR b = true);
+SELECT * FROM (SELECT t4.i4, t5.i5, a, b FROM t4, t5 WHERE a = false OR b = true);
 
 -- Check VIEW.
 CREATE VIEW v AS SELECT b FROM t5;
@@ -191,16 +196,16 @@ UPDATE t4 SET a = NOT a;
 SELECT * FROM t4;
 
 -- Check SWITCH-CASE.
-SELECT i, \
+SELECT i4, \
 CASE \
-	WHEN a == true AND i % 2 == 1 THEN false \
-	WHEN a == true and i % 2 == 0 THEN true \
+    WHEN a == true AND i4 % 2 == 1 THEN false \
+    WHEN a == true and i4 % 2 == 0 THEN true \
 	WHEN a != true then false \
 END AS a0 \
 FROM t4;
 
 -- Check ORDER BY.
-SELECT * FROM t4 UNION SELECT * FROM t5 ORDER BY a, i;
+SELECT * FROM t4 UNION SELECT * FROM t5 ORDER BY a, i4;
 
 -- Check GROUP BY.
 SELECT a, COUNT(*) FROM (SELECT * FROM t4 UNION SELECT * FROM t5) GROUP BY a;
@@ -1244,3 +1249,7 @@ DROP TABLE t1;
 DROP TABLE t0;
 DROP TABLE ts;
 DROP TABLE t;
+
+DELETE FROM "_func" WHERE "name" = 'check_t1_ck';
+DELETE FROM "_func" WHERE "name" = 'return_type';
+DELETE FROM "_func" WHERE "name" = 'is_boolean';

@@ -85,7 +85,6 @@ struct unixFile {
 	int szChunk;		/* Configured by FCNTL_CHUNK_SIZE */
 	int nFetchOut;		/* Number of outstanding xFetch refs */
 	sql_int64 mmapSize;	/* Usable size of mapping at pMapRegion */
-	sql_int64 mmapSizeActual;	/* Actual size of mapping at pMapRegion */
 	sql_int64 mmapSizeMax;	/* Configured FCNTL_MMAP_SIZE value */
 	void *pMapRegion;	/* Memory mapped region */
 };
@@ -113,10 +112,6 @@ static pid_t randomnessPid = 0;
 #define O_BINARY 0
 #endif
 #ifndef O_LARGEFILE
-#define O_LARGEFILE 0
-#endif
-#ifdef SQL_DISABLE_LFS
-#undef O_LARGEFILE
 #define O_LARGEFILE 0
 #endif
 #ifndef O_NOFOLLOW
@@ -339,7 +334,7 @@ closePendingFds(unixFile * pFile)
 	for (p = pInode->pUnused; p; p = pNext) {
 		pNext = p->pNext;
 		close(p->fd);
-		sql_free(p);
+		free(p);
 	}
 	pInode->pUnused = 0;
 }
@@ -366,7 +361,7 @@ releaseInodeInfo(unixFile * pFile)
 				assert(pInode->pNext->pPrev == pInode);
 				pInode->pNext->pPrev = pInode->pPrev;
 			}
-			sql_free(pInode);
+			free(pInode);
 		}
 	}
 }
@@ -407,10 +402,7 @@ findInodeInfo(unixFile * pFile,	/* Unix file with file desc used in the key */
 		pInode = pInode->pNext;
 	}
 	if (pInode == 0) {
-		pInode = sql_malloc64(sizeof(*pInode));
-		if (pInode == 0) {
-			return -1;
-		}
+		pInode = xmalloc(sizeof(*pInode));
 		memset(pInode, 0, sizeof(*pInode));
 		memcpy(&pInode->fileId, &fileId, sizeof(fileId));
 		pInode->nRef = 1;
@@ -646,7 +638,7 @@ closeUnixFile(sql_file * id)
 		close(pFile->h);
 		pFile->h = -1;
 	}
-	sql_free(pFile->pUnused);
+	free(pFile->pUnused);
 	memset(pFile, 0, sizeof(unixFile));
 	return 0;
 }
@@ -1014,13 +1006,9 @@ unixFileControl(sql_file * id, int op, void *pArg)
 			return 0;
 		}
 	case SQL_FCNTL_TEMPFILENAME:{
-			char *zTFile =
-			    sql_malloc64(pFile->pVfs->mxPathname);
-			if (zTFile) {
-				unixGetTempname(pFile->pVfs->mxPathname,
-						zTFile);
-				*(char **)pArg = zTFile;
-			}
+			char *zTFile = xmalloc(pFile->pVfs->mxPathname);
+			unixGetTempname(pFile->pVfs->mxPathname, zTFile);
+			*(char **)pArg = zTFile;
 			return 0;
 		}
 	case SQL_FCNTL_HAS_MOVED:{
@@ -1056,10 +1044,9 @@ unixUnmapfile(unixFile * pFd)
 {
 	assert(pFd->nFetchOut == 0);
 	if (pFd->pMapRegion) {
-		munmap(pFd->pMapRegion, pFd->mmapSizeActual);
+		munmap(pFd->pMapRegion, pFd->mmapSize);
 		pFd->pMapRegion = 0;
 		pFd->mmapSize = 0;
-		pFd->mmapSizeActual = 0;
 	}
 }
 
@@ -1071,7 +1058,6 @@ unixUnmapfile(unixFile * pFd)
  *
  *       unixFile.pMapRegion
  *       unixFile.mmapSize
- *       unixFile.mmapSizeActual
  *
  * If unsuccessful,the three variables above are zeroed. In this
  * case sql should continue accessing the database using the
@@ -1084,7 +1070,8 @@ unixRemapfile(unixFile * pFd,	/* File descriptor object */
 {
 	int h = pFd->h;		/* File descriptor open on db file */
 	u8 *pOrig = (u8 *) pFd->pMapRegion;	/* Pointer to current file mapping */
-	i64 nOrig = pFd->mmapSizeActual;	/* Size of pOrig region in bytes */
+	/* Size of pOrig region in bytes. */
+	i64 nOrig = pFd->mmapSize;
 	u8 *pNew = 0;		/* Location of new mapping */
 	int flags = PROT_READ;	/* Flags to pass to mmap() */
 
@@ -1092,23 +1079,17 @@ unixRemapfile(unixFile * pFd,	/* File descriptor object */
 	assert(nNew > pFd->mmapSize);
 	assert(nNew <= pFd->mmapSizeMax);
 	assert(nNew > 0);
-	assert(pFd->mmapSizeActual >= pFd->mmapSize);
 	assert(MAP_FAILED != 0);
 
 	if (pOrig) {
-		i64 nReuse = pFd->mmapSize;
-		u8 *pReq = &pOrig[nReuse];
-
-		/* Unmap any pages of the existing mapping that cannot be reused. */
-		if (nReuse != nOrig)
-			munmap(pReq, nOrig - nReuse);
 		#if !defined(__APPLE__) && !defined(__FreeBSD__) && !defined(__OpenBSD__)
-		pNew = mremap(pOrig, nReuse, nNew, MREMAP_MAYMOVE);
+		pNew = mremap(pOrig, nOrig, nNew, MREMAP_MAYMOVE);
 		#else
-		pNew = mmap(pReq, nNew - nReuse, flags, MAP_SHARED, h, nReuse);
+		u8 *pReq = &pOrig[nOrig];
+		pNew = mmap(pReq, nNew - nOrig, flags, MAP_SHARED, h, nOrig);
 		if (pNew != MAP_FAILED) {
 			if (pNew != pReq) {
-				munmap(pNew, nNew - nReuse);
+				munmap(pNew, nNew - nOrig);
 				pNew = NULL;
 			} else {
 				pNew = pOrig;
@@ -1118,7 +1099,7 @@ unixRemapfile(unixFile * pFd,	/* File descriptor object */
 
 		/* The attempt to extend the existing mapping failed. Free it. */
 		if (pNew == MAP_FAILED || pNew == NULL)
-			munmap(pOrig, nReuse);
+			munmap(pOrig, nOrig);
 	}
 
 	/* If pNew is still NULL, try to create an entirely new mapping. */
@@ -1136,7 +1117,7 @@ unixRemapfile(unixFile * pFd,	/* File descriptor object */
 		pFd->mmapSizeMax = 0;
 	}
 	pFd->pMapRegion = (void *)pNew;
-	pFd->mmapSize = pFd->mmapSizeActual = nNew;
+	pFd->mmapSize = nNew;
 }
 
 /*
@@ -1409,12 +1390,8 @@ fillInUnixFile(sql_vfs * pVfs,	/* Pointer to vfs object */
 		}
 	}
 	storeLastErrno(pNew, 0);
-	if (rc != 0) {
-		if (h >= 0)
-			close(h);
-	} else {
+	if (rc == 0)
 		pNew->pMethod = pLockingStyle;
-	}
 	return rc;
 }
 
@@ -1433,14 +1410,16 @@ unixTempFileDir(void)
 		"/tmp",
 		"."
 	};
+	static char zbuf0[PATH_MAX];
+	static char zbuf1[PATH_MAX];
 	unsigned int i = 0;
 	struct stat buf;
 	const char *zDir = sql_temp_directory;
 
 	if (!azDirs[0])
-		azDirs[0] = getenv("SQL_TMPDIR");
+		azDirs[0] = getenv_safe("SQL_TMPDIR", zbuf0, sizeof(zbuf0));
 	if (!azDirs[1])
-		azDirs[1] = getenv("TMPDIR");
+		azDirs[1] = getenv_safe("TMPDIR", zbuf1, sizeof(zbuf1));
 	while (1) {
 		if (zDir != 0 && stat(zDir, &buf) == 0 &&
 		    S_ISDIR(buf.st_mode) && access(zDir, 03) == 0)
@@ -1694,10 +1673,7 @@ unixOpen(sql_vfs * pVfs,	/* The VFS for which this is the xOpen method */
 		if (pUnused) {
 			fd = pUnused->fd;
 		} else {
-			pUnused = sql_malloc64(sizeof(*pUnused));
-			if (!pUnused) {
-				return -1;
-			}
+			pUnused = xmalloc(sizeof(*pUnused));
 		}
 		p->pUnused = pUnused;
 
@@ -1796,7 +1772,7 @@ unixOpen(sql_vfs * pVfs,	/* The VFS for which this is the xOpen method */
 
  open_finished:
 	if (rc != 0)
-		sql_free(p->pUnused);
+		free(p->pUnused);
 	return rc;
 }
 

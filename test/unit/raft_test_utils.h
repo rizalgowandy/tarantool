@@ -32,6 +32,9 @@
 #include "fakesys/fakeev.h"
 #include "fiber.h"
 #include "raft/raft.h"
+#include "raft/raft_ev.h"
+
+#define UNIT_TAP_COMPATIBLE 1
 #include "unit.h"
 
 /** WAL simulation. It stores a list of rows which raft wanted to persist. */
@@ -104,7 +107,9 @@ struct raft_node {
 	double cfg_election_timeout;
 	int cfg_election_quorum;
 	double cfg_death_timeout;
+	double cfg_max_shift;
 	uint32_t cfg_instance_id;
+	int cfg_cluster_size;
 	struct vclock *cfg_vclock;
 };
 
@@ -185,6 +190,14 @@ raft_node_send_follower(struct raft_node *node, uint64_t term, uint32_t source);
 void
 raft_node_send_heartbeat(struct raft_node *node, uint32_t source);
 
+/**
+ * Deliver a message with is_leader_seen set to @a is_seen from @a source
+ * instance.
+ */
+int
+raft_node_send_is_leader_seen(struct raft_node *node, uint64_t term,
+			      bool is_seen, uint32_t source);
+
 /** Restart the node. The same as stop + start. */
 void
 raft_node_restart(struct raft_node *node);
@@ -200,6 +213,14 @@ raft_node_stop(struct raft_node *node);
 void
 raft_node_start(struct raft_node *node);
 
+/** Start the node but not configure it yet. Only recover. */
+void
+raft_node_recover(struct raft_node *node);
+
+/** Apply the entire Raft config to a started node. */
+void
+raft_node_cfg(struct raft_node *node);
+
 /** Block async work execution. */
 void
 raft_node_block(struct raft_node *node);
@@ -211,6 +232,10 @@ raft_node_unblock(struct raft_node *node);
 /** Promote the node. It bumps the term and tries to become a leader. */
 void
 raft_node_promote(struct raft_node *node);
+
+/** Resign leadership. Node becomes follower without bumping the term. */
+void
+raft_node_resign(struct raft_node *node);
 
 /**
  * Restore the node's state back to its is_candidate config. It is demoted if
@@ -228,6 +253,9 @@ void
 raft_node_cfg_is_candidate(struct raft_node *node, bool value);
 
 void
+raft_node_cfg_cluster_size(struct raft_node *node, int value);
+
+void
 raft_node_cfg_election_timeout(struct raft_node *node, double value);
 
 void
@@ -235,6 +263,9 @@ raft_node_cfg_election_quorum(struct raft_node *node, int value);
 
 void
 raft_node_cfg_death_timeout(struct raft_node *node, double value);
+
+void
+raft_node_cfg_max_shift(struct raft_node *node, double value);
 
 /** Check that @a msg message matches the given arguments. */
 bool

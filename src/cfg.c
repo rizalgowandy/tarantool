@@ -32,8 +32,9 @@
 #include "cfg.h"
 #include "lua/utils.h"
 #include "tt_static.h"
+#include "lua/uri.h"
 
-enum { MAX_OPT_NAME_LEN = 256, MAX_OPT_VAL_LEN = 256 };
+enum { MAX_OPT_NAME_LEN = 256, MAX_OPT_VAL_LEN = 512 };
 
 static void
 cfg_get(const char *param)
@@ -42,6 +43,15 @@ cfg_get(const char *param)
 		tt_snprintf(MAX_OPT_NAME_LEN, "return box.cfg.%s", param);
 	if (luaL_dostring(tarantool_L, buf) != 0)
 		panic("cfg_get('%s')", param);
+}
+
+int
+cfg_get_uri_set(const char *param, struct uri_set *uri_set)
+{
+	cfg_get(param);
+	int rc = luaT_uri_set_create(tarantool_L, -1, uri_set);
+	lua_pop(tarantool_L, 1);
+	return rc;
 }
 
 int
@@ -66,14 +76,20 @@ cfg_isnumber(const char *param)
 	return ret;
 }
 
-int
+bool
+cfg_isboolean(const char *param)
+{
+	cfg_get(param);
+	bool ret = !!lua_isboolean(tarantool_L, -1);
+	lua_pop(tarantool_L, 1);
+	return ret;
+}
+
+bool
 cfg_getb(const char *param)
 {
 	cfg_get(param);
-	int val;
-	if (lua_isnil(tarantool_L, -1))
-		return -1;
-	val = lua_toboolean(tarantool_L, -1);
+	bool val = lua_toboolean(tarantool_L, -1);
 	lua_pop(tarantool_L, 1);
 	return val;
 }
@@ -84,6 +100,7 @@ cfg_geti_default(const char *param, int default_val)
 	cfg_get(param);
 	int ok;
 	int val = lua_tointegerx(tarantool_L, -1, &ok);
+	lua_pop(tarantool_L, 1);
 	return ok ? val : default_val;
 }
 
@@ -129,9 +146,27 @@ cfg_getd_default(const char *param, double default_val)
 	cfg_get(param);
 	int ok;
 	double val = lua_tonumberx(tarantool_L, -1, &ok);
+	lua_pop(tarantool_L, 1);
 	return ok ? val : default_val;
 }
 
+bool
+cfg_isnil(const char *name)
+{
+	cfg_get(name);
+	bool is_nil = lua_isnil(tarantool_L, -1);
+	lua_pop(tarantool_L, 1);
+	return is_nil;
+}
+
+bool
+cfg_istable(const char *name)
+{
+	cfg_get(name);
+	bool is_table = lua_istable(tarantool_L, -1);
+	lua_pop(tarantool_L, 1);
+	return is_table;
+}
 
 int
 cfg_getarr_size(const char *name)

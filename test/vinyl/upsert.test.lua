@@ -206,6 +206,7 @@ index = space:create_index('primary')
 stat1 = index:stat()
 
 -- separate upserts w/o on disk data
+-- NOT squashed, see gh-5080
 space:upsert({1, 1, 1}, {{'+', 2, 10}})
 space:upsert({1, 1, 1}, {{'-', 2, 20}})
 space:upsert({1, 1, 1}, {{'=', 2, 20}})
@@ -338,7 +339,11 @@ box.snapshot()
 s:get(10) -- add [10, 10] to the cache
 ch = fiber.channel(1)
 test_run:cmd("setopt delimiter ';'")
-_ = fiber.create(function() ch:put(s:select()) end)
+_ = fiber.create(function()
+    box.begin({txn_isolation = 'read-committed'})
+    ch:put(s:select())
+    box.commit()
+end)
 s:upsert({10, 10}, {{'+', 2, 10}})
 test_run:cmd("setopt delimiter ''");
 ch:get() -- should see the UPSERT and return [10, 20]
@@ -490,10 +495,10 @@ pk = s:create_index('pk')
 s:replace{1, 1, 1, 1.1, decimal.new(1.1) }
 s:replace{2, 1, 1, 1.1, decimal.new(1.1)}
 box.snapshot()
--- Can't assign integer to float field. First operation is still applied.
+-- Can assign integer to float field.
 --
-s:upsert({1, 1, 1, 2.5, decimal.new(1.1)}, {{'+', 4, 4}})
 s:upsert({1, 1, 1, 2.5, decimal.new(1.1)}, {{'=', 4, 4}})
+s:upsert({1, 1, 1, 2.5, decimal.new(1.1)}, {{'+', 4, 4}})
 -- Can't add floating point to integer (result is floating point).
 --
 s:upsert({2, 1, 1, 2.5, decimal.new(1.1)}, {{'+', 2, 5}})

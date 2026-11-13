@@ -1,9 +1,10 @@
 #include "tuple.h"
-#include "unit.h"
 #include <stdio.h>
 #include <memory.h>
 #include <fiber.h>
 
+#define UNIT_TAP_COMPATIBLE 1
+#include "unit.h"
 
 static char data[500];
 
@@ -61,9 +62,10 @@ tuple_field_u32_test()
 int
 main()
 {
+	plan(2);
 	memory_init();
 	fiber_init(fiber_c_invoke);
-	tuple_init(NULL);
+	tuple_init();
 
 
 	tuple_next_u32_test();
@@ -73,5 +75,5 @@ main()
 	fiber_free();
 	memory_free();
 
-	return 0;
+	return check_plan();
 }

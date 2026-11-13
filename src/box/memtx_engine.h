@@ -36,46 +36,45 @@
 #include <small/quota.h>
 #include <small/small.h>
 #include <small/mempool.h>
+#include <small/matras.h>
+#include <small/region.h>
+
 
 #include "engine.h"
 #include "xlog.h"
 #include "salad/stailq.h"
 #include "sysalloc.h"
+#include "trivia/util.h"
+#include "tuple.h"
+#include "memtx_index.h"
 
 #if defined(__cplusplus)
 extern "C" {
 #endif /* defined(__cplusplus) */
 
 struct index;
+struct index_def;
+struct index_read_view;
+struct info_handler;
+struct iterator;
 struct fiber;
-struct tuple;
+struct read_view_tuple;
 struct tuple_format;
+struct memtx_tx_snapshot_cleaner;
 
 /**
- * Free mode, determines a strategy for freeing up memory
- */
-enum memtx_engine_free_mode {
-	/** Free objects immediately. */
-	MEMTX_ENGINE_FREE,
-	/** Collect garbage after delayed free. */
-	MEMTX_ENGINE_COLLECT_GARBAGE,
-	/** Postpone deletion of objects. */
-	MEMTX_ENGINE_DELAYED_FREE,
-};
-
-/**
- * The state of memtx recovery process.
- * There is a global state of the entire engine state of each
- * space. The state of a space is initialized from the engine
- * state when the space is created. The exception is system
- * spaces, which are always created in the final (OK) state.
+ * Recovery state of memtx engine.
  *
- * The states exist to speed up recovery: initial state
+ * For faster recovery an optimization is used: initial recovery
  * assumes write-only flow of sorted rows from a snapshot.
- * It's followed by a state for read-write recovery
- * of rows from the write ahead log; these rows are
- * inserted only into the primary key. The final
- * state is for a fully functional space.
+ * It's followed by a final recovery state for read-write recovery
+ * of rows from the write ahead log; these rows are inserted only into
+ * the primary key.
+ * When recovery is finished all spaces become fully functional.
+ *
+ * Note that this state describes only optimization state of recovery.
+ * For instance in case of force recovery the state is set to MEMTX_OK
+ * nearly in the start before snapshot loading.
  */
 enum memtx_recovery_state {
 	/** The space has no indexes. */
@@ -97,32 +96,20 @@ enum memtx_recovery_state {
 	MEMTX_OK,
 };
 
-/** Memtx extents pool, available to statistics. */
-extern struct mempool memtx_index_extent_pool;
-
-enum memtx_reserve_extents_num {
-	/**
-	 * This number is calculated based on the
-	 * max (realistic) number of insertions
-	 * a deletion from a B-tree or an R-tree
-	 * can lead to, and, as a result, the max
-	 * number of new block allocations.
-	 */
-	RESERVE_EXTENTS_BEFORE_DELETE = 8,
-	RESERVE_EXTENTS_BEFORE_REPLACE = 16
-};
-
 /**
  * The size of the biggest memtx iterator. Used with
  * mempool_create. This is the size of the block that will be
  * allocated for each iterator (except rtree index iterator that
  * is significantly bigger so has own pool).
  */
-#define MEMTX_ITERATOR_SIZE (152)
+#define MEMTX_ITERATOR_SIZE (184)
+
+typedef void
+(*memtx_on_indexes_built_cb)(void);
 
 struct memtx_engine {
 	struct engine base;
-	/** Engine recovery state. */
+	/** Engine recovery state, see enum memtx_recovery_state description. */
 	enum memtx_recovery_state state;
 	/** Non-zero if there is a checkpoint (snapshot) in progress. */
 	struct checkpoint *checkpoint;
@@ -132,11 +119,13 @@ struct memtx_engine {
 	uint64_t snap_io_rate_limit;
 	/** Skip invalid snapshot records if this flag is set. */
 	bool force_recovery;
+	/** Save and load the sort data. */
+	bool use_sort_data;
 	/**
-	 * Cord being currently used to join replica. It is only
-	 * needed to be able to cancel it on shutdown.
+	 * A callback run once memtx engine builds secondary indexes for the
+	 * data.
 	 */
-	struct cord *replica_join_cord;
+	memtx_on_indexes_built_cb on_indexes_built_cb;
 	/** Common quota for tuples and indexes. */
 	struct quota quota;
 	/**
@@ -150,27 +139,14 @@ struct memtx_engine {
 	struct slab_cache slab_cache;
 	/** Slab cache for allocating index extents. */
 	struct slab_cache index_slab_cache;
-	/** Index extent allocator. */
+	/** Index extent source. */
 	struct mempool index_extent_pool;
-	/**
-	 * To ensure proper statement-level rollback in case
-	 * of out of memory conditions, we maintain a number
-	 * of slack memory extents reserved before a statement
-	 * is begun. If there isn't enough slack memory,
-	 * we don't begin the statement.
-	 */
-	int num_reserved_extents;
-	void *reserved_extents;
+	/** Index extent allocator. */
+	struct matras_allocator index_extent_allocator;
+	/** Index extent allocator statistics. */
+	struct matras_stats index_extent_stats;
 	/** Maximal allowed tuple size, box.cfg.memtx_max_tuple_size. */
 	size_t max_tuple_size;
-	/** Incremented with each next snapshot. */
-	uint32_t snapshot_version;
-	/**
-	 * Unless zero, freeing of tuples allocated before the last
-	 * call to memtx_enter_delayed_free_mode() is delayed until
-	 * memtx_leave_delayed_free_mode() is called.
-	 */
-	uint32_t delayed_free_mode;
 	/** Memory pool for rtree index iterator. */
 	struct mempool rtree_iterator_pool;
 	/**
@@ -190,10 +166,127 @@ struct memtx_engine {
 	 */
 	struct stailq gc_queue;
 	/**
-	 * Free mode, determines a strategy for freeing up memory
+	 * Format used for allocating functional index keys.
 	 */
-	enum memtx_engine_free_mode free_mode;
+	struct tuple_format *func_key_format;
+	/**
+	 * Number of threads used to sort keys of secondary indexes on engine
+	 * start.
+	 */
+	int sort_threads;
+	/** Set of extents allocated using malloc. */
+	struct mh_ptr_t *malloc_extents;
+	/** The fields that are only used on .snap recovery. */
+	struct {
+		/** ID of the space the last insert is performed into. */
+		uint32_t last_space_id;
+		/** The memtx index sort data reader. */
+		struct memtx_sort_data_reader *sort_data_reader;
+	} recovery;
 };
+
+/**
+ * Container for deleted tuples.
+ */
+struct memtx_tuple_list {
+	/* A deleted tuple. */
+	struct tuple *tuple;
+	/* The next one. */
+	struct memtx_tuple_list *next;
+};
+
+/**
+ * Traverse all the tuples in the list.
+ *
+ * Handle NULL if there's no tuples in the list and @a or_null_ is set to true.
+ */
+#define memtx_tuple_list_foreach_impl(or_null_, list_, tuple_, code_) do { \
+		struct memtx_tuple_list *list__ = list_; \
+		if ((or_null_) && list__ == NULL) { \
+			tuple_ = NULL; \
+			code_ \
+		} \
+		while (list__ != NULL) { \
+			tuple_ = list__->tuple; \
+			list__ = list__->next; \
+			code_ \
+		} \
+} while (false)
+
+/**
+ * Traverse all the tuples in the list.
+ */
+#define memtx_tuple_list_foreach(list_, tuple_, code_) \
+	memtx_tuple_list_foreach_impl(false, list_, tuple_, code_)
+
+/**
+ * Traverse all the tuples in the list or a single NULL if there's none.
+ */
+#define memtx_tuple_list_foreach_or_null(list_, tuple_, code_) \
+	memtx_tuple_list_foreach_impl(true, list_, tuple_, code_)
+
+/**
+ * Structure which contains pointers to the tuples,
+ * that are used in rollback.
+ */
+struct memtx_stmt_rollback_info {
+	/* A list of deleted tuples (NULL if no tuple deleted).*/
+	struct memtx_tuple_list *old_tuples;
+	/* The inserted tuple (NULL if no tuple inserted). */
+	struct tuple *new_tuple;
+};
+
+/**
+ * Allocate and zero-initialize a rollback info on the region.
+ */
+static inline struct memtx_stmt_rollback_info *
+memtx_stmt_rollback_info_new(struct region *region)
+{
+	struct memtx_stmt_rollback_info *undo =
+		xregion_alloc_object(region, typeof(*undo));
+	memset(undo, 0, sizeof(*undo));
+	return undo;
+}
+
+/**
+ * Unref the tuples referenced by the rollback info.
+ */
+static inline void
+memtx_stmt_rollback_info_delete(struct memtx_stmt_rollback_info *undo)
+{
+	struct tuple *old_tuple;
+	memtx_tuple_list_foreach(undo->old_tuples, old_tuple, {
+		tuple_unref(old_tuple);
+	});
+	if (undo->new_tuple != NULL)
+		tuple_unref(undo->new_tuple);
+}
+
+/**
+ * Add a deleted tuple to the rollback info. Steals the tuple reference.
+ */
+static inline void
+memtx_stmt_rollback_info_add_old_tuple(struct memtx_stmt_rollback_info *undo,
+				       struct tuple *old_tuple,
+				       struct region *region)
+{
+	struct memtx_tuple_list *prev_deleted = undo->old_tuples;
+	undo->old_tuples =
+		xregion_alloc_object(region, struct memtx_tuple_list);
+	undo->old_tuples->tuple = old_tuple;
+	undo->old_tuples->next = prev_deleted;
+}
+
+/**
+ * Set the new tuple in the rollback info. Steals the tuple reference.
+ */
+static inline void
+memtx_stmt_rollback_info_set_new_tuple(struct memtx_stmt_rollback_info *undo,
+				       struct tuple *new_tuple)
+{
+	assert(undo->new_tuple == NULL);
+	undo->new_tuple = new_tuple;
+}
 
 struct memtx_gc_task;
 
@@ -228,7 +321,21 @@ struct memtx_engine *
 memtx_engine_new(const char *snap_dirname, bool force_recovery,
 		 uint64_t tuple_arena_max_size, uint32_t objsize_min,
 		 bool dontdump, unsigned granularity,
-		 const char *allocator, float alloc_factor);
+		 const char *allocator, float alloc_factor, int threads_num,
+		 memtx_on_indexes_built_cb on_indexes_built);
+
+/**
+ * Memtx engine statistics (box.stat.memtx()).
+ */
+void
+memtx_engine_stat(struct memtx_engine *memtx, struct info_handler *h);
+
+/**
+ * End building a space fast recovered (using PK build) from the snapshot.
+ * This means building its PK and (optionally) building its secondary keys.
+ */
+int
+memtx_end_build_snapshot_space(struct memtx_engine *memtx, uint32_t space_id);
 
 int
 memtx_engine_recover_snapshot(struct memtx_engine *memtx,
@@ -240,25 +347,14 @@ memtx_engine_set_snap_io_rate_limit(struct memtx_engine *memtx, double limit);
 int
 memtx_engine_set_memory(struct memtx_engine *memtx, size_t size);
 
+/**
+ * The box.cfg.memtx_use_sort_data field update handler.
+ */
+void
+memtx_engine_set_use_sort_data(struct memtx_engine *memtx, bool value);
+
 void
 memtx_engine_set_max_tuple_size(struct memtx_engine *memtx, size_t max_size);
-
-/**
- * Enter tuple delayed free mode: tuple allocated before the call
- * won't be freed until memtx_leave_delayed_free_mode() is called.
- * This function is reentrant, meaning it's okay to call it multiple
- * times from the same or different fibers - one just has to leave
- * the delayed free mode the same amount of times then.
- */
-void
-memtx_enter_delayed_free_mode(struct memtx_engine *memtx);
-
-/**
- * Leave tuple delayed free mode. This function undoes the effect
- * of memtx_enter_delayed_free_mode().
- */
-void
-memtx_leave_delayed_free_mode(struct memtx_engine *memtx);
 
 /** Tuple format vtab for memtx engine. */
 extern struct tuple_format_vtab memtx_tuple_format_vtab;
@@ -269,25 +365,27 @@ enum {
 };
 
 /**
- * Allocate a block of size MEMTX_EXTENT_SIZE for memtx index
- * @ctx must point to memtx engine
+ * Flags for 'memtx_tuple_new_raw' function that allow
+ * to tune its behavior.
  */
-void *
-memtx_index_extent_alloc(void *ctx);
+enum {
+	/** This flag allows to disable data validation on tuple allocation. */
+	MEMTX_TUPLE_NEW_RAW_NO_VALIDATE = 1 << 0,
+	/** This flag allows to bypass tuple max size limitation. */
+	MEMTX_TUPLE_NEW_RAW_NO_TUPLE_MAX_SIZE = 1 << 1,
+};
 
 /**
- * Free a block previously allocated by memtx_index_extent_alloc
- * @ctx must point to memtx engine
+ * Allocate and return new memtx tuple. Behavior can be tuned with flags.
+ * On error returns NULL and set diag.
  */
-void
-memtx_index_extent_free(void *ctx, void *extent);
+extern struct tuple *
+(*memtx_tuple_new_raw)(struct tuple_format *format, const char *data,
+		       const char *end, unsigned flags);
 
-/**
- * Reserve num extents in pool.
- * Ensure that next num extent_alloc will succeed w/o an error
- */
-int
-memtx_index_extent_reserve(struct memtx_engine *memtx, int num);
+/** Check if the given index definition support the MemTX sort data. */
+bool
+memtx_index_def_supports_sort_data(struct index_def *def);
 
 /**
  * Generic implementation of index_vtab::def_change_requires_rebuild,
@@ -300,6 +398,67 @@ memtx_index_def_change_requires_rebuild(struct index *index,
 void
 memtx_set_tuple_format_vtab(const char *allocator_name);
 
+/**
+ * Converts a tuple from format in which it is stored in space
+ * to format in which, it should be visible for users.
+ */
+int
+memtx_prepare_result_tuple(struct space *space, struct tuple **result);
+
+/**
+ * Prepares a tuple retrieved from a consistent index read view to be returned
+ * to the user.
+ *
+ * A pointer to the raw tuple data and its size are returned in the result
+ * argument.
+ *
+ * This function performs two tasks:
+ *
+ *  1. Eliminates dirty tuples using the provided snapshot cleaner created
+ *     at read_view_new. If the given tuple should be skipped, the data is
+ *     set to NULL.
+ *
+ *  2. Decompresses tuples if required, unless the disable_decompression flag
+ *     was set in the read view options. Decompressed tuple data is stored on
+ *     the fiber region.
+ *
+ * Returns 0 on success. On error returns -1 and sets diag.
+ */
+int
+memtx_prepare_read_view_tuple(struct memtx_index_entry entry,
+			      struct index_read_view *index,
+			      struct memtx_tx_snapshot_cleaner *cleaner,
+			      struct read_view_tuple *result);
+
+/**
+ * Common function for all memtx indexes. Get tuple from memtx @a index
+ * and return it in @a result in format in which, it should be visible for
+ * users.
+ */
+int
+memtx_index_get(struct index *index, const char *key, uint32_t part_count,
+		struct tuple **result);
+
+/**
+ * Common function for all memtx indexes. Iterate to the next tuple and
+ * return it in @a ret in format in which, it should be visible for users.
+ */
+int
+memtx_iterator_next(struct iterator *it, struct tuple **ret);
+
+/*
+ * Check tuple data correspondence to the space format.
+ * Same as simple tuple_validate function, but can work
+ * with compressed tuples.
+ * @param format Format to which the tuple must match.
+ * @param tuple  Tuple to validate.
+ *
+ * @retval  0 The tuple is valid.
+ * @retval -1 The tuple is invalid.
+ */
+int
+memtx_tuple_validate(struct tuple_format *format, struct tuple *tuple);
+
 #if defined(__cplusplus)
 } /* extern "C" */
 
@@ -309,13 +468,15 @@ static inline struct memtx_engine *
 memtx_engine_new_xc(const char *snap_dirname, bool force_recovery,
 		    uint64_t tuple_arena_max_size, uint32_t objsize_min,
 		    bool dontdump, unsigned granularity,
-		    const char *allocator, float alloc_factor)
+		    const char *allocator, float alloc_factor,
+		    int sort_threads,
+		    memtx_on_indexes_built_cb on_indexes_built)
 {
 	struct memtx_engine *memtx;
 	memtx = memtx_engine_new(snap_dirname, force_recovery,
-				 tuple_arena_max_size,
-				 objsize_min, dontdump,
-				 granularity, allocator, alloc_factor);
+				 tuple_arena_max_size, objsize_min, dontdump,
+				 granularity, allocator, alloc_factor,
+				 sort_threads, on_indexes_built);
 	if (memtx == NULL)
 		diag_raise();
 	return memtx;

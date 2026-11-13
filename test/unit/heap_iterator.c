@@ -2,7 +2,7 @@
 #include <limits.h>
 #include <stdio.h>
 #include <stdbool.h>
-#include <memory.h>
+#include <string.h>
 
 #include "unit.h"
 
@@ -37,6 +37,7 @@ void free_all_nodes(heap_t *p_heap)
 				offsetof(struct test_type, node));
 		free(root_value);
 	}
+	test_heap_destroy(p_heap);
 }
 
 static void

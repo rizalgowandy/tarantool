@@ -1,6 +1,6 @@
-cmake_minimum_required(VERSION 2.8)
+cmake_minimum_required(VERSION 3.18)
 
-project(tarantool C CXX)
+project(tarantool C CXX ASM)
 
 set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake" ${CMAKE_MODULE_PATH})
 set(CMAKE_INCLUDE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake" ${CMAKE_INCLUDE_PATH})
@@ -18,6 +18,20 @@ include(CheckFunctionExists)
 include(FindOptionalPackage)
 include(FindPackageMessage)
 include(ExternalProject)
+include(CheckPatch)
+include(MakeLuaPath)
+include(LuaAnnotations)
+include(CAPIDoc)
+
+# We have to set OLD or NEW to silence warnings on CMake 3.24+.
+#
+# NEW works smoother: re-downloading archive sources (due to, say, changing
+# the project's URL) triggers rebuilding of the subproject.
+#
+# https://cmake.org/cmake/help/latest/policy/CMP0135.html
+if(POLICY CMP0135)
+    cmake_policy(SET CMP0135 NEW)
+endif()
 
 find_program(ECHO echo)
 find_program(CAT cat)
@@ -26,6 +40,11 @@ find_program(GIT git)
 find_program(LD ld)
 find_program(CTAGS ctags)
 find_program(LUACHECK luacheck ENV PATH)
+find_program(PYTHON python)
+find_program(RM rm)
+
+include (CTest)
+enable_testing()
 
 # Define PACKAGE macro in tarantool/config.h
 set(PACKAGE "Tarantool" CACHE STRING "Package name.")
@@ -40,18 +59,83 @@ if(NOT CMAKE_BUILD_TYPE)
         FORCE)
 endif()
 
+include(cmake/SetBuildParallelLevel.cmake)
+SetBuildParallelLevel(CMAKE_BUILD_PARALLEL_LEVEL)
+
+set(CTEST_OUTPUT_ON_FAILURE TRUE)
+math(EXPR CTEST_PARALLEL_LEVEL
+     "${CMAKE_BUILD_PARALLEL_LEVEL} * 2" OUTPUT_FORMAT DECIMAL)
+math(EXPR CTEST_CPU_THRESHOLD
+     "${CMAKE_BUILD_PARALLEL_LEVEL} * 3 / 2" OUTPUT_FORMAT DECIMAL)
+# TARANTOOL_CTEST_FLAGS is used by CMake targets.
+# XXX: CMake 3.17 introduces CMAKE_CTEST_ARGUMENTS that contains
+# CTest options and is used by `test` target.
+list(APPEND TARANTOOL_CTEST_FLAGS
+    --no-tests=error
+    --output-on-failure
+    --parallel ${CTEST_PARALLEL_LEVEL}
+    --repeat until-pass:3
+    --schedule-random
+    # CPU load threshold for starting new parallel tests.
+    # The option `--test-load` accepts a maximum number of
+    # tests that waiting CPU, upon reaching which the test will
+    # stop running new tests. This option may slowdown test
+    # running and increase a total test time, but it makes testing
+    # more stable than without option. It is recommended to set
+    # a value to $(nproc), see [1].
+    #
+    # 1. https://discourse.cmake.org/t/what-does-test-load-do/8610/3
+    --test-load ${CTEST_CPU_THRESHOLD}
+)
+if(CMAKE_VERBOSE_MAKEFILE)
+    list(APPEND TARANTOOL_CTEST_FLAGS --verbose)
+endif()
+
+# It is not possible to add dependencies to `add_test()`
+# in CMake, see [1]. CMake 3.7 introduces FIXTURES_REQUIRED [2]
+# and FIXTURES_SETUP [3], but these test properties cannot be
+# used - this feature is unsupported in the current CMake version.
+# To workaround this, the function `add_test_suite_target` is
+# introduced. It adds a CMake target that builds testsuite's
+# prerequisites and CMake test that executes that target.
+#
+# 1. https://gitlab.kitware.com/cmake/cmake/-/issues/8774
+# 2. https://cmake.org/cmake/help/latest/prop_test/FIXTURES_REQUIRED.html
+# 3. https://cmake.org/cmake/help/latest/prop_test/FIXTURES_SETUP.html
+function(_add_test_suite_target target)
+  set(prefix ARG)
+  set(noValues)
+  set(singleValues LABELS)
+  set(multiValues DEPENDS)
+
+  cmake_parse_arguments(${prefix}
+                        "${noValues}"
+                        "${singleValues}"
+                        "${multiValues}"
+                        ${ARGN})
+
+  set(_DEPS_TARGET ${target}-deps)
+
+  add_custom_target(${_DEPS_TARGET} DEPENDS ${ARG_DEPENDS})
+
+  add_test(NAME ${_DEPS_TARGET}
+    COMMAND ${CMAKE_COMMAND}
+            --build ${CMAKE_BINARY_DIR}
+            --target ${_DEPS_TARGET}
+  )
+  set_tests_properties(${_DEPS_TARGET} PROPERTIES
+    LABELS ${ARG_LABELS}
+  )
+endfunction()
+
 #
 # Check submodules
 #
-function(update_submodules)
-    message(STATUS "Updating submodules")
-    execute_process(COMMAND ${GIT} submodule update --init --recursive
-                    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-endfunction()
-
-if(NOT EXISTS ${CMAKE_SOURCE_DIR}/src/lib/small/CMakeLists.txt)
-    if (EXISTS "${CMAKE_SOURCE_DIR}/.git" AND GIT)
-        update_submodules()
+if(NOT EXISTS ${PROJECT_SOURCE_DIR}/src/lib/small/CMakeLists.txt)
+    if (EXISTS "${PROJECT_SOURCE_DIR}/.git" AND GIT)
+        message(STATUS "Updating submodules")
+        execute_process(COMMAND ${GIT} submodule update --init --recursive
+                        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     else()
         message(FATAL_ERROR "Failed to find submodules")
     endif()
@@ -59,6 +143,14 @@ endif()
 
 # Define GNU standard installation directories
 include(GNUInstallDirs)
+
+if(BUILD_STATIC_WITH_BUNDLED_LIBS)
+    set(BUILD_STATIC ON)
+endif()
+
+if(NOT BUNDLED_LIBS_INSTALL_DIR)
+    set(BUNDLED_LIBS_INSTALL_DIR ${PROJECT_BINARY_DIR}/build)
+endif()
 
 include(cmake/utils.cmake)
 include(cmake/pod2man.cmake)
@@ -74,6 +166,18 @@ include(cmake/atomic.cmake)
 include(cmake/profile.cmake)
 include(cmake/module.cmake)
 include(cmake/thread.cmake)
+include(cmake/hardening.cmake)
+include(cmake/prefix.cmake)
+include(cmake/SetFiberStackSize.cmake)
+
+add_compile_flags("C;CXX" ${HARDENING_FLAGS})
+set(DEPENDENCY_CFLAGS "${DEPENDENCY_CFLAGS} ${HARDENING_FLAGS}")
+set(DEPENDENCY_CXXFLAGS "${DEPENDENCY_CXXFLAGS} ${HARDENING_FLAGS}")
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${HARDENING_LDFLAGS}")
+
+add_compile_flags("C;CXX" ${PREFIX_MAP_FLAGS})
+set(DEPENDENCY_CFLAGS "${DEPENDENCY_CFLAGS} ${PREFIX_MAP_FLAGS}")
+set(DEPENDENCY_CXXFLAGS "${DEPENDENCY_CXXFLAGS} ${PREFIX_MAP_FLAGS}")
 
 set(CMAKE_REQUIRED_DEFINITIONS "-D_GNU_SOURCE")
 
@@ -127,6 +231,14 @@ check_function_exists(clock_gettime HAVE_CLOCK_GETTIME_WITHOUT_RT)
 
 check_symbol_exists(__get_cpuid cpuid.h HAVE_CPUID)
 check_symbol_exists(strlcpy string.h HAVE_STRLCPY)
+check_symbol_exists(strlcat string.h HAVE_STRLCAT)
+
+# On Linux the GNU version of strerror_r is used, because we define
+# the _GNU_SOURCE macro, see cmake/os.cmake.
+check_c_source_compiles("
+        #include <string.h>
+        int main() { return strerror_r(0, NULL, 0)[0] == 0; }
+    " HAVE_STRERROR_R_GNU)
 
 # Checks for libev
 include(CheckStructHasMember)
@@ -145,6 +257,9 @@ check_function_exists(setproctitle HAVE_SETPROCTITLE)
 check_function_exists(setprogname HAVE_SETPROGNAME)
 check_function_exists(getprogname HAVE_GETPROGNAME)
 
+check_symbol_exists(malloc_info malloc.h HAVE_MALLOC_INFO)
+check_symbol_exists(malloc_trim malloc.h HAVE_MALLOC_TRIM)
+
 #
 # Enable 'make tags' target.
 #
@@ -152,7 +267,7 @@ list(APPEND tagsExclude "--exclude=.git/*")
 list(APPEND tagsExclude "--exclude=.pc/*")
 list(APPEND tagsExclude "--exclude=patches/*")
 add_custom_target(tags COMMAND ${CTAGS} -R ${tagsExclude} -f tags
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 add_custom_target(ctags DEPENDS tags)
 
 #
@@ -185,10 +300,10 @@ file_is_in_directory(BINARY_DIR_INSIDE_SOURCE_DIR "${BINARY_REALPATH}"
 if (BINARY_DIR_INSIDE_SOURCE_DIR)
     set(EXCLUDE_FILES --exclude-files "${BINARY_REALPATH}/**/*.lua")
 endif()
-add_custom_target(luacheck DEPENDS LuaJIT-luacheck)
-add_custom_command(TARGET luacheck
+add_custom_target(luacheck
     COMMAND ${LUACHECK} --codes --config .luacheckrc . ${EXCLUDE_FILES}
     WORKING_DIRECTORY ${SOURCE_REALPATH}
+    DEPENDS LuaJIT-luacheck
     COMMENT "Perform static analysis of Lua code"
 )
 unset(BINARY_REALPATH)
@@ -196,66 +311,41 @@ unset(SOURCE_REALPATH)
 unset(BINARY_DIR_INSIDE_SOURCE_DIR)
 unset(EXCLUDE_FILES)
 
-if (WITH_JEPSEN)
-    ExternalProject_Add(
-        jepsen-tests
-        GIT_REPOSITORY https://github.com/tarantool/jepsen.tarantool
-        CONFIGURE_COMMAND ""
-        BUILD_COMMAND ""
-        INSTALL_COMMAND ""
-        TEST_COMMAND ""
-    )
-
-    #
-    # Enable 'make run-jepsen' target.
-    #
-
-    add_custom_target(run-jepsen DEPENDS jepsen-tests)
-    add_custom_command(TARGET run-jepsen
-        COMMAND ${BASH} ${PROJECT_SOURCE_DIR}/tools/run-jepsen-tests.sh
-				${PROJECT_SOURCE_DIR}
-                                ${PROJECT_BINARY_DIR}
-        COMMENT "Running Jepsen tests"
-    )
-endif()
-
 #
 # Get version
 #
 
-set (PACKAGE_VERSION "")
-set (TARANTOOL_VERSION "")
-
-# Try to get version from VERSION file
-set(VERSION_FILE_ORIG "${PROJECT_SOURCE_DIR}/VERSION")
-set(VERSION_FILE "${PROJECT_BINARY_DIR}/VERSION")
-if (EXISTS "${VERSION_FILE_ORIG}")
-    file (STRINGS "${VERSION_FILE_ORIG}" TARANTOOL_VERSION)
-elseif (EXISTS "${VERSION_FILE}")
-    file (STRINGS "${VERSION_FILE}" TARANTOOL_VERSION)
-endif()
-
-# Get git version only if source directory has .git repository, this
-# avoids git to search .git repository in parent
-# directories.
-#
-if (EXISTS "${CMAKE_SOURCE_DIR}/.git" AND GIT)
-    execute_process (COMMAND ${GIT} describe --long HEAD
-        OUTPUT_VARIABLE TARANTOOL_GIT_VERSION
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-
-    if (NOT ("${TARANTOOL_GIT_VERSION}" STREQUAL "${TARANTOOL_VERSION}"))
-        set(TARANTOOL_VERSION "${TARANTOOL_GIT_VERSION}")
-        message(STATUS "Generating VERSION file")
-        file(WRITE ${VERSION_FILE} "${TARANTOOL_VERSION}\n")
-
-        update_submodules()
+if(NOT TARANTOOL_VERSION)
+    # Try to get version from VERSION file
+    set(VERSION_FILE_ORIG "${PROJECT_SOURCE_DIR}/VERSION")
+    set(VERSION_FILE "${PROJECT_BINARY_DIR}/VERSION")
+    if (EXISTS "${VERSION_FILE_ORIG}")
+        file (STRINGS "${VERSION_FILE_ORIG}" TARANTOOL_VERSION)
+    elseif (EXISTS "${VERSION_FILE}")
+        file (STRINGS "${VERSION_FILE}" TARANTOOL_VERSION)
     endif()
-endif()
 
-if (NOT TARANTOOL_VERSION)
-    message (FATAL_ERROR "Unable to retrive version from git or ${VERSION_FILE} file.")
+    # Get git version only if source directory has .git repository, this
+    # avoids git to search .git repository in parent
+    # directories.
+    #
+    if (EXISTS "${CMAKE_SOURCE_DIR}/.git" AND GIT)
+        execute_process (COMMAND ${GIT} describe --long HEAD
+            OUTPUT_VARIABLE TARANTOOL_GIT_VERSION
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+        if (NOT ("${TARANTOOL_GIT_VERSION}" STREQUAL "${TARANTOOL_VERSION}"))
+            set(TARANTOOL_VERSION "${TARANTOOL_GIT_VERSION}")
+            message(STATUS "Generating VERSION file")
+            file(WRITE ${VERSION_FILE} "${TARANTOOL_VERSION}\n")
+        endif()
+    endif()
+
+    if (NOT TARANTOOL_VERSION)
+        message (FATAL_ERROR
+            "Unable to retrive version from git or ${VERSION_FILE} file.")
+    endif()
 endif()
 
 #
@@ -284,8 +374,10 @@ include_directories(${PROJECT_SOURCE_DIR}/src)
 include_directories(${PROJECT_BINARY_DIR}/src)
 include_directories(${PROJECT_SOURCE_DIR}/src/lib)
 include_directories(${PROJECT_SOURCE_DIR}/src/lib/small/include)
+include_directories(${PROJECT_BINARY_DIR}/src/lib/small/small/include)
 include_directories(${PROJECT_SOURCE_DIR}/src/lib/small/third_party)
 include_directories(${PROJECT_SOURCE_DIR}/src/lib/core)
+include_directories(${PROJECT_SOURCE_DIR}/src/lib/digest)
 include_directories(${PROJECT_SOURCE_DIR}/third_party)
 
 #
@@ -328,19 +420,15 @@ endforeach()
 set(_libdirs)
 list(APPEND _libdirs "/usr/local/${MULTILIB}") # LuaRocks
 list(APPEND _libdirs "${CMAKE_INSTALL_FULL_LIBDIR}") # Install prefix
-if(NOT CMAKE_CROSSCOMPILING AND EXISTS "/etc/debian_version")
-    # gh-1085: LuaRocks on Debian uses lib instead of lib/x86_64-linux-gnu/
-    list(APPEND _libdirs "/usr/local/lib") # LuaRocks on Debian
-endif()
-if(NOT CMAKE_CROSSCOMPILING AND EXISTS "/etc/gentoo-release")
-    # LuaRocks on Gentoo
-    list(APPEND _libdirs "/usr/${MULTILIB}/lua/luarocks/lib")
-endif()
-if(NOT CMAKE_CROSSCOMPILING AND EXISTS "/etc/alpine-release")
-    # LuaRocks on Alpine
-    list(APPEND _libdirs "/usr/local/lib")
-endif()
-list(APPEND _libdirs "/usr/${MULTILIB}") # System packages
+# gh-1085: LuaRocks on Debian and Alpine uses lib instead
+# of lib/${ARCH}-linux-gnu/
+list(APPEND _libdirs "/usr/local/lib")
+# LuaRocks on Gentoo
+list(APPEND _libdirs "/usr/${MULTILIB}/lua/luarocks/lib")
+# System packages
+list(APPEND _libdirs "/usr/${MULTILIB}")
+# Add CPATH on Debian based systems depending on architecture
+list(APPEND _libdirs "/usr/lib/${CMAKE_HOST_SYSTEM_PROCESSOR}-linux-gnu")
 list(REMOVE_DUPLICATES _libdirs)
 set(MODULE_LIBPATH)
 foreach(dir
@@ -356,10 +444,19 @@ find_package_message(MODULE_LUAPATH "Lua package.path: ${MODULE_LUAPATH}"
 find_package_message(MODULE_LIBPATH "Lua package.cpath: ${MODULE_LIBPATH}"
     "${MODULE_LIBPATH}")
 
+set(TARANTOOL_DEBUG OFF)
+if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(TARANTOOL_DEBUG ON)
+endif(CMAKE_BUILD_TYPE STREQUAL "Debug")
 
 ##
 ## Third-Party libraries
 ##
+
+# URL of the backup storage to download bundled dependencies from.
+set(BACKUP_STORAGE "https://distrib.hb.vkcloud-storage.ru" CACHE STRING "Source to download third party dependencies")
+
+set(EMBED_LUAZLIB ${BUILD_STATIC})
 
 #
 # Since we *optionally* build bundled libs, a direct build
@@ -370,6 +467,10 @@ find_package_message(MODULE_LIBPATH "Lua package.cpath: ${MODULE_LIBPATH}"
 #
 
 add_custom_target(build_bundled_libs)
+
+#
+# ZSTD
+#
 
 # Debian: missing zstd_static.h in libzstd-dev
 # Fedora: not found
@@ -386,9 +487,54 @@ else()
 endif()
 
 #
+# ZLIB
+#
+
+option(ENABLE_BUNDLED_ZLIB "Enable building of the bundled zlib"
+    ${BUILD_STATIC_WITH_BUNDLED_LIBS})
+if(ENABLE_BUNDLED_ZLIB)
+    include(BuildZLIB)
+    add_dependencies(build_bundled_libs bundled-zlib)
+else()
+    set(ZLIB_FIND_REQUIRED ON)
+    find_package(ZLIB)
+endif()
+
+#
+# ZZIP
+#
+
+option(ENABLE_BUNDLED_ZZIP "Enable building of the bundled zzip"
+    ${BUILD_STATIC_WITH_BUNDLED_LIBS})
+if(EMBED_LUAZIP)
+    if(ENABLE_BUNDLED_ZZIP)
+        include(BuildZZIP)
+        add_dependencies(build_bundled_libs bundled-zzip)
+    else()
+        set(ZZIP_FIND_REQUIRED ON)
+        find_package(ZZIP)
+    endif()
+endif()
+
+#
 # OpenSSL
 #
-find_package(OpenSSL)
+
+option(OPENSSL_USE_STATIC_LIBS "Link OpenSSL statically"
+    ${BUILD_STATIC})
+set(ENABLE_BUNDLED_OPENSSL_DEFAULT OFF)
+if(BUILD_STATIC_WITH_BUNDLED_LIBS AND OPENSSL_USE_STATIC_LIBS)
+    set(ENABLE_BUNDLED_OPENSSL_DEFAULT ON)
+endif()
+option(ENABLE_BUNDLED_OPENSSL "Enable building of the bundled openssl"
+    ${ENABLE_BUNDLED_OPENSSL_DEFAULT})
+if(ENABLE_BUNDLED_OPENSSL)
+    set(OPENSSL_USE_STATIC_LIBS ON)
+    include(BuildOpenSSL)
+    add_dependencies(build_bundled_libs bundled-openssl)
+else()
+    find_package(OpenSSL)
+endif()
 if (OPENSSL_FOUND)
     message(STATUS "OpenSSL ${OPENSSL_VERSION} found")
     include_directories(${OPENSSL_INCLUDE_DIR})
@@ -401,12 +547,10 @@ endif()
 # it to libraries list in case of static openssl linking.
 #
 if(OPENSSL_USE_STATIC_LIBS)
-    if(BUILD_STATIC)
-        find_library(Z_LIBRARY libz.a)
-    else()
-        find_library(Z_LIBRARY z)
+    set(OPENSSL_LIBRARIES ${OPENSSL_LIBRARIES} ${ZLIB_LIBRARIES})
+    if(ENABLE_BUNDLED_OPENSSL AND ENABLE_BUNDLED_ZLIB)
+        add_dependencies(bundled-openssl bundled-zlib)
     endif()
-    set(OPENSSL_LIBRARIES ${OPENSSL_LIBRARIES} ${Z_LIBRARY})
 endif()
 
 #
@@ -415,10 +559,16 @@ endif()
 option(ENABLE_BUNDLED_LIBCURL "Enable building of the bundled libcurl" ON)
 option(BUNDLED_LIBCURL_USE_ARES "Build curl with bundled c-ares"
        ${ENABLE_BUNDLED_LIBCURL})
+option(BUNDLED_LIBCURL_USE_NGHTTP2 "Build curl with bundled nghttp2"
+       ${ENABLE_BUNDLED_LIBCURL})
 if (ENABLE_BUNDLED_LIBCURL)
     if(BUNDLED_LIBCURL_USE_ARES)
         include(BuildAres)
         ares_build()
+    endif()
+    if(BUNDLED_LIBCURL_USE_NGHTTP2)
+        include(BuildNghttp2)
+        nghttp2_build()
     endif()
     include(BuildLibCURL)
     curl_build()
@@ -456,21 +606,140 @@ message(STATUS "EXPORT_LIBCURL_SYMBOLS: ${EXPORT_LIBCURL_SYMBOLS}")
 # ReadLine
 #
 
-set(Readline_FIND_REQUIRED ON)
-find_package(Readline)
+option(ENABLE_BUNDLED_READLINE "Enable building of the bundled readline"
+    ${BUILD_STATIC_WITH_BUNDLED_LIBS})
+if(ENABLE_BUNDLED_READLINE)
+    include(BuildReadline)
+    add_dependencies(build_bundled_libs bundled-readline)
+else()
+    set(Readline_FIND_REQUIRED ON)
+    find_package(Readline)
+endif()
 
 #
 # ICONV
 #
-set(ICONV_FIND_REQUIRED ON)
-find_package(ICONV)
+
+# In Linux iconv is embedded into glibc.
+set(ENABLE_BUNDLED_ICONV_DEFAULT OFF)
+if(APPLE AND BUILD_STATIC_WITH_BUNDLED_LIBS)
+    set(ENABLE_BUNDLED_ICONV_DEFAULT ON)
+endif()
+option(ENABLE_BUNDLED_ICONV "Enable building of the bundled iconv"
+    ${ENABLE_BUNDLED_ICONV_DEFAULT})
+if(ENABLE_BUNDLED_ICONV)
+    include(BuildICONV)
+    add_dependencies(build_bundled_libs bundled-iconv)
+else()
+    set(ICONV_FIND_REQUIRED ON)
+    find_package(ICONV)
+endif()
 
 #
 # ICU
 #
 
-set(ICU_FIND_REQUIRED ON)
-find_package(ICU)
+option(ENABLE_BUNDLED_ICU "Enable building of the bundled icu"
+    ${BUILD_STATIC_WITH_BUNDLED_LIBS})
+if(ENABLE_BUNDLED_ICU)
+    include(BuildICU)
+    add_dependencies(build_bundled_libs bundled-icu)
+else()
+    set(ICU_FIND_REQUIRED ON)
+    find_package(ICU)
+endif()
+
+#
+# libunwind
+#
+
+if(ENABLE_BACKTRACE)
+    if(NOT HAVE_FORCE_ALIGN_ARG_POINTER_ATTR)
+        message(SEND_ERROR "backtrace feature requires \
+                            `force_align_arg_pointer` function attribute \
+                            support from C/C++ compiler")
+    endif()
+
+    if(NOT HAVE_CFI_ASM)
+        message(SEND_ERROR "backtrace feature requires CFI assembly support \
+                            from C/C++ compiler")
+    endif()
+
+    if(ENABLE_BUNDLED_LIBUNWIND)
+        if(APPLE)
+            message(SEND_ERROR "libunwind does not support macOS")
+        endif()
+        if(NOT HAVE_STDATOMIC_H)
+            message(SEND_ERROR "building bundled libunwind requires stdatomic.h \
+                                support from C compiler")
+        endif()
+
+        include(BuildLibUnwind)
+        add_dependencies(build_bundled_libs
+                         bundled-libunwind
+                         bundled-libunwind-platform)
+    else()
+        find_package(LibUnwind MODULE REQUIRED)
+    endif()
+    if(NOT APPLE AND NOT ENABLE_BUNDLED_LIBUNWIND AND
+        LIBUNWIND_VERSION VERSION_LESS "1.3" AND
+        ${CMAKE_SYSTEM_PROCESSOR} STREQUAL "aarch64")
+        message(SEND_ERROR "versions of libunwind earlier than 1.3.0 are \
+                            broken on AARCH64 architecture")
+    endif()
+endif()
+
+#
+# mimalloc
+#
+# Do not support ASAN and valgrind builds, because neither LeakSanitizer nor
+# valgrind would see the leaks of the memory served mimalloc.
+# From the mimalloc's readme.md: "we recommend using the standard allocator with
+# memory tracking tools".
+#
+if(NOT ENABLE_ASAN AND NOT ENABLE_VALGRIND)
+    set(ENABLE_BUNDLED_MIMALLOC_DEFAULT ON)
+else()
+    set(ENABLE_BUNDLED_MIMALLOC_DEFAULT OFF)
+endif()
+option(ENABLE_BUNDLED_MIMALLOC "Build the bundled mimalloc allocator"
+    ${ENABLE_BUNDLED_MIMALLOC_DEFAULT})
+if(ENABLE_BUNDLED_MIMALLOC)
+    if(ENABLE_ASAN OR ENABLE_VALGRIND)
+        message(FATAL_ERROR "ENABLE_BUNDLED_MIMALLOC is incompatible with "
+                            "ENABLE_ASAN or ENABLE_VALGRIND")
+    endif()
+    include(BuildMimalloc)
+    include_directories(${MIMALLOC_INCLUDE_DIR})
+    add_dependencies(build_bundled_libs bundled-mimalloc)
+endif()
+
+# MIMALLOC_OVERRIDE selects what is served by the bundled mimalloc:
+#   none - nothing, mimalloc is only built (e.g. for direct mi_* API users);
+#   cpp  - C++ operator new/delete; malloc/free stay on the system allocator.
+#
+if(ENABLE_BUNDLED_MIMALLOC)
+    set(MIMALLOC_OVERRIDE_DEFAULT cpp)
+else()
+    set(MIMALLOC_OVERRIDE_DEFAULT none)
+endif()
+set(MIMALLOC_OVERRIDE ${MIMALLOC_OVERRIDE_DEFAULT} CACHE STRING
+    "What is served by the bundled mimalloc: none or cpp")
+set_property(CACHE MIMALLOC_OVERRIDE PROPERTY STRINGS none cpp)
+if(NOT MIMALLOC_OVERRIDE MATCHES "^(none|cpp)$")
+    message(FATAL_ERROR "Invalid MIMALLOC_OVERRIDE value '${MIMALLOC_OVERRIDE}'"
+                        ": expected none or cpp")
+endif()
+if(NOT MIMALLOC_OVERRIDE STREQUAL "none")
+    if(NOT ENABLE_BUNDLED_MIMALLOC)
+        message(FATAL_ERROR "MIMALLOC_OVERRIDE=${MIMALLOC_OVERRIDE} requires "
+                            "ENABLE_BUNDLED_MIMALLOC")
+    endif()
+endif()
+set(MIMALLOC_OVERRIDE_CPP OFF)
+if(MIMALLOC_OVERRIDE STREQUAL "cpp")
+    set(MIMALLOC_OVERRIDE_CPP ON)
+endif()
 
 #
 # LuaJIT
@@ -479,6 +748,12 @@ find_package(ICU)
 #
 set(ENABLE_BUNDLED_LUAJIT ON)
 set(LUAJIT_ENABLE_GC64_DEFAULT OFF)
+set(LUAJIT_JIT_STATUS_DEFAULT ON)
+
+if(NOT ENABLE_BACKTRACE)
+    set(LUAJIT_DISABLE_SYSPROF ON)
+    message(STATUS "Sysprof is not available without backtrace.")
+endif()
 if (TARGET_OS_DARWIN)
     # LuaJIT is unusable on OS X without enabled GC64
     # See https://github.com/tarantool/tarantool/issues/2643
@@ -486,6 +761,8 @@ if (TARGET_OS_DARWIN)
 endif()
 option(LUAJIT_ENABLE_GC64 "Use 64-bit GC objects by default."
        ${LUAJIT_ENABLE_GC64_DEFAULT})
+option(LUAJIT_JIT_STATUS "Turn JIT engine off on platform start."
+       ${LUAJIT_JIT_STATUS_DEFAULT})
 include(luajit)
 
 #
@@ -561,15 +838,11 @@ option(ENABLE_BUNDLED_LIBYAML "Enable building of the bundled libyaml" ON)
 if (ENABLE_BUNDLED_LIBYAML)
     include(BuildLibYAML)
     libyaml_build()
-    add_dependencies(build_bundled_libs yaml)
+    add_dependencies(build_bundled_libs bundled-libyaml)
 else()
     set(LIBYAML_FIND_REQUIRED ON)
     find_package(LibYAML)
 endif()
-
-#
-# zstd
-#
 
 #
 # Christian Hansen c-dt
@@ -587,6 +860,10 @@ include(BuildMisc)
 libmisc_build()
 add_dependencies(build_bundled_libs misc)
 
+if(DEFINED EXTRA_DEPENDENCIES_CMAKE)
+    include(${EXTRA_DEPENDENCIES_CMAKE})
+endif()
+
 # cpack config. called package.cmake to avoid
 # conflicts with the global CPack.cmake (On MacOS X
 # file names are case-insensitive)
@@ -600,11 +877,24 @@ include (cmake/package.cmake)
 #
 include (cmake/rpm.cmake)
 
-add_subdirectory(src)
+set(TARANTOOL_BIN $<TARGET_FILE:tarantool>)
+
 add_subdirectory(extra)
 add_subdirectory(test)
-add_subdirectory(perf)
+add_subdirectory(proofs/tla/test)
+if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+    message(AUTHOR_WARNING "Benchmarks are available only in release build")
+else ()
+    add_subdirectory(perf)
+endif ()
+# XXX: src should be processed after perf, since small perf tests
+# require bundled libbenchmark library defined in the perf
+# subdirectory.
+add_subdirectory(src)
 add_subdirectory(doc)
+
+# Create the Lua API documentation target after all lua_stub() calls.
+lua_doc()
 
 option(WITH_NOTIFY_SOCKET "Enable notifications on NOTIFY_SOCKET" ON)
 
@@ -634,14 +924,12 @@ if (WITH_NOTIFY_SOCKET)
 endif()
 
 if(NOT "${PROJECT_BINARY_DIR}" STREQUAL "${PROJECT_SOURCE_DIR}")
-    add_custom_target(distclean)
-    add_custom_command(TARGET distclean
+    add_custom_target(distclean
         COMMAND ${CMAKE_COMMAND} -E remove_directory "${PROJECT_BINARY_DIR}"
         COMMENT "Removing the build directory and its content"
     )
 elseif(IS_DIRECTORY .git AND GIT)
-    add_custom_target(distclean)
-    add_custom_command(TARGET distclean
+    add_custom_target(distclean
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${GIT} submodule foreach --recursive git clean -f -X -d
         COMMAND ${GIT} clean -f -X -d
@@ -649,11 +937,36 @@ elseif(IS_DIRECTORY .git AND GIT)
     )
 endif()
 
+set(TZDATA_VERSION "")
+set(TZCODE_SOURCE_DIR ${PROJECT_SOURCE_DIR}/third_party/tz)
+if (EXISTS "${TZCODE_SOURCE_DIR}/.git" AND GIT)
+    execute_process(COMMAND ${GIT_EXECUTABLE} describe --tags --dirty
+                    WORKING_DIRECTORY ${TZCODE_SOURCE_DIR}
+                    OUTPUT_VARIABLE TZDATA_VERSION
+                    RESULT_VARIABLE TZDATA_ERROR_CODE
+                    OUTPUT_STRIP_TRAILING_WHITESPACE)
+endif()
+
+if(TZDATA_VERSION STREQUAL "")
+    # The current version of tzdata, must be update on bump.
+    set(TZDATA_VERSION 2022a)
+    message(WARNING "Failed to determine tzdata version from Git tags. \
+                     Using default version \"${TZDATA_VERSION}\".")
+endif()
+
+option(TEST_BUILD "Use defaults suited for tests" OFF)
+set(ABORT_ON_LEAK_DEFAULT ${TEST_BUILD})
+option(ABORT_ON_LEAK "Abort if memory leak is found." ${ABORT_ON_LEAK_DEFAULT})
+
 #
 # tarantool info summary (used in server version output)
 #
 set(TARANTOOL_OPTIONS "-DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX}")
-set(TARANTOOL_OPTIONS "${TARANTOOL_OPTIONS} -DENABLE_BACKTRACE=${ENABLE_BACKTRACE}")
+if(ENABLE_BACKTRACE)
+    set(TARANTOOL_OPTIONS "${TARANTOOL_OPTIONS} -DENABLE_BACKTRACE=TRUE")
+else()
+    set(TARANTOOL_OPTIONS "${TARANTOOL_OPTIONS} -DENABLE_BACKTRACE=FALSE")
+endif()
 set(TARANTOOL_BUILD "${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}-${CMAKE_BUILD_TYPE}")
 set(TARANTOOL_C_COMPILER ${CMAKE_C_COMPILER})
 set(TARANTOOL_CXX_COMPILER ${CMAKE_CXX_COMPILER})
@@ -674,11 +987,25 @@ set(options PACKAGE VERSION BUILD C_COMPILER CXX_COMPILER C_FLAGS CXX_FLAGS
     ENABLE_SSE2 ENABLE_AVX
     ENABLE_GCOV ENABLE_GPROF ENABLE_VALGRIND ENABLE_ASAN ENABLE_UB_SANITIZER ENABLE_FUZZER
     ENABLE_BACKTRACE
+    ABORT_ON_LEAK
+    FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+    ENABLE_HARDENING
     ENABLE_DOC
     ENABLE_DIST
+    ENABLE_BUNDLED_ZLIB
+    OPENSSL_USE_STATIC_LIBS
+    ENABLE_BUNDLED_OPENSSL
     ENABLE_BUNDLED_LIBCURL
+    BUNDLED_LIBCURL_USE_ARES
+    ENABLE_BUNDLED_READLINE
+    ENABLE_BUNDLED_ICONV
+    ENABLE_BUNDLED_ICU
     ENABLE_BUNDLED_LIBYAML
-    ENABLE_BUNDLED_MSGPUCK)
+    ENABLE_BUNDLED_MSGPUCK
+    ENABLE_BUNDLED_LIBUNWIND
+    ENABLE_BUNDLED_MIMALLOC
+    MIMALLOC_OVERRIDE
+    ENABLE_FEEDBACK_DAEMON)
 foreach(option IN LISTS options)
     if (NOT DEFINED ${option})
         set(value "${TARANTOOL_${option}}")

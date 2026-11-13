@@ -33,9 +33,18 @@
 
 #include <stdint.h>
 
+struct uri_set;
+
 #if defined(__cplusplus)
 extern "C" {
 #endif /* defined(__cplusplus) */
+
+/**
+ * Fill @a uri_set according to cfg @a param.
+ * Return 0 if success, otherwise return -1
+ */
+int
+cfg_get_uri_set(const char *param, struct uri_set *uri_set);
 
 int
 cfg_geti(const char *param);
@@ -47,10 +56,16 @@ bool
 cfg_isnumber(const char *param);
 
 /**
- * Gets boolean parameter of cfg.
- * Returns -1 in case of nil
+ * Test if cfg parameter is a boolean.
  */
-int
+bool
+cfg_isboolean(const char *param);
+
+/**
+ * Gets boolean parameter of cfg.
+ * Returns false in case of nil
+ */
+bool
 cfg_getb(const char *param);
 
 int
@@ -67,6 +82,14 @@ cfg_getd(const char *param);
 
 double
 cfg_getd_default(const char *param, double default_val);
+
+/** Whether the parameter is absent. */
+bool
+cfg_isnil(const char *name);
+
+/** Whether the parameter is table. */
+bool
+cfg_istable(const char *name);
 
 int
 cfg_getarr_size(const char *name);

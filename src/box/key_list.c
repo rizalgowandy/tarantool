@@ -40,16 +40,17 @@
 #include "port.h"
 #include "schema.h"
 #include "tt_static.h"
+#include "tuple.h"
 
 int
 key_list_iterator_create(struct key_list_iterator *it, struct tuple *tuple,
 			 struct index_def *index_def, bool validate,
-			 key_list_allocator_t key_allocator)
+			 struct tuple_format *format)
 {
 	it->index_def = index_def;
 	it->validate = validate;
 	it->tuple = tuple;
-	it->key_allocator = key_allocator;
+	it->format = format;
 
 	struct region *region = &fiber()->gc;
 	size_t region_svp = region_used(region);
@@ -58,24 +59,21 @@ key_list_iterator_create(struct key_list_iterator *it, struct tuple *tuple,
 	struct port out_port, in_port;
 	port_c_create(&in_port);
 	port_c_add_tuple(&in_port, tuple);
-	int rc = func_call(func, &in_port, &out_port);
+	int rc = func_call_no_access_check(func, &in_port, &out_port);
 	port_destroy(&in_port);
 	if (rc != 0) {
 		/* Can't evaluate function. */
-		struct space *space = space_by_id(index_def->space_id);
 		diag_add(ClientError, ER_FUNC_INDEX_FUNC, index_def->name,
-			 space ? space_name(space) : "",
-			 "can't evaluate function");
+			 index_def->space_name, "can't evaluate function");
 		return -1;
 	}
 	uint32_t key_data_sz;
 	const char *key_data = port_get_msgpack(&out_port, &key_data_sz);
 	port_destroy(&out_port);
 	if (key_data == NULL) {
-		struct space *space = space_by_id(index_def->space_id);
 		/* Can't get a result returned by function . */
-		diag_add(ClientError, ER_FUNC_INDEX_FUNC, index_def->name,
-			 space ? space_name(space) : "",
+		diag_add(ClientError, ER_FUNC_INDEX_FUNC,
+			 index_def->name, index_def->space_name,
 			 "can't get a value returned by function");
 		return -1;
 	}
@@ -83,29 +81,28 @@ key_list_iterator_create(struct key_list_iterator *it, struct tuple *tuple,
 	it->data_end = key_data + key_data_sz;
 	assert(mp_typeof(*key_data) == MP_ARRAY);
 	if (mp_decode_array(&key_data) != 1) {
-		struct space *space = space_by_id(index_def->space_id);
 		/*
 		 * Function return doesn't follow the
 		 * convention: to many values were returned.
 		 * i.e. return 1, 2
 		 */
 		region_truncate(region, region_svp);
-		diag_set(ClientError, ER_FUNC_INDEX_FORMAT, index_def->name,
-			 space ? space_name(space) : "",
+		diag_set(ClientError, ER_FUNC_INDEX_FORMAT,
+			 index_def->name, index_def->space_name,
 			 "to many values were returned");
 		return -1;
 	}
-	if (func->def->opts.is_multikey) {
+
+	it->func_is_multikey = func->def->opts.is_multikey;
+	if (it->func_is_multikey) {
 		if (mp_typeof(*key_data) != MP_ARRAY) {
-			struct space * space = space_by_id(index_def->space_id);
 			/*
 			 * Multikey function must return an array
 			 * of keys.
 			 */
 			region_truncate(region, region_svp);
 			diag_set(ClientError, ER_FUNC_INDEX_FORMAT,
-				 index_def->name,
-				 space ? space_name(space) : "",
+				 index_def->name, index_def->space_name,
 				 "a multikey function mustn't return a scalar");
 			return -1;
 		}
@@ -116,7 +113,7 @@ key_list_iterator_create(struct key_list_iterator *it, struct tuple *tuple,
 }
 
 int
-key_list_iterator_next(struct key_list_iterator *it, const char **value)
+key_list_iterator_next(struct key_list_iterator *it, struct tuple **value)
 {
 	assert(it->data <= it->data_end);
 	if (it->data == it->data_end) {
@@ -124,25 +121,25 @@ key_list_iterator_next(struct key_list_iterator *it, const char **value)
 		return 0;
 	}
 	const char *key = it->data;
+	const char *key_end;
 	if (!it->validate) {
 		/*
 		 * Valid key is a MP_ARRAY, so just go to the
 		 * next key via mp_next().
 		 */
-		mp_next(&it->data);
-		assert(it->data <= it->data_end);
-		*value = it->key_allocator(it->tuple, key, it->data - key);
-		return *value != NULL ? 0 : -1;
+		key_end = it->data;
+		mp_next(&key_end);
+		assert(key_end <= it->data_end);
+		goto out;
 	}
 
 	if (mp_typeof(*key) != MP_ARRAY) {
-		struct space *space = space_by_id(it->index_def->space_id);
 		/*
 		 * A value returned by func_index function is
 		 * not a valid key, i.e. {1}.
 		 */
-		diag_set(ClientError, ER_FUNC_INDEX_FORMAT, it->index_def->name,
-			 space ? space_name(space) : "",
+		diag_set(ClientError, ER_FUNC_INDEX_FORMAT,
+			 it->index_def->name, it->index_def->space_name,
 			 tt_sprintf("supplied key type is invalid: expected %s",
 				    field_type_strs[FIELD_TYPE_ARRAY]));
 		return -1;
@@ -151,32 +148,34 @@ key_list_iterator_next(struct key_list_iterator *it, const char **value)
 	const char *rptr = key;
 	uint32_t part_count = mp_decode_array(&rptr);
 	if (part_count != key_def->part_count) {
-		struct space *space = space_by_id(it->index_def->space_id);
 		/*
 		 * The key must have exact functional index
 		 * definition's part_count(s).
 		 */
-		diag_set(ClientError, ER_FUNC_INDEX_FORMAT, it->index_def->name,
-			 space ? space_name(space) : "",
+		diag_set(ClientError, ER_FUNC_INDEX_FORMAT,
+			 it->index_def->name, it->index_def->space_name,
 			 tt_sprintf(tnt_errcode_desc(ER_EXACT_MATCH),
 				   key_def->part_count, part_count));
 		return -1;
 	}
-	const char *key_end;
 	if (key_validate_parts(key_def, rptr, part_count, true,
 			       &key_end) != 0) {
-		struct space *space = space_by_id(it->index_def->space_id);
 		/*
 		 * The key doesn't follow functional index key
 		 * definition.
 		 */
-		diag_add(ClientError, ER_FUNC_INDEX_FORMAT, it->index_def->name,
-			 space ? space_name(space) : "",
+		diag_add(ClientError, ER_FUNC_INDEX_FORMAT,
+			 it->index_def->name, it->index_def->space_name,
 			 "key does not follow functional index definition");
 		return -1;
 	}
-
+out:
 	it->data = key_end;
-	*value = it->key_allocator(it->tuple, key, key_end - key);
-	return *value != NULL ? 0 : -1;
+	*value = tuple_new(it->format, key, key_end);
+	if (*value == NULL)
+		return -1;
+	if (tuple_has_flag(it->tuple, TUPLE_IS_TEMPORARY))
+		tuple_set_flag(*value, TUPLE_IS_TEMPORARY);
+	tuple_bless(*value);
+	return 0;
 }

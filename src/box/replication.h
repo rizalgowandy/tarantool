@@ -30,7 +30,6 @@
  * THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  */
-#include "uuid/tt_uuid.h"
 #include "trigger.h"
 #include <stdint.h>
 #define RB_COMPACT 1
@@ -38,6 +37,8 @@
 #include <small/rlist.h>
 #include "applier.h"
 #include "fiber_cond.h"
+#include "node_name.h"
+#include "tt_uuid.h"
 #include "vclock/vclock.h"
 #include "latch.h"
 
@@ -97,12 +98,107 @@ extern "C" {
 struct gc_consumer;
 
 static const int REPLICATION_CONNECT_QUORUM_ALL = INT_MAX;
+/**
+ * Time to live for anonymous replicas - if we haven't heard from an anonymous
+ * replica during this time, it will be removed.
+ */
+extern double replication_anon_ttl;
+/**
+ * Fiber that removes anonymous replicas that haven't been in touch
+ * for too long.
+ */
+extern struct fiber *replication_anon_gc_fiber;
+
+enum { REPLICATION_THREADS_MAX = 1000 };
+
+enum bootstrap_strategy {
+	BOOTSTRAP_STRATEGY_INVALID = -1,
+	BOOTSTRAP_STRATEGY_AUTO,
+	BOOTSTRAP_STRATEGY_LEGACY,
+	BOOTSTRAP_STRATEGY_CONFIG,
+	BOOTSTRAP_STRATEGY_SUPERVISED,
+};
+
+/** Instance's bootstrap strategy. Controls replication reconfiguration. */
+extern enum bootstrap_strategy bootstrap_strategy;
+
+enum replicaset_state {
+	REPLICASET_BOOTSTRAP,
+	REPLICASET_JOIN,
+	REPLICASET_RECOVERY,
+	REPLICASET_READY,
+};
+
+/**
+ * Whether this replica should be anonymous or not, e.g. be present in _cluster
+ * table and have a non-zero id.
+ */
+extern bool cfg_replication_anon;
+
+/**
+ * The uuid of the bootstrap leader configured via the bootstrap_leader
+ * configuration option.
+ */
+extern struct tt_uuid cfg_bootstrap_leader_uuid;
+
+/**
+ * The uri of the bootstrap leader configured via the bootstrap_leader
+ * configuration option.
+ */
+extern struct uri cfg_bootstrap_leader_uri;
+
+/**
+ * The name of the bootstrap leader configured via the bootstrap_leader
+ * configuration option.
+ */
+extern char cfg_bootstrap_leader_name[];
+
+/**
+ * Whether the given instance is configured to make bootstrap of
+ * the replicaset.
+ *
+ * Has an effect only in the supervised bootstrap strategy.
+ *
+ * This flag have to be consistent with bootstrap_leader_uuid
+ * except the following cases:
+ *
+ * - INSTANCE_UUID is zero UUID
+ * - the bootstrap strategy is not 'supervised'
+ */
+extern bool is_supervised_bootstrap_leader;
+
+/**
+ * A graceful bootstrap leadership request means that we check
+ * other peers first and if there is no bootstrap leader across
+ * them, continue as the bootstrap leader.
+ */
+extern bool is_graceful_supervised_bootstrap_requested;
+
+/**
+ * Configured name of this instance. Might be different from the actual name if
+ * the configuration is not fully applied yet.
+ */
+extern char cfg_instance_name[];
+
+/** Replica set state. */
+extern enum replicaset_state replicaset_state;
+
+/**
+ * Remote peer URIs. Set by box.cfg.replication_uris.
+ */
+extern struct uri_set replication_uris;
 
 /**
  * Network timeout. Determines how often master and slave exchange
  * heartbeat messages. Set by box.cfg.replication_timeout.
  */
 extern double replication_timeout;
+
+/**
+ * Wait for the given period of time before trying to reconnect
+ * to a master.
+ */
+extern double replication_reconnect_timeout;
 
 /**
  * Maximal time box.cfg() may wait for connections to all configured
@@ -132,10 +228,24 @@ extern double replication_sync_lag;
 extern int replication_synchro_quorum;
 
 /**
+ * Minimum number of replicas a node must synchronize with before making a
+ * linearizable transaction.
+ */
+extern int replication_linearizable_quorum;
+
+/**
  * Time in seconds which the master node is able to wait for ACKs
  * for a synchronous transaction until it is rolled back.
  */
 extern double replication_synchro_timeout;
+
+/**
+ * Part of internal.tweaks.replication_synchro_timeout_rollback_enabled.
+ * Indicates whether the replication_synchro_timeout option rolls back
+ * transactions or it only used to wait confirmation in box_(promote/demote)
+ * and gc_do_checkpoint.
+ */
+extern bool replication_synchro_timeout_rollback_enabled;
 
 /**
  * Max time to wait for appliers to synchronize before entering
@@ -149,34 +259,54 @@ extern double replication_sync_timeout;
  */
 extern bool replication_skip_conflict;
 
-/**
- * Whether this replica will be anonymous or not, e.g. be preset
- * in _cluster table and have a non-zero id.
- */
-extern bool replication_anon;
+/** How many threads to use for decoding incoming replication stream. */
+extern int replication_threads;
+
+/** A list of triggers fired when quorum health flips. */
+extern struct rlist replicaset_on_quorum_change;
 
 /**
  * Wait for the given period of time before trying to reconnect
  * to a master.
  */
 static inline double
-replication_reconnect_interval(void)
+replication_effective_reconnect_timeout(void)
 {
-	return replication_timeout;
+	/**
+	 * By default replication_reconnect_timeout mirrors
+	 * replication_timeout's value.
+	 */
+	return replication_reconnect_timeout < 0 ?
+		replication_timeout : replication_reconnect_timeout;
 }
 
 /**
  * Disconnect a replica if no heartbeat message has been
  * received from it within the given period.
+ * This timeout might be different for Raft leader. Used in strict fencing,
+ * to provide best effort to achieve leader uniqueness.
  */
-static inline double
-replication_disconnect_timeout(void)
-{
-	return replication_timeout * 4;
-}
+double
+replication_disconnect_timeout(void);
 
 void
-replication_init(void);
+replication_init(int num_threads);
+
+/**
+ * Initializes GC of anonymous replicas and creates missing anonymous
+ * replicas for orphan WAL GC consumers.
+ *
+ * Must be called after loading WAL GC consumers.
+ */
+void
+replication_anon_gc_init(void);
+
+/**
+ * Prepare for freeing resources in replication_free while TX event loop is
+ * still running.
+ */
+void
+replication_shutdown(void);
 
 void
 replication_free(void);
@@ -185,8 +315,15 @@ replication_free(void);
 extern uint32_t instance_id;
 /** UUID of the instance. */
 extern struct tt_uuid INSTANCE_UUID;
-/** UUID of the replica set. */
+/** Name of the instance. */
+extern char INSTANCE_NAME[];
+
+/** UUID of the replicaset. */
 extern struct tt_uuid REPLICASET_UUID;
+/** Name of the replicaset. */
+extern char REPLICASET_NAME[];
+/** Name of the entire cluster with all its replicasets. */
+extern char CLUSTER_NAME[];
 
 typedef rb_tree(struct replica) replica_hash_t;
 
@@ -196,6 +333,8 @@ struct replication_ack {
 	uint32_t source;
 	/** Confirmed vclock. */
 	const struct vclock *vclock;
+	/** Vclock sync received with ACK. */
+	uint64_t vclock_sync;
 };
 
 /**
@@ -213,16 +352,6 @@ struct replicaset {
 	 * to connect and those that failed to connect.
 	 */
 	struct rlist anon;
-	/**
-	 * TX thread local vclock reflecting the state
-	 * of the cluster as maintained by appliers.
-	 */
-	struct vclock vclock;
-	/**
-	 * This flag is set while the instance is bootstrapping
-	 * from a remote master.
-	 */
-	bool is_joining;
 	/* A number of anonymous replicas following this instance. */
 	int anon_count;
 	/**
@@ -232,6 +361,13 @@ struct replicaset {
 	 * accounted here.
 	 */
 	int registered_count;
+	/**
+	 * Number of registered replicas, to which this node has a bidirectional
+	 * connection, such that both relay and applier are in FOLLOW state.
+	 * Used to notify various subsystems whether there is a quorum of
+	 * followers connected.
+	 */
+	int healthy_count;
 	/** Applier state. */
 	struct {
 		/**
@@ -281,8 +417,15 @@ struct replicaset {
 	} applier;
 	/** Triggers are invoked on each ACK from each replica. */
 	struct rlist on_ack;
+	/** Triggers invoked once relay thread becomes operational. */
+	struct rlist on_relay_thread_start;
 	/** Map of all known replica_id's to correspponding replica's. */
 	struct replica *replica_by_id[VCLOCK_MAX];
+	/**
+	 * Signaled whenever a replication configuration option is changed
+	 * (currently used only for `replication_linearizable_quorum`).
+	 */
+	struct fiber_cond option_update_cond;
 };
 extern struct replicaset replicaset;
 
@@ -297,6 +440,8 @@ struct replica {
 	 * applier has not received from the master yet.
 	 */
 	struct tt_uuid uuid;
+	/** Instance name. */
+	char name[NODE_NAME_SIZE_MAX];
 	/**
 	 * Replica ID or nil if the replica has not been
 	 * registered in the _cluster space yet.
@@ -308,12 +453,29 @@ struct replica {
 	 * _cluster table.
 	 */
 	bool anon;
+	/** Whether there is an established relay to this replica. */
+	bool is_relay_healthy;
+	/** Whether there is an applier subscribed to this replica. */
+	bool is_applier_healthy;
+	/**
+	 * Whether the replica has an established incoming connection right now.
+	 * The main difference from `is_relay_healthy` is that the flag is set
+	 * even when the replica is connected but its relay is not used - it
+	 * happens, for example, on initial join/fetch snapshot or when the
+	 * replica is being registered in `_cluster`.
+	 * Note that if flag `is_relay_healthy` is set, this flag is set as well
+	 * because only replicas with established incoming connection can have
+	 * an established relay.
+	 */
+	bool has_incoming_connection;
 	/** Applier fiber. */
 	struct applier *applier;
 	/** Relay thread. */
 	struct relay *relay;
 	/** Garbage collection state associated with the replica. */
 	struct gc_consumer *gc;
+	/** Reference to retained checkpoint, is set only on checkpoint join. */
+	struct gc_checkpoint_ref *gc_checkpoint_ref;
 	/** Link in the anon_replicas list. */
 	struct rlist in_anon;
 	/**
@@ -331,11 +493,6 @@ struct replica {
 	 * separate from applier.
 	 */
 	enum applier_state applier_sync_state;
-	/**
-	 * Applier's last written to WAL transaction timestamp.
-	 * Needed for relay lagging statistics.
-	 */
-	double applier_txn_last_tm;
 	/* The latch is used to order replication requests. */
 	struct latch order_latch;
 };
@@ -353,6 +510,18 @@ enum {
  */
 struct replica *
 replica_by_uuid(const struct tt_uuid *uuid);
+
+/** Find a replica by its name. */
+struct replica *
+replica_by_name(const char *name);
+
+/**
+ * Return representation of the replica in the next format:
+ * <replica_name or replica_uuid> (id = <replica_id>).
+ * If addr is not NULL, appends ", addr: <addr>" to the result.
+ */
+const char *
+replica_to_string(const struct replica *replica, const char *addr);
 
 /**
  * Find a replica by ID
@@ -388,6 +557,10 @@ replicaset_next(struct replica *replica);
 void
 replica_set_id(struct replica *replica, uint32_t id);
 
+/** Give the replica a new name. */
+void
+replica_set_name(struct replica *replica, const char *name);
+
 /*
  * Clear the numeric replica-set-local id of a replica.
  *
@@ -396,11 +569,97 @@ replica_set_id(struct replica *replica, uint32_t id);
 void
 replica_clear_id(struct replica *replica);
 
-void
-replica_clear_applier(struct replica *replica);
+/**
+ * See if the replica still has active connections or might be trying to make
+ * new ones.
+ */
+bool
+replica_has_connections(const struct replica *replica);
 
+/**
+ * Collects garbage of a replica that is gone for a while: removes associated
+ * WAL GC state including persistent one and if the replica is anonymous, it
+ * is deleted. If the replica is connected or does not exist, an error is
+ * thrown.
+ */
+int
+replica_gc(const struct tt_uuid *uuid);
+
+/**
+ * Check if there are enough "healthy" connections, and fire the appropriate
+ * triggers. A replica connection is considered "healthy", when:
+ * - it is a connection to a registered replica.
+ * - it is bidirectional, e.g. there are both relay and applier for this
+ *   replica.
+ * - both relay and applier are in "FOLLOW" state, the normal state of operation
+ *   during SUBSCRIBE.
+ */
 void
-replica_set_applier(struct replica * replica, struct applier * applier);
+replicaset_on_health_change(void);
+
+/**
+ * A special wrapper for replication_synchro_quorum, which lowers it to the
+ * count of nodes registered in cluster.
+ * The resulting value may differ from the configured synchro_quorum only
+ * during bootstrap, when specified value is too high to operate.
+ * Note, this value should never be used to commit synchronous transactions.
+ * It's only used for leader elections and some extensions like pre-vote and
+ * fencing.
+ * See the comment in function body for more details.
+ */
+static inline int
+replicaset_healthy_quorum(void)
+{
+	/*
+	 * When the instance is started first time, it does not have an ID, so
+	 * the registered count is 0. But the quorum can never be 0. At least
+	 * the current instance should participate in the quorum.
+	 */
+	int max = MAX(replicaset.registered_count, 1);
+	/*
+	 * Election quorum is not strictly equal to synchronous replication
+	 * quorum. Sometimes it can be lowered. That is about bootstrap.
+	 *
+	 * The problem with bootstrap is that when the replicaset boots, all the
+	 * instances can't write to WAL and can't recover from their initial
+	 * snapshot. They need one node which will boot first, and then they
+	 * will replicate from it.
+	 *
+	 * This one node should boot from its zero snapshot, create replicaset
+	 * UUID, register self with ID 1 in _cluster space, and then register
+	 * all the other instances here. To do that the node must be writable.
+	 * It should have read_only = false, connection quorum satisfied, and be
+	 * a Raft leader if Raft is enabled.
+	 *
+	 * To be elected a Raft leader it needs to perform election. But it
+	 * can't be done before at least synchronous quorum of the replicas is
+	 * bootstrapped. And they can't be bootstrapped because wait for a
+	 * leader to initialize _cluster. Cyclic dependency.
+	 *
+	 * This is resolved by truncation of the election quorum to the number
+	 * of registered replicas, if their count is less than synchronous
+	 * quorum. That helps to elect a first leader.
+	 *
+	 * It may seem that the first node could just declare itself a leader
+	 * and then strictly follow the protocol from now on, but that won't
+	 * work, because if the first node will restart after it is booted, but
+	 * before quorum of replicas is booted, the cluster will stuck again.
+	 *
+	 * The current solution is totally safe because
+	 *
+	 * - after all the cluster will have node count >= quorum, if user used
+	 *   a correct config (God help him if he didn't);
+	 *
+	 * - synchronous replication quorum is untouched - it is not truncated.
+	 *   Only leader election quorum is affected. So synchronous data won't
+	 *   be lost.
+	 */
+	return MIN(max, replication_synchro_quorum);
+}
+
+/** Track an established downstream connection in replica. */
+void
+replica_on_relay_follow(struct replica *replica);
 
 /**
  * Unregister \a relay from the \a replica.
@@ -408,8 +667,14 @@ replica_set_applier(struct replica * replica, struct applier * applier);
 void
 replica_on_relay_stop(struct replica *replica);
 
-#if defined(__cplusplus)
-} /* extern "C" */
+/**
+ * Disconnection handler:
+ * 1. Removes WAL GC state if the replica is not anonymous and was
+ *    evicted from the cluster.
+ * 2. Deletes the replica if it became orphan.
+ */
+void
+replica_on_disconnect(struct replica *replica);
 
 int
 replica_check_id(uint32_t replica_id);
@@ -426,6 +691,16 @@ replicaset_add(uint32_t replica_id, const struct tt_uuid *instance_uuid);
 struct replica *
 replicaset_add_anon(const struct tt_uuid *replica_uuid);
 
+/*
+ * Find the minimal vclock which has all the data confirmed on a quorum.
+ */
+int
+replicaset_collect_confirmed_vclock(struct vclock *confirmed_vclock,
+				    double deadline);
+
+#if defined(__cplusplus)
+} /* extern "C" */
+
 /**
  * Try to connect appliers to remote peers and receive UUID.
  * Appliers that did not connect will connect asynchronously.
@@ -433,18 +708,55 @@ replicaset_add_anon(const struct tt_uuid *replica_uuid);
  * \post appliers are connected to remote hosts and paused.
  * Use replicaset_follow() to resume appliers.
  *
- * \param appliers the array of appliers
- * \param count size of appliers array
- * \param timeout connection timeout
- * \param connect_quorum if this flag is set, fail unless at
- *                       least replication_connect_quorum
- *                       appliers have successfully connected.
- * \param keep_connect   if this flag is set do not force a reconnect if the
+ * \param uris           remote peer URIs
+ * \param timeout        connection timeout
+ * \param demand_quorum  whether it should fail in case it can't connect
+ *                       to a quorum.
+ * \param keep_connect   whether it shouldn't force a reconnect if the
  *                       old connection to the replica is fine.
+ * \param wait_all       whether it should wait for all connections to be
+ *                       established for a full replication_connect_timeout,
+ *                       or it may exit as soon as a quorum is gathered. Even
+ *                       if wait_all = true, and during the timeout it failed
+ *                       to connect to everyone, but enough connections were
+ *                       established to gather a quorum, it does not throw
+ *                       anything. More connections are better, but it doesn't
+ *                       matter if you can't connect to everyone.
  */
 void
-replicaset_connect(struct applier **appliers, int count,
-		   bool connect_quorum, bool keep_connect);
+replicaset_connect(const struct uri_set *uris,
+		   bool demand_quorum, bool keep_connect, bool wait_all);
+/**
+ * Wake up replicaset_connect() to re-verify if the waiting for
+ * connect quorum/bootstrap leader can be finished. To be called
+ * after changing local bootstrap leadership flags in the
+ * supervised bootstrap strategy.
+ *
+ * No-op if replicaset_connect() is not in the waiting loop or not
+ * in progress at all.
+ */
+void
+replicaset_connect_wakeup(void);
+
+/**
+ * Wake up functions, which wait on `option_update_cond`, so that they notice
+ * configuration option change.
+ */
+void
+replicaset_option_update_wakeup(void);
+
+/**
+ * Reload replica URIs.
+ *
+ * Called on reconfiguration in case the remote peer URIs are the same.
+ * A URI parameter may store a path to a file (for example, an SSL
+ * certificate), which could change, so we need to recreate appliers'
+ * IO stream contexts in this case.
+ *
+ * Throws an exception on failure.
+ */
+void
+replicaset_reload_uris(void);
 
 /**
  * Check if the current instance fell too much behind its
@@ -475,6 +787,16 @@ replicaset_sync(void);
  */
 void
 replicaset_check_quorum(void);
+
+/**
+ * Find the maximum lsn of a transaction created by the current instance in a
+ * replicaset. There may be situations when a transaction created at some
+ * point on the current instance is no longer present on this instance, but is
+ * present on some node in the replicaset. This may happen as a result of a
+ * crash and loss of logs.
+ */
+int64_t
+replicaset_max_instance_lsn(void);
 
 #endif /* defined(__cplusplus) */
 

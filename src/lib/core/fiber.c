@@ -37,16 +37,35 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pmatomic.h>
+#include <tarantool_ev.h>
 
 #include "assoc.h"
 #include "memory.h"
 #include "trigger.h"
 #include "errinj.h"
+#include "clock.h"
+#include "tt_sigaction.h"
+#include "tt_static.h"
 
 extern void cord_on_yield(void);
 
-#if ENABLE_FIBER_TOP
-#include <x86intrin.h> /* __rdtscp() */
+static struct fiber_slice zero_slice = {.warn = 0.0, .err = 0.0};
+
+/**
+ * ASAN build is slow. Turn slice check off to suppress noisy failures
+ * on exceeding slice limit in this case.
+ */
+#if ENABLE_ASAN
+static struct fiber_slice default_slice = {
+	.warn = TIMEOUT_INFINITY,
+	.err = TIMEOUT_INFINITY,
+};
+#else
+static struct fiber_slice default_slice = {.warn = 0.5, .err = 1.0};
+#endif
+
+/** Number of cord-threads still running right now. */
+static int cord_count = 0;
 
 static inline void
 clock_stat_add_delta(struct clock_stat *stat, uint64_t clock_delta)
@@ -85,72 +104,51 @@ clock_stat_reset(struct clock_stat *stat)
 static void
 cpu_stat_start(struct cpu_stat *stat)
 {
-	stat->prev_clock = __rdtscp(&stat->prev_cpu_id);
-	stat->cpu_miss_count = 0;
+	stat->prev_clock = clock_monotonic64();
 	/*
 	 * We want to measure thread cpu time here to calculate
 	 * each fiber's cpu time, so don't use libev's ev_now() or
 	 * ev_time() since they use either monotonic or realtime
 	 * system clocks.
 	 */
-	struct timespec ts;
-	if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) {
-		say_debug("clock_gettime(): failed to get this thread's"
-			  " cpu time.");
-		return;
-	}
-	stat->prev_cputime = (uint64_t) ts.tv_sec * FIBER_TIME_RES + ts.tv_nsec;
+	stat->prev_cputime = clock_thread64();
 }
 
 static inline void
 cpu_stat_reset(struct cpu_stat *stat)
 {
-	stat->prev_cpu_miss_count = 0;
 	cpu_stat_start(stat);
 }
 
 static uint64_t
 cpu_stat_on_csw(struct cpu_stat *stat)
 {
-	uint32_t cpu_id;
-	uint64_t delta, clock = __rdtscp(&cpu_id);
-
-	if (cpu_id == stat->prev_cpu_id) {
-		delta = clock - stat->prev_clock;
-	} else {
+	uint64_t delta, clock = clock_monotonic64();
+	/*
+	 * Just in case. On Linux CLOCK_MONOTONIC guarantee that the
+	 * time returned by consecutive calls to clock_gettime will not
+	 * go backwards, however for other systems it might not be true.
+	 */
+	if (clock < stat->prev_clock)
 		delta = 0;
-		stat->prev_cpu_id = cpu_id;
-		stat->cpu_miss_count++;
-	}
-	stat->prev_clock = clock;
+	else
+		delta = clock - stat->prev_clock;
 
+	stat->prev_clock = clock;
 	return delta;
 }
 
 static double
 cpu_stat_end(struct cpu_stat *stat, struct clock_stat *cord_clock_stat)
 {
-	stat->prev_cpu_miss_count = stat->cpu_miss_count;
-	stat->cpu_miss_count = 0;
-
-	struct timespec ts;
-	uint64_t delta_time;
 	double nsec_per_clock = 0;
-	if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) {
-		say_debug("clock_gettime(): failed to get this thread's"
-			  " cpu time.");
-	} else {
-		delta_time = (uint64_t) ts.tv_sec * FIBER_TIME_RES +
-			     ts.tv_nsec;
-		if (delta_time > stat->prev_cputime && cord_clock_stat->delta > 0) {
-			delta_time -= stat->prev_cputime;
-			nsec_per_clock = (double) delta_time / cord()->clock_stat.delta;
-		}
+	uint64_t delta_time = clock_thread64();
+	if (delta_time > stat->prev_cputime && cord_clock_stat->delta > 0) {
+		delta_time -= stat->prev_cputime;
+		nsec_per_clock = (double)delta_time / cord()->clock_stat.delta;
 	}
 	return nsec_per_clock;
 }
-
-#endif /* ENABLE_FIBER_TOP */
 
 #include <valgrind/memcheck.h>
 
@@ -159,21 +157,27 @@ static int (*fiber_invoke)(fiber_func f, va_list ap);
 #if ENABLE_ASAN
 #include <sanitizer/asan_interface.h>
 
-#define ASAN_START_SWITCH_FIBER(var_name, will_switch_back, bottom, size) \
-	void *var_name = NULL; \
-	__sanitizer_start_switch_fiber((will_switch_back) ? &var_name : NULL, \
+#define ASAN_START_SWITCH_FIBER(fake_stack_save, will_switch_back, bottom,     \
+				size)					       \
+	/*								       \
+	 * When leaving a fiber definitely, NULL must be passed as the first   \
+	 * argument so that the fake stack is destroyed.		       \
+	 */								       \
+	void *fake_stack_save = NULL;					       \
+	__sanitizer_start_switch_fiber((will_switch_back) ? &fake_stack_save   \
+							  : NULL,	       \
                                        (bottom), (size))
 #if ASAN_INTERFACE_OLD
-#define ASAN_FINISH_SWITCH_FIBER(var_name) \
-	__sanitizer_finish_switch_fiber(var_name);
+#define ASAN_FINISH_SWITCH_FIBER(fake_stack_save) \
+	__sanitizer_finish_switch_fiber(fake_stack_save)
 #else
-#define ASAN_FINISH_SWITCH_FIBER(var_name) \
-	__sanitizer_finish_switch_fiber(var_name, 0, 0);
+#define ASAN_FINISH_SWITCH_FIBER(fake_stack_save) \
+	__sanitizer_finish_switch_fiber(fake_stack_save, NULL, NULL)
 #endif
 
 #else
-#define ASAN_START_SWITCH_FIBER(var_name, will_switch_back, bottom, size)
-#define ASAN_FINISH_SWITCH_FIBER(var_name)
+#define ASAN_START_SWITCH_FIBER(fake_stack_save, will_switch_back, bottom, size)
+#define ASAN_FINISH_SWITCH_FIBER(fake_stack_save)
 #endif
 
 static inline int
@@ -193,38 +197,99 @@ fiber_madvise(void *addr, size_t len, int advice)
 	return 0;
 }
 
-static inline int
+static int
 fiber_mprotect(void *addr, size_t len, int prot)
 {
-	int rc = 0;
-
 	struct errinj *inj = errinj(ERRINJ_FIBER_MPROTECT, ERRINJ_INT);
 	if (inj != NULL && inj->iparam == prot) {
 		errno = ENOMEM;
-		rc = -1;
+		goto error;
 	}
-
-	if (rc != 0 || mprotect(addr, len, prot) != 0) {
-		diag_set(SystemError, "fiber mprotect failed");
-		return -1;
-	}
+	if (mprotect(addr, len, prot) != 0)
+		goto error;
 	return 0;
+error:
+	diag_set(SystemError, "fiber mprotect failed");
+	return -1;
 }
 
-#if ENABLE_FIBER_TOP
+/**
+ * Sets an alternative signal stack.
+ *
+ * We use an alternative signal stack so that we can print the stack trace on
+ * stack overflow, which makes the current stack unusable. This function should
+ * be called in each thread because the SIGSEGV signal is thread-directed.
+ * At thread exit, one should call signal_stack_free() to free the stack set by
+ * this function.
+ *
+ * We skip this for ASAN because it installs its own signal stack.
+ */
+static void
+signal_stack_init(void)
+{
+#ifndef ENABLE_ASAN
+	stack_t stack;
+	stack.ss_flags = 0;
+	/* SIGSTKSZ doesn't seem to be enough for libunwind. */
+	stack.ss_size = 4 * SIGSTKSZ;
+	stack.ss_sp = xmalloc(stack.ss_size);
+	if (sigaltstack(&stack, NULL) != 0) {
+		say_syserror("sigaltstack");
+		free(stack.ss_sp);
+	}
+#endif
+}
+
+/**
+ * Frees the signal stack set with signal_stack_init().
+ */
+static void
+signal_stack_free(void)
+{
+#ifndef ENABLE_ASAN
+	stack_t stack;
+	if (sigaltstack(NULL, &stack) != 0) {
+		say_syserror("sigaltstack");
+	} else {
+		free(stack.ss_sp);
+	}
+#endif
+}
+
 static __thread bool fiber_top_enabled = false;
-#endif /* ENABLE_FIBER_TOP */
+
+#ifdef ENABLE_BACKTRACE
+#ifndef NDEBUG
+__thread bool fiber_leak_backtrace_enable = true;
+#else
+__thread bool fiber_leak_backtrace_enable = false;
+#endif
+#endif
+
+#ifdef ABORT_ON_LEAK
+__thread bool fiber_abort_on_gc_leak = true;
+#else
+__thread bool fiber_abort_on_gc_leak = false;
+#endif
+
+#ifdef ENABLE_BACKTRACE
+static __thread bool fiber_parent_backtrace_enabled;
+#endif /* ENABLE_BACKTRACE */
 
 /**
  * An action performed each time a context switch happens.
  * Used to count each fiber's processing time.
  */
+#if ENABLE_UB_SANITIZER
+static inline void
+clock_set_on_csw(struct fiber *caller)
+  __attribute__((no_sanitize("signed-integer-overflow")));
+#endif
 static inline void
 clock_set_on_csw(struct fiber *caller)
 {
 	caller->csw++;
 
-#if ENABLE_FIBER_TOP
 	if (!fiber_top_enabled)
 		return;
 
@@ -232,8 +297,6 @@ clock_set_on_csw(struct fiber *caller)
 
 	clock_stat_add_delta(&cord()->clock_stat, delta);
 	clock_stat_add_delta(&caller->clock_stat, delta);
-#endif /* ENABLE_FIBER_TOP */
-
 }
 
 /*
@@ -261,11 +324,13 @@ pthread_t main_thread_id;
 static size_t page_size;
 static int stack_direction;
 
+#ifndef FIBER_STACK_SIZE_DEFAULT
+#error "Default fiber stack size is not set"
+#endif
+
 enum {
 	/* The minimum allowable fiber stack size in bytes */
 	FIBER_STACK_SIZE_MINIMAL = 16384,
-	/* Default fiber stack size in bytes */
-	FIBER_STACK_SIZE_DEFAULT = 524288,
 	/* Stack size watermark in bytes. */
 	FIBER_STACK_SIZE_WATERMARK = 65536,
 };
@@ -373,7 +438,39 @@ static void
 fiber_stack_recycle(struct fiber *fiber);
 
 static void
-fiber_destroy(struct cord *cord, struct fiber *f);
+fiber_delete(struct cord *cord, struct fiber *f);
+
+/**
+ * Try to delete a fiber right now or later if can't do now. The latter happens
+ * for self fiber - can't delete own stack.
+ */
+static void
+cord_add_garbage(struct cord *cord, struct fiber *f);
+
+/**
+ * Reset slice for currently running fiber.
+ * The function is used on yields by main cord.
+ */
+static inline void
+cord_reset_slice(struct fiber *f)
+{
+	cord()->call_time = clock_lowres_monotonic();
+	struct fiber_slice new_slice = cord()->max_slice;
+	if ((f->flags & FIBER_CUSTOM_SLICE) != 0)
+		new_slice = f->max_slice;
+	cord()->slice = new_slice;
+}
+
+/**
+ * True if a fiber with `fiber_flags` can be reused.
+ * A fiber can not be reused if it is somehow non-standard.
+ */
+static bool
+fiber_is_reusable(uint32_t fiber_flags)
+{
+	/* For now we can not reuse fibers with custom stack size. */
+	return (fiber_flags & FIBER_CUSTOM_STACK) == 0;
+}
 
 /**
  * Transfer control to callee fiber.
@@ -403,6 +500,8 @@ fiber_call_impl(struct fiber *callee)
 	cord->fiber = callee;
 	callee->flags = (callee->flags & ~FIBER_IS_READY) | FIBER_IS_RUNNING;
 
+	cord_reset_slice(callee);
+
 	ASAN_START_SWITCH_FIBER(asan_state, 1,
 				callee->stack,
 				callee->stack_size);
@@ -422,8 +521,7 @@ fiber_call(struct fiber *callee)
 	if (! rlist_empty(&caller->on_yield))
 		trigger_run(&caller->on_yield, NULL);
 
-	if (cord_is_main())
-		cord_on_yield();
+	cord_on_yield();
 
 	clock_set_on_csw(caller);
 	callee->caller = caller;
@@ -438,12 +536,6 @@ fiber_start(struct fiber *callee, ...)
 	va_start(callee->f_data, callee);
 	fiber_call(callee);
 	va_end(callee->f_data);
-}
-
-bool
-fiber_checkstack(void)
-{
-	return false;
 }
 
 static void
@@ -480,78 +572,103 @@ fiber_make_ready(struct fiber *f)
 	 * It's critical that the newly scheduled fiber is
 	 * added to the tail of the list, to preserve correct
 	 * transaction commit order after a successful WAL write.
-	 * (see tx_schedule_commit()/tx_schedule_rollback() in
-	 * box/wal.cc)
+	 * (see tx_schedule_queue() in box/wal.c)
 	 */
 	rlist_move_tail_entry(&cord->ready, f, state);
 	f->flags |= FIBER_IS_READY;
 }
 
 void
+fiber_set_ctx(struct fiber *f, void *f_arg)
+{
+	if (f == NULL)
+		f = fiber();
+	f->f_arg = f_arg;
+}
+
+void *
+fiber_get_ctx(struct fiber *f)
+{
+	if (f == NULL)
+		f = fiber();
+	return f->f_arg;
+}
+
+void
+fiber_set_audit_context(struct fiber *f, const char *ctx, size_t size)
+{
+	assert(f != NULL);
+	char *copy = NULL;
+	if (ctx != NULL) {
+		copy = runtime_memory_alloc(size + 1);
+		memcpy(copy, ctx, size);
+		copy[size] = '\0';
+	}
+	fiber_move_audit_context(f, copy, size);
+}
+
+void
+fiber_move_audit_context(struct fiber *f, char *ctx, size_t size)
+{
+	if (f->storage.audit_context != NULL)
+		runtime_memory_free(f->storage.audit_context,
+				    f->storage.audit_context_len + 1);
+	f->storage.audit_context = ctx;
+	f->storage.audit_context_len = size;
+}
+
+const char *
+fiber_get_audit_context(struct fiber *f, size_t *size)
+{
+	assert(f != NULL);
+	if (size != NULL)
+		*size = f->storage.audit_context_len;
+	return f->storage.audit_context;
+}
+
+void
 fiber_wakeup(struct fiber *f)
 {
 	/*
-	 * DEAD is checked both in the assertion and in the release build
-	 * because it should not ever happen, at least internally. But in some
-	 * user modules it might happen, and better ignore such fibers.
-	 * Especially since this was allowed for quite some time in the public
-	 * API and need to keep it if it costs nothing, for backward
-	 * compatibility.
+	 * DEAD fiber can be lingering in the cord fiber list
+	 * if it is joinable. And once its execution is complete
+	 * it should be reaped with fiber_join() call.
+	 *
+	 * Still our API allows to call fiber_wakeup() on dead
+	 * joinable fibers so simply ignore it.
 	 */
-	assert((f->flags & FIBER_IS_DEAD) == 0);
+	assert((f->flags & FIBER_IS_DEAD) == 0 ||
+	       (f->flags & FIBER_IS_JOINABLE) != 0);
 	const int no_flags = FIBER_IS_READY | FIBER_IS_DEAD | FIBER_IS_RUNNING;
 	if ((f->flags & no_flags) == 0)
 		fiber_make_ready(f);
 }
 
-/** Cancel the subject fiber.
-*
- * Note: cancelation is asynchronous. Use fiber_join() to wait for the
- * cancelation to complete.
- *
- * A fiber may opt to set FIBER_IS_CANCELLABLE to false, and never test
- * that it was cancelled.  Such fiber can not ever be cancelled.
- * However, as long as most of the cooperative code calls
- * fiber_testcancel(), most of the fibers are cancellable.
- *
- * The fiber which is cancelled, has FiberIsCancelled raised
- * in it. For cancellation to work, this exception type should be
- * re-raised whenever (if) it is caught.
- */
 void
 fiber_cancel(struct fiber *f)
 {
-	assert(f->fid != 0);
 	/**
 	 * Do nothing if the fiber is dead, since cancelling
 	 * the fiber would clear the diagnostics area and
 	 * the cause of death would be lost.
 	 */
-	if (fiber_is_dead(f))
+	if (fiber_is_dead(f)) {
+		if ((f->flags & FIBER_IS_JOINABLE) == 0) {
+			panic("Cancel of a finished and already "
+			      "recycled fiber");
+		}
+		assert(f->fid != 0);
 		return;
+	}
 
 	f->flags |= FIBER_IS_CANCELLED;
-
-	/**
-	 * Don't wake self and zombies.
-	 */
-	if ((f->flags & FIBER_IS_CANCELLABLE) != 0)
-		fiber_wakeup(f);
+	fiber_wakeup(f);
 }
 
-/**
- * Change the current cancellation state of a fiber. This is not
- * a cancellation point.
- */
 bool
-fiber_set_cancellable(bool yesno)
+fiber_set_cancellable(MAYBE_UNUSED bool yesno)
 {
-	bool prev = fiber()->flags & FIBER_IS_CANCELLABLE;
-	if (yesno == true)
-		fiber()->flags |= FIBER_IS_CANCELLABLE;
-	else
-		fiber()->flags &= ~FIBER_IS_CANCELLABLE;
-	return prev;
+	return true;
 }
 
 bool
@@ -563,6 +680,58 @@ fiber_is_cancelled(void)
 void
 fiber_set_joinable(struct fiber *fiber, bool yesno)
 {
+	if (fiber == NULL)
+		fiber = fiber();
+
+	/*
+	 * The C fiber API does not allow to report any error to the caller. At
+	 * the same time using the function in some conditions is unsafe. So in
+	 * case if such a condition is met the function panics.
+	 *
+	 * Here're the conditions the function may be called in:
+	 * 1. The fiber is not joinable and hasn't finished yet. We're good to
+	 *    change the fiber's joinability.
+	 * 2. The fiber is not joinable and is finished. That means the fiber
+	 *    is recycled already, so this is a use after free. This case is
+	 *    impossible from the Lua world, but can be done with C API, so it
+	 *    is to be prohibited.
+	 * 3. The fiber is joinable, not finished and not joined. We're good to
+	 *    change its joinability.
+	 * 4. The fiber is joinable, not finished, but joined already. Making
+	 *    the fiber non-joinable will lead to a double free: one in the
+	 *    fiber_loop, the second one in the active fiber_join_timeout.
+	 *    Making it joinable is a sign of attempt to join it later, so we
+	 *    can expect the second join in the future - detect it now, while
+	 *    we can do it, because in the future the fiber struct may be
+	 *    reused and it will be much more difficult to find the root cause
+	 *    of the double join (or we won't be able to detect it at all).
+	 * 5. The fiber is joinable, finished and not joined. The fiber should
+	 *    be joined in order to be recycled, so making it non-joinable can
+	 *    lead to a fiber leak and to be prohibited. The point about making
+	 *    it joinable from the statement #4 is applied here too.
+	 * 6. The fiber is joinable, finished and joined. In order to avoid
+	 *    introducing a new fiber flag, a joined fiber becomes non-joinable
+	 *    on death (see the fiber_join_timeout implementation), so this
+	 *    condition transforms into #2. And it's a use after free too.
+	 *
+	 * Simplifying:
+	 *   OK:
+	 *     1: !is_joinable && !is_dead
+	 *     3: is_joinable && !is_dead && !is_joined
+	 *   NOT OK:
+	 *     2: !is_joinable && is_dead
+	 *     4: is_joinable && !is_dead && is_joined
+	 *     5: is_joinable && is_dead && !is_joined
+	 *     6. is_joinable && is_dead && is_joined
+	 *
+	 *  Othervice, OK: !is_dead && (!is_joinable || !is_joined)
+	 *  So NOT OK: is_dead || (is_joinable && is_joined)
+	 *  So NOT OK: is_dead || is_joined, because joined implies joinable.
+	 */
+	if ((fiber->flags & FIBER_IS_DEAD) != 0 ||
+	    (fiber->flags & FIBER_JOIN_BEEN_INVOKED) != 0)
+		panic("%s on a dead or joined fiber detected", __func__);
+
 	if (yesno == true)
 		fiber->flags |= FIBER_IS_JOINABLE;
 	else
@@ -576,10 +745,10 @@ fiber_time(void)
 	return ev_now(loop());
 }
 
-uint64_t
+int64_t
 fiber_time64(void)
 {
-	return (uint64_t) ( ev_now(loop()) * 1000000 + 0.5 );
+	return (int64_t)(ev_now(loop()) * 1000000 + 0.5);
 }
 
 double
@@ -588,10 +757,10 @@ fiber_clock(void)
 	return ev_monotonic_now(loop());
 }
 
-uint64_t
+int64_t
 fiber_clock64(void)
 {
-	return (uint64_t) ( ev_monotonic_now(loop()) * 1000000 + 0.5 );
+	return (int64_t)(ev_monotonic_now(loop()) * 1000000 + 0.5);
 }
 
 /**
@@ -617,44 +786,55 @@ fiber_join(struct fiber *fiber)
 	return fiber_join_timeout(fiber, TIMEOUT_INFINITY);
 }
 
+bool
+fiber_wait_on_deadline(struct fiber *fiber, double deadline)
+{
+	rlist_add_tail_entry(&fiber->wake, fiber(), state);
+
+	return fiber_yield_deadline(deadline);
+}
+
 int
 fiber_join_timeout(struct fiber *fiber, double timeout)
 {
 	if ((fiber->flags & FIBER_IS_JOINABLE) == 0)
 		panic("the fiber is not joinable");
 
-	if (! fiber_is_dead(fiber)) {
-		bool exceeded = false;
-		do {
-			/*
-			 * In case fiber is cancelled during yield
-			 * it will be removed from wake queue by a
-			 * wakeup following the cancel, so we have
-			 * to put it back in.
-			 */
-			rlist_add_tail_entry(&fiber->wake, fiber(), state);
-			if (timeout != TIMEOUT_INFINITY) {
-				double time = fiber_clock();
-				exceeded = fiber_yield_timeout(timeout);
-				timeout -= (fiber_clock() - time);
-			} else {
-				fiber_yield();
-			}
-		} while (! fiber_is_dead(fiber) && ! exceeded && timeout > 0);
-	}
+	if ((fiber->flags & FIBER_JOIN_BEEN_INVOKED) != 0)
+		panic("join of a joined fiber detected");
 
-	if (! fiber_is_dead(fiber)) {
-		/*
-		 * Not exactly the right error message for this place. Error
-		 * message is generated based on the ETIMEDOUT code, that is
-		 * used for network timeouts in linux. But in other places,
-		 * this type of error is always used when the timeout expires,
-		 * regardless of whether it is related to the network (see
-		 * cbus_call for example).
-		 */
-		diag_set(TimedOut);
-		return -1;
+	if (fiber() == fiber)
+		panic("cannot join itself");
+
+	/* Prohibit joining the fiber and changing its joinability. */
+	fiber->flags |= FIBER_JOIN_BEEN_INVOKED;
+
+	if (!fiber_is_dead(fiber)) {
+		double deadline = fiber_clock() + timeout;
+		while (!fiber_wait_on_deadline(fiber, deadline) &&
+		       !fiber_is_dead(fiber)) {
+		}
+		if (!fiber_is_dead(fiber)) {
+			/*
+			 * Not exactly the right error message for this place.
+			 * Error message is generated based on the ETIMEDOUT
+			 * code, that is used for network timeouts in linux. But
+			 * in other places, this type of error is always used
+			 * when the timeout expires, regardless of whether it is
+			 * related to the network (see cbus_call for example).
+			 */
+			diag_set(TimedOut);
+			return -1;
+		}
 	}
+	assert((fiber->flags & FIBER_IS_RUNNING) == 0);
+	assert((fiber->flags & FIBER_IS_JOINABLE) != 0);
+	/*
+	 * This line is here just to make the following statement true: if
+	 * a fiber is dead and is not joinable, that means it's recycled.
+	 * So we don't have to introduce a new FIBER_IS_RECYCLED flag.
+	 */
+	fiber->flags &= ~FIBER_IS_JOINABLE;
 
 	/* Move exception to the caller */
 	int ret = fiber->f_ret;
@@ -668,12 +848,11 @@ fiber_join_timeout(struct fiber *fiber, double timeout)
 }
 
 /**
- * @note: this is not a cancellation point (@sa fiber_testcancel())
- * but it is considered good practice to call testcancel()
- * after each yield.
+ * Implementation of `fiber_yield()` and `fiber_yield_final()`.
+ * `will_switch_back` argument is used only by ASAN.
  */
-void
-fiber_yield(void)
+static void
+fiber_yield_impl(MAYBE_UNUSED bool will_switch_back)
 {
 	struct cord *cord = cord();
 	struct fiber *caller = cord->fiber;
@@ -684,8 +863,8 @@ fiber_yield(void)
 	if (! rlist_empty(&caller->on_yield))
 		trigger_run(&caller->on_yield, NULL);
 
-	if (cord_is_main())
-		cord_on_yield();
+	cord_on_yield();
+	cord_reset_slice(callee);
 
 	clock_set_on_csw(caller);
 
@@ -695,15 +874,35 @@ fiber_yield(void)
 	assert((callee->flags & FIBER_IS_RUNNING) == 0);
 
 	caller->flags &= ~FIBER_IS_RUNNING;
+	if (unlikely(cord->is_shutdown) &&
+	    !(caller->flags & (FIBER_IS_CANCELLED |
+			       FIBER_IS_DEAD)) &&
+	    (!(caller->flags & FIBER_IS_SYSTEM) ||
+	     (caller->flags & FIBER_MANAGED_SHUTDOWN)))
+		fiber_cancel(caller);
 	cord->fiber = callee;
 	callee->flags = (callee->flags & ~FIBER_IS_READY) | FIBER_IS_RUNNING;
 
-	ASAN_START_SWITCH_FIBER(asan_state,
-				(caller->flags & FIBER_IS_DEAD) == 0,
-				callee->stack,
+	ASAN_START_SWITCH_FIBER(asan_state, will_switch_back, callee->stack,
 				callee->stack_size);
 	coro_transfer(&caller->ctx, &callee->ctx);
 	ASAN_FINISH_SWITCH_FIBER(asan_state);
+}
+
+void
+fiber_yield(void)
+{
+	fiber_yield_impl(true);
+}
+
+/**
+ * Like `fiber_yield()`, but should be used when this is the last switch from
+ * a dead fiber to the scheduler.
+ */
+static void
+fiber_yield_final(void)
+{
+	fiber_yield_impl(false);
 }
 
 struct fiber_watcher_data {
@@ -740,6 +939,13 @@ fiber_yield_timeout(ev_tstamp delay)
 	fiber_yield();
 	ev_timer_stop(loop(), &timer);
 	return state.timed_out;
+}
+
+bool
+fiber_yield_deadline(ev_tstamp deadline)
+{
+	ev_tstamp timeout = deadline - ev_monotonic_now(loop());
+	return fiber_yield_timeout(timeout);
 }
 
 /**
@@ -809,6 +1015,7 @@ fiber_schedule_wakeup(ev_loop *loop, ev_async *watcher, int revents)
 	(void) watcher;
 	(void) revents;
 	struct cord *cord = cord();
+	fiber_check_gc();
 	fiber_schedule_list(&cord->ready);
 }
 
@@ -853,42 +1060,31 @@ fiber_self(void)
 	return fiber();
 }
 
-void
-fiber_gc(void)
-{
-	if (region_used(&fiber()->gc) < 128 * 1024) {
-		region_reset(&fiber()->gc);
-		return;
-	}
-
-	region_free(&fiber()->gc);
-}
-
 /** Common part of fiber_new() and fiber_recycle(). */
 static void
 fiber_reset(struct fiber *fiber)
 {
 	rlist_create(&fiber->on_yield);
 	rlist_create(&fiber->on_stop);
-	/*
-	 * Preserve the running flag if set. Reset might be called on the
-	 * current fiber when it is recycled.
-	 */
-	fiber->flags = FIBER_DEFAULT_FLAGS | (fiber->flags & FIBER_IS_RUNNING);
-#if ENABLE_FIBER_TOP
+	rlist_create(&fiber->on_destroy);
 	clock_stat_reset(&fiber->clock_stat);
-#endif /* ENABLE_FIBER_TOP */
+	fiber_set_audit_context(fiber, NULL, 0);
 }
 
-/** Destroy an active fiber and prepare it for reuse. */
+/** Destroy an active fiber and prepare it for reuse or delete it. */
 static void
 fiber_recycle(struct fiber *fiber)
 {
+	assert((fiber->flags & FIBER_IS_DEAD) != 0);
 	/* no exceptions are leaking */
 	assert(diag_is_empty(&fiber->diag));
 	/* no pending wakeup */
 	assert(rlist_empty(&fiber->state));
-	bool has_custom_stack = fiber->flags & FIBER_CUSTOM_STACK;
+	assert(rlist_empty(&fiber->on_stop));
+	if (trigger_run(&fiber->on_destroy, fiber) != 0)
+		panic("on_destroy triggers can't fail");
+	/* On destroy triggers are expected to remove themselves. */
+	assert(rlist_empty(&fiber->on_destroy));
 	fiber_stack_recycle(fiber);
 	fiber_reset(fiber);
 	fiber->name[0] = '\0';
@@ -899,12 +1095,85 @@ fiber_recycle(struct fiber *fiber)
 	fiber->storage.lua.fid_ref = FIBER_LUA_NOREF;
 	unregister_fid(fiber);
 	fiber->fid = 0;
+	fiber->gc_initial_size = 0;
+#ifdef ENABLE_BACKTRACE
+	fiber->parent_bt = NULL;
+	fiber->first_alloc_bt = NULL;
+	region_set_callbacks(&fiber->gc, NULL, NULL, NULL);
+#endif
 	region_free(&fiber->gc);
-	if (!has_custom_stack) {
+	if (fiber_is_reusable(fiber->flags)) {
 		rlist_move_entry(&cord()->dead, fiber, link);
 	} else {
-		fiber_destroy(cord(), fiber);
+		cord_add_garbage(cord(), fiber);
 	}
+}
+
+#ifdef ENABLE_BACKTRACE
+/**
+ * Called on allocation on region gc. Saves allocation caller backtrace
+ * to report it later if region gc leak is found.
+ */
+static void
+fiber_on_gc_alloc(struct region *region, size_t size, void *opaque)
+{
+	(void)region;
+	(void)size;
+	struct fiber *fiber = opaque;
+
+	assert(region_used(&fiber->gc) >= fiber->gc_initial_size);
+	if (region_used(&fiber->gc) == fiber->gc_initial_size) {
+		/* 1 is to skip not interesting frames. */
+		backtrace_collect(fiber->first_alloc_bt, NULL, 1);
+		assert(fiber->first_alloc_bt->frame_count > 0);
+	}
+}
+
+/**
+ * Called on region gc truncation. Resets previously saved backtrace so
+ * it won't be falsely reported in case of programmatic mistake.
+ */
+static void
+fiber_on_gc_truncate(struct region *region, size_t used, void *opaque)
+{
+	(void)region;
+	struct fiber *fiber = opaque;
+
+	assert(used >= fiber->gc_initial_size);
+	if (used == fiber->gc_initial_size)
+		fiber->first_alloc_bt->frame_count = 0;
+}
+#endif /* ENABLE_BACKTRACE */
+
+void
+fiber_check_gc(void)
+{
+	struct fiber *fiber = fiber();
+
+	assert(region_used(&fiber->gc) >= fiber->gc_initial_size);
+	if (region_used(&fiber->gc) == fiber->gc_initial_size)
+		return;
+
+#ifdef ENABLE_BACKTRACE
+	if (fiber->first_alloc_bt) {
+		say_error("Fiber gc leak is found. "
+			  "First leaked fiber gc allocation"
+			  " backtrace:\n%s",
+			  TOSTR(backtrace_snprint, fiber->first_alloc_bt));
+	} else {
+		say_error("Fiber gc leak is found. "
+			  "Leak backtrace is not available. "
+			  "Make sure fiber.leak_backtrace_enable() is called"
+			  " before starting this fiber to obtain "
+			  " the backtrace.");
+	}
+#else
+	say_error("Fiber gc leak is found. "
+		  "Leak backtrace is not available on your platform.");
+#endif
+
+	if (fiber_abort_on_gc_leak)
+		abort();
 }
 
 static void
@@ -916,6 +1185,7 @@ fiber_loop(MAYBE_UNUSED void *data)
 
 		assert(fiber != NULL && fiber->f != NULL && fiber->fid != 0);
 		fiber->f_ret = fiber_invoke(fiber->f, fiber->f_data);
+		fiber_check_gc();
 		if (fiber->f_ret != 0) {
 			struct error *e = diag_last_error(&fiber->diag);
 			/* diag must not be empty on error */
@@ -944,6 +1214,18 @@ fiber_loop(MAYBE_UNUSED void *data)
 		       assert(f != fiber);
 		       fiber_wakeup(f);
 	        }
+		if (!(fiber->flags & FIBER_IS_SYSTEM)) {
+			assert(cord()->client_fiber_count > 0);
+			cord()->client_fiber_count--;
+		}
+		if (fiber->flags & FIBER_MANAGED_SHUTDOWN) {
+			assert(cord()->managed_shutdown_fiber_count > 0);
+			cord()->managed_shutdown_fiber_count--;
+		}
+		if (unlikely(cord()->shutdown_fiber != NULL) &&
+		    cord()->client_fiber_count == 0 &&
+		    cord()->managed_shutdown_fiber_count == 0)
+			fiber_wakeup(cord()->shutdown_fiber);
 		fiber_on_stop(fiber);
 		/* reset pending wakeups */
 		rlist_del(&fiber->state);
@@ -954,14 +1236,23 @@ fiber_loop(MAYBE_UNUSED void *data)
 		 * function again, ap is garbage by now.
 		 */
 		fiber->f = NULL;
-		fiber_yield();	/* give control back to scheduler */
+		/*
+		 * Give control back to the scheduler.
+		 * If the fiber is not reusable, this is its final yield.
+		 */
+		if (fiber_is_reusable(fiber->flags))
+			fiber_yield();
+		else
+			fiber_yield_final();
 	}
 }
 
 void
-fiber_set_name(struct fiber *fiber, const char *name)
+fiber_set_name_n(struct fiber *fiber, const char *name, uint32_t len)
 {
-	size_t size = strlen(name) + 1;
+	if (fiber == NULL)
+		fiber = fiber();
+	size_t size = len + 1;
 	if (size <= FIBER_NAME_INLINE) {
 		if (fiber->name != fiber->inline_name) {
 			free(fiber->name);
@@ -984,6 +1275,30 @@ fiber_set_name(struct fiber *fiber, const char *name)
 	fiber->name[size] = 0;
 }
 
+const char *
+fiber_name(const struct fiber *fiber)
+{
+	if (fiber == NULL)
+		fiber = fiber();
+	return fiber->name;
+}
+
+uint64_t
+fiber_id(const struct fiber *fiber)
+{
+	if (fiber == NULL)
+		fiber = fiber();
+	return fiber->fid;
+}
+
+uint64_t
+fiber_csw(const struct fiber *fiber)
+{
+	if (fiber == NULL)
+		fiber = fiber();
+	return fiber->csw;
+}
+
 static inline void *
 page_align_down(void *ptr)
 {
@@ -994,6 +1309,21 @@ static inline void *
 page_align_up(void *ptr)
 {
 	return page_align_down(ptr + page_size - 1);
+}
+
+/**
+ * Call madvise(2) on given range but align start on page up and
+ * end on page down.
+ *
+ * This way madvise(2) requirement on alignment of start address is met.
+ * Also we won't touch memory after end due to rounding up of range length.
+ */
+static inline int
+fiber_madvise_unaligned(void *start, void *end, int advice)
+{
+	start = page_align_up(start);
+	end = page_align_down(end);
+	return fiber_madvise(start, (char *)end - (char *)start, advice);
 }
 
 #ifdef HAVE_MADV_DONTNEED
@@ -1052,9 +1382,9 @@ fiber_stack_recycle(struct fiber *fiber)
 	void *start, *end;
 	if (stack_direction < 0) {
 		start = fiber->stack;
-		end = page_align_down(fiber->stack_watermark);
+		end = fiber->stack_watermark;
 	} else {
-		start = page_align_up(fiber->stack_watermark);
+		start = fiber->stack_watermark;
 		end = fiber->stack + fiber->stack_size;
 	}
 
@@ -1063,7 +1393,7 @@ fiber_stack_recycle(struct fiber *fiber)
 	 * just a hint for OS and not critical for
 	 * functionality.
 	 */
-	fiber_madvise(start, end - start, MADV_DONTNEED);
+	fiber_madvise_unaligned(start, end, MADV_DONTNEED);
 	stack_put_watermark(fiber->stack_watermark);
 }
 
@@ -1071,12 +1401,13 @@ fiber_stack_recycle(struct fiber *fiber)
  * Initialize fiber stack watermark.
  */
 static void
-fiber_stack_watermark_create(struct fiber *fiber)
+fiber_stack_watermark_create(struct fiber *fiber,
+			     const struct fiber_attr *fiber_attr)
 {
 	assert(fiber->stack_watermark == NULL);
 
 	/* No tracking on custom stacks for simplicity. */
-	if (fiber->flags & FIBER_CUSTOM_STACK)
+	if (fiber_attr->flags & FIBER_CUSTOM_STACK)
 		return;
 
 	/*
@@ -1085,8 +1416,8 @@ fiber_stack_watermark_create(struct fiber *fiber)
 	 * not exit if MADV_DONTNEED failed, it is just a hint
 	 * for OS, not critical one.
 	 */
-	fiber_madvise(fiber->stack, fiber->stack_size, MADV_DONTNEED);
-
+	fiber_madvise_unaligned(fiber->stack, fiber->stack + fiber->stack_size,
+				MADV_DONTNEED);
 	/*
 	 * To increase probability of stack overflow detection
 	 * we put the first mark at a random position.
@@ -1112,9 +1443,11 @@ fiber_stack_recycle(struct fiber *fiber)
 }
 
 static void
-fiber_stack_watermark_create(struct fiber *fiber)
+fiber_stack_watermark_create(struct fiber *fiber,
+			     const struct fiber_attr *fiber_attr)
 {
 	(void)fiber;
+	(void)fiber_attr;
 }
 #endif /* HAVE_MADV_DONTNEED */
 
@@ -1125,16 +1458,14 @@ fiber_stack_destroy(struct fiber *fiber, struct slab_cache *slabc)
 
 	if (fiber->stack != NULL) {
 		VALGRIND_STACK_DEREGISTER(fiber->stack_id);
-#if ENABLE_ASAN
-		ASAN_UNPOISON_MEMORY_REGION(fiber->stack, fiber->stack_size);
-#endif
 		void *guard;
 		if (stack_direction < 0)
 			guard = page_align_down(fiber->stack - page_size);
 		else
 			guard = page_align_up(fiber->stack + fiber->stack_size);
 
-		if (fiber_mprotect(guard, page_size, mprotect_flags) != 0) {
+		if (fiber->has_guard &&
+		    fiber_mprotect(guard, page_size, mprotect_flags) != 0) {
 			/*
 			 * FIXME: We need some intelligent handling:
 			 * say put this slab into a queue and retry
@@ -1154,24 +1485,26 @@ fiber_stack_destroy(struct fiber *fiber, struct slab_cache *slabc)
 			 */
 			say_syserror("fiber: Can't put guard page to slab. "
 				     "Leak %zu bytes", (size_t)fiber->stack_size);
+			/*
+			 * Suppress memory leak report for this object.
+			 *
+			 * Works even though it is not a beginning of
+			 * allocation (there is ASAN slab cache allocation
+			 * header).
+			 */
+			LSAN_IGNORE_OBJECT(fiber->stack_slab);
 		} else {
 			slab_put(slabc, fiber->stack_slab);
 		}
 	}
 }
 
-static int
-fiber_stack_create(struct fiber *fiber, struct slab_cache *slabc,
-		   size_t stack_size)
+static void
+fiber_stack_create(struct fiber *fiber, const struct fiber_attr *fiber_attr,
+		   struct slab_cache *slabc)
 {
-	stack_size -= slab_sizeof();
-	fiber->stack_slab = slab_get(slabc, stack_size);
-
-	if (fiber->stack_slab == NULL) {
-		diag_set(OutOfMemory, stack_size,
-			 "runtime arena", "fiber stack");
-		return -1;
-	}
+	size_t stack_size = fiber_attr->stack_size - slab_sizeof();
+	fiber->stack_slab = xslab_get(slabc, stack_size);
 	void *guard;
 	/* Adjust begin and size for stack memory chunk. */
 	if (stack_direction < 0) {
@@ -1201,18 +1534,41 @@ fiber_stack_create(struct fiber *fiber, struct slab_cache *slabc,
 						  (char *)fiber->stack +
 						  fiber->stack_size);
 
-	if (fiber_mprotect(guard, page_size, PROT_NONE)) {
-		/*
-		 * Write an error into the log since a guard
-		 * page is critical for functionality.
-		 */
-		diag_log();
-		fiber_stack_destroy(fiber, slabc);
-		return -1;
+#ifndef ENABLE_ASAN
+	fiber->has_guard = fiber_mprotect(guard, page_size, PROT_NONE) == 0;
+	if (!fiber->has_guard)
+		say_syserror("can't create guard page");
+#else
+	/*
+	 * If we panic then fiber stacks remain protected which cause leak
+	 * sanitizer failures. Disable memory protection under ASAN.
+	 */
+	fiber->has_guard = false;
+#endif
+
+	fiber_stack_watermark_create(fiber, fiber_attr);
+}
+
+static void
+fiber_gc_checker_init(struct fiber *fiber)
+{
+#ifdef ENABLE_BACKTRACE
+	if (!fiber_leak_backtrace_enable) {
+		fiber->first_alloc_bt = NULL;
+		fiber->gc_initial_size = 0;
+		return;
 	}
 
-	fiber_stack_watermark_create(fiber);
-	return 0;
+	fiber->first_alloc_bt =
+		xregion_alloc_object(&fiber->gc,
+				     typeof(*fiber->first_alloc_bt));
+	fiber->gc_initial_size = region_used(&fiber->gc);
+	region_set_callbacks(&fiber->gc,
+			     fiber_on_gc_alloc, fiber_on_gc_truncate,
+			     fiber);
+#else
+	fiber->gc_initial_size = 0;
+#endif
 }
 
 struct fiber *
@@ -1222,30 +1578,19 @@ fiber_new_ex(const char *name, const struct fiber_attr *fiber_attr,
 	struct cord *cord = cord();
 	struct fiber *fiber = NULL;
 	assert(fiber_attr != NULL);
+	cord_collect_garbage(cord);
 
-	/* Now we can not reuse fiber if custom attribute was set */
-	if (!(fiber_attr->flags & FIBER_CUSTOM_STACK) &&
-	    !rlist_empty(&cord->dead)) {
-		fiber = rlist_first_entry(&cord->dead,
-					  struct fiber, link);
+	if (fiber_is_reusable(fiber_attr->flags) && !rlist_empty(&cord->dead)) {
+		fiber = rlist_first_entry(&cord->dead, struct fiber, link);
 		rlist_move_entry(&cord->alive, fiber, link);
+		assert(fiber_is_dead(fiber));
 	} else {
-		fiber = (struct fiber *)
-			mempool_alloc(&cord->fiber_mempool);
-		if (fiber == NULL) {
-			diag_set(OutOfMemory, sizeof(struct fiber),
-				 "fiber pool", "fiber");
-			return NULL;
-		}
+		fiber = xmempool_alloc(&cord->fiber_mempool);
 		memset(fiber, 0, sizeof(struct fiber));
 		fiber->storage.lua.storage_ref = FIBER_LUA_NOREF;
 		fiber->storage.lua.fid_ref = FIBER_LUA_NOREF;
 
-		if (fiber_stack_create(fiber, &cord()->slabc,
-				       fiber_attr->stack_size)) {
-			mempool_free(&cord->fiber_mempool, fiber);
-			return NULL;
-		}
+		fiber_stack_create(fiber, fiber_attr, &cord()->slabc);
 		coro_create(&fiber->ctx, fiber_loop, NULL,
 			    fiber->stack, fiber->stack_size);
 
@@ -1255,81 +1600,102 @@ fiber_new_ex(const char *name, const struct fiber_attr *fiber_attr,
 		rlist_create(&fiber->wake);
 		diag_create(&fiber->diag);
 		fiber_reset(fiber);
-		fiber->flags = fiber_attr->flags;
 
 		rlist_add_entry(&cord->alive, fiber, link);
 	}
-
+	fiber->flags = fiber_attr->flags;
 	fiber->f = f;
+	struct fiber *creator = fiber();
+	if (creator != NULL && !(fiber->flags & FIBER_IS_SYSTEM)) {
+		size_t size;
+		const char *ctx = fiber_get_audit_context(creator, &size);
+		if (ctx != NULL)
+			fiber_set_audit_context(fiber, ctx, size);
+	}
 	fiber->fid = cord->next_fid;
 	fiber_set_name(fiber, name);
 	register_fid(fiber);
+	fiber->max_slice = zero_slice;
 	fiber->csw = 0;
-
+#ifdef ENABLE_BACKTRACE
+	fiber->parent_bt = NULL;
+#endif /* ENABLE_BACKTRACE */
+	fiber_gc_checker_init(fiber);
 	cord->next_fid++;
 	assert(cord->next_fid > FIBER_ID_MAX_RESERVED);
+	if (!(fiber->flags & FIBER_IS_SYSTEM))
+		cord()->client_fiber_count++;
 
 	return fiber;
 
 }
 
-/**
- * Create a new fiber.
- *
- * Takes a fiber from fiber cache, if it's not empty.
- * Can fail only if there is not enough memory for
- * the fiber structure or fiber stack.
- *
- * The created fiber automatically returns itself
- * to the fiber cache when its "main" function
- * completes.
- */
 struct fiber *
 fiber_new(const char *name, fiber_func f)
 {
 	return fiber_new_ex(name, &fiber_attr_default, f);
 }
 
-/**
- * Free as much memory as possible taken by the fiber.
- *
- * Sic: cord()->sched needs manual destruction in
- * cord_destroy().
- */
+struct fiber *
+fiber_new_system(const char *name, fiber_func f)
+{
+	struct fiber_attr system_attrs;
+	fiber_attr_create(&system_attrs);
+	system_attrs.flags |= FIBER_IS_SYSTEM;
+	return fiber_new_ex(name, &system_attrs, f);
+}
+
+/** Free all fiber's resources. */
 static void
 fiber_destroy(struct cord *cord, struct fiber *f)
 {
-	if (f == fiber()) {
-		/** End of the application. */
-		assert(cord == &main_cord);
-		return;
-	}
-	assert(f != &cord->sched);
-
+	assert(f != cord->fiber);
 	trigger_destroy(&f->on_yield);
 	trigger_destroy(&f->on_stop);
+	trigger_destroy(&f->on_destroy);
 	rlist_del(&f->state);
 	rlist_del(&f->link);
+	rlist_del(&f->wake);
+	fiber_set_audit_context(f, NULL, 0);
+#ifdef ENABLE_BACKTRACE
+	region_set_callbacks(&f->gc, NULL, NULL, NULL);
+#endif
 	region_destroy(&f->gc);
 	fiber_stack_destroy(f, &cord->slabc);
 	diag_destroy(&f->diag);
 	if (f->name != f->inline_name)
 		free(f->name);
-	f->name = NULL;
+	TRASH(f);
+}
+
+/** Free all fiber's resources and the fiber itself. */
+static void
+fiber_delete(struct cord *cord, struct fiber *f)
+{
+	assert(f != &cord->sched);
+	fiber_destroy(cord, f);
+	mempool_free(&cord->fiber_mempool, f);
+}
+
+/** Delete all fibers in the given list so it becomes empty. */
+static void
+cord_delete_fibers_in_list(struct cord *cord, struct rlist *list)
+{
+	while (!rlist_empty(list)) {
+		struct fiber *f = rlist_first_entry(list, struct fiber, link);
+		fiber_delete(cord, f);
+	}
 }
 
 void
-fiber_destroy_all(struct cord *cord)
+fiber_delete_all(struct cord *cord)
 {
-	while (!rlist_empty(&cord->alive))
-		fiber_destroy(cord, rlist_first_entry(&cord->alive,
-						      struct fiber, link));
-	while (!rlist_empty(&cord->dead))
-		fiber_destroy(cord, rlist_first_entry(&cord->dead,
-						      struct fiber, link));
+	cord_collect_garbage(cord);
+	cord_delete_fibers_in_list(cord, &cord->alive);
+	cord_delete_fibers_in_list(cord, &cord->dead);
+	cord_delete_fibers_in_list(cord, &cord->ready);
 }
 
-#if ENABLE_FIBER_TOP
 static void
 loop_on_iteration_start(ev_loop *loop, ev_check *watcher, int revents)
 {
@@ -1408,7 +1774,26 @@ fiber_top_disable(void)
 		fiber_top_enabled = false;
 	}
 }
-#endif /* ENABLE_FIBER_TOP */
+
+#ifdef ENABLE_BACKTRACE
+bool
+fiber_parent_backtrace_is_enabled(void)
+{
+	return fiber_parent_backtrace_enabled;
+}
+
+void
+fiber_parent_backtrace_enable(void)
+{
+	fiber_parent_backtrace_enabled = true;
+}
+
+void
+fiber_parent_backtrace_disable(void)
+{
+	fiber_parent_backtrace_enabled = false;
+}
+#endif /* ENABLE_BACKTRACE */
 
 size_t
 box_region_used(void)
@@ -1440,10 +1825,32 @@ box_region_truncate(size_t size)
 	return region_truncate(&fiber()->gc, size);
 }
 
+/**
+ * Callback for cord's cancel_event.
+ *
+ * If the cord has main_fiber (i.e. it was started with cord_costart),
+ * cancels the fiber. The event loop will be broken by fiber's on_stop
+ * trigger. If there's no main_fiber, breaks the event loop immediately.
+ * The latter is useful if the cord was started with cord_start and
+ * the cord function called ev_run directly.
+ */
+static void
+cord_cancel_callback(ev_loop *loop, ev_async *watcher, int revents)
+{
+	(void)loop;
+	(void)watcher;
+	(void)revents;
+	if (cord()->main_fiber != NULL) {
+		fiber_cancel(cord()->main_fiber);
+	} else {
+		ev_break(loop(), EVBREAK_ALL);
+	}
+}
+
 void
 cord_create(struct cord *cord, const char *name)
 {
-	cord() = cord;
+	cord_ptr = cord;
 	slab_cache_set_thread(&cord()->slabc);
 
 	cord->id = pthread_self();
@@ -1451,20 +1858,37 @@ cord_create(struct cord *cord, const char *name)
 	slab_cache_create(&cord->slabc, &runtime);
 	mempool_create(&cord->fiber_mempool, &cord->slabc,
 		       sizeof(struct fiber));
+
+	const int RUNTIME_OBJSIZE_MIN = 16;
+	const double RUNTIME_ALLOC_FACTOR = 1.05;
+	float actual_alloc_factor;
+	small_alloc_create(
+		&cord->small, &cord()->slabc, RUNTIME_OBJSIZE_MIN,
+		sizeof(intptr_t), RUNTIME_ALLOC_FACTOR, &actual_alloc_factor);
+
 	rlist_create(&cord->alive);
 	rlist_create(&cord->ready);
 	rlist_create(&cord->dead);
+	cord->garbage = NULL;
 	cord->fiber_registry = mh_i64ptr_new();
 
 	/* sched fiber is not present in alive/ready/dead list. */
+	memset(&cord->sched, 0, sizeof(cord->sched));
+	rlist_create(&cord->sched.state);
+	rlist_create(&cord->sched.link);
+	rlist_create(&cord->sched.wake);
 	cord->sched.fid = FIBER_ID_SCHED;
 	fiber_reset(&cord->sched);
+	cord->sched.f_ret = 0;
 	diag_create(&cord->sched.diag);
 	region_create(&cord->sched.gc, &cord->slabc);
+	fiber_gc_checker_init(&cord->sched);
 	cord->sched.name = NULL;
 	fiber_set_name(&cord->sched, "sched");
 	cord->fiber = &cord->sched;
-	cord->sched.flags |= FIBER_IS_RUNNING;
+	cord->sched.flags = FIBER_IS_RUNNING | FIBER_IS_SYSTEM;
+	cord->sched.max_slice = zero_slice;
+	cord->max_slice = default_slice;
 
 	cord->next_fid = FIBER_ID_MAX_RESERVED + 1;
 	/*
@@ -1474,16 +1898,15 @@ cord_create(struct cord *cord, const char *name)
 	 */
 	ev_async_init(&cord->wakeup_event, fiber_schedule_wakeup);
 
+	cord->main_fiber = NULL;
+	ev_async_init(&cord()->cancel_event, cord_cancel_callback);
+
 	ev_idle_init(&cord->idle_event, fiber_schedule_idle);
 
-#if ENABLE_FIBER_TOP
-	/* fiber.top() currently works only for the main thread. */
-	if (cord_is_main()) {
-		fiber_top_init();
-	}
-#endif /* ENABLE_FIBER_TOP */
+	fiber_top_init();
 	cord_set_name(name);
 
+	trigger_init_in_thread();
 #if ENABLE_ASAN
 	/* Record stack extents */
 	tt_pthread_attr_getstack(cord->id, &cord->sched.stack,
@@ -1496,23 +1919,63 @@ cord_create(struct cord *cord, const char *name)
 #ifdef HAVE_MADV_DONTNEED
 	cord->sched.stack_watermark = NULL;
 #endif
+	signal_stack_init();
+	cord->shutdown_fiber = NULL;
+	cord->client_fiber_count = 0;
+	cord->managed_shutdown_fiber_count = 0;
+	cord->is_shutdown = false;
+}
+
+void
+cord_collect_garbage(struct cord *cord)
+{
+	struct fiber *garbage = cord->garbage;
+	if (garbage == NULL)
+		return;
+	fiber_delete(cord, garbage);
+	cord->garbage = NULL;
+}
+
+static void
+cord_add_garbage(struct cord *cord, struct fiber *f)
+{
+	cord_collect_garbage(cord);
+	assert(cord->garbage == NULL);
+	if (f != cord->fiber)
+		fiber_delete(cord, f);
+	else
+		cord->garbage = f;
+}
+
+void
+cord_exit(struct cord *cord)
+{
+	assert(cord == cord());
+	(void)cord;
+	trigger_free_in_thread();
+	signal_stack_free();
 }
 
 void
 cord_destroy(struct cord *cord)
 {
+	assert(cord->id == 0 || pthread_equal(cord->id, pthread_self()));
+	cord->id = 0;
 	slab_cache_set_thread(&cord->slabc);
 	if (cord->loop)
 		ev_loop_destroy(cord->loop);
 	/* Only clean up if initialized. */
 	if (cord->fiber_registry) {
-		fiber_destroy_all(cord);
+		fiber_delete_all(cord);
 		mh_i64ptr_delete(cord->fiber_registry);
 	}
-	region_destroy(&cord->sched.gc);
-	diag_destroy(&cord->sched.diag);
-	if (cord->sched.name != cord->sched.inline_name)
-		free(cord->sched.name);
+	cord->fiber = NULL;
+#if ENABLE_ASAN
+	cord->sched.stack = NULL;
+	cord->sched.stack_size = 0;
+#endif
+	fiber_destroy(cord, &cord->sched);
+	small_alloc_destroy(&cord->small);
 	slab_cache_destroy(&cord->slabc);
 }
 
@@ -1535,6 +1998,11 @@ void *cord_thread_func(void *p)
 {
 	struct cord_thread_arg *ct_arg = (struct cord_thread_arg *) p;
 	cord_create(ct_arg->cord, (ct_arg->name));
+	/*
+	 * cancel_event must be started before notifying cord_start so that
+	 * the caller may use it as soon as cord_start returns.
+	 */
+	ev_async_start(loop(), &cord()->cancel_event);
 	/** Can't possibly be the main thread */
 	assert(cord()->id != main_thread_id);
 	tt_pthread_mutex_lock(&ct_arg->start_mutex);
@@ -1543,6 +2011,7 @@ void *cord_thread_func(void *p)
 	ct_arg->is_started = true;
 	tt_pthread_cond_signal(&ct_arg->start_cond);
 	tt_pthread_mutex_unlock(&ct_arg->start_mutex);
+	ERROR_INJECT_SIGILL(ERRINJ_SIGILL_NONMAIN_THREAD);
 	void *res = f(arg);
 	/*
 	 * cord()->on_exit initially holds NULL. This field is
@@ -1561,6 +2030,10 @@ void *cord_thread_func(void *p)
 	                                            CORD_ON_EXIT_WONT_RUN);
 	if (!changed)
 		handler->callback(handler->argument);
+
+	ev_async_stop(loop(), &cord()->cancel_event);
+	cord_exit(cord());
+
 	return res;
 }
 
@@ -1581,6 +2054,7 @@ cord_start(struct cord *cord, const char *name, void *(*f)(void *), void *arg)
 		diag_set(SystemError, "failed to create thread");
 		goto end;
 	}
+	pm_atomic_fetch_add(&cord_count, 1);
 	res = 0;
 	while (! ct_arg.is_started)
 		tt_pthread_cond_wait(&ct_arg.start_cond, &ct_arg.start_mutex);
@@ -1600,10 +2074,16 @@ end:
 int
 cord_join(struct cord *cord)
 {
-	assert(cord() != cord); /* Can't join self. */
+	assert(cord() != cord);
+	assert(cord->id != 0);
+
 	void *retval = NULL;
 	int res = tt_pthread_join(cord->id, &retval);
 	if (res == 0) {
+		int old_cord_count = pm_atomic_fetch_sub(&cord_count, 1);
+		assert(old_cord_count > 0);
+		(void)old_cord_count;
+		cord->id = 0;
 		struct fiber *f = cord->fiber;
 		if (f->f_ret != 0) {
 			assert(!diag_is_empty(&f->diag));
@@ -1615,6 +2095,12 @@ cord_join(struct cord *cord)
 	}
 	cord_destroy(cord);
 	return res;
+}
+
+void
+cord_cancel(struct cord *cord)
+{
+	ev_async_send(cord->loop, &cord->cancel_event);
 }
 
 /** The state of the waiter for a thread to complete. */
@@ -1654,7 +2140,8 @@ cord_cojoin_wakeup(struct ev_loop *loop, struct ev_async *ev, int revents)
 int
 cord_cojoin(struct cord *cord)
 {
-	assert(cord() != cord); /* Can't join self. */
+	assert(cord() != cord);
+	assert(cord->id != 0);
 
 	struct cord_cojoin_ctx ctx;
 	ctx.loop = loop();
@@ -1688,17 +2175,13 @@ cord_cojoin(struct cord *cord)
 		 * thread invokes cord_cojoin_on_exit, signaling
 		 * ev_async, making the event loop call
 		 * cord_cojoin_wakeup, waking up this fiber again.
-		 *
-		 * The fiber is non-cancellable during the wait to
-		 * avoid invalidating of the cord_cojoin_ctx
-		 * object declared on stack.
 		 */
-		bool cancellable = fiber_set_cancellable(false);
-		fiber_yield();
-		/* Spurious wakeup indicates a severe BUG, fail early. */
-		if (ctx.task_complete == 0)
-			panic("Wrong fiber woken");
-		fiber_set_cancellable(cancellable);
+		do {
+			assert(cord->id != 0);
+			if (fiber_is_cancelled())
+				cord_cancel(cord);
+			fiber_yield();
+		} while (!ctx.task_complete);
 	}
 
 	ev_async_stop(loop(), &ctx.async);
@@ -1728,12 +2211,9 @@ cord_costart_thread_func(void *arg)
 	free(arg);
 
 	struct fiber *f = fiber_new("main", ctx.run);
-	if (f == NULL)
-		return NULL;
+	cord()->main_fiber = f;
 
-	struct trigger break_ev_loop = {
-		RLIST_LINK_INITIALIZER, break_ev_loop_f, NULL, NULL
-	};
+	TRIGGER(break_ev_loop, break_ev_loop_f);
 	/*
 	 * Got to be in a trigger, to break the loop even
 	 * in case of an exception.
@@ -1751,6 +2231,8 @@ cord_costart_thread_func(void *arg)
 	 */
 	assert(fiber_is_dead(f));
 	fiber()->f_ret = fiber_join(f);
+	fiber_check_gc();
+	cord()->main_fiber = NULL;
 
 	return NULL;
 }
@@ -1777,9 +2259,13 @@ cord_costart(struct cord *cord, const char *name, fiber_func f, void *arg)
 void
 cord_set_name(const char *name)
 {
-	snprintf(cord()->name, sizeof(cord()->name), "%s", name);
-	/* Main thread's name will replace process title in ps, skip it */
-	if (cord_is_main())
+	snprintf(cord()->name, sizeof(cord()->name), "%s",
+		 name != NULL ? name : "unknown");
+	/*
+	 * Main thread's name will replace process title in ps, skip it.
+	 * Also, skip anonymous cord - its thread's name is set by creator.
+	 */
+	if (cord_is_main() || name == NULL)
 		return;
 	tt_pthread_setname(name);
 }
@@ -1788,12 +2274,6 @@ bool
 cord_is_main(void)
 {
 	return cord() == &main_cord;
-}
-
-struct slab_cache *
-cord_slab_cache(void)
-{
-	return &cord()->slabc;
 }
 
 static NOINLINE int
@@ -1805,18 +2285,52 @@ check_stack_direction(void *prev_stack_frame)
 void
 fiber_init(int (*invoke)(fiber_func f, va_list ap))
 {
-	page_size = sysconf(_SC_PAGESIZE);
+	page_size = small_getpagesize();
 	stack_direction = check_stack_direction(__builtin_frame_address(0));
 	fiber_invoke = invoke;
 	main_thread_id = pthread_self();
 	main_cord.loop = ev_default_loop(EVFLAG_AUTO | EVFLAG_ALLOCFD);
+	if (main_cord.loop == NULL)
+		panic("can't init event loop");
 	cord_create(&main_cord, "main");
 }
 
 void
 fiber_free(void)
 {
+	assert(pm_atomic_load(&cord_count) == 0);
+	cord_exit(&main_cord);
 	cord_destroy(&main_cord);
+}
+
+int
+fiber_wakeup_trigger_cb(struct trigger *trigger, void *event)
+{
+	(void)event;
+	fiber_wakeup(trigger->data);
+	return 0;
+}
+
+/** Reset current slice on SIGURG. */
+static void
+signal_sigurg_cb(int signum)
+{
+	(void)signum;
+	assert(cord_is_main());
+	fiber_set_slice(zero_slice);
+}
+
+void
+fiber_signal_init(void)
+{
+	assert(cord_is_main());
+	clock_lowres_signal_init();
+
+	struct sigaction sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = signal_sigurg_cb;
+	if (tt_sigaction(SIGURG, &sa, NULL) == -1)
+		panic_syserror("cannot set fiber sigurg handler");
 }
 
 int fiber_stat(fiber_stat_cb cb, void *cb_ctx)
@@ -1829,5 +2343,68 @@ int fiber_stat(fiber_stat_cb cb, void *cb_ctx)
 		if (res != 0)
 			return res;
 	}
+	return 0;
+}
+
+struct lua_State *
+fiber_lua_state(struct fiber *f)
+{
+	return f->storage.lua.stack;
+}
+
+void
+fiber_set_system(struct fiber *f, bool yesno)
+{
+	if (yesno) {
+		if (!(f->flags & FIBER_IS_SYSTEM)) {
+			f->flags |= FIBER_IS_SYSTEM;
+			assert(cord()->client_fiber_count > 0);
+			cord()->client_fiber_count--;
+			if (cord()->shutdown_fiber != NULL &&
+			    cord()->client_fiber_count == 0 &&
+			    cord()->managed_shutdown_fiber_count == 0)
+				fiber_wakeup(cord()->shutdown_fiber);
+		}
+	} else {
+		if (f->flags & FIBER_IS_SYSTEM) {
+			f->flags &= ~FIBER_IS_SYSTEM;
+			cord()->client_fiber_count++;
+		}
+	}
+}
+
+void
+fiber_set_managed_shutdown(struct fiber *f)
+{
+	if (!(f->flags & FIBER_MANAGED_SHUTDOWN)) {
+		f->flags |= FIBER_MANAGED_SHUTDOWN;
+		cord()->managed_shutdown_fiber_count++;
+	}
+}
+
+int
+fiber_shutdown(double timeout)
+{
+	assert(cord()->shutdown_fiber == NULL);
+	cord()->is_shutdown = true;
+	struct fiber *fiber;
+	rlist_foreach_entry(fiber, &cord()->alive, link) {
+		if (!(fiber->flags & FIBER_IS_SYSTEM) ||
+		    (fiber->flags & FIBER_MANAGED_SHUTDOWN))
+			fiber_cancel(fiber);
+	}
+	cord()->shutdown_fiber = fiber();
+	double deadline = ev_monotonic_now(loop()) + timeout;
+	while (cord()->client_fiber_count != 0 ||
+	       cord()->managed_shutdown_fiber_count != 0) {
+		if (fiber_yield_deadline(deadline)) {
+			diag_set(TimedOut);
+			break;
+		}
+	}
+	cord()->shutdown_fiber = NULL;
+	if (cord()->client_fiber_count != 0 ||
+	    cord()->managed_shutdown_fiber_count != 0)
+		return -1;
 	return 0;
 }

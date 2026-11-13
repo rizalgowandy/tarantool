@@ -251,7 +251,7 @@ box.space.features_sync:drop()
 
 local function check_stats(stat)
     local sub = test:test('feedback operation stats')
-    sub:plan(27)
+    sub:plan(29)
     local box_stat = box.stat()
     local net_stat = box.stat.net()
     for op, val in pairs(box_stat) do
@@ -314,5 +314,4 @@ events_expected = {
 
 test:is_deeply(actual.events, events_expected, "Events are counted correctly")
 
-test:check()
-os.exit(0)
+os.exit(test:check() == true and 0 or 1)

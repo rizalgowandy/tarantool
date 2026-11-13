@@ -44,6 +44,7 @@
 #include "space.h"
 #include "index.h"
 #include "engine.h"
+#include "user.h"
 #include "func.h"
 #include "tuple.h"
 #include "session.h"
@@ -91,15 +92,26 @@ sysview_iterator_next(struct iterator *iterator, struct tuple **ret)
 	assert(iterator->free == sysview_iterator_free);
 	struct sysview_iterator *it = sysview_iterator(iterator);
 	*ret = NULL;
-	if (it->source->space_cache_version != space_cache_version)
-		return 0; /* invalidate iterator */
-	struct sysview_index *index = (struct sysview_index *)iterator->index;
+	struct sysview_index *index = (struct sysview_index *)
+		index_weak_ref_get_index_checked(&iterator->index_ref);
 	int rc;
 	while ((rc = iterator_next(it->source, ret)) == 0 && *ret != NULL) {
 		if (index->filter(it->space, *ret))
 			break;
 	}
 	return rc;
+}
+
+/**
+ * Implementation of `position` iterator method for this engine. Simply calls
+ * the same method of the source iterator.
+ */
+static int
+sysview_iterator_position(struct iterator *it, const char **pos, uint32_t *size)
+{
+	assert(it->free == sysview_iterator_free);
+	struct sysview_iterator *sysview_it = sysview_iterator(it);
+	return iterator_position(sysview_it->source, pos, size);
 }
 
 static void
@@ -110,7 +122,8 @@ sysview_index_destroy(struct index *index)
 
 static struct iterator *
 sysview_index_create_iterator(struct index *base, enum iterator_type type,
-			      const char *key, uint32_t part_count)
+			      const char *key, uint32_t part_count,
+			      const char *pos)
 {
 	struct sysview_index *index = (struct sysview_index *)base;
 	struct sysview_engine *sysview = (struct sysview_engine *)base->engine;
@@ -126,7 +139,7 @@ sysview_index_create_iterator(struct index *base, enum iterator_type type,
 	 * It is possible to change a source space without changing
 	 * the view.
 	 */
-	if (key_validate(pk->def, type, key, part_count))
+	if (iterator_validate(pk->def, type, key, part_count))
 		return NULL;
 
 	struct sysview_iterator *it = mempool_alloc(&sysview->iterator_pool);
@@ -139,8 +152,10 @@ sysview_index_create_iterator(struct index *base, enum iterator_type type,
 	it->pool = &sysview->iterator_pool;
 	it->base.next = sysview_iterator_next;
 	it->base.free = sysview_iterator_free;
+	it->base.position = sysview_iterator_position;
 
-	it->source = index_create_iterator(pk, type, key, part_count);
+	it->source = index_create_iterator_after(pk, type, key, part_count,
+						 pos);
 	if (it->source == NULL) {
 		mempool_free(&sysview->iterator_pool, it);
 		return NULL;
@@ -160,11 +175,7 @@ sysview_index_get(struct index *base, const char *key,
 	struct index *pk = index_find(source, index->source_index_id);
 	if (pk == NULL)
 		return -1;
-	if (!pk->def->opts.is_unique) {
-		diag_set(ClientError, ER_MORE_THAN_ONE_TUPLE);
-		return -1;
-	}
-	if (exact_key_validate(pk->def->key_def, key, part_count) != 0)
+	if (exact_key_validate(pk->def, key, part_count) != 0)
 		return -1;
 	struct tuple *tuple;
 	if (index_get(pk, key, part_count, &tuple) != 0)
@@ -188,22 +199,21 @@ static const struct index_vtab sysview_index_vtab = {
 		generic_index_def_change_requires_rebuild,
 	/* .size = */ generic_index_size,
 	/* .bsize = */ generic_index_bsize,
+	/* .quantile = */ generic_index_quantile,
 	/* .min = */ generic_index_min,
 	/* .max = */ generic_index_max,
 	/* .random = */ generic_index_random,
 	/* .count = */ generic_index_count,
 	/* .get = */ sysview_index_get,
-	/* .replace = */ generic_index_replace,
 	/* .create_iterator = */ sysview_index_create_iterator,
-	/* .create_snapshot_iterator = */
-		generic_index_create_snapshot_iterator,
+	/* .create_iterator_with_offset = */
+	generic_index_create_iterator_with_offset,
+	/* .create_arrow_stream = */ generic_index_create_arrow_stream,
+	/* .create_read_view = */ generic_index_create_read_view,
+	/* .info = */ generic_index_info,
 	/* .stat = */ generic_index_stat,
 	/* .compact = */ generic_index_compact,
 	/* .reset_stat = */ generic_index_reset_stat,
-	/* .begin_build = */ generic_index_begin_build,
-	/* .reserve = */ generic_index_reserve,
-	/* .build_next = */ generic_index_build_next,
-	/* .end_build = */ generic_index_end_build,
 };
 
 static void
@@ -258,7 +268,7 @@ sysview_space_execute_upsert(struct space *space, struct txn *txn,
 /*
  * System view filters.
  * Filter gives access to an object, if one of the following conditions is true:
- * 1. User has read, write, drop or alter access to universe.
+ * 1. User has read, write, drop, alter or grant access to universe.
  * 2. User has read access to according system space.
  * 3. User has read, write, drop or alter access to the object.
  * 4. User is a owner of the object.
@@ -267,17 +277,20 @@ sysview_space_execute_upsert(struct space *space, struct txn *txn,
  * 7. User is parent for the user/role.
  */
 
-const uint32_t PRIV_WRDA = PRIV_W | PRIV_D | PRIV_A | PRIV_R;
+enum {
+	PRIV_WRDA = PRIV_W | PRIV_D | PRIV_A | PRIV_R,
+	PRIV_WRDAG = PRIV_WRDA | PRIV_GRANT,
+};
 
 static bool
 vspace_filter(struct space *source, struct tuple *tuple)
 {
 	struct credentials *cr = effective_user();
 	/*
-	 * Allow access for a user with read, write,
-	 * drop or alter privileges for universe.
+	 * Allow access for a user with read, write, drop or
+	 * alter privileges for universe, or a universe grantor.
 	 */
-	if (PRIV_WRDA & cr->universal_access)
+	if (PRIV_WRDAG & cr->universal_access)
 		return true;
 	/* Allow access for a user with space privileges. */
 	if (PRIV_WRDA & entity_access_get(SC_SPACE)[cr->auth_token].effective)
@@ -304,10 +317,10 @@ vuser_filter(struct space *source, struct tuple *tuple)
 {
 	struct credentials *cr = effective_user();
 	/*
-	 * Allow access for a user with read, write,
-	 * drop or alter privileges for universe.
+	 * Allow access for a user with read, write, drop or
+	 * alter privileges for universe, or a universe grantor.
 	 */
-	if (PRIV_WRDA & cr->universal_access)
+	if (PRIV_WRDAG & cr->universal_access)
 		return true;
 	if (PRIV_R & source->access[cr->auth_token].effective)
 		return true; /* read access to _user space */
@@ -318,8 +331,22 @@ vuser_filter(struct space *source, struct tuple *tuple)
 	uint32_t owner_id;
 	if (tuple_field_u32(tuple, BOX_USER_FIELD_UID, &owner_id) != 0)
 		return false;
+
 	/* Allow access for self, childs or public user. */
-	return uid == cr->uid || owner_id == cr->uid || uid == PUBLIC;
+	if (uid == cr->uid || owner_id == cr->uid || uid == PUBLIC)
+		return true;
+
+	/* Allow access for a user with user/role privileges. */
+	struct user *user = user_by_id(uid);
+	if (PRIV_WRDA &
+	    entity_access_get(user->def->type)[cr->auth_token].effective)
+		return true;
+
+	/* Allow access to a role granted to the effective user. */
+	if (user->def->type == SC_ROLE && role_is_granted(user, cr->auth_token))
+		return true;
+
+	return false;
 }
 
 static bool
@@ -350,10 +377,10 @@ vfunc_filter(struct space *source, struct tuple *tuple)
 {
 	struct credentials *cr = effective_user();
 	/*
-	 * Allow access for a user with read, write,
-	 * drop, alter or execute privileges for universe.
+	 * Allow access for a user with read, write, drop, alter
+	 * or execute privileges for universe, or a universe owner.
 	 */
-	if ((PRIV_WRDA | PRIV_X) & cr->universal_access)
+	if ((PRIV_WRDAG | PRIV_X) & cr->universal_access)
 		return true;
 	/* Allow access for a user with function privileges. */
 	if ((PRIV_WRDA | PRIV_X) &
@@ -379,10 +406,10 @@ vsequence_filter(struct space *source, struct tuple *tuple)
 {
 	struct credentials *cr = effective_user();
 	/*
-	 * Allow access for a user with read, write,
-	 * drop, alter or execute privileges for universe.
+	 * Allow access for a user with read, write, drop, alter
+	 * or execute privileges for universe, or a universe owner.
 	 */
-	if ((PRIV_WRDA | PRIV_X) & cr->universal_access)
+	if ((PRIV_WRDAG | PRIV_X) & cr->universal_access)
 		return true;
 	/* Allow access for a user with sequence privileges. */
 	if ((PRIV_WRDA | PRIV_X) &
@@ -456,6 +483,11 @@ sysview_space_create_index(struct space *space, struct index_def *def)
 		source_index_id = def->iid;
 		filter = vsequence_filter;
 		break;
+	case BOX_VSPACE_SEQUENCE_ID:
+		source_space_id = BOX_SPACE_SEQUENCE_ID;
+		source_index_id = def->iid;
+		filter = vspace_filter;
+		break;
 	case BOX_VCOLLATION_ID:
 		source_space_id = BOX_COLLATION_ID;
 		source_index_id = def->iid;
@@ -468,18 +500,9 @@ sysview_space_create_index(struct space *space, struct index_def *def)
 		return NULL;
 	}
 
-	struct sysview_index *index =
-		(struct sysview_index *)calloc(1, sizeof(*index));
-	if (index == NULL) {
-		diag_set(OutOfMemory, sizeof(*index),
-			 "malloc", "struct sysview_index");
-		return NULL;
-	}
-	if (index_create(&index->base, (struct engine *)sysview,
-			 &sysview_index_vtab, def) != 0) {
-		free(index);
-		return NULL;
-	}
+	struct sysview_index *index = xcalloc(1, sizeof(*index));
+	index_create(&index->base, (struct engine *)sysview,
+		     &sysview_index_vtab, def);
 
 	index->source_space_id = source_space_id;
 	index->source_index_id = source_index_id;
@@ -494,6 +517,8 @@ static const struct space_vtab sysview_space_vtab = {
 	/* .execute_delete = */ sysview_space_execute_delete,
 	/* .execute_update = */ sysview_space_execute_update,
 	/* .execute_upsert = */ sysview_space_execute_upsert,
+	/* .execute_insert_arrow = */ generic_space_execute_insert_arrow,
+	/* .execute_delete_range = */ generic_space_execute_delete_range,
 	/* .ephemeral_replace = */ generic_space_ephemeral_replace,
 	/* .ephemeral_delete = */ generic_space_ephemeral_delete,
 	/* .ephemeral_rowid_next = */ generic_space_ephemeral_rowid_next,
@@ -507,11 +532,13 @@ static const struct space_vtab sysview_space_vtab = {
 	/* .build_index = */ generic_space_build_index,
 	/* .swap_index = */ generic_space_swap_index,
 	/* .prepare_alter = */ generic_space_prepare_alter,
+	/* .finish_alter = */ generic_space_finish_alter,
+	/* .prepare_upgrade = */ generic_space_prepare_upgrade,
 	/* .invalidate = */ generic_space_invalidate,
 };
 
 static void
-sysview_engine_shutdown(struct engine *engine)
+sysview_engine_free(struct engine *engine)
 {
 	struct sysview_engine *sysview = (struct sysview_engine *)engine;
 	if (mempool_is_initialized(&sysview->iterator_pool))
@@ -537,16 +564,11 @@ sysview_engine_create_space(struct engine *engine, struct space_def *def,
 	 * same machinery to do selects from such views from Lua
 	 * land.
 	 */
+	size_t region_svp = region_used(&fiber()->gc);
 	struct key_def **keys = index_def_to_key_def(key_list, &key_count);
-	if (keys == NULL) {
-		free(space);
-		return NULL;
-	}
 	struct tuple_format *format =
-		tuple_format_new(NULL, NULL, keys, key_count, def->fields,
-				 def->field_count, def->exact_field_count,
-				 def->dict, def->opts.is_temporary,
-				 def->opts.is_ephemeral);
+		space_tuple_format_new(NULL, NULL, keys, key_count, def);
+	region_truncate(&fiber()->gc, region_svp);
 	if (format == NULL) {
 		free(space);
 		return NULL;
@@ -563,8 +585,10 @@ sysview_engine_create_space(struct engine *engine, struct space_def *def,
 }
 
 static const struct engine_vtab sysview_engine_vtab = {
-	/* .shutdown = */ sysview_engine_shutdown,
+	/* .free = */ sysview_engine_free,
+	/* .shutdown = */ generic_engine_shutdown,
 	/* .create_space = */ sysview_engine_create_space,
+	/* .create_read_view = */ generic_engine_create_read_view,
 	/* .prepare_join = */ generic_engine_prepare_join,
 	/* .join = */ generic_engine_join,
 	/* .complete_join = */ generic_engine_complete_join,
@@ -574,7 +598,9 @@ static const struct engine_vtab sysview_engine_vtab = {
 	/* .commit = */ generic_engine_commit,
 	/* .rollback_statement = */ generic_engine_rollback_statement,
 	/* .rollback = */ generic_engine_rollback,
-	/* .switch_to_ro = */ generic_engine_switch_to_ro,
+	/* .destroy_savepoint = */ generic_engine_destroy_savepoint,
+	/* .send_to_read_view = */ generic_engine_send_to_read_view,
+	/* .abort_with_conflict = */ generic_engine_abort_with_conflict,
 	/* .bootstrap = */ generic_engine_bootstrap,
 	/* .begin_initial_recovery = */ generic_engine_begin_initial_recovery,
 	/* .begin_final_recovery = */ generic_engine_begin_final_recovery,

@@ -38,10 +38,6 @@
 #include "small/ibuf.h"
 #include "tt_static.h"
 
-/** Collations for cmp/casecmp functions. */
-static struct coll *unicode_coll = NULL;
-static struct coll *unicode_ci_coll = NULL;
-
 static int
 utf8_str_to_case(struct lua_State *L, const char *src, int src_bsize,
 		 bool is_to_upper)
@@ -449,29 +445,9 @@ void
 tarantool_lua_utf8_init(struct lua_State *L)
 {
 	assert(icu_ucase_default_map != NULL);
-	struct coll_def def;
-	memset(&def, 0, sizeof(def));
-	def.icu.strength = COLL_ICU_STRENGTH_TERTIARY;
-	unicode_coll = coll_new(&def);
-	if (unicode_coll == NULL)
-		goto error_coll;
-	def.icu.strength = COLL_ICU_STRENGTH_PRIMARY;
-	unicode_ci_coll = coll_new(&def);
-	if (unicode_ci_coll == NULL)
-		goto error_coll;
-	luaL_register(L, "utf8", utf8_lib);
-	lua_pop(L, 1);
-	return;
-error_coll:
-	tarantool_lua_utf8_free();
-	luaT_error(L);
-}
-
-void
-tarantool_lua_utf8_free()
-{
-	if (unicode_coll != NULL)
-		coll_unref(unicode_coll);
-	if (unicode_ci_coll != NULL)
-		coll_unref(unicode_ci_coll);
+	assert(unicode_coll != NULL);
+	assert(unicode_ci_coll != NULL);
+	luaT_newmodule(L, "utf8", utf8_lib);
+	/* Assign to _G.utf8 for compatibility with Lua 5.3. */
+	lua_setfield(L, LUA_GLOBALSINDEX, "utf8");
 }

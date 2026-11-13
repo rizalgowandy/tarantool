@@ -42,6 +42,7 @@
 #include "core/fiber.h"
 #include "core/exception.h"
 #include "tarantool_ev.h"
+#include "trivia/util.h"
 
 #include "lua/utils.h"
 #include "lua/fiber.h"
@@ -53,7 +54,6 @@ static const char *popen_handle_uname = "popen_handle";
 static const char *popen_handle_closed_uname = "popen_handle_closed";
 
 #define POPEN_LUA_READ_BUF_SIZE        4096
-#define POPEN_LUA_WAIT_DELAY           0.1
 #define POPEN_LUA_ENV_CAPACITY_DEFAULT 256
 
 /**
@@ -280,25 +280,6 @@ static const struct {
 /* }}} */
 
 /* {{{ General-purpose Lua helpers */
-
-/**
- * Extract a string from the Lua stack.
- *
- * Return (const char *) for a string, otherwise return NULL.
- *
- * Unlike luaL_tolstring() it accepts only a string and does not
- * accept a number.
- */
-static const char *
-luaL_tolstring_strict(struct lua_State *L, int idx, size_t *len_ptr)
-{
-	if (lua_type(L, idx) != LUA_TSTRING)
-		return NULL;
-
-	const char *res = lua_tolstring(L, idx, len_ptr);
-	assert(res != NULL);
-	return res;
-}
 
 /**
  * Extract a timeout value from the Lua stack.
@@ -701,9 +682,6 @@ luaT_popen_parse_stdX(struct lua_State *L, int idx, int fd,
  * Glue key and value on the Lua stack into "key=value" entry.
  *
  * Raise an error in case of the incorrect parameter.
- *
- * Return NULL in case of an allocation error and set a diag
- * (OutOfMemory).
  */
 static char *
 luaT_popen_parse_env_entry(struct lua_State *L, int key_idx, int value_idx,
@@ -729,11 +707,7 @@ luaT_popen_parse_env_entry(struct lua_State *L, int key_idx, int value_idx,
 
 	/* entry = "${key}=${value}" */
 	size_t entry_size = key_len + value_len + 2;
-	char *entry = region_alloc(region, entry_size);
-	if (entry == NULL) {
-		diag_set(OutOfMemory, entry_size, "region_alloc", "env entry");
-		return NULL;
-	}
+	char *entry = xregion_alloc(region, entry_size);
 	memcpy(entry, key, key_len);
 	size_t pos = key_len;
 	entry[pos++] = '=';
@@ -754,14 +728,9 @@ luaT_popen_parse_env_entry(struct lua_State *L, int key_idx, int value_idx,
  * Strings and array of them are allocated on the provided
  * region. A caller should call region_used() before invoking
  * this function and call region_truncate() when the result
- * is not needed anymore. Alternatively a caller may assume
- * that fiber_gc() will collect this memory eventually, but
- * it is recommended to do so only for rare paths.
+ * is not needed anymore.
  *
  * Raise an error in case of the incorrect parameter.
- *
- * Return NULL in case of an allocation error and set a diag
- * (OutOfMemory).
  */
 static char **
 luaT_popen_parse_env(struct lua_State *L, int idx, struct region *region)
@@ -779,13 +748,7 @@ luaT_popen_parse_env(struct lua_State *L, int idx, struct region *region)
 
 	size_t capacity = POPEN_LUA_ENV_CAPACITY_DEFAULT;
 	size_t region_svp = region_used(region);
-	size_t size;
-	char **env = region_alloc_array(region, typeof(env[0]), capacity,
-					&size);
-	if (env == NULL) {
-		diag_set(OutOfMemory, size, "region_alloc_array", "env");
-		return NULL;
-	}
+	char **env = xregion_alloc_array(region, typeof(env[0]), capacity);
 	size_t nr_env = 0;
 
 	bool only_count = false;
@@ -811,10 +774,6 @@ luaT_popen_parse_env(struct lua_State *L, int idx, struct region *region)
 			continue;
 		}
 		char *entry = luaT_popen_parse_env_entry(L, -2, -1, region);
-		if (entry == NULL) {
-			region_truncate(region, region_svp);
-			return NULL;
-		}
 		env[nr_env++] = entry;
 		lua_pop(L, 1);
 	}
@@ -830,20 +789,11 @@ luaT_popen_parse_env(struct lua_State *L, int idx, struct region *region)
 	 * the traverse again and fill `env` array.
 	 */
 	capacity = nr_env + 1;
-	env = region_alloc_array(region, typeof(env[0]), capacity, &size);
-	if (env == NULL) {
-		region_truncate(region, region_svp);
-		diag_set(OutOfMemory, size, "region_alloc_array", "env");
-		return NULL;
-	}
+	env = xregion_alloc_array(region, typeof(env[0]), capacity);
 	nr_env = 0;
 	lua_pushnil(L);
 	while (lua_next(L, idx) != 0) {
 		char *entry = luaT_popen_parse_env_entry(L, -2, -1, region);
-		if (entry == NULL) {
-			region_truncate(region, region_svp);
-			return NULL;
-		}
 		assert(nr_env < capacity - 1);
 		env[nr_env++] = entry;
 		lua_pop(L, 1);
@@ -851,6 +801,43 @@ luaT_popen_parse_env(struct lua_State *L, int idx, struct region *region)
 	assert(nr_env == capacity - 1);
 	env[nr_env] = NULL;
 	return env;
+}
+
+/**
+ * Parse popen.new() "opts.inherit_fds" parameter.
+ *
+ * Return a new array of file descriptors on success.
+ * The size of the array is stored in @a len.
+ *
+ * The array is allocated on the provided region. A caller
+ * should call region_used() before invoking this function
+ * and call region_truncate() when the result is not needed
+ * anymore.
+ *
+ * Raise an error in case of the incorrect parameter.
+ */
+static int *
+luaT_popen_parse_inherit_fds(struct lua_State *L, int idx, size_t *len,
+			     struct region *region)
+{
+	if (lua_type(L, idx) != LUA_TTABLE)
+		luaT_popen_param_type_error(L, idx, "popen.new",
+					    "opts.inherit_fds", "table or nil");
+
+	*len = lua_objlen(L, idx);
+	if (*len == 0)
+		return NULL;
+
+	int *fds = xregion_alloc_array(region, typeof(fds[0]), *len);
+	for (size_t i = 0; i < *len; ++i) {
+		lua_rawgeti(L, idx, i + 1);
+		if (!luaL_tointeger_strict(L, -1, &fds[i]) || fds[i] < 0)
+			luaT_popen_array_elem_type_error(
+				L, -1, "popen.new", "opts.inherit_fds", i + 1,
+				"nonnegative integer");
+		lua_pop(L, 1);
+	}
+	return fds;
 }
 
 /**
@@ -862,14 +849,11 @@ luaT_popen_parse_env(struct lua_State *L, int idx, struct region *region)
  *
  * Raise an error in case of the incorrect parameter.
  *
- * Return 0 at success. Allocates opts->env on @a region if
+ * Allocates opts->env and opts->inherit_fds on @a region if
  * needed. @see luaT_popen_parse_env() for details how to
  * free it.
- *
- * Return -1 in case of an allocation error and set a diag
- * (OutOfMemory).
  */
-static int
+static void
 luaT_popen_parse_opts(struct lua_State *L, int idx, struct popen_opts *opts,
 		      struct region *region)
 {
@@ -908,11 +892,8 @@ luaT_popen_parse_opts(struct lua_State *L, int idx, struct popen_opts *opts,
 		lua_pop(L, 1);
 
 		lua_getfield(L, idx, "env");
-		if (! lua_isnil(L, -1)) {
+		if (!lua_isnil(L, -1))
 			opts->env = luaT_popen_parse_env(L, -1, region);
-			if (opts->env == NULL)
-				return -1;
-		}
 		lua_pop(L, 1);
 
 		/*
@@ -959,6 +940,12 @@ luaT_popen_parse_opts(struct lua_State *L, int idx, struct popen_opts *opts,
 		}
 		lua_pop(L, 1);
 
+		lua_getfield(L, idx, "inherit_fds");
+		if (!lua_isnil(L, -1))
+			opts->inherit_fds = luaT_popen_parse_inherit_fds(
+					L, -1, &opts->nr_inherit_fds, region);
+		lua_pop(L, 1);
+
 		lua_getfield(L, idx, "restore_signals");
 		if (! lua_isnil(L, -1)) {
 			if (lua_type(L, -1) != LUA_TBOOLEAN)
@@ -999,8 +986,6 @@ luaT_popen_parse_opts(struct lua_State *L, int idx, struct popen_opts *opts,
 		}
 		lua_pop(L, 1);
 	}
-
-	return 0;
 }
 
 /**
@@ -1012,14 +997,11 @@ luaT_popen_parse_opts(struct lua_State *L, int idx, struct popen_opts *opts,
  *
  * Raise an error in case of the incorrect parameter.
  *
- * Return 0 at success. Sets opts->argv and opts->nr_argv.
+ * Sets opts->argv and opts->nr_argv.
  * Allocates opts->argv on @a region (@see
  * luaT_popen_parse_env() for details how to free it).
- *
- * Return -1 in case of an allocation error and set a diag
- * (OutOfMemory).
  */
-static int
+static void
 luaT_popen_parse_argv(struct lua_State *L, int idx, struct popen_opts *opts,
 		      struct region *region)
 {
@@ -1039,14 +1021,8 @@ luaT_popen_parse_argv(struct lua_State *L, int idx, struct popen_opts *opts,
 	opts->nr_argv = argv_len + 1;
 	if (opts->flags & POPEN_FLAG_SHELL)
 		opts->nr_argv += 2;
-
-	size_t size;
-	opts->argv = region_alloc_array(region, typeof(opts->argv[0]),
-					opts->nr_argv, &size);
-	if (opts->argv == NULL) {
-		diag_set(OutOfMemory, size, "region_alloc_array", "opts->argv");
-		return -1;
-	}
+	opts->argv = xregion_alloc_array(region, typeof(opts->argv[0]),
+					 opts->nr_argv);
 
 	/* Keep place for "sh", "-c" as popen_new() expects. */
 	const char **to = (const char **)opts->argv;
@@ -1061,7 +1037,7 @@ luaT_popen_parse_argv(struct lua_State *L, int idx, struct popen_opts *opts,
 		const char *arg = luaL_tolstring_strict(L, -1, NULL);
 		if (arg == NULL) {
 			region_truncate(region, region_svp);
-			return luaT_popen_array_elem_type_error(
+			luaT_popen_array_elem_type_error(
 				L, -1, "popen.new", "argv", i + 1, "string");
 		}
 		*to++ = arg;
@@ -1069,8 +1045,6 @@ luaT_popen_parse_argv(struct lua_State *L, int idx, struct popen_opts *opts,
 	}
 	*to++ = NULL;
 	assert((const char **)opts->argv + opts->nr_argv == to);
-
-	return 0;
 }
 
 /**
@@ -1194,8 +1168,12 @@ luaT_popen_parse_mode(struct lua_State *L, int idx)
  *
  * @param opts.close_fds        (boolean, default: true)
  *        true                  close all inherited fds from a
- *                              parent
+ *                              parent except @a opts.inherit_fds
  *        false                 don't do that
+ *
+ * @param opts.inherit_fds      an array of fds that should be
+ *                              left open in the child process
+ *                              if @a opts.close_fds is set
  *
  * @param opts.restore_signals  (boolean, default: true)
  *        true                  reset all signal actions
@@ -1248,12 +1226,10 @@ luaT_popen_parse_mode(struct lua_State *L, int idx)
  *
  * Return `nil, err` on a failure. Possible reasons:
  *
- * - SystemError: dup(), fcntl(), pipe(), vfork() or close()
- *                fails in the parent process.
+ * - SystemError: dup(), fcntl(), pipe(), vfork(), close() or
+ *                getpgrp() fails in the parent process.
  * - SystemError: (temporary restriction) the parent process
  *                has closed stdin, stdout or stderr.
- * - OutOfMemory: unable to allocate the handle or a temporary
- *                buffer.
  *
  * Example 1:
  *
@@ -1373,28 +1349,22 @@ lbox_popen_new(struct lua_State *L)
 
 	/* Parse opts and argv. */
 	struct popen_opts opts = { .argv = NULL, };
-	int rc = luaT_popen_parse_opts(L, 2, &opts, region);
-	if (rc != 0)
-		goto err;
-	rc = luaT_popen_parse_argv(L, 1, &opts, region);
-	if (rc != 0)
-		goto err;
+	luaT_popen_parse_opts(L, 2, &opts, region);
+	luaT_popen_parse_argv(L, 1, &opts, region);
 
 	struct popen_handle *handle = popen_new(&opts);
 
-	if (handle == NULL)
-		goto err;
-
 	region_truncate(region, region_svp);
+
+	if (handle == NULL) {
+		struct error *e = diag_last_error(diag_get());
+		if (e->type == &type_IllegalParams)
+			return luaT_error(L);
+		return luaT_push_nil_and_error(L);
+	}
+
 	luaT_push_popen_handle(L, handle);
 	return 1;
-
-err:
-	region_truncate(region, region_svp);
-	struct error *e = diag_last_error(diag_get());
-	if (e->type == &type_IllegalParams)
-		return luaT_error(L);
-	return luaT_push_nil_and_error(L);
 }
 
 /**
@@ -1632,7 +1602,10 @@ lbox_popen_kill(struct lua_State *L)
 /**
  * Wait until a child process get exited or signaled.
  *
- * @param handle  a handle of process to wait
+ * @param handle        a handle of process to wait
+ * @param opts          table of options
+ * @param opts.timeout  time quota in seconds
+ *                      (default: infinity)
  *
  * Raise an error on incorrect parameters or when the fiber is
  * cancelled:
@@ -1642,38 +1615,70 @@ lbox_popen_kill(struct lua_State *L)
  * - FiberIsCancelled: cancelled by an outside code.
  *
  * Return a process status table (the same as ph.status and
- * ph.info().status). @see lbox_popen_info() for the format
- * of the table.
+ * ph.info().status) at success. @see lbox_popen_info() for
+ * the format of the table.
+ *
+ * Return `nil, err` on a failure:
+ *
+ * - TimedOut:        @a timeout quota is exceeded.
+ * - ChannelIsClosed: @a handle was closed during the operation.
  */
 static int
 lbox_popen_wait(struct lua_State *L)
 {
-	/*
-	 * FIXME: Use trigger or fiber conds to sleep and wake up.
-	 * FIXME: Add timeout option: ph:wait({timeout = <...>})
-	 */
-	struct popen_handle *handle;
+	/* Extract handle. */
 	bool is_closed;
-	if ((handle = luaT_check_popen_handle(L, 1, &is_closed)) == NULL) {
-		diag_set(IllegalParams, "Bad params, use: ph:wait()");
-		return luaT_error(L);
-	}
+	struct popen_handle *handle = luaT_check_popen_handle(L, 1, &is_closed);
+	if (handle == NULL)
+		goto usage;
 	if (is_closed)
 		return luaT_popen_handle_closed_error(L);
 
-	int state;
-	int exit_code;
+	ev_tstamp timeout = TIMEOUT_INFINITY;
 
-	while (true) {
-		popen_state(handle, &state, &exit_code);
-		assert(state < POPEN_STATE_MAX);
-		if (state != POPEN_STATE_ALIVE)
-			break;
-		fiber_sleep(POPEN_LUA_WAIT_DELAY);
-		luaL_testcancel(L);
+	/* Extract options. */
+	if (!lua_isnoneornil(L, 2)) {
+		if (lua_type(L, 2) != LUA_TTABLE)
+			goto usage;
+
+		lua_getfield(L, 2, "timeout");
+		if (!lua_isnil(L, -1))
+			timeout = luaT_check_timeout(L, -1);
+		if (timeout < 0.0)
+			goto usage;
+		lua_pop(L, 1);
 	}
 
+	int rc = popen_wait_timeout(handle, timeout);
+	if (rc < 0) {
+		struct error *e = diag_last_error(diag_get());
+		if (e->type == &type_FiberIsCancelled)
+			return luaT_error(L);
+		return luaT_push_nil_and_error(L);
+	}
+
+	/*
+	 * The handle may be freed by call to :close() in another
+	 * fiber. We can't call popen_state() on a freed handle.
+	 */
+	handle = luaT_check_popen_handle(L, 1, &is_closed);
+	assert(handle != NULL);
+	if (is_closed) {
+		diag_set(ChannelIsClosed);
+		return luaT_push_nil_and_error(L);
+	}
+
+	int state;
+	int exit_code;
+	popen_state(handle, &state, &exit_code);
+	assert(state < POPEN_STATE_MAX);
+	assert(state != POPEN_STATE_ALIVE);
 	return luaT_push_popen_process_status(L, state, exit_code);
+
+usage:
+	diag_set(IllegalParams, "Bad params, use: ph:wait([{"
+		 "timeout = <number>}])");
+	return luaT_error(L);
 }
 
 /**
@@ -1714,7 +1719,6 @@ lbox_popen_wait(struct lua_State *L)
  *
  * - SocketError: an IO error occurs at read().
  * - TimedOut:    @a timeout quota is exceeded.
- * - OutOfMemory: no memory space for a buffer to read into.
  * - LuajitError: ("not enough memory"): no memory space for
  *                the Lua string.
  */
@@ -1781,11 +1785,7 @@ lbox_popen_read(struct lua_State *L)
 		flags |= POPEN_FLAG_FD_STDOUT;
 
 	size_t size = POPEN_LUA_READ_BUF_SIZE;
-	char *buf = region_alloc(region, size);
-	if (buf == NULL) {
-		diag_set(OutOfMemory, size, "region_alloc", "read buffer");
-		return luaT_push_nil_and_error(L);
-	}
+	char *buf = xregion_alloc(region, size);
 
 	static_assert(POPEN_LUA_READ_BUF_SIZE <= SSIZE_MAX,
 		      "popen: read buffer is too big");
@@ -2277,6 +2277,30 @@ lbox_popen_close(struct lua_State *L)
 }
 
 /**
+ * Check if the popen handle is closed.
+ *
+ * @param handle  a handle to check
+ *
+ * Raise an error on incorrect parameters:
+ *
+ * - IllegalParams: an incorrect handle parameter.
+ *
+ * Return `true` if popen handle is closed, `false` otherwise.
+ */
+static int
+lbox_popen_is_closed(struct lua_State *L)
+{
+	bool is_closed;
+	struct popen_handle *handle = luaT_check_popen_handle(L, 1, &is_closed);
+	if (handle == NULL) {
+		diag_set(IllegalParams, "Bad params, use: ph:is_closed()");
+		return luaT_error(L);
+	}
+	lua_pushboolean(L, is_closed);
+	return 1;
+}
+
+/**
  * Get a field from a handle.
  *
  * @param handle  a handle of a child process
@@ -2489,7 +2513,7 @@ tarantool_lua_popen_init(struct lua_State *L)
 		{"shell",	lbox_popen_shell,	},
 		{NULL, NULL},
 	};
-	luaL_register_module(L, "popen", popen_methods);
+	luaT_newmodule(L, "popen", popen_methods);
 
 	/*
 	 * Popen handle methods and metamethods.
@@ -2507,6 +2531,7 @@ tarantool_lua_popen_init(struct lua_State *L)
 		{"shutdown",		lbox_popen_shutdown,	},
 		{"info",		lbox_popen_info,	},
 		{"close",		lbox_popen_close,	},
+		{"is_closed",		lbox_popen_is_closed	},
 		{"__index",		lbox_popen_index	},
 		{"__serialize",		lbox_popen_serialize	},
 		{"__gc",		lbox_popen_gc		},

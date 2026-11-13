@@ -1,13 +1,11 @@
 local t = require('luatest')
 local log = require('log')
-local Cluster =  require('test.luatest_helpers.cluster')
-local asserts = require('test.luatest_helpers.asserts')
-local helpers = require('test.luatest_helpers')
+local Cluster = require('luatest.replica_set')
+local server = require('luatest.server')
 
 local pg = t.group('quorum_orphan', {{engine = 'memtx'}, {engine = 'vinyl'}})
 
 pg.before_each(function(cg)
-    local engine = cg.params.engine
     cg.cluster = Cluster:new({})
 
     local box_cfg = {
@@ -16,22 +14,21 @@ pg.before_each(function(cg)
         replication_sync_lag = 0.01;
         replication_connect_quorum = 3;
         replication = {
-            helpers.instance_uri('quorum', 1);
-            helpers.instance_uri('quorum', 2);
-            helpers.instance_uri('quorum', 3);
+            server.build_listen_uri('quorum1', cg.cluster.id);
+            server.build_listen_uri('quorum2', cg.cluster.id);
+            server.build_listen_uri('quorum3', cg.cluster.id);
         };
     }
 
-    cg.quorum1 = cg.cluster:build_server({alias = 'quorum1', engine = engine, box_cfg = box_cfg})
-    cg.quorum2 = cg.cluster:build_server({alias = 'quorum2', engine = engine, box_cfg = box_cfg})
-    cg.quorum3 = cg.cluster:build_server({alias = 'quorum3', engine = engine, box_cfg = box_cfg})
+    cg.quorum1 = cg.cluster:build_server({alias = 'quorum1', box_cfg = box_cfg})
+    cg.quorum2 = cg.cluster:build_server({alias = 'quorum2', box_cfg = box_cfg})
+    cg.quorum3 = cg.cluster:build_server({alias = 'quorum3', box_cfg = box_cfg})
 
     pcall(log.cfg, {level = 6})
 
 end)
 
 pg.after_each(function(cg)
-    cg.cluster.servers = nil
     cg.cluster:drop()
 end)
 
@@ -40,11 +37,11 @@ pg.before_test('test_replica_is_orphan_after_restart', function(cg)
     cg.cluster:add_server(cg.quorum2)
     cg.cluster:add_server(cg.quorum3)
     cg.cluster:start()
-    local bootstrap_function = function()
-        box.schema.space.create('test', {engine = os.getenv('TARANTOOL_ENGINE')})
+    local bootstrap_function = function(params)
+        box.schema.space.create('test', {engine = params.engine})
         box.space.test:create_index('primary')
     end
-   cg.cluster:exec_on_leader(bootstrap_function)
+   cg.cluster:get_leader():exec(bootstrap_function, {cg.params})
 
 end)
 
@@ -57,7 +54,7 @@ pg.test_replica_is_orphan_after_restart = function(cg)
     -- * reconfigure replication
     -- * reset box.cfg.replication_connect_quorum
     -- * wait until a quorum is formed asynchronously
-    asserts:wait_fullmesh({cg.quorum1, cg.quorum2, cg.quorum3})
+    cg.cluster:wait_for_fullmesh()
     cg.quorum1:stop()
     cg.quorum2:restart()
     t.assert_equals(cg.quorum2.net_box.state, 'active')
@@ -69,8 +66,9 @@ pg.test_replica_is_orphan_after_restart = function(cg)
     t.helpers.retrying({timeout = 30}, function()
         t.assert(cg.quorum2:eval('return box.space.test ~= nil'))
     end)
-    t.assert_error_msg_content_equals(
-        "Can't modify data because this instance is in read-only mode.",
+    local err_ro_msg = "Can't modify data on a read-only instance - "..
+                       "it is an orphan"
+    t.assert_error_msg_content_equals(err_ro_msg,
         function()
             cg.quorum2:eval('return box.space.test:replace{100}')
         end
@@ -87,8 +85,7 @@ pg.test_replica_is_orphan_after_restart = function(cg)
     end)
     t.assert(cg.quorum2:eval('return box.info.ro'))
     t.assert(cg.quorum2:eval('return box.space.test ~= nil'))
-    t.assert_error_msg_content_equals(
-        "Can't modify data because this instance is in read-only mode.",
+    t.assert_error_msg_content_equals(err_ro_msg,
         function()
             cg.quorum2:eval('return box.space.test:replace{100}')
         end
@@ -106,8 +103,7 @@ pg.test_replica_is_orphan_after_restart = function(cg)
     end)
     t.assert(cg.quorum2:eval('return box.info.ro'))
     t.assert(cg.quorum2:eval('return box.space.test ~= nil'))
-    t.assert_error_msg_content_equals(
-        "Can't modify data because this instance is in read-only mode.",
+    t.assert_error_msg_content_equals(err_ro_msg,
         function()
             cg.quorum2:eval('return box.space.test:replace{100}')
         end
@@ -116,5 +112,4 @@ pg.test_replica_is_orphan_after_restart = function(cg)
     cg.quorum2:eval('return box.ctl.wait_rw()')
     t.assert_not(cg.quorum2:eval('return box.info.ro'))
     t.assert_str_matches(cg.quorum2:eval('return box.info.status'), 'running')
-
 end

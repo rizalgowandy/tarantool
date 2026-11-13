@@ -60,8 +60,6 @@ static SQL_NOINLINE int
 walkExpr(Walker * pWalker, Expr * pExpr)
 {
 	int rc;
-	testcase(ExprHasProperty(pExpr, EP_TokenOnly));
-	testcase(ExprHasProperty(pExpr, EP_Reduced));
 	rc = pWalker->xExprCallback(pWalker, pExpr);
 	if (rc || ExprHasProperty(pExpr, (EP_TokenOnly | EP_Leaf))) {
 		return rc & WRC_Abort;
@@ -148,11 +146,6 @@ sqlWalkSelectFrom(Walker * pWalker, Select * p)
 	if (ALWAYS(pSrc)) {
 		for (i = pSrc->nSrc, pItem = pSrc->a; i > 0; i--, pItem++) {
 			if (sqlWalkSelect(pWalker, pItem->pSelect)) {
-				return WRC_Abort;
-			}
-			if (pItem->fg.isTabFunc
-			    && sqlWalkExprList(pWalker, pItem->u1.pFuncArg)
-			    ) {
 				return WRC_Abort;
 			}
 		}

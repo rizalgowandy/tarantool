@@ -295,25 +295,26 @@ space = box.schema.space.create('test', {engine = engine})
 ...
 pk = space:create_index('pk', {parts={{field1 = 1, type = 'unsigned'}}})
 ---
-- error: 'Illegal parameters, options.parts[1]: field (name or number) is expected'
+- error: 'options.parts[1]: field (name or number) is expected'
 ...
 pk = space:create_index('pk', {parts={{field = 0, type = 'unsigned'}}})
 ---
-- error: 'Illegal parameters, options.parts[1]: field (number) must be one-based'
+- error: 'options.parts[1]: field (number) must be one-based'
 ...
 pk = space:create_index('pk', {parts={{field = 1, type = 'const char *'}}})
 ---
-- error: 'Wrong index parts: unknown field type; expected field1 id (number), field1
-    type (string), ...'
+- error: 'Wrong index part 1: unknown field type'
 ...
 pk = space:create_index('pk', {parts={{field = 1, type = 'unsigned'}}})
 ---
 ...
 pk.parts
 ---
-- - type: unsigned
+- - fieldno: 1
+    sort_order: asc
+    type: unsigned
+    exclude_null: false
     is_nullable: false
-    fieldno: 1
 ...
 pk:drop()
 ---
@@ -323,9 +324,11 @@ pk = space:create_index('pk', {parts={{1, 'unsigned'}}})
 ...
 pk.parts
 ---
-- - type: unsigned
+- - fieldno: 1
+    sort_order: asc
+    type: unsigned
+    exclude_null: false
     is_nullable: false
-    fieldno: 1
 ...
 pk:drop()
 ---
@@ -335,9 +338,11 @@ pk = space:create_index('pk', {parts={{1, type='unsigned'}}})
 ...
 pk.parts
 ---
-- - type: unsigned
+- - fieldno: 1
+    sort_order: asc
+    type: unsigned
+    exclude_null: false
     is_nullable: false
-    fieldno: 1
 ...
 space:insert{1, 2, 3}
 ---
@@ -390,16 +395,13 @@ s:drop()
 -- gh-3414: do not increase schema_version on space:truncate()
 --
 -- update schema_version on space.create()
-sch_ver = box.internal.schema_version
----
-...
-v = sch_ver()
+v = box.info.schema_version
 ---
 ...
 s = box.schema.create_space('test')
 ---
 ...
-v + 1 == sch_ver()
+v + 1 == box.info.schema_version
 ---
 - true
 ...
@@ -407,7 +409,7 @@ v + 1 == sch_ver()
 prim = s:create_index("primary")
 ---
 ...
-v + 2 == sch_ver()
+v + 2 == box.info.schema_version
 ---
 - true
 ...
@@ -415,7 +417,7 @@ v + 2 == sch_ver()
 s:truncate()
 ---
 ...
-v + 2 == sch_ver()
+v + 2 == box.info.schema_version
 ---
 - true
 ...
@@ -423,7 +425,7 @@ v + 2 == sch_ver()
 prim:alter{name="new_primary"}
 ---
 ...
-v + 3 == sch_ver()
+v + 3 == box.info.schema_version
 ---
 - true
 ...
@@ -431,7 +433,7 @@ v + 3 == sch_ver()
 box.schema.index.drop(s.id, 0)
 ---
 ...
-v + 4 == sch_ver()
+v + 4 == box.info.schema_version
 ---
 - true
 ...
@@ -439,7 +441,7 @@ v + 4 == sch_ver()
 s:drop()
 ---
 ...
-v + 5 == sch_ver()
+v + 5 == box.info.schema_version
 ---
 - true
 ...
@@ -634,14 +636,14 @@ s:drop()
 --
 s = box.schema.space.create('test', { engine = engine, format = "format" })
 ---
-- error: Illegal parameters, options parameter 'format' should be of type table
+- error: options parameter 'format' should be of type table
 ...
 format = { { name = 100 } }
 ---
 ...
 s = box.schema.space.create('test', { engine = engine, format = format })
 ---
-- error: 'Illegal parameters, format[1]: name (string) is expected'
+- error: 'format[1]: name (string) is expected'
 ...
 long = string.rep('a', box.schema.NAME_MAX + 1)
 ---
@@ -651,21 +653,21 @@ format = { { name = long } }
 ...
 s = box.schema.space.create('test', { engine = engine, format = format })
 ---
-- error: 'Failed to create space ''test'': field 1 name is too long'
+- error: 'Wrong space format field 1: field name is too long'
 ...
 format = { { name = 'id', type = '100' } }
 ---
 ...
 s = box.schema.space.create('test', { engine = engine, format = format })
 ---
-- error: 'Failed to create space ''test'': field 1 has unknown field type'
+- error: 'Wrong space format field 1: unknown field type'
 ...
 format = { setmetatable({}, { __serialize = 'map' }) }
 ---
 ...
 s = box.schema.space.create('test', { engine = engine, format = format })
 ---
-- error: 'Illegal parameters, format[1]: name (string) is expected'
+- error: 'format[1]: name (string) is expected'
 ...
 -- Ensure the format is updated after index drop.
 format = { { name = 'id', type = 'unsigned' } }
@@ -729,9 +731,11 @@ s:format()
 ...
 s.index.sk3.parts
 ---
-- - type: string
+- - fieldno: 2
+    sort_order: asc
+    type: string
+    exclude_null: false
     is_nullable: false
-    fieldno: 2
 ...
 -- Space format can be updated, if conflicted index is deleted.
 sk3:drop()
@@ -944,21 +948,23 @@ s = box.schema.space.create('test', { engine = engine })
 ...
 s:create_index('test', {parts = {'test'}})
 ---
-- error: 'Illegal parameters, options.parts[1]: field was not found by name ''test'''
+- error: 'options.parts[1]: field was not found by name ''test'''
 ...
 s:create_index('test', {parts = {{'test'}}})
 ---
-- error: 'Illegal parameters, options.parts[1]: field was not found by name ''test'''
+- error: 'options.parts[1]: field was not found by name ''test'''
 ...
 s:create_index('test', {parts = {{field = 'test'}}})
 ---
-- error: 'Illegal parameters, options.parts[1]: field was not found by name ''test'''
+- error: 'options.parts[1]: field was not found by name ''test'''
 ...
 s:create_index('test', {parts = {1}}).parts
 ---
-- - type: scalar
+- - fieldno: 1
+    sort_order: asc
+    type: scalar
+    exclude_null: false
     is_nullable: false
-    fieldno: 1
 ...
 s:drop()
 ---
@@ -971,21 +977,23 @@ s:format{{'test1', 'integer'}, 'test2', {'test3', 'integer'}, {'test4','scalar'}
 ...
 s:create_index('test', {parts = {'test'}})
 ---
-- error: 'Illegal parameters, options.parts[1]: field was not found by name ''test'''
+- error: 'options.parts[1]: field was not found by name ''test'''
 ...
 s:create_index('test', {parts = {{'test'}}})
 ---
-- error: 'Illegal parameters, options.parts[1]: field was not found by name ''test'''
+- error: 'options.parts[1]: field was not found by name ''test'''
 ...
 s:create_index('test', {parts = {{field = 'test'}}})
 ---
-- error: 'Illegal parameters, options.parts[1]: field was not found by name ''test'''
+- error: 'options.parts[1]: field was not found by name ''test'''
 ...
 s:create_index('test1', {parts = {'test1'}}).parts
 ---
-- - type: integer
+- - fieldno: 1
+    sort_order: asc
+    type: integer
+    exclude_null: false
     is_nullable: false
-    fieldno: 1
 ...
 s:create_index('test2', {parts = {'test2'}}).parts
 ---
@@ -994,48 +1002,66 @@ s:create_index('test2', {parts = {'test2'}}).parts
 ...
 s:create_index('test3', {parts = {{'test1', 'integer'}}}).parts
 ---
-- - type: integer
+- - fieldno: 1
+    sort_order: asc
+    type: integer
+    exclude_null: false
     is_nullable: false
-    fieldno: 1
 ...
 s:create_index('test4', {parts = {{'test2', 'integer'}}}).parts
 ---
-- - type: integer
+- - fieldno: 2
+    sort_order: asc
+    type: integer
+    exclude_null: false
     is_nullable: false
-    fieldno: 2
 ...
 s:create_index('test5', {parts = {{'test2', 'integer'}}}).parts
 ---
-- - type: integer
+- - fieldno: 2
+    sort_order: asc
+    type: integer
+    exclude_null: false
     is_nullable: false
-    fieldno: 2
 ...
 s:create_index('test6', {parts = {1, 3}}).parts
 ---
-- - type: integer
+- - fieldno: 1
+    sort_order: asc
+    type: integer
+    exclude_null: false
     is_nullable: false
-    fieldno: 1
-  - type: integer
+  - fieldno: 3
+    sort_order: asc
+    type: integer
+    exclude_null: false
     is_nullable: false
-    fieldno: 3
 ...
 s:create_index('test7', {parts = {'test1', 4}}).parts
 ---
-- - type: integer
+- - fieldno: 1
+    sort_order: asc
+    type: integer
+    exclude_null: false
     is_nullable: false
-    fieldno: 1
-  - type: scalar
+  - fieldno: 4
+    sort_order: asc
+    type: scalar
+    exclude_null: false
     is_nullable: false
-    fieldno: 4
 ...
 s:create_index('test8', {parts = {{1, 'integer'}, {'test4', 'scalar'}}}).parts
 ---
-- - type: integer
+- - fieldno: 1
+    sort_order: asc
+    type: integer
+    exclude_null: false
     is_nullable: false
-    fieldno: 1
-  - type: scalar
+  - fieldno: 4
+    sort_order: asc
+    type: scalar
+    exclude_null: false
     is_nullable: false
-    fieldno: 4
 ...
 s:drop()
 ---
@@ -1568,7 +1594,7 @@ format[7] = {name = 'field7', type = 'unsigned'}
 -- Fail, the tuple {1, ... 1} is invalid for a new format.
 s:format(format)
 ---
-- error: Tuple field 7 required by space format is missing
+- error: Tuple field 7 (field7) required by space format is missing
 ...
 s:drop()
 ---
@@ -1671,9 +1697,11 @@ i = s:create_index('primary', { parts = {'field1'} })
 ...
 i.parts
 ---
-- - type: unsigned
+- - fieldno: 1
+    sort_order: asc
+    type: unsigned
+    exclude_null: false
     is_nullable: false
-    fieldno: 1
 ...
 -- Check that is_nullable can't be set to false on non-empty space
 s:insert({1, NULL})
@@ -1745,9 +1773,11 @@ i = s:create_index('secondary', { parts = {{2, 'string', is_nullable = true}} })
 ...
 i.parts
 ---
-- - type: string
+- - fieldno: 2
+    sort_order: asc
+    type: string
+    exclude_null: false
     is_nullable: true
-    fieldno: 2
 ...
 s:insert({1, NULL})
 ---

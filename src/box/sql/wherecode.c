@@ -131,15 +131,7 @@ explainIndexRange(StrAccum * pStr, WhereLoop * pLoop)
 		return;
 	sqlStrAccumAppend(pStr, " (", 2);
 	for (i = 0; i < nEq; i++) {
-		const char *z;
-		if (def != NULL) {
-			z = explainIndexColumnName(def, i);
-		} else {
-			struct space *space = space_cache_find(def->space_id);
-			assert(space != NULL);
-			uint32_t fieldno = def->key_def->parts[i].fieldno;
-			z = space->def->fields[fieldno].name;
-		}
+		const char *z = explainIndexColumnName(def, i);
 		if (i)
 			sqlStrAccumAppend(pStr, " AND ", 5);
 		sqlXPrintf(pStr, i >= nSkip ? "%s=?" : "ANY(%s)", z);
@@ -173,35 +165,41 @@ sqlWhereExplainOneScan(Parse * pParse,	/* Parse context */
 			   int iFrom,		/* Value for "from" column of output */
 			   u16 wctrlFlags)	/* Flags passed to sqlWhereBegin() */
 {
+	/* The controlling WhereLoop object. */
+	struct WhereLoop *pLoop = pLevel->pWLoop;
+	/* Flags that describe this loop. */
+	uint32_t flags = pLoop->wsFlags;
+	if ((flags & WHERE_MULTI_OR) || (wctrlFlags & WHERE_OR_SUBCLAUSE))
+		return 0;
+	/* True for a SEARCH. False for SCAN. */
+	bool is_search = (flags & (WHERE_BTM_LIMIT | WHERE_TOP_LIMIT)) != 0 ||
+			 (pLoop->nEq > 0) ||
+			 ((wctrlFlags &
+			   (WHERE_ORDERBY_MIN | WHERE_ORDERBY_MAX)) != 0);
+	struct SrcList_item *pItem = &pTabList->a[pLevel->iFrom];
+	assert(pItem->zName != NULL || pItem->pSelect != NULL);
+	if (pParse->explain == 0 && !is_search && pItem->fg.disallow_scan &&
+	    (pParse->sql_flags & SQL_SeqScan) == 0) {
+		const char *obj = pItem->zName == NULL ? "subselect" :
+				  tt_sprintf("'%s'", pItem->zName);
+		diag_set(ClientError, ER_SQL_SEQ_SCAN, obj);
+		pParse->is_aborted = true;
+		return 0;
+	}
+
 	int ret = 0;
 #if !defined(SQL_DEBUG)
 	if (pParse->explain == 2)
 #endif
 	{
-		struct SrcList_item *pItem = &pTabList->a[pLevel->iFrom];
 		Vdbe *v = pParse->pVdbe;	/* VM being constructed */
-		sql *db = pParse->db;	/* Database handle */
 		int iId = pParse->iSelectId;	/* Select id (left-most output column) */
-		int isSearch;	/* True for a SEARCH. False for SCAN. */
-		WhereLoop *pLoop;	/* The controlling WhereLoop object */
-		u32 flags;	/* Flags that describe this loop */
 		char *zMsg;	/* Text to add to EQP output */
 		StrAccum str;	/* EQP output string */
 		char zBuf[100];	/* Initial space for EQP output string */
 
-		pLoop = pLevel->pWLoop;
-		flags = pLoop->wsFlags;
-		if ((flags & WHERE_MULTI_OR)
-		    || (wctrlFlags & WHERE_OR_SUBCLAUSE))
-			return 0;
-
-		isSearch = (flags & (WHERE_BTM_LIMIT | WHERE_TOP_LIMIT)) != 0
-		    || (pLoop->nEq > 0)
-		    || (wctrlFlags & (WHERE_ORDERBY_MIN | WHERE_ORDERBY_MAX));
-
-		sqlStrAccumInit(&str, db, zBuf, sizeof(zBuf),
-				    SQL_MAX_LENGTH);
-		sqlStrAccumAppendAll(&str, isSearch ? "SEARCH" : "SCAN");
+		sqlStrAccumInit(&str, zBuf, sizeof(zBuf), SQL_MAX_LENGTH);
+		sqlStrAccumAppendAll(&str, is_search ? "SEARCH" : "SCAN");
 		if (pItem->pSelect) {
 			sqlXPrintf(&str, " SUBQUERY %d", pItem->iSelectId);
 		} else {
@@ -222,9 +220,8 @@ sqlWhereExplainOneScan(Parse * pParse,	/* Parse context */
 			if ((flags & WHERE_AUTO_INDEX) != 0) {
 				zFmt = "EPHEMERAL INDEX";
 			} else if (idx_def->iid == 0) {
-				if (isSearch) {
+				if (is_search)
 					zFmt = "PRIMARY KEY";
-				}
 			} else if (flags & WHERE_IDX_ONLY) {
 				zFmt = "COVERING INDEX %s";
 			} else {
@@ -381,8 +378,6 @@ codeEqualityTerm(Parse * pParse,	/* The parsing context */
 
 		if (pLoop->index_def != NULL &&
 		    pLoop->index_def->key_def->parts[iEq].sort_order) {
-			testcase(iEq == 0);
-			testcase(bRev);
 			bRev = !bRev;
 		}
 		assert(pX->op == TK_IN);
@@ -407,7 +402,7 @@ codeEqualityTerm(Parse * pParse,	/* The parsing context */
 					       &iSingleIdxCol);
 		} else {
 			Select *pSelect = pX->x.pSelect;
-			sql *db = pParse->db;
+			struct sql *db = sql_get();
 			u16 savedDbOptFlags = db->dbOptFlags;
 			ExprList *pOrigRhs = pSelect->pEList;
 			ExprList *pOrigLhs = pX->pLeft->x.pList;
@@ -418,79 +413,66 @@ codeEqualityTerm(Parse * pParse,	/* The parsing context */
 				if (pLoop->aLTerm[i]->pExpr == pX) {
 					int iField =
 					    pLoop->aLTerm[i]->iField - 1;
-					Expr *pNewRhs =
-					    sqlExprDup(db,
-							   pOrigRhs->a[iField].
-							   pExpr, 0);
-					Expr *pNewLhs =
-					    sqlExprDup(db,
-							   pOrigLhs->a[iField].
-							   pExpr, 0);
+					Expr *pNewRhs = sqlExprDup(
+						pOrigRhs->a[iField].pExpr, 0);
+					Expr *pNewLhs = sqlExprDup(
+						pOrigLhs->a[iField].pExpr, 0);
 
-					pRhs =
-					    sql_expr_list_append(pParse->db,
-								 pRhs, pNewRhs);
-					pLhs =
-					    sql_expr_list_append(pParse->db,
-								 pLhs, pNewLhs);
+					pRhs = sql_expr_list_append(pRhs,
+								    pNewRhs);
+					pLhs = sql_expr_list_append(pLhs,
+								    pNewLhs);
 				}
 			}
-			if (!db->mallocFailed) {
-				Expr *pLeft = pX->pLeft;
 
-				if (pSelect->pOrderBy) {
-					/* If the SELECT statement has an ORDER BY clause, zero the
-					 * iOrderByCol variables. These are set to non-zero when an
-					 * ORDER BY term exactly matches one of the terms of the
-					 * result-set. Since the result-set of the SELECT statement may
-					 * have been modified or reordered, these variables are no longer
-					 * set correctly.  Since setting them is just an optimization,
-					 * it's easiest just to zero them here.
-					 */
-					ExprList *pOrderBy = pSelect->pOrderBy;
-					for (i = 0; i < pOrderBy->nExpr; i++) {
-						pOrderBy->a[i].u.x.iOrderByCol =
-						    0;
-					}
-				}
-
-				/* Take care here not to generate a TK_VECTOR containing only a
-				 * single value. Since the parser never creates such a vector, some
-				 * of the subroutines do not handle this case.
+			struct Expr *pLeft = pX->pLeft;
+			if (pSelect->pOrderBy != NULL) {
+				/*
+				 * If the SELECT statement has an ORDER BY
+				 * clause, zero the iOrderByCol variables. These
+				 * are set to non-zero when an ORDER BY term
+				 * exactly matches one of the terms of the
+				 * result-set. Since the result-set of the
+				 * SELECT statement may have been modified or
+				 * reordered, these variables are no longer set
+				 * correctly. Since setting them is just an
+				 * optimization, it's easiest just to zero them
+				 * here.
 				 */
-				if (pLhs->nExpr == 1) {
-					pX->pLeft = pLhs->a[0].pExpr;
-				} else {
-					pLeft->x.pList = pLhs;
-					aiMap =
-					    (int *)sqlDbMallocZero(pParse->db,
-								       sizeof(int) * nEq);
-					testcase(aiMap == 0);
-				}
-				pSelect->pEList = pRhs;
-				db->dbOptFlags |= SQL_QueryFlattener;
-				eType =
-				    sqlFindInIndex(pParse, pX,
-						       IN_INDEX_LOOP, 0, aiMap,
-						       0);
-				db->dbOptFlags = savedDbOptFlags;
-				testcase(aiMap != 0 && aiMap[0] != 0);
-				pSelect->pEList = pOrigRhs;
-				pLeft->x.pList = pOrigLhs;
-				pX->pLeft = pLeft;
+				struct ExprList *pOrderBy = pSelect->pOrderBy;
+				for (i = 0; i < pOrderBy->nExpr; i++)
+					pOrderBy->a[i].u.x.iOrderByCol = 0;
 			}
-			sql_expr_list_delete(pParse->db, pLhs);
-			sql_expr_list_delete(pParse->db, pRhs);
+
+			/*
+			 * Take care here not to generate a TK_VECTOR containing
+			 * only a single value. Since the parser never creates
+			 * such a vector, some of the subroutines do not handle
+			 * this case.
+			 */
+			if (pLhs->nExpr == 1) {
+				pX->pLeft = pLhs->a[0].pExpr;
+			} else {
+				pLeft->x.pList = pLhs;
+				aiMap = sql_xmalloc0(sizeof(int) * nEq);
+			}
+			pSelect->pEList = pRhs;
+			db->dbOptFlags |= SQL_QueryFlattener;
+			eType = sqlFindInIndex(pParse, pX, IN_INDEX_LOOP, 0,
+					       aiMap, 0);
+			db->dbOptFlags = savedDbOptFlags;
+			pSelect->pEList = pOrigRhs;
+			pLeft->x.pList = pOrigLhs;
+			pX->pLeft = pLeft;
+			sql_expr_list_delete(pLhs);
+			sql_expr_list_delete(pRhs);
 		}
 
 		if (eType == IN_INDEX_INDEX_DESC) {
-			testcase(bRev);
 			bRev = !bRev;
 		}
 		iTab = pX->iTable;
 		sqlVdbeAddOp2(v, bRev ? OP_Last : OP_Rewind, iTab, 0);
-		VdbeCoverageIf(v, bRev);
-		VdbeCoverageIf(v, !bRev);
 		assert((pLoop->wsFlags & WHERE_MULTI_OR) == 0);
 
 		pLoop->wsFlags |= WHERE_IN_ABLE;
@@ -501,39 +483,33 @@ codeEqualityTerm(Parse * pParse,	/* The parsing context */
 		i = pLevel->u.in.nIn;
 		pLevel->u.in.nIn += nEq;
 		pLevel->u.in.aInLoop =
-		    sqlDbReallocOrFree(pParse->db, pLevel->u.in.aInLoop,
-					   sizeof(pLevel->u.in.aInLoop[0]) *
-					   pLevel->u.in.nIn);
+			sql_xrealloc(pLevel->u.in.aInLoop,
+				     sizeof(pLevel->u.in.aInLoop[0]) *
+				     pLevel->u.in.nIn);
 		pIn = pLevel->u.in.aInLoop;
-		if (pIn) {
-			int iMap = 0;	/* Index in aiMap[] */
-			pIn += i;
-			for (i = iEq; i < pLoop->nLTerm; i++) {
-				if (pLoop->aLTerm[i]->pExpr == pX) {
-					int iOut = iReg + i - iEq;
-					int iCol =
-						aiMap ? aiMap[iMap++] :
-						iSingleIdxCol;
-					pIn->addrInTop =
-						sqlVdbeAddOp3(v, OP_Column,
-								  iTab, iCol,
-								  iOut);
-					sqlVdbeAddOp1(v, OP_IsNull, iOut);
-					VdbeCoverage(v);
-					if (i == iEq) {
-						pIn->iCur = iTab;
-						pIn->eEndLoopOp =
-						    bRev ? OP_PrevIfOpen : OP_NextIfOpen;
-					} else {
-						pIn->eEndLoopOp = OP_Noop;
-					}
-					pIn++;
+		/* Index in aiMap[]. */
+		int iMap = 0;
+		pIn += i;
+		for (i = iEq; i < pLoop->nLTerm; i++) {
+			if (pLoop->aLTerm[i]->pExpr == pX) {
+				int iOut = iReg + i - iEq;
+				int iCol = aiMap ? aiMap[iMap++] :
+					   iSingleIdxCol;
+				pIn->addrInTop =
+					sqlVdbeAddOp3(v, OP_Column, iTab, iCol,
+						      iOut);
+				sqlVdbeAddOp1(v, OP_IsNull, iOut);
+				if (i == iEq) {
+					pIn->iCur = iTab;
+					pIn->eEndLoopOp = bRev ? OP_PrevIfOpen :
+							  OP_NextIfOpen;
+				} else {
+					pIn->eEndLoopOp = OP_Noop;
 				}
+				pIn++;
 			}
-		} else {
-			pLevel->u.in.nIn = 0;
 		}
-		sqlDbFree(pParse->db, aiMap);
+		sql_xfree(aiMap);
 	}
 	disableTerm(pLevel, pTerm);
 	return iReg;
@@ -571,7 +547,7 @@ codeEqualityTerm(Parse * pParse,	/* The parsing context */
  *
  * Before returning, @types is set to point to a buffer containing a
  * copy of the column types array of the index allocated using
- * sqlDbMalloc(). This array is passed to OP_ApplyType to provide
+ * sql_xmalloc(). This array is passed to OP_ApplyType to provide
  * correct implicit conversions.
  */
 static int
@@ -605,15 +581,11 @@ codeAllEqualityTerms(Parse * pParse,	/* Parsing context */
 	if (nSkip) {
 		int iIdxCur = pLevel->iIdxCur;
 		sqlVdbeAddOp1(v, (bRev ? OP_Last : OP_Rewind), iIdxCur);
-		VdbeCoverageIf(v, bRev == 0);
-		VdbeCoverageIf(v, bRev != 0);
 		VdbeComment((v, "begin skip-scan on %s", idx_def->name));
 		j = sqlVdbeAddOp0(v, OP_Goto);
 		pLevel->addrSkip =
 		    sqlVdbeAddOp4Int(v, (bRev ? OP_SeekLT : OP_SeekGT),
 					 iIdxCur, 0, regBase, nSkip);
-		VdbeCoverageIf(v, bRev == 0);
-		VdbeCoverageIf(v, bRev != 0);
 		sqlVdbeJumpHere(v, j);
 		for (j = 0; j < nSkip; j++) {
 			sqlVdbeAddOp3(v, OP_Column, iIdxCur,
@@ -632,8 +604,6 @@ codeAllEqualityTerms(Parse * pParse,	/* Parsing context */
 		/* The following testcase is true for indices with redundant columns.
 		 * Ex: CREATE INDEX i1 ON t1(a,b,a); SELECT * FROM t1 WHERE a=0 AND b=0;
 		 */
-		testcase((pTerm->wtFlags & TERM_CODED) != 0);
-		testcase(pTerm->wtFlags & TERM_VIRTUAL);
 		r1 = codeEqualityTerm(pParse, pTerm, pLevel, j, bRev,
 				      regBase + j);
 		if (r1 != regBase + j) {
@@ -649,7 +619,6 @@ codeAllEqualityTerms(Parse * pParse,	/* Parsing context */
 			if (sqlExprCanBeNull(pRight)) {
 				sqlVdbeAddOp2(v, OP_IsNull, regBase + j,
 						  pLevel->addrBrk);
-				VdbeCoverage(v);
 			}
 		}
 	}
@@ -708,7 +677,6 @@ sqlWhereCodeOneLoopStart(WhereInfo * pWInfo,	/* Complete information about the W
 	WhereClause *pWC;	/* Decomposition of the entire WHERE clause */
 	WhereTerm *pTerm;	/* A WHERE clause term */
 	Parse *pParse;		/* Parsing context */
-	sql *db;		/* Database connection */
 	Vdbe *v;		/* The prepared stmt under constructions */
 	struct SrcList_item *pTabItem;	/* FROM clause term being coded */
 	int addrBrk;		/* Jump here to break out of the loop */
@@ -717,7 +685,6 @@ sqlWhereCodeOneLoopStart(WhereInfo * pWInfo,	/* Complete information about the W
 	pParse = pWInfo->pParse;
 	v = pParse->pVdbe;
 	pWC = &pWInfo->sWC;
-	db = pParse->db;
 	pLevel = &pWInfo->a[iLevel];
 	pLoop = pLevel->pWLoop;
 	pTabItem = &pWInfo->pTabList->a[pLevel->iFrom];
@@ -728,8 +695,6 @@ sqlWhereCodeOneLoopStart(WhereInfo * pWInfo,	/* Complete information about the W
 	omitTable = (pLoop->wsFlags & WHERE_IDX_ONLY) != 0
 	    && ((pWInfo->wctrlFlags & WHERE_OR_SUBCLAUSE) == 0 ||
 		(pLoop->wsFlags & WHERE_AUTO_INDEX) != 0);
-	VdbeModuleComment((v, "Begin WHERE-loop%d: %s", iLevel,
-			   pTabItem->pTab->zName));
 
 	/* Create labels for the "break" and "continue" instructions
 	 * for the current loop.  Jump to addrBrk to break out of a loop.
@@ -760,7 +725,6 @@ sqlWhereCodeOneLoopStart(WhereInfo * pWInfo,	/* Complete information about the W
 		sqlVdbeAddOp3(v, OP_InitCoroutine, regYield, 0,
 				  pTabItem->addrFillSub);
 		pLevel->p2 = sqlVdbeAddOp2(v, OP_Yield, regYield, addrBrk);
-		VdbeCoverage(v);
 		VdbeComment((v, "next row of \"%s\"", pTabItem->space->def->name));
 		pLevel->op = OP_Goto;
 	} else if (pLoop->wsFlags & WHERE_INDEXED) {
@@ -910,10 +874,6 @@ sqlWhereCodeOneLoopStart(WhereInfo * pWInfo,	/* Complete information about the W
 		    codeAllEqualityTerms(pParse, pLevel, bRev, nExtraReg);
 		addrNxt = pLevel->addrNxt;
 
-		testcase(pRangeStart && (pRangeStart->eOperator & WO_LE) != 0);
-		testcase(pRangeStart && (pRangeStart->eOperator & WO_GE) != 0);
-		testcase(pRangeEnd && (pRangeEnd->eOperator & WO_LE) != 0);
-		testcase(pRangeEnd && (pRangeEnd->eOperator & WO_GE) != 0);
 		startEq = !pRangeStart
 		    || pRangeStart->eOperator & (WO_LE | WO_GE);
 		endEq = !pRangeEnd || pRangeEnd->eOperator & (WO_LE | WO_GE);
@@ -929,11 +889,9 @@ sqlWhereCodeOneLoopStart(WhereInfo * pWInfo,	/* Complete information about the W
 			    && sqlExprCanBeNull(pRight)) {
 				sqlVdbeAddOp2(v, OP_IsNull, regBase + nEq,
 						  addrNxt);
-				VdbeCoverage(v);
 			}
 
 			nConstraint += nBtm;
-			testcase(pRangeStart->wtFlags & TERM_VIRTUAL);
 			if (sqlExprIsVector(pRight) == 0) {
 				disableTerm(pLevel, pRangeStart);
 			} else {
@@ -957,19 +915,6 @@ sqlWhereCodeOneLoopStart(WhereInfo * pWInfo,	/* Complete information about the W
 			assert(op != 0);
 			sqlVdbeAddOp4Int(v, op, iIdxCur, addrNxt, regBase,
 					     nConstraint);
-			VdbeCoverage(v);
-			VdbeCoverageIf(v, op == OP_Rewind);
-			testcase(op == OP_Rewind);
-			VdbeCoverageIf(v, op == OP_Last);
-			testcase(op == OP_Last);
-			VdbeCoverageIf(v, op == OP_SeekGT);
-			testcase(op == OP_SeekGT);
-			VdbeCoverageIf(v, op == OP_SeekGE);
-			testcase(op == OP_SeekGE);
-			VdbeCoverageIf(v, op == OP_SeekLE);
-			testcase(op == OP_SeekLE);
-			VdbeCoverageIf(v, op == OP_SeekLT);
-			testcase(op == OP_SeekLT);
 		}
 
 		/* Load the value for the inequality constraint at the end of the
@@ -984,10 +929,8 @@ sqlWhereCodeOneLoopStart(WhereInfo * pWInfo,	/* Complete information about the W
 			    && sqlExprCanBeNull(pRight)) {
 				sqlVdbeAddOp2(v, OP_IsNull, regBase + nEq,
 						  addrNxt);
-				VdbeCoverage(v);
 			}
 			nConstraint += nTop;
-			testcase(pRangeEnd->wtFlags & TERM_VIRTUAL);
 
 			if (sqlExprIsVector(pRight) == 0) {
 				disableTerm(pLevel, pRangeEnd);
@@ -1008,14 +951,6 @@ sqlWhereCodeOneLoopStart(WhereInfo * pWInfo,	/* Complete information about the W
 			op = aEndOp[bRev * 2 + endEq];
 			sqlVdbeAddOp4Int(v, op, iIdxCur, addrNxt, regBase,
 					     nConstraint);
-			testcase(op == OP_IdxGT);
-			VdbeCoverageIf(v, op == OP_IdxGT);
-			testcase(op == OP_IdxGE);
-			VdbeCoverageIf(v, op == OP_IdxGE);
-			testcase(op == OP_IdxLT);
-			VdbeCoverageIf(v, op == OP_IdxLT);
-			testcase(op == OP_IdxLE);
-			VdbeCoverageIf(v, op == OP_IdxLE);
 		}
 
 		/* Seek the table cursor, if required */
@@ -1032,7 +967,6 @@ sqlWhereCodeOneLoopStart(WhereInfo * pWInfo,	/* Complete information about the W
 			}
 			sqlVdbeAddOp4Int(v, OP_NotFound, iCur, addrCont,
 					     iKeyReg, pk_part_count);
-			VdbeCoverage(v);
 			sqlReleaseTempRange(pParse, iKeyReg, pk_part_count);
 		}
 
@@ -1103,10 +1037,8 @@ sqlWhereCodeOneLoopStart(WhereInfo * pWInfo,	/* Complete information about the W
 			int nNotReady;	/* The number of notReady tables */
 			struct SrcList_item *origSrc;	/* Original list of tables */
 			nNotReady = pWInfo->nLevel - iLevel - 1;
-			pOrTab = sqlStackAllocRaw(db,
-						      sizeof(*pOrTab) +
-						      nNotReady *
-						      sizeof(pOrTab->a[0]));
+			pOrTab = sqlStackAllocRaw(sizeof(*pOrTab) + nNotReady *
+							 sizeof(pOrTab->a[0]));
 			if (pOrTab == 0)
 				return notReady;
 			pOrTab->nAlloc = (u8) (nNotReady + 1);
@@ -1138,10 +1070,6 @@ sqlWhereCodeOneLoopStart(WhereInfo * pWInfo,	/* Complete information about the W
 			struct sql_space_info *info =
 				sql_space_info_new_from_index_def(index_def,
 								  false);
-			if (info == NULL) {
-				pParse->is_aborted = true;
-				return notReady;
-			}
 			sqlVdbeAddOp4(v, OP_OpenTEphemeral, reg_row_set,
 				      pk_part_count, 0, (char *)info,
 				      P4_DYNAMIC);
@@ -1172,20 +1100,14 @@ sqlWhereCodeOneLoopStart(WhereInfo * pWInfo,	/* Complete information about the W
 					continue;
 				if (ExprHasProperty(pExpr, EP_FromJoin))
 					continue;
-				testcase(pWC->a[iTerm].wtFlags & TERM_VIRTUAL);
-				testcase(pWC->a[iTerm].wtFlags & TERM_CODED);
 				if ((pWC->a[iTerm].
 				     wtFlags & (TERM_VIRTUAL | TERM_CODED)) !=
 				    0)
 					continue;
 				if ((pWC->a[iTerm].eOperator & WO_ALL) == 0)
 					continue;
-				testcase(pWC->a[iTerm].wtFlags & TERM_ORINFO);
-				pExpr = sqlExprDup(db, pExpr, 0);
-				pAndExpr = sql_and_expr_new(db, pAndExpr,
-							    pExpr);
-				if (pAndExpr == NULL)
-					pParse->is_aborted = true;
+				pExpr = sqlExprDup(pExpr, 0);
+				pAndExpr = sql_and_expr_new(pAndExpr, pExpr);
 			}
 			if (pAndExpr) {
 				pAndExpr =
@@ -1221,8 +1143,7 @@ sqlWhereCodeOneLoopStart(WhereInfo * pWInfo,	/* Complete information about the W
 				    sqlWhereBegin(pParse, pOrTab, pOrExpr,
 						      0, 0, wctrlFlags,
 						      iCovCur);
-				assert(pSubWInfo || pParse->is_aborted
-				       || db->mallocFailed);
+				assert(pSubWInfo || pParse->is_aborted);
 				if (pSubWInfo) {
 					WhereLoop *pSubLoop;
 				    	sqlWhereExplainOneScan(pParse,
@@ -1278,7 +1199,6 @@ sqlWhereCodeOneLoopStart(WhereInfo * pWInfo,	/* Complete information about the W
 								 cur_row_set, 0,
 								 r,
 								 pk_part_count);
-							VdbeCoverage(v);
 						}
 						if (iSet >= 0) {
 							sqlVdbeAddOp3
@@ -1346,14 +1266,14 @@ sqlWhereCodeOneLoopStart(WhereInfo * pWInfo,	/* Complete information about the W
 			pLevel->iIdxCur = iCovCur;
 		if (pAndExpr) {
 			pAndExpr->pLeft = 0;
-			sql_expr_delete(db, pAndExpr, false);
+			sql_expr_delete(pAndExpr);
 		}
 		sqlVdbeChangeP1(v, iRetInit, sqlVdbeCurrentAddr(v));
 		sqlVdbeGoto(v, pLevel->addrBrk);
 		sqlVdbeResolveLabel(v, iLoopBody);
 
 		if (pWInfo->nLevel > 1)
-			sqlStackFree(db, pOrTab);
+			sqlStackFree(pOrTab);
 		if (!untestedTerms)
 			disableTerm(pLevel, pTerm);
 	} else
@@ -1376,8 +1296,6 @@ sqlWhereCodeOneLoopStart(WhereInfo * pWInfo,	/* Complete information about the W
 			pLevel->p2 =
 			    1 + sqlVdbeAddOp2(v, aStart[bRev], iCur,
 						  addrBrk);
-			VdbeCoverageIf(v, bRev == 0);
-			VdbeCoverageIf(v, bRev != 0);
 			pLevel->p5 = SQL_STMTSTATUS_FULLSCAN_STEP;
 		}
 	}
@@ -1388,14 +1306,9 @@ sqlWhereCodeOneLoopStart(WhereInfo * pWInfo,	/* Complete information about the W
 	for (pTerm = pWC->a, j = pWC->nTerm; j > 0; j--, pTerm++) {
 		Expr *pE;
 		int skipLikeAddr = 0;
-		testcase(pTerm->wtFlags & TERM_VIRTUAL);
-		testcase(pTerm->wtFlags & TERM_CODED);
 		if (pTerm->wtFlags & (TERM_VIRTUAL | TERM_CODED))
 			continue;
 		if ((pTerm->prereqAll & pLevel->notReady) != 0) {
-			testcase(pWInfo->untestedTerms == 0
-				 && (pWInfo->wctrlFlags & WHERE_OR_SUBCLAUSE) !=
-				 0);
 			pWInfo->untestedTerms = 1;
 			continue;
 		}
@@ -1450,9 +1363,6 @@ sqlWhereCodeOneLoopStart(WhereInfo * pWInfo,	/* Complete information about the W
 			continue;
 		if (pAlt->wtFlags & (TERM_CODED))
 			continue;
-		testcase(pAlt->eOperator & WO_EQ);
-		testcase(pAlt->eOperator & WO_IN);
-		VdbeModuleComment((v, "begin transitive constraint"));
 		sEAlt = *pAlt->pExpr;
 		sEAlt.pLeft = pE->pLeft;
 		sqlExprIfFalse(pParse, &sEAlt, addrCont, SQL_JUMPIFNULL);
@@ -1467,8 +1377,6 @@ sqlWhereCodeOneLoopStart(WhereInfo * pWInfo,	/* Complete information about the W
 		VdbeComment((v, "record LEFT JOIN hit"));
 		sqlExprCacheClear(pParse);
 		for (pTerm = pWC->a, j = 0; j < pWC->nTerm; j++, pTerm++) {
-			testcase(pTerm->wtFlags & TERM_VIRTUAL);
-			testcase(pTerm->wtFlags & TERM_CODED);
 			if (pTerm->wtFlags & (TERM_VIRTUAL | TERM_CODED))
 				continue;
 			if ((pTerm->prereqAll & pLevel->notReady) != 0) {

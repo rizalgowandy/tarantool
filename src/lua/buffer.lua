@@ -1,6 +1,8 @@
 -- buffer.lua (internal file)
 
 local ffi = require('ffi')
+local asan = require('internal.asan')
+
 local READAHEAD = 16320
 
 ffi.cdef[[
@@ -81,10 +83,19 @@ local function ibuf_recycle(buf)
     builtin.ibuf_reinit(buf)
 end
 
+local function ibuf_poison_unallocated(buf)
+    asan.poison_memory_region(buf.wpos, buf.epos - buf.wpos);
+end
+
+local function ibuf_unpoison_unallocated(buf)
+    asan.unpoison_memory_region(buf.wpos, buf.epos - buf.wpos);
+end
+
 local function ibuf_reset(buf)
     checkibuf(buf, 'reset')
     buf.rpos = buf.buf
     buf.wpos = buf.buf
+    ibuf_poison_unallocated(buf)
 end
 
 local function ibuf_reserve_slow(buf, size)
@@ -98,6 +109,7 @@ end
 local function ibuf_reserve(buf, size)
     checkibuf(buf, 'reserve')
     if buf.wpos + size <= buf.epos then
+        ibuf_unpoison_unallocated(buf)
         return buf.wpos
     end
     return ibuf_reserve_slow(buf, size)
@@ -107,11 +119,18 @@ local function ibuf_alloc(buf, size)
     checkibuf(buf, 'alloc')
     local wpos
     if buf.wpos + size <= buf.epos then
+        --
+        -- In case of using same buffer we need to unpoison newly
+        -- allocated memory after previous ibuf_alloc or poison after
+        -- newly allocated memory after previous ibuf_reserve.
+        --
+        ibuf_unpoison_unallocated(buf)
         wpos = buf.wpos
     else
         wpos = ibuf_reserve_slow(buf, size)
     end
     buf.wpos = buf.wpos + size
+    ibuf_poison_unallocated(buf)
     return wpos
 end
 
@@ -136,6 +155,13 @@ local function ibuf_read(buf, size)
     return rpos
 end
 
+local function ibuf_consume(buf, size)
+    checkibuf(buf, 'consume')
+    checksize(buf, size)
+    asan.poison_memory_region(buf.rpos, size);
+    buf.rpos = buf.rpos + size
+end
+
 local function ibuf_serialize(buf)
     local properties = { rpos = buf.rpos, wpos = buf.wpos }
     return { ibuf = properties }
@@ -150,6 +176,7 @@ local ibuf_methods = {
 
     checksize = ibuf_checksize;
     read = ibuf_read;
+    consume = ibuf_consume;
     __serialize = ibuf_serialize;
 
     size = ibuf_used;

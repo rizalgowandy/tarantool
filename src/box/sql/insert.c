@@ -37,22 +37,18 @@
 #include "tarantoolInt.h"
 #include "mem.h"
 #include "vdbeInt.h"
-#include "box/ck_constraint.h"
 #include "bit/bit.h"
 #include "box/box.h"
 #include "box/schema.h"
+#include "box/tuple_format.h"
 
 void
 sql_emit_table_types(struct Vdbe *v, struct space_def *def, int reg)
 {
 	assert(reg > 0);
-	struct sql *db = sqlVdbeDb(v);
 	uint32_t field_count = def->field_count;
 	size_t sz = (field_count + 1) * sizeof(enum field_type);
-	enum field_type *colls_type =
-		(enum field_type *) sqlDbMallocZero(db, sz);
-	if (colls_type == NULL)
-		return;
+	enum field_type *colls_type = sql_xmalloc0(sz);
 	for (uint32_t i = 0; i < field_count; ++i)
 		colls_type[i] = def->fields[i].type;
 	colls_type[field_count] = field_type_MAX;
@@ -65,8 +61,6 @@ sql_space_info_new_from_id_list(const struct space_def *def, int len,
 				const struct IdList *list)
 {
 	struct sql_space_info *info = sql_space_info_new(len + 1, 1);
-	if (info == NULL)
-		return NULL;
 	assert(len > 0 && len <= (int)def->field_count);
 	struct field_def *fields = def->fields;
 	for (int i = 0; i < len; ++i) {
@@ -101,14 +95,14 @@ sql_space_autoinc_fieldno(struct space *space)
  * SELECT. Otherwise, it may fall into infinite loop.
  *
  * @param parser Parse context.
- * @param space_def Space definition.
+ * @param space_id Space ID.
  * @retval  true if the space (given by space_id) in database or
  *          any of its indices have been opened at any point in
  *          the VDBE program.
  * @retval  false else.
  */
 static bool
-vdbe_has_space_read(struct Parse *parser, const struct space_def *space_def)
+vdbe_has_space_open(struct Parse *parser, uint32_t space_id)
 {
 	struct Vdbe *v = sqlGetVdbe(parser);
 	int last_instr = sqlVdbeCurrentAddr(v);
@@ -119,13 +113,8 @@ vdbe_has_space_read(struct Parse *parser, const struct space_def *space_def)
 		 * Currently, there is no difference between Read
 		 * and Write cursors.
 		 */
-		if (op->opcode == OP_IteratorOpen) {
-			struct space *space = NULL;
-			if (op->p4type == P4_SPACEPTR)
-				space = op->p4.space;
-			else
-				continue;
-			if (space->def->id == space_def->id)
+		if (op->opcode == OP_OpenSpace) {
+			if (op->p2 == (int)space_id)
 				return true;
 		}
 	}
@@ -243,7 +232,6 @@ sqlInsert(Parse * pParse,	/* Parser context */
 	      IdList * pColumn,	/* Column names corresponding to IDLIST. */
 	      enum on_conflict_action on_error)
 {
-	sql *db;		/* The main database structure */
 	char *zTab;		/* Name of the table into which we are inserting */
 	int i, j;		/* Loop counters */
 	Vdbe *v;		/* Generate code into this virtual machine */
@@ -267,11 +255,9 @@ sqlInsert(Parse * pParse,	/* Parser context */
 	struct sql_trigger *trigger;
 	int tmask;		/* Mask of trigger times */
 
-	db = pParse->db;
 	memset(&dest, 0, sizeof(dest));
-	if (pParse->is_aborted || db->mallocFailed) {
+	if (pParse->is_aborted)
 		goto insert_cleanup;
-	}
 
 	/* If the Select object is really just a simple VALUES() list with a
 	 * single row (the common case) then keep that one row of values
@@ -281,7 +267,7 @@ sqlInsert(Parse * pParse,	/* Parser context */
 	    && pSelect->pPrior == 0) {
 		pList = pSelect->pEList;
 		pSelect->pEList = 0;
-		sql_select_delete(db, pSelect);
+		sql_select_delete(pSelect);
 		pSelect = 0;
 	}
 
@@ -323,10 +309,7 @@ sqlInsert(Parse * pParse,	/* Parser context */
 
 	/* Allocate a VDBE. */
 	v = sqlGetVdbe(pParse);
-	if (v == NULL)
-		goto insert_cleanup;
 	sqlVdbeCountChanges(v);
-	sql_set_multi_write(pParse, pSelect != NULL || trigger != NULL);
 
 	/* If the statement is of the form
 	 *
@@ -370,16 +353,8 @@ sqlInsert(Parse * pParse,	/* Parser context */
 			pColumn->a[i].idx = -1;
 		}
 		for (i = 0; i < pColumn->nId; i++) {
-			for (j = 0; j < (int) space_def->field_count; j++) {
-				if (strcmp(pColumn->a[i].zName,
-					   space_def->fields[j].name) == 0) {
-					pColumn->a[i].idx = j;
-					if (i != j)
-						bIdListInOrder = 0;
-					break;
-				}
-			}
-			if (j >= (int) space_def->field_count) {
+			uint32_t id = sql_fieldno_by_id(space, &pColumn->a[i]);
+			if (id == UINT32_MAX) {
 				diag_set(ClientError,
 					 ER_NO_SUCH_FIELD_NAME_IN_SPACE,
 					 pColumn->a[i].zName,
@@ -387,7 +362,10 @@ sqlInsert(Parse * pParse,	/* Parser context */
 				pParse->is_aborted = true;
 				goto insert_cleanup;
 			}
-			if (bit_test(used_columns, j)) {
+			pColumn->a[i].idx = id;
+			if ((uint32_t)i != id)
+				bIdListInOrder = 0;
+			if (bit_test(used_columns, id)) {
 				const char *err = "table id list: duplicate "\
 						  "column name %s";
 				diag_set(ClientError, ER_SQL_PARSER_GENERIC,
@@ -395,9 +373,12 @@ sqlInsert(Parse * pParse,	/* Parser context */
 				pParse->is_aborted = true;
 				goto insert_cleanup;
 			}
-			bit_set(used_columns, j);
+			bit_set(used_columns, id);
 		}
 	}
+
+	int reg = ++pParse->nMem;
+	sqlVdbeAddOp2(v, OP_OpenSpace, reg, space->def->id);
 
 	int reg_eph;
 	/* Figure out how many columns of data are supplied.  If the data
@@ -421,83 +402,12 @@ sqlInsert(Parse * pParse,	/* Parser context */
 		dest.nSdst = space_def->field_count;
 		rc = sqlSelect(pParse, pSelect, &dest);
 		regFromSelect = dest.iSdst;
-		if (rc || db->mallocFailed || pParse->is_aborted)
+		if (rc != 0 || pParse->is_aborted)
 			goto insert_cleanup;
 		sqlVdbeEndCoroutine(v, regYield);
 		sqlVdbeJumpHere(v, addrTop - 1);	/* label B: */
 		assert(pSelect->pEList);
 		nColumn = pSelect->pEList->nExpr;
-
-		/*
-		 * Set useTempTable to TRUE if the result of the
-		 * SELECT statement should be written into a
-		 * temporary table (template 4). Set to FALSE if
-		 * each output row of the SELECT can be written
-		 * directly into the destination table
-		 * (template 3).
-		 *
-		 * A temp table must be used if the table being
-		 * updated is also one of the tables being read by
-		 * the SELECT statement. Also use a temp table in
-		 * the case of row triggers.
-		 */
-		if (trigger != NULL || vdbe_has_space_read(pParse, space_def))
-			useTempTable = 1;
-
-		if (useTempTable) {
-			/* Invoke the coroutine to extract information from the SELECT
-			 * and add it to a transient table srcTab.  The code generated
-			 * here is from the 4th template:
-			 *
-			 *      B: open temp table
-			 *      L: yield X, goto M at EOF
-			 *         insert row from R..R+n into temp table
-			 *         goto L
-			 *      M: ...
-			 */
-			int regRec;	/* Register to hold packed record */
-			int regCopy;    /* Register to keep copy of registers from select */
-			int addrL;	/* Label "L" */
-
-			srcTab = pParse->nTab++;
-			reg_eph = ++pParse->nMem;
-			regRec = sqlGetTempReg(pParse);
-			regCopy = sqlGetTempRange(pParse, nColumn + 1);
-			/*
-			 * Order of inserted values is important since it is
-			 * possible, that NULL will be inserted in field with
-			 * AUTOINCREMENT. So, the first part of key should be
-			 * rowid. Since each rowid is unique, we do not need any
-			 * other parts.
-			 */
-			struct sql_space_info *info =
-				sql_space_info_new_from_id_list(space_def,
-								nColumn,
-								pColumn);
-			if (info == NULL) {
-				pParse->is_aborted = true;
-				goto insert_cleanup;
-			}
-			sqlVdbeAddOp4(v, OP_OpenTEphemeral, reg_eph, 0, 0,
-				      (char *)info, P4_DYNAMIC);
-			addrL = sqlVdbeAddOp1(v, OP_Yield, dest.iSDParm);
-			VdbeCoverage(v);
-			sqlVdbeAddOp2(v, OP_NextIdEphemeral, reg_eph,
-					  regCopy + nColumn);
-			sqlVdbeAddOp3(v, OP_Copy, regFromSelect, regCopy, nColumn-1);
-			sqlVdbeAddOp4(v, OP_ApplyType, regCopy, nColumn + 1, 0,
-				      (char *)info->types, P4_STATIC);
-			sqlVdbeAddOp3(v, OP_MakeRecord, regCopy,
-					  nColumn + 1, regRec);
-			/* Set flag to save memory allocating one by malloc. */
-			sqlVdbeChangeP5(v, 1);
-			sqlVdbeAddOp2(v, OP_IdxInsert, regRec, reg_eph);
-
-			sqlVdbeGoto(v, addrL);
-			sqlVdbeJumpHere(v, addrL);
-			sqlReleaseTempReg(pParse, regRec);
-			sqlReleaseTempRange(pParse, regCopy, nColumn);
-		}
 	} else {
 		/* This is the case if the data for the INSERT is coming from a
 		 * single-row VALUES clause
@@ -506,7 +416,6 @@ sqlInsert(Parse * pParse,	/* Parser context */
 		memset(&sNC, 0, sizeof(sNC));
 		sNC.pParse = pParse;
 		srcTab = -1;
-		reg_eph = -1;
 		assert(useTempTable == 0);
 		if (pList) {
 			nColumn = pList->nExpr;
@@ -536,6 +445,74 @@ sqlInsert(Parse * pParse,	/* Parser context */
 		goto insert_cleanup;
 	}
 
+	/* Invoke the coroutine to extract information from the SELECT
+	 * and add it to a transient table srcTab. The code generated
+	 * here is from the 4th template:
+	 *
+	 *      B: open temp table
+	 *      L: yield X, goto M at EOF
+	 *         insert row from R..R+n into temp table
+	 *         goto L
+	 *      M: ...
+	 */
+	if (pSelect && (trigger != NULL ||
+			vdbe_has_space_open(pParse, space_def->id))) {
+		/*
+		 * Set useTempTable to TRUE if the result of the
+		 * SELECT statement should be written into a
+		 * temporary table (template 4). Set to FALSE if
+		 * each output row of the SELECT can be written
+		 * directly into the destination table
+		 * (template 3).
+		 *
+		 * A temp table must be used if the table being
+		 * updated is also one of the tables being read by
+		 * the SELECT statement. Also use a temp table in
+		 * the case of row triggers.
+		 */
+		useTempTable = 1;
+
+		/* Register to hold packed record */
+		int regRec;
+		/* Register to keep copy of registers from select */
+		int regCopy;
+		/* Label "L" */
+		int addrL;
+
+		srcTab = pParse->nTab++;
+		reg_eph = ++pParse->nMem;
+		regRec = sqlGetTempReg(pParse);
+		regCopy = sqlGetTempRange(pParse, nColumn + 1);
+		/*
+		 * Order of inserted values is important since it is
+		 * possible, that NULL will be inserted in field with
+		 * AUTOINCREMENT. So, the first part of key should be
+		 * rowid. Since each rowid is unique, we do not need any
+		 * other parts.
+		 */
+		struct sql_space_info *info =
+			sql_space_info_new_from_id_list(space_def, nColumn,
+							pColumn);
+		sqlVdbeAddOp4(v, OP_OpenTEphemeral, reg_eph, 0, 0,
+			      (char *)info, P4_DYNAMIC);
+		sqlVdbeAddOp3(v, OP_IteratorOpen, srcTab, 0, reg_eph);
+		addrL = sqlVdbeAddOp1(v, OP_Yield, dest.iSDParm);
+		sqlVdbeAddOp2(v, OP_NextIdEphemeral, reg_eph,
+			      regCopy + nColumn);
+		sqlVdbeAddOp3(v, OP_Copy, regFromSelect, regCopy, nColumn - 1);
+		sqlVdbeAddOp4(v, OP_ApplyType, regCopy, nColumn + 1, 0,
+			      (char *)info->types, P4_STATIC);
+		sqlVdbeAddOp3(v, OP_MakeRecord, regCopy, nColumn + 1, regRec);
+		/* Set flag to save memory allocating one by malloc. */
+		sqlVdbeChangeP5(v, 1);
+		sqlVdbeAddOp2(v, OP_IdxInsert, regRec, reg_eph);
+
+		sqlVdbeGoto(v, addrL);
+		sqlVdbeJumpHere(v, addrL);
+		sqlReleaseTempReg(pParse, regRec);
+		sqlReleaseTempRange(pParse, regCopy, nColumn);
+	}
+
 	/* This is the top of the main insertion loop */
 	if (useTempTable) {
 		/* This block codes the top of loop only.  The complete loop is the
@@ -547,9 +524,7 @@ sqlInsert(Parse * pParse,	/* Parser context */
 		 *         end loop
 		 *      D: ...
 		 */
-		sqlVdbeAddOp3(v, OP_IteratorOpen, srcTab, 0, reg_eph);
 		addrInsTop = sqlVdbeAddOp1(v, OP_Rewind, srcTab);
-		VdbeCoverage(v);
 		addrCont = sqlVdbeCurrentAddr(v);
 	} else if (pSelect) {
 		/* This block codes the top of loop only.  The complete loop is the
@@ -562,7 +537,6 @@ sqlInsert(Parse * pParse,	/* Parser context */
 		 */
 		addrInsTop = addrCont =
 		    sqlVdbeAddOp1(v, OP_Yield, dest.iSDParm);
-		VdbeCoverage(v);
 	}
 	assert(space != NULL);
 	uint32_t autoinc_fieldno = sql_space_autoinc_fieldno(space);
@@ -584,17 +558,11 @@ sqlInsert(Parse * pParse,	/* Parser context */
 			}
 			if ((!useTempTable && !pList)
 			    || (pColumn && j >= pColumn->nId)) {
-				if (i == (int) autoinc_fieldno) {
-					sqlVdbeAddOp2(v, OP_Integer, -1,
-							  regCols + i + 1);
-				} else {
-					struct Expr *dflt = NULL;
-					dflt = space_def->fields[i].
-						default_value_expr;
-					sqlExprCode(pParse,
-							dflt,
-							regCols + i + 1);
-				}
+				int reg = regCols + i + 1;
+				if (i == (int)autoinc_fieldno)
+					sqlVdbeAddOp2(v, OP_Integer, -1, reg);
+				else
+					sqlVdbeAddOp2(v, OP_Null, 0, reg);
 			} else if (useTempTable) {
 				sqlVdbeAddOp3(v, OP_Column, srcTab, j,
 						  regCols + i + 1);
@@ -646,15 +614,7 @@ sqlInsert(Parse * pParse,	/* Parser context */
 			}
 			if (j < 0 || nColumn == 0
 			    || (pColumn && j >= pColumn->nId)) {
-				if (i == (int) autoinc_fieldno) {
-					sqlVdbeAddOp2(v, OP_Null, 0, iRegStore);
-					continue;
-				}
-				struct Expr *dflt = NULL;
-				dflt = space_def->fields[i].default_value_expr;
-				sqlExprCodeFactorable(pParse,
-							  dflt,
-							  iRegStore);
+				sqlVdbeAddOp2(v, OP_Null, 0, iRegStore);
 			} else if (useTempTable) {
 				if (i == (int) autoinc_fieldno) {
 					int regTmp = ++pParse->nMem;
@@ -757,8 +717,7 @@ sqlInsert(Parse * pParse,	/* Parser context */
 		 */
 		vdbe_emit_constraint_checks(pParse, space, regIns + 1,
 					    on_error, endOfLoop, 0);
-		fk_constraint_emit_check(pParse, space, 0, regIns, 0);
-		vdbe_emit_insertion_completion(v, space, regIns + 1,
+		vdbe_emit_insertion_completion(v, reg, regIns + 1,
 					       space->def->field_count,
 					       on_error, autoinc_reg);
 	}
@@ -777,7 +736,6 @@ sqlInsert(Parse * pParse,	/* Parser context */
 	sqlVdbeResolveLabel(v, endOfLoop);
 	if (useTempTable) {
 		sqlVdbeAddOp2(v, OP_Next, srcTab, addrCont);
-		VdbeCoverage(v);
 		sqlVdbeJumpHere(v, addrInsTop);
 		sqlVdbeAddOp1(v, OP_Close, srcTab);
 	} else if (pSelect) {
@@ -786,32 +744,11 @@ sqlInsert(Parse * pParse,	/* Parser context */
 	}
 
  insert_cleanup:
-	sqlSrcListDelete(db, pTabList);
-	sql_expr_list_delete(db, pList);
-	sql_select_delete(db, pSelect);
-	sqlIdListDelete(db, pColumn);
-	sqlDbFree(db, aRegIdx);
-}
-
-void
-vdbe_emit_ck_constraint(struct Parse *parser, struct Expr *expr,
-			const char *name, const char *expr_str,
-			int vdbe_field_ref_reg)
-{
-	parser->vdbe_field_ref_reg = vdbe_field_ref_reg;
-	struct Vdbe *v = sqlGetVdbe(parser);
-	const char *ck_constraint_name = sqlDbStrDup(parser->db, name);
-	VdbeNoopComment((v, "BEGIN: ck constraint %s test",
-			ck_constraint_name));
-	int check_is_passed = sqlVdbeMakeLabel(v);
-	sqlExprIfTrue(parser, expr, check_is_passed, SQL_JUMPIFNULL);
-	const char *fmt = tnt_errcode_desc(ER_CK_CONSTRAINT_FAILED);
-	const char *error_msg = tt_sprintf(fmt, ck_constraint_name, expr_str);
-	sqlVdbeAddOp4(v, OP_SetDiag, ER_CK_CONSTRAINT_FAILED, 0, 0,
-		      sqlDbStrDup(parser->db, error_msg), P4_DYNAMIC);
-	sqlVdbeAddOp2(v, OP_Halt, -1, ON_CONFLICT_ACTION_ABORT);
-	VdbeNoopComment((v, "END: ck constraint %s test", ck_constraint_name));
-	sqlVdbeResolveLabel(v, check_is_passed);
+	sqlSrcListDelete(pTabList);
+	sql_expr_list_delete(pList);
+	sql_select_delete(pSelect);
+	sqlIdListDelete(pColumn);
+	sql_xfree(aRegIdx);
 }
 
 void
@@ -844,24 +781,23 @@ vdbe_emit_constraint_checks(struct Parse *parse_context, struct space *space,
 			on_conflict != ON_CONFLICT_ACTION_DEFAULT ?
 			on_conflict : def->fields[i].nullable_action;
 		/* ABORT is a default error action. */
-		if (on_conflict_nullable == ON_CONFLICT_ACTION_DEFAULT)
+		if (on_conflict_nullable == ON_CONFLICT_ACTION_DEFAULT ||
+		    on_conflict_nullable == ON_CONFLICT_ACTION_REPLACE)
 			on_conflict_nullable = ON_CONFLICT_ACTION_ABORT;
-		struct Expr *dflt = space_column_default_expr(def->id, i);
-		if (on_conflict_nullable == ON_CONFLICT_ACTION_REPLACE &&
-		    dflt == NULL)
-			on_conflict_nullable = ON_CONFLICT_ACTION_ABORT;
+		/* If default it set it will be inserted instead of NULL. */
+		if (on_conflict_nullable == ON_CONFLICT_ACTION_ABORT &&
+		    def->fields[i].default_value != NULL)
+			on_conflict_nullable = ON_CONFLICT_ACTION_NONE;
 		int addr;
 		switch (on_conflict_nullable) {
 		case ON_CONFLICT_ACTION_ABORT:
 		case ON_CONFLICT_ACTION_ROLLBACK:
 		case ON_CONFLICT_ACTION_FAIL:
-			err = tt_sprintf(tnt_errcode_desc(ER_SQL_EXECUTE),
-					 tt_sprintf("NOT NULL constraint "\
-						    "failed: %s.%s", def->name,
-						    def->fields[i].name));
+			err = tt_sprintf("NOT NULL constraint failed: %s.%s",
+					 def->name, def->fields[i].name);
 			addr = sqlVdbeAddOp1(v, OP_NotNull, new_tuple_reg + i);
-			sqlVdbeAddOp4(v, OP_SetDiag, ER_SQL_EXECUTE, 0, 0, err,
-				      P4_STATIC);
+			sqlVdbeAddOp4(v, OP_SetDiag, ER_SQL_EXECUTE, 0, 0,
+				      sql_xstrdup(err), P4_DYNAMIC);
 			sqlVdbeAddOp2(v, OP_Halt, -1, on_conflict_nullable);
 			sqlVdbeJumpHere(v, addr);
 			break;
@@ -869,14 +805,8 @@ vdbe_emit_constraint_checks(struct Parse *parse_context, struct space *space,
 			sqlVdbeAddOp2(v, OP_IsNull, new_tuple_reg + i,
 					  ignore_label);
 			break;
-		case ON_CONFLICT_ACTION_REPLACE:
-			addr = sqlVdbeAddOp1(v, OP_NotNull,
-						  new_tuple_reg + i);
-			sqlExprCode(parse_context, dflt, new_tuple_reg + i);
-			sqlVdbeJumpHere(v, addr);
-			break;
 		default:
-			unreachable();
+			assert(on_conflict_nullable == ON_CONFLICT_ACTION_NONE);
 		}
 	}
 	sql_emit_table_types(v, space->def, new_tuple_reg);
@@ -954,7 +884,6 @@ process_index:  ;
 			sqlVdbeAddOp4Int(v, OP_NoConflict, cursor,
 					     skip_index, idx_key_reg,
 					     part_count);
-			sql_set_multi_write(parse_context, true);
 			struct sql_trigger *trigger =
 				sql_triggers_exist(space->def, TK_DELETE, NULL,
 						   parse_context->sql_flags,
@@ -970,7 +899,7 @@ process_index:  ;
 }
 
 void
-vdbe_emit_insertion_completion(struct Vdbe *v, struct space *space,
+vdbe_emit_insertion_completion(struct Vdbe *v, int space_reg,
 			       int raw_data_reg, uint32_t tuple_len,
 			       enum on_conflict_action on_conflict,
 			       int autoinc_reg)
@@ -980,9 +909,8 @@ vdbe_emit_insertion_completion(struct Vdbe *v, struct space *space,
 	SET_CONFLICT_FLAG(pik_flags, on_conflict);
 	sqlVdbeAddOp3(v, OP_MakeRecord, raw_data_reg, tuple_len,
 			  raw_data_reg + tuple_len);
-	sqlVdbeAddOp3(v, OP_IdxInsert, raw_data_reg + tuple_len, 0,
+	sqlVdbeAddOp3(v, OP_IdxInsert, raw_data_reg + tuple_len, space_reg,
 		      autoinc_reg);
-	sqlVdbeChangeP4(v, -1, (char *)space, P4_SPACEPTR);
 	sqlVdbeChangeP5(v, pik_flags);
 }
 
@@ -1111,7 +1039,7 @@ xferOptimization(Parse * pParse,	/* Parser context */
 	 * we have to check the semantics.
 	 */
 	pItem = pSelect->pSrc->a;
-	struct space *src = space_by_name(pItem->zName);
+	const struct space *src = sql_space_by_src(pItem);
 	/* FROM clause does not contain a real table. */
 	if (src == NULL)
 		return 0;
@@ -1120,6 +1048,9 @@ xferOptimization(Parse * pParse,	/* Parser context */
 		return 0;
 	/* Src may not be a view. */
 	if (src->def->opts.is_view)
+		return 0;
+	/* Src should have at least one index. */
+	if (src->index_count < 1)
 		return 0;
 	/* Number of columns must be the same in src and dst. */
 	if (dest->def->field_count != src->def->field_count)
@@ -1137,46 +1068,20 @@ xferOptimization(Parse * pParse,	/* Parser context */
 		if (!dest->def->fields[i].is_nullable &&
 		    src->def->fields[i].is_nullable)
 			return 0;
-		/* Default values for second and subsequent columns need to match. */
-		if (i > 0) {
-			char *src_expr_str = src->def->fields[i].default_value;
-			char *dest_expr_str =
-				dest->def->fields[i].default_value;
-			if ((dest_expr_str == NULL) != (src_expr_str == NULL) ||
-			    (dest_expr_str &&
-			     strcmp(src_expr_str, dest_expr_str) != 0)
-			    ) {
-				return 0;	/* Default values must be the same for all columns */
-			}
-		}
 	}
 
 	for (uint32_t i = 0; i < dest->index_count; ++i) {
 		pDestIdx = dest->index[i];
-		for (uint32_t j = 0; j < src->index_count; ++j) {
+		bool is_compat = false;
+		for (uint32_t j = 0; j < src->index_count && !is_compat; ++j) {
 			pSrcIdx = src->index[j];
-			if (sql_index_is_xfer_compatible(pDestIdx->def,
-							 pSrcIdx->def))
-				break;
+			is_compat = sql_index_is_xfer_compatible(pDestIdx->def,
+								 pSrcIdx->def);
 		}
 		/* pDestIdx has no corresponding index in pSrc. */
-		if (pSrcIdx == NULL)
+		if (!is_compat)
 			return 0;
 	}
-	/*
-	 * Dissallow the transfer optimization if the are check
-	 * constraints.
-	 */
-	if (!rlist_empty(&dest->ck_constraint) ||
-	    !rlist_empty(&src->ck_constraint))
-		return 0;
-	/* Disallow the transfer optimization if the destination table constains
-	 * any foreign key constraints.  This is more restrictive than necessary.
-	 * So the extra complication to make this rule less restrictive is probably
-	 * not worth the effort.  Ticket [6284df89debdfa61db8073e062908af0c9b6118e]
-	 */
-	if (!rlist_empty(&dest->child_fk_constraint))
-		return 0;
 
 	/* If we get this far, it means that the xfer optimization is at
 	 * least a possibility, though it might only work if the destination
@@ -1205,23 +1110,22 @@ xferOptimization(Parse * pParse,	/* Parser context */
 	    onError == ON_CONFLICT_ACTION_IGNORE) ||
 	    is_err_action_default) {
 		addr1 = sqlVdbeAddOp2(v, OP_Rewind, iDest, 0);
-		VdbeCoverage(v);
 		emptyDestTest = sqlVdbeAddOp0(v, OP_Goto);
 		sqlVdbeJumpHere(v, addr1);
 	}
 
 	vdbe_emit_open_cursor(pParse, iSrc, 0, src);
 	VdbeComment((v, "%s", src->def->name));
-	addr1 = sqlVdbeAddOp2(v, OP_Rewind, iSrc, 0);
-	VdbeCoverage(v);
-	sqlVdbeAddOp2(v, OP_RowData, iSrc, regData);
+	int addr_rewind = sqlVdbeAddOp2(v, OP_Rewind, iSrc, 0);
+	int reg = ++pParse->nMem;
+	sqlVdbeAddOp2(v, OP_OpenSpace, reg, dest->def->id);
+	addr1 = sqlVdbeAddOp2(v, OP_RowData, iSrc, regData);
 
 #ifdef SQL_TEST
 	sqlVdbeChangeP5(v, OPFLAG_XFER_OPT);
 #endif
 
-	sqlVdbeAddOp4(v, OP_IdxInsert, regData, 0, 0,
-			  (char *)dest, P4_SPACEPTR);
+	sqlVdbeAddOp2(v, OP_IdxInsert, regData, reg);
 	switch (onError) {
 	case ON_CONFLICT_ACTION_IGNORE:
 		sqlVdbeChangeP5(v, OPFLAG_OE_IGNORE | OPFLAG_NCHANGE);
@@ -1233,9 +1137,8 @@ xferOptimization(Parse * pParse,	/* Parser context */
 		sqlVdbeChangeP5(v, OPFLAG_NCHANGE);
 		break;
 	}
-	sqlVdbeAddOp2(v, OP_Next, iSrc, addr1 + 1);
-	VdbeCoverage(v);
-	sqlVdbeJumpHere(v, addr1);
+	sqlVdbeAddOp2(v, OP_Next, iSrc, addr1);
+	sqlVdbeJumpHere(v, addr_rewind);
 	sqlVdbeAddOp2(v, OP_Close, iSrc, 0);
 	sqlVdbeAddOp2(v, OP_Close, iDest, 0);
 

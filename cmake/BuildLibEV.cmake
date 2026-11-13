@@ -1,7 +1,7 @@
 #
 # A macro to build the bundled libev
 macro(libev_build)
-    set(ev_compile_flags)
+    set(ev_compile_flags ${DEPENDENCY_CFLAGS})
     set(ev_link_libraries)
 # There are warnings in libev code which are impossible to selectively
 # turn off, see
@@ -24,6 +24,10 @@ macro(libev_build)
         # On FreeBSD build libev loop on top of
         set(ev_compile_flags "${ev_compile_flags} -DEV_USE_KQUEUE")
     endif()
+
+    if (TARANTOOL_DEBUG)
+        set(ev_compile_flags "${ev_compile_flags} ${CMAKE_C_FLAGS_DEBUG}")
+    endif(TARANTOOL_DEBUG)
 
     list(APPEND ev_link_libraries "m")
     if (TARGET_OS_DEBIAN_FREEBSD)

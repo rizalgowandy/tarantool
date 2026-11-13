@@ -28,6 +28,9 @@
  * THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  */
+
+#pragma GCC system_header
+
 #include "trivia/config.h"
 #include <time.h>
 #include <sys/types.h>
@@ -60,7 +63,7 @@
 extern "C" {
 #endif /* defined(__cplusplus) */
 
-extern const ev_tstamp TIMEOUT_INFINITY;
+#define TIMEOUT_INFINITY (365*86400*100.0)
 
 typedef void (*ev_io_cb)(ev_loop *, ev_io *, int);
 typedef void (*ev_async_cb)(ev_loop *, ev_async *, int);

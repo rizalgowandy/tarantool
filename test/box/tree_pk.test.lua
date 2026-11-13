@@ -1,4 +1,6 @@
 utils = dofile('utils.lua')
+fiber = require('fiber')
+fiber.set_max_slice(100500)
 
 s0 = box.schema.space.create('tweedledum')
 i0 = s0:create_index('primary', { type = 'tree', parts = {1, 'unsigned'}, unique = true })
@@ -212,14 +214,28 @@ i2:select{2}
 i2:select{1, 5}
 i3:select{box.NULL}
 
+-- Alter of PK is forbidden
 i1:alter{parts = {4, 'unsigned'}}
+
+-- Drop indexes, alter PK, and create them again
+i2:drop()
+i3:drop()
+i1:alter{parts = {4, 'unsigned'}}
+i2 = s:create_index('i2', { type = 'tree', parts = {2, 'unsigned'}, unique = false })
+i3 = s:create_index('i3', { type = 'tree', parts = {{3, 'unsigned', is_nullable = true}}, unique = true })
+
 i2:select{1}
 i2:select{2}
 i2:select{1, 1}
 i3:select{box.NULL}
 
 s:truncate()
+i2:drop()
+i3:drop()
 i1:alter{parts = {1, 'str'}}
+i2 = s:create_index('i2', { type = 'tree', parts = {2, 'unsigned'}, unique = false })
+i3 = s:create_index('i3', { type = 'tree', parts = {{3, 'unsigned', is_nullable = true}}, unique = true })
+
 _ = s:replace{"5", 1, box.NULL}
 _ = s:replace{"4", 1, box.NULL}
 _ = s:replace{"6", 1, box.NULL}
@@ -302,11 +318,25 @@ s:drop()
 box.internal.collation.drop('test')
 box.internal.collation.drop('test-ci')
 
--- hints
+-- memtx hints
 s = box.schema.space.create('test')
-s:create_index('test', {type = 'tree', hint = 'true'} )
-s:create_index('test', {type = 'hash', hint = true} )
-s:create_index('test', {type = 'hash'}):alter({hint = true})
+s:create_index('t1', {type = 'TRee'}).hint
+s:create_index('h1', {type = 'hAsh'}).hint
+s:create_index('t2', {type = 'trEE', hint = 'true'})
+s:create_index('t2', {type = 'TREE', hint = true}).hint
+s:create_index('t3', {type = 'tree', hint = false}).hint
+s:create_index('h2', {type = 'HASH', hint = true})
+s:create_index('h2', {type = 'hash', hint = false}).hint
+_ = s:create_index('t4', {type = 'TREE'}):alter({hint = true})
+s.index.t4.hint
+_ = s:create_index('t5', {type = 'tree'}):alter({hint = false})
+s.index.t5.hint
+s:create_index('h3', {type = 'haSH'}):alter({hint = true})
+s:create_index('h4', {type = 'hash'}):alter({hint = false})
+s.index.h4.hint
+box.space._index:insert{s.id, s.index.h4.id + 1, "h5", "hash", {hint = true}, {{0, "unsigned"}}}
+_ = box.space._index:insert{s.id, s.index.h4.id + 1, "h5", "hash", {hint = false}, {{0, "unsigned"}}}
+box.space._index:insert{s.id, s.index.h5.id + 1, "h6", "hash", {hint = "false"}, {{0, "unsigned"}}}
 s:create_index('multikey', {hint = true, parts = {{2, 'int', path = '[*]'}}})
 s:create_index('multikey', {parts = {{2, 'int', path = '[*]'}}}):alter({hint = true})
 lua_code = [[function(tuple) return {tuple[1] + tuple[2]} end]]
@@ -314,8 +344,15 @@ box.schema.func.create('s', {body = lua_code, is_deterministic = true, is_sandbo
 s:create_index('func', {hint = true, func = box.func.s.id, parts = {{1, 'unsigned'}}})
 s:drop()
 
+-- vinyl hints
 s = box.schema.space.create('test', {engine = 'vinyl'})
-s:create_index('test', {type = 'tree', hint = true} )
+s:create_index('i1', {type = 'tree'}).hint
+s:create_index('i2', {type = 'TREE', hint = true})
+s:create_index('i2', {type = 'tree', hint = false}).hint
+s:create_index('i3', {type = 'TREE'}):alter({hint = true})
+_ = s:create_index('i4', {type = 'tree'}):alter({hint = false})
+box.space._index:insert{s.id, s.index.i4.id + 1, "i5", "tree", {hint = true}, {{0, "unsigned"}}}
+_ = box.space._index:insert{s.id, s.index.i4.id + 1, "i6", "tree", {hint = false}, {{0, "unsigned"}}}
 s:drop()
 
 -- numeric hints

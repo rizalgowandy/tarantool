@@ -256,6 +256,9 @@ static const struct lbox_sockopt_reg so_opts[] = {
 #ifdef SO_REUSEADDR
 	{"SO_REUSEADDR",	SO_REUSEADDR,		1,	1, },
 #endif
+#ifdef SO_REUSEPORT
+	{"SO_REUSEPORT",	SO_REUSEPORT,		1,	1, },
+#endif
 #ifdef SO_SNDBUF
 	{"SO_SNDBUF",		SO_SNDBUF,		1,	1, },
 #endif
@@ -616,10 +619,10 @@ lbox_socket_push_protocol(struct lua_State *L, int protonumber)
 		lua_pushinteger(L, 0);
 		return 1;
 	}
-
-	struct protoent *p = getprotobynumber(protonumber);
-	if (p) {
-		lua_pushstring(L, p->p_name);
+	char *name = sio_getprotobynumber(protonumber);
+	if (name != NULL) {
+		lua_pushstring(L, name);
+		free(name);
 	} else {
 		lua_pushinteger(L, protonumber);
 	}
@@ -998,6 +1001,17 @@ lbox_socket_recvfrom(struct lua_State *L)
 	return 2;
 }
 
+static int
+lbox_socket_getprotobyname(struct lua_State *L)
+{
+	int proto = sio_getprotobyname(luaL_checkstring(L, 1));
+	if (proto >= 0)
+		lua_pushinteger(L, proto);
+	else
+		lua_pushnil(L);
+	return 1;
+}
+
 static void
 lbox_socket_pushsockopt(lua_State *L, const struct lbox_sockopt_reg *reg)
 {
@@ -1032,10 +1046,11 @@ tarantool_lua_socket_init(struct lua_State *L)
 		{ "peer",		lbox_socket_peername	},
 		{ "recvfrom",		lbox_socket_recvfrom	},
 		{ "accept",		lbox_socket_accept	},
+		{ "getprotobyname",	lbox_socket_getprotobyname},
 		{ NULL,			NULL			}
 	};
 
-	luaL_register_module(L, "socket", internal_methods);
+	luaT_newmodule(L, "socket.lib", internal_methods);
 
 	/* domains table */
 	lua_pushliteral(L, "DOMAIN");

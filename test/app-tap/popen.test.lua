@@ -430,8 +430,8 @@ local function test_new_invalid_args(test)
         [{false}]                            = argerr('argv', 'boolean'),
         [{0}]                                = argerr('argv', 'number'),
         [{''}]                               = argerr('argv', 'string'),
-        -- FIXME: A table is ok, but not an empty one.
-        [{{}}]                               = nil,
+        -- A table is ok, but not an empty one.
+        [{{}}]                               = 'popen: no command to run',
         [{popen.shell}]                      = argerr('argv', 'function'),
         [{io.stdin}]                         = argerr('argv', 'userdata'),
         [{coroutine.create(function() end)}] = argerr('argv', 'thread'),
@@ -589,6 +589,8 @@ test:test('methods_on_invalid_handle', test_methods_on_invalid_handle)
 --   - info: get both true and false for each opts.<...> boolean
 --     option
 --   - FiberIsCancelled is raised from read(), write() and wait()
+--     NB: It is verified for wait() in
+--     app-luatest/popen_wait_test.lua.
 --
 -- - verify dubious code paths
 --   - popen.new

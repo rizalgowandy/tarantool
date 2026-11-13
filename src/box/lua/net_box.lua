@@ -1,84 +1,87 @@
 -- net_box.lua (internal file)
 local log      = require('log')
 local ffi      = require('ffi')
-local socket   = require('socket')
 local fiber    = require('fiber')
 local msgpack  = require('msgpack')
 local urilib   = require('uri')
 local internal = require('net.box.lib')
 local trigger  = require('internal.trigger')
+local utils    = require('internal.utils')
+
+local this_module
 
 local max               = math.max
 local fiber_clock       = fiber.clock
-local fiber_self        = fiber.self
 
-local check_iterator_type = box.internal.check_iterator_type
+local check_select_opts   = box.internal.check_select_opts
 local check_index_arg     = box.internal.check_index_arg
 local check_space_arg     = box.internal.check_space_arg
 local check_primary_index = box.internal.check_primary_index
+local check_param         = utils.check_param
+local check_param_table   = utils.check_param_table
 
-local perform_request_impl          = internal.perform_request
-local perform_async_request_impl    = internal.perform_async_request
-local watch_impl                    = internal.watch
-local unwatch_impl                  = internal.unwatch
+local ibuf_t = ffi.typeof('struct ibuf')
+local is_tuple = box.tuple.is
 
 local TIMEOUT_INFINITY = 500 * 365 * 86400
-local VSPACE_ID        = 281
-local VINDEX_ID        = 289
-local VCOLLATION_ID    = 277
-local DEFAULT_CONNECT_TIMEOUT = 10
-local IPROTO_GREETING_SIZE = 128
 
 -- select errors from box.error
-local E_UNKNOWN              = box.error.UNKNOWN
 local E_NO_CONNECTION        = box.error.NO_CONNECTION
 local E_PROC_LUA             = box.error.PROC_LUA
 
--- Method types used internally by net.box.
-local M_PING        = 0
-local M_CALL_16     = 1
-local M_CALL_17     = 2
-local M_EVAL        = 3
-local M_INSERT      = 4
-local M_REPLACE     = 5
-local M_DELETE      = 6
-local M_UPDATE      = 7
-local M_UPSERT      = 8
-local M_SELECT      = 9
-local M_EXECUTE     = 10
-local M_PREPARE     = 11
-local M_UNPREPARE   = 12
-local M_GET         = 13
-local M_MIN         = 14
-local M_MAX         = 15
-local M_COUNT       = 16
-local M_BEGIN       = 17
-local M_COMMIT      = 18
-local M_ROLLBACK    = 19
--- Injects raw data into connection. Used by console and tests.
-local M_INJECT      = 20
+local REQUEST_OPTION_TYPES = {
+    is_async    = "boolean",
+    iterator    = "string",
+    limit       = "number",
+    offset      = "number",
+    on_push     = "function",
+    on_push_ctx = "any",
+    return_raw  = "boolean",
+    skip_header = "boolean",
+    timeout     = "number",
+    fetch_pos   = "boolean",
+    after = function(after)
+        if after ~= nil and type(after) ~= "string" and type(after) ~= "table"
+                and not is_tuple(after) then
+            return false, "string, table, tuple"
+        end
+        return true
+    end,
+    buffer = function(buf)
+       if not ffi.istype(ibuf_t, buf) then
+           return false, "struct ibuf"
+       end
+       return true
+    end,
+    _thread_id = "number",
+}
 
--- utility tables
-local is_final_state         = {closed = 1, error = 1}
-
--- IPROTO feature id -> name
-local IPROTO_FEATURE_NAMES = {
-    [0]     = 'streams',
-    [1]     = 'transactions',
-    [2]     = 'error_extension',
-    [3]     = 'watchers',
+local CONNECT_OPTION_TYPES = {
+    user                        = "string",
+    password                    = "string",
+    wait_connected              = "number, boolean",
+    reconnect_after             = "number",
+    console                     = "boolean",
+    connect_timeout             = "number",
+    fetch_schema                = "boolean",
+    auth_type                   = "string",
+    required_protocol_version   = "number",
+    required_protocol_features  = "table",
+    _disable_graceful_shutdown  = "boolean",
 }
 
 -- Given an array of IPROTO feature ids, returns a map {feature_name: bool}.
 local function iproto_features_resolve(feature_ids)
     local features = {}
-    for _, feature_name in pairs(IPROTO_FEATURE_NAMES) do
-        features[feature_name] = false
+    local feature_names = {}
+    for name, id in pairs(box.iproto.feature) do
+        features[name] = false
+        feature_names[id] = name
     end
-    for _, feature_id in ipairs(feature_ids) do
-        local feature_name = IPROTO_FEATURE_NAMES[feature_id]
-        assert(feature_name ~= nil)
-        features[feature_name] = true
+    for _, id in ipairs(feature_ids) do
+        local name = feature_names[id]
+        assert(name ~= nil)
+        features[name] = true
     end
     return features
 end
@@ -98,472 +101,44 @@ local function iproto_features_check(features, required)
 end
 
 --
--- Connect to a remote server, do handshake.
--- @param host Hostname.
--- @param port TCP port.
--- @param timeout Timeout to connect and receive greeting.
---
--- @retval nil, err Error occured. The reason is returned.
--- @retval two non-nils A connected socket and a decoded greeting.
---
-local function establish_connection(host, port, timeout)
-    local timeout = timeout or DEFAULT_CONNECT_TIMEOUT
-    local begin = fiber.clock()
-    local s, err = socket.tcp_connect(host, port, timeout)
-    if not s then
-        return nil, err
-    end
-    local msg = s:read({chunk = IPROTO_GREETING_SIZE},
-                        timeout - (fiber.clock() - begin))
-    if not msg then
-        local err = s:error()
-        s:close()
-        return nil, err
-    end
-    local greeting, err = internal.decode_greeting(msg)
-    if not greeting then
-        s:close()
-        return nil, err
-    end
-    return s, greeting
-end
-
---
 -- Default action on push during a synchronous request -
 -- ignore.
 --
 local function on_push_sync_default() end
 
---
--- Basically, *transport* is a TCP connection speaking one of
--- Tarantool network protocols. This is a low-level interface.
--- Primary features:
---  * implements protocols; concurrent perform_request()-s benefit from
---    multiplexing support in the protocol;
---  * schema-aware (optional) - snoops responses and initiates
---    schema reload when a response has a new schema version;
---  * delivers transport events via the callback.
---
--- Transport state machine:
---
--- State machine starts in 'initial' state. New_sm method
--- accepts an established connection and spawns a worker fiber.
--- Stop method sets the state to 'closed' and kills the worker.
--- If the transport is already in 'error' state stop() does
--- nothing.
---
--- State chart:
---
--- connecting -> initial +-> active
---                        \
---                         +-> auth -> fetch_schema <-> active
---
---  (any state, on error) -> error_reconnect -> connecting -> ...
---                                           \
---                                             -> [error]
---  (any_state, but [error]) -> [closed]
---
---
--- State change events can be delivered to the transport user via
--- the optional 'callback' argument:
---
--- The callback functions needs to have the following signature:
---
---  callback(event_name, ...)
---
--- The following events are delivered, with arguments:
---
---  'state_changed', state, error
---  'handshake', greeting -> nil (accept) / errno, error (reject)
---  'will_fetch_schema'   -> true (approve) / false (skip fetch)
---  'did_fetch_schema', schema_version, spaces, indices
---  'reconnect_timeout'   -> get reconnect timeout if set and > 0,
---                           else nil is returned.
---
--- Suggestion for callback writers: sleep a few secs before approving
--- reconnect.
---
-local function create_transport(host, port, user, password, callback,
-                                sock, greeting)
-    -- check / normalize credentials
-    if user == nil and password ~= nil then
-        box.error(E_PROC_LUA, 'net.box: user is not defined')
-    end
-    if user ~= nil and password == nil then password = '' end
-
-    -- Current state machine's state.
-    local state             = 'initial'
-    local last_errno
-    local last_error
-    local state_cond        = fiber.cond() -- signaled when the state changes
-
-    local function on_event(key, value)
-        callback('event', key, value)
-    end
-
-    -- The transport stores requests that are currently 'in flight'
-    -- for this connection.
-    -- Async request can not be timed out completely. Instead a
-    -- user must decide when he does not want to wait for
-    -- response anymore.
-    -- Sync requests are implemented as async call + immediate
-    -- wait for a result.
-    local transport         = internal.new_transport(on_event)
-
-    local worker_fiber
-    -- Flag indicates that connection is closing and waits until
-    -- send buf became empty.
-    local is_closing        = false
-
-    -- STATE SWITCHING --
-    local function set_state(new_state, new_errno, new_error)
-        state = new_state
-        last_errno = new_errno
-        last_error = new_error
-        callback('state_changed', new_state, new_error)
-        state_cond:broadcast()
-        if state == 'error' or state == 'error_reconnect' or
-           state == 'closed' then
-            transport:reset(box.error.new({code = new_errno,
-                                           reason = new_error}))
-        end
-    end
-
-    -- FYI: [] on a string is valid
-    local function wait_state(target_state, timeout)
-        local deadline = fiber_clock() + (timeout or TIMEOUT_INFINITY)
-        repeat until state == target_state or target_state[state] or
-                     is_final_state[state] or
-                     not state_cond:wait(max(0, deadline - fiber_clock()))
-        return state == target_state or target_state[state] or false
-    end
-
-    -- START/STOP --
-    local protocol_sm
-
-    local function start()
-        if state ~= 'initial' then return not is_final_state[state] end
-        fiber.create(function()
-            local ok, err, timeout
-            worker_fiber = fiber_self()
-            fiber.name(string.format('%s:%s (net.box)', host, port), {truncate=true})
-            if not sock then
-                goto do_connect
-            end
-    ::handle_connection::
-            ok, err = pcall(protocol_sm)
-            if not (ok or is_final_state[state]) then
-                set_state('error', E_UNKNOWN, err)
-            end
-            if sock then
-                sock:close()
-                sock = nil
-            end
-            timeout = callback('reconnect_timeout')
-    ::do_reconnect::
-            if not timeout or state ~= 'error_reconnect' then
-                goto stop
-            end
-            fiber.sleep(timeout)
-            timeout = callback('reconnect_timeout')
-            if not timeout or state ~= 'error_reconnect' then
-                goto stop
-            end
-    ::do_connect::
-            sock, greeting =
-                establish_connection(host, port, callback('fetch_connect_timeout'))
-            if sock then
-                goto handle_connection
-            end
-            timeout = callback('reconnect_timeout')
-            if not timeout then
-                set_state('error', E_NO_CONNECTION, greeting)
-                goto stop
-            end
-            set_state('error_reconnect', E_NO_CONNECTION, greeting)
-            goto do_reconnect
-    ::stop::
-            worker_fiber = nil
-        end)
-    end
-
-    local function stop()
-        if not is_final_state[state] then
-            is_closing = true
-            -- Here we are waiting until send buf became empty:
-            -- it is necessary to ensure that all requests are
-            -- sent before the connection is closed.
-            transport:wait_all_sent()
-            is_closing = false
-            -- While we were waiting for the send buffer to be
-            -- empty, the state could change.
-            if not is_final_state[state] then
-                set_state('closed', E_NO_CONNECTION, 'Connection closed')
-            end
-        end
-        if worker_fiber then
-            worker_fiber:cancel()
-            worker_fiber = nil
-        end
-    end
-
-    local function prepare_perform_request()
-        if state ~= 'active' and state ~= 'fetch_schema' then
-            local code = last_errno or E_NO_CONNECTION
-            local msg = last_error or
-                string.format('Connection is not established, state is "%s"',
-                              state)
-            return box.error.new({code = code, reason = msg})
-        end
-        if is_closing then
-            local code = E_NO_CONNECTION
-            local msg = string.format("Connection is closing")
-            return box.error.new({code = code, reason = msg})
-        end
-        -- Alert worker to notify it of the queued outgoing data.
-        worker_fiber:wakeup()
-    end
-
-    --
-    -- Send a request and do not wait for response.
-    -- @retval nil, error Error occured.
-    -- @retval not nil Future object.
-    --
-    local function perform_async_request(buffer, skip_header, method, on_push,
-                                         on_push_ctx, format, stream_id, ...)
-        local err = prepare_perform_request()
-        if err then
-            return nil, err
-        end
-        return perform_async_request_impl(transport, buffer, skip_header,
-                                          method, on_push, on_push_ctx, format,
-                                          stream_id, ...)
-    end
-
-    --
-    -- Send a request and wait for response.
-    -- @retval nil, error Error occured.
-    -- @retval not nil Response object.
-    --
-    local function perform_request(timeout, buffer, skip_header, method,
-                                   on_push, on_push_ctx, format,
-                                   stream_id, ...)
-        local err = prepare_perform_request()
-        if err then
-            return nil, err
-        end
-        return perform_request_impl(timeout, transport, buffer, skip_header,
-                                    method, on_push, on_push_ctx, format,
-                                    stream_id, ...)
-    end
-
-    -- Send a WATCH request. No-op if the connection is inactive or closing.
-    local function watch(key)
-        if not is_closing and
-           (state == 'active' or state == 'fetch_schema') then
-            watch_impl(transport, key)
-            worker_fiber:wakeup()
-        end
-    end
-
-    -- Send an UNWATCH request. No-op if the connection is inactive or closing.
-    local function unwatch(key)
-        if not is_closing and
-           (state == 'active' or state == 'fetch_schema') then
-            unwatch_impl(transport, key)
-            worker_fiber:wakeup()
-        end
-    end
-
-    -- PROTOCOL STATE MACHINE (WORKER FIBER) --
-    --
-    -- The sm is implemented as a collection of functions performing
-    -- tail-recursive calls to each other. Yep, Lua optimizes
-    -- such calls, and yep, this is the canonical way to implement
-    -- a state machine in Lua.
-    local console_setup_sm, console_sm, iproto_setup_sm, iproto_auth_sm,
-        iproto_schema_sm, iproto_sm, error_sm
-
-    --
-    -- Protocol_sm is a core function of netbox. It calls all
-    -- other ..._sm() functions, and explicitly or implicitly
-    -- holds Lua referece on a connection object. It means, that
-    -- until it works, the connection can not be garbage
-    -- collected. See gh-3164, where because of reconnect sleeps
-    -- in this function, a connection could not be deleted.
-    --
-    protocol_sm = function()
-        assert(sock)
-        assert(greeting)
-        local err, msg = callback('handshake', greeting)
-        if err then
-            return error_sm(err, msg)
-        end
-        -- @deprecated since 1.10
-        if greeting.protocol == 'Lua console' then
-            return console_setup_sm()
-        elseif greeting.protocol == 'Binary' then
-            return iproto_setup_sm()
-        else
-            return error_sm(E_NO_CONNECTION,
-                            'Unknown protocol: '..greeting.protocol)
-        end
-    end
-
-    console_setup_sm = function()
-        log.warn("Netbox text protocol support is deprecated since 1.10, "..
-                 "please use require('console').connect() instead")
-        local err = internal.console_setup(transport, sock:fd())
-        if err then
-            return error_sm(err.code, err.message)
-        end
-        set_state('active')
-        return console_sm()
-    end
-
-    console_sm = function()
-        local err = internal.console_loop(transport, sock:fd())
-        return error_sm(err.code, err.message)
-    end
-
-    iproto_setup_sm = function()
-        local version, features = internal.iproto_id(greeting.version_id,
-                                                     transport, sock:fd())
-        if not version then
-            local err = features
-            return error_sm(err.code, err.message)
-        end
-        local err, msg = callback('id', version, features)
-        if err then
-            return error_sm(err, msg)
-        end
-        return iproto_auth_sm(greeting.salt)
-    end
-
-    iproto_auth_sm = function(salt)
-        set_state('auth')
-        if not user or not password then
-            set_state('fetch_schema')
-            return iproto_schema_sm()
-        end
-        local schema_version, err = internal.iproto_auth(user, password, salt,
-                                                         transport, sock:fd())
-        if not schema_version then
-            return error_sm(err.code, err.message)
-        end
-        set_state('fetch_schema')
-        return iproto_schema_sm(schema_version)
-    end
-
-    iproto_schema_sm = function(schema_version)
-        if not callback('will_fetch_schema') then
-            set_state('active')
-            return iproto_sm(schema_version)
-        end
-        local schema_version, schema = internal.iproto_schema(
-            greeting.version_id, transport, sock:fd())
-        if not schema_version then
-            local err = schema
-            return error_sm(err.code, err.message)
-        end
-        callback('did_fetch_schema', schema_version, schema[VSPACE_ID],
-                 schema[VINDEX_ID], schema[VCOLLATION_ID])
-        set_state('active')
-        return iproto_sm(schema_version)
-    end
-
-    iproto_sm = function(schema_version)
-        local schema_version, err = internal.iproto_loop(schema_version,
-                                                         transport, sock:fd())
-        if not schema_version then
-            return error_sm(err.code, err.message)
-        end
-        -- schema_version has been changed - start to load a new version.
-        -- Sic: self.schema_version will be updated only after reload.
-        set_state('fetch_schema')
-        return iproto_schema_sm(schema_version)
-    end
-
-    error_sm = function(err, msg)
-        if sock then sock:close(); sock = nil end
-        if state ~= 'closed' then
-            if callback('reconnect_timeout') then
-                set_state('error_reconnect', err, msg)
-            else
-                set_state('error', err, msg)
-            end
-        end
-    end
-
-    return {
-        stop            = stop,
-        start           = start,
-        wait_state      = wait_state,
-        perform_request = perform_request,
-        perform_async_request = perform_async_request,
-        watch           = watch,
-        unwatch         = unwatch,
-    }
-end
-
--- Wrap create_transport, adding auto-stop-on-GC feature.
--- All the GC magic is neatly encapsulated!
--- The tricky part is the callback:
---  * callback (typically) references the transport (indirectly);
---  * worker fiber references the callback;
---  * fibers are GC roots - i.e. transport is never GC-ed!
--- We solve the issue by making the worker->callback ref weak.
--- Now it is necessary to have a strong ref to callback somewhere or
--- it is GC-ed prematurely. We wrap stop() method, stashing the
--- ref in an upvalue (stop() performance doesn't matter much.)
-local create_transport = function(host, port, user, password, callback,
-                                  sock, greeting)
-    local weak_refs = setmetatable({callback = callback}, {__mode = 'v'})
-    local function weak_callback(...)
-        local callback = weak_refs.callback
-        if callback then return callback(...) end
-    end
-    local transport = create_transport(host, port, user, password,
-                                       weak_callback, sock, greeting)
-    local transport_stop = transport.stop
-    local gc_hook = ffi.gc(ffi.new('char[1]'), function()
-        pcall(transport_stop)
-    end)
-    transport.stop = function()
-        -- dummy gc_hook, callback refs prevent premature GC
-        return transport_stop(gc_hook, callback)
-    end
-    return transport
-end
-
 local function parse_connect_params(host_or_uri, ...) -- self? host_or_uri port? opts?
     local port, opts = ...
-    if type(host_or_uri) == 'table' then host_or_uri, port, opts = ... end
+    if host_or_uri == this_module then host_or_uri, port, opts = ... end
     if type(port) == 'table' then opts = port; port = nil end
     if opts == nil then opts = {} else
         local copy = {}
         for k, v in pairs(opts) do copy[k] = v end
         opts = copy
     end
-    local host = host_or_uri
-    if port == nil then
-        local url = urilib.parse(tostring(host))
-        if url == nil or url.service == nil then
-            box.error(E_PROC_LUA,
-                "usage: connect(uri[, opts] | host, port[, opts])")
+    local uri
+    if port == nil and (type(host_or_uri) == 'string' or
+                        type(host_or_uri) == 'number' or
+                        type(host_or_uri) == 'table') then
+        if type(host_or_uri) == 'number' then
+            uri = tostring(host_or_uri)
+        else
+            uri = host_or_uri
         end
-        host, port = url.host, url.service
-        if opts.user == nil and opts.password == nil then
-            opts.user, opts.password = url.login, url.password
-        end
+    elseif (type(host_or_uri) == 'string' or host_or_uri == nil) and
+            (type(port) == 'string' or type(port) == 'number') then
+        uri = urilib.format({host = host_or_uri, service = tostring(port)})
+    else
+        box.error(E_PROC_LUA,
+                  "usage: connect(uri[, opts] | host, port[, opts])")
     end
-    return host, port, opts
+    return uri, opts
 end
 
 local function remote_serialize(self)
     return {
         host = self.host,
         port = self.port,
+        fd = self.fd,
         opts = next(self.opts) and self.opts,
         state = self.state,
         error = self.error,
@@ -582,16 +157,8 @@ local function stream_serialize(self)
     return t
 end
 
-local function stream_spaces_serialize(self)
-    return self._stream._conn.space
-end
-
 local function stream_space_serialize(self)
     return self._src
-end
-
-local function stream_indexes_serialize(self)
-    return self._space._src.index
 end
 
 local function stream_index_serialize(self)
@@ -604,12 +171,6 @@ local remote_mt = {
     __metatable = false
 }
 
-local console_methods = {}
-local console_mt = {
-    __index = console_methods, __serialize = remote_serialize,
-    __metatable = false
-}
-
 -- Create stream space index, which is same as connection space
 -- index, but have non zero stream ID.
 local function stream_wrap_index(stream_id, src)
@@ -618,87 +179,107 @@ local function stream_wrap_index(stream_id, src)
         _src = src,
     }, {
         __index = src,
-        __serialize = stream_index_serialize
+        __serialize = stream_index_serialize,
+        __autocomplete = stream_index_serialize
     })
 end
-
--- Metatable for stream space indexes. When stream space being
--- created there are no indexes in it. When accessing the space
--- index, we look for corresponding space index in corresponding
--- connection space. If it is found we create same index for the
--- stream space but with corresponding stream ID. We do not need
--- to compare stream _schema_version and connection schema_version,
--- because all access to index  is carried out through it's space.
--- So we update schema_version when we access space.
-local stream_indexes_mt = {
-    __index = function(self, key)
-        local _space = self._space
-        local src = _space._src.index[key]
-        if not src then
-            return nil
-        end
-        local res = stream_wrap_index(_space._stream_id, src)
-        self[key] = res
-        return res
-    end,
-    __serialize = stream_indexes_serialize
-}
 
 -- Create stream space, which is same as connection space,
 -- but have non zero stream ID.
 local function stream_wrap_space(stream, src)
-    local res = setmetatable({
+    local space = setmetatable({
         _stream_id = stream._stream_id,
         _src = src,
-        index = setmetatable({
-            _space = nil,
-        }, stream_indexes_mt)
     }, {
         __index = src,
-        __serialize = stream_space_serialize
+        __serialize = stream_space_serialize,
+        __autocomplete = stream_space_serialize
     })
-    res.index._space = res
-    return res
+    local space_index_cache = {}
+    local stream_indexes_serialize = function() return space._src.index end
+    -- Metatable for stream space indexes. When stream space being
+    -- created there are no indexes in it. When accessing the space
+    -- index, we look for corresponding space index in corresponding
+    -- connection space. If it is found we create same index for the
+    -- stream space but with corresponding stream ID. We do not need
+    -- to compare stream _schema_version and connection schema_version,
+    -- because all access to index  is carried out through it's space.
+    -- So we update schema_version when we access space.
+    space.index = setmetatable({}, {
+        __index = function(_, key)
+            if space_index_cache[key] then
+                return space_index_cache[key]
+            end
+            local src = space._src.index[key]
+            if not src then
+                return nil
+            end
+            local res = stream_wrap_index(space._stream_id, src)
+            space_index_cache[key] = res
+            return res
+        end,
+        __serialize = stream_indexes_serialize,
+        __autocomplete = stream_indexes_serialize
+    })
+    return space
 end
 
--- Metatable for stream spaces. When stream being created there
--- are no spaces in it. When user try to access some space in
--- stream, we first of all compare _schema_version of stream with
--- schema_version from connection and if they are not equal, we
--- clear stream space cache and update it's schema_version. Then
--- we look for corresponding space in the connection. If it is
--- found we create same space for the stream but with corresponding
--- stream ID.
-local stream_spaces_mt = {
-    __index = function(self, key)
-        local stream = self._stream
-        if stream._schema_version ~= stream._conn.schema_version then
-            stream._schema_version = stream._conn.schema_version
-            self._stream_space_cache = {}
-        end
-        if self._stream_space_cache[key] then
-            return self._stream_space_cache[key]
-        end
-        local src = stream._conn.space[key]
-        if not src then
-            return nil
-        end
-        local res = stream_wrap_space(stream, src)
-        self._stream_space_cache[key] = res
-        return res
-    end,
-    __serialize = stream_spaces_serialize
-}
+-- This callback is invoked in a new fiber upon receiving 'box.shutdown' event
+-- from a remote host. It runs on_shutdown triggers and then gracefully
+-- terminates the connection.
+local function graceful_shutdown(remote)
+    remote._shutdown_pending = true
+    local ok, err = pcall(remote._on_shutdown.run, remote._on_shutdown, remote)
+    if not ok then
+        log.error(err)
+    end
+    -- While the triggers were running, the connection could have been closed
+    -- and even reestablished (if reconnect_after is set), in which case we
+    -- must not initiate a graceful shutdown.
+    if remote._shutdown_pending then
+        remote._transport:graceful_shutdown()
+        remote._shutdown_pending = nil
+    end
+end
 
 local space_metatable, index_metatable
 
-local function new_sm(host, port, opts, sock, greeting)
+local function new_sm(uri_or_fd, opts)
+    local host, port, fd
+    if type(uri_or_fd) == 'string' or type(uri_or_fd) == 'table' then
+        local parsed_uri, err = urilib.parse(uri_or_fd)
+        if not parsed_uri then
+            error(err)
+        end
+        if opts.user == nil and opts.password == nil then
+            opts.user, opts.password = parsed_uri.login, parsed_uri.password
+        end
+        if opts.auth_type == nil and parsed_uri.params ~= nil and
+           parsed_uri.params.auth_type ~= nil then
+            opts.auth_type = parsed_uri.params.auth_type[1]
+        end
+        host, port = parsed_uri.host, parsed_uri.service
+    else
+        assert(type(uri_or_fd) == 'number')
+        fd = uri_or_fd
+    end
     local user, password = opts.user, opts.password; opts.password = nil
-    local last_reconnect_error
-    local remote = {host = host, port = port, opts = opts, state = 'initial'}
+    local last_err_code, last_err_name, last_prev_err_code
+    local remote = {
+        host = host,
+        port = port,
+        fd = fd,
+        opts = opts,
+        state = 'initial',
+    }
     local function callback(what, ...)
+        if remote._fiber == nil then
+            remote._fiber = fiber.self()
+        end
         if what == 'state_changed' then
             local state, err = ...
+            remote.state = state
+            remote.error = err and err.message
             local was_connected = remote._is_connected
             if state == 'active' then
                 if not was_connected then
@@ -709,60 +290,113 @@ local function new_sm(host, port, opts, sock, greeting)
                    state == 'closed' then
                 if was_connected then
                     remote._is_connected = false
-                    remote._on_disconnect:run(remote)
+                    local ok, trigger_err = pcall(remote._on_disconnect.run,
+                                                  remote._on_disconnect, remote)
+                    if not ok then
+                        log.error(trigger_err)
+                    end
                 end
+                -- A server may exit after initiating a graceful shutdown but
+                -- before all clients close their connections (for example, on
+                -- timeout). In this case it's important that we don't initiate
+                -- a graceful shutdown on our side, because a connection can
+                -- already be reestablished (if reconnect_after is set) by the
+                -- time we finish running on_shutdown triggers.
+                remote._shutdown_pending = nil
             end
-            remote.state, remote.error = state, err
             if state == 'error_reconnect' then
-                -- Repeat the same error in verbose log only.
-                -- Else the error clogs the log. See gh-3175.
-                if err ~= last_reconnect_error then
-                    log.warn('%s:%s: %s', host or "", port or "", err)
-                    last_reconnect_error = err
+                -- We display error in "warning" mode only if
+                -- 1) This error is the first one in netbox session.
+                -- 2) Current and previous error has different types (codes).
+                -- 3) Current and previous error has different messages and
+                --    different types of parent error.
+                -- Otherwise, current error will be repeated in "verbose" mode
+                local prev_err_code = err.prev and err.prev.code
+                if (err.code ~= last_err_code) or
+                   (err.message ~= last_err_name and
+                    prev_err_code ~= last_prev_err_code) then
+                    log.warn("%s:%s: %s", host or "", port or "", err.message)
                 else
-                    log.verbose('%s:%s: %s', host or "", port or "", err)
+                    log.verbose("%s:%s: %s", host or "", port or "",
+                                err.message)
                 end
+                last_err_name, last_err_code, last_prev_err_code =
+                    err.message, err.code, prev_err_code
             end
+            remote._state_cond:broadcast()
         elseif what == 'handshake' then
-            local greeting = ...
-            if not opts.console and greeting.protocol ~= 'Binary' then
-                return E_NO_CONNECTION,
-                       'Unsupported protocol: '..greeting.protocol
-            end
+            local greeting, version, features = ...
             remote.protocol = greeting.protocol
             remote.peer_uuid = greeting.uuid
             remote.peer_version_id = greeting.version_id
-        elseif what == 'id' then
-            local version, features = ...
             features = iproto_features_resolve(features)
             remote.peer_protocol_version = version
             remote.peer_protocol_features = features
             if opts.required_protocol_version and
                opts.required_protocol_version > version then
-                return E_NO_CONNECTION,
-                       string.format('Protocol version (%d) < required (%d)',
-                                     version, opts.required_protocol_version)
+                box.error({
+                    code = E_NO_CONNECTION,
+                    reason = string.format(
+                        'Protocol version (%d) < required (%d)',
+                         version, opts.required_protocol_version),
+                })
             end
             if opts.required_protocol_features then
                 local ok, missing = iproto_features_check(
                     features, opts.required_protocol_features)
                 if not ok then
-                    return E_NO_CONNECTION,
-                           'Missing required protocol features: ' ..
-                           table.concat(missing, ', ')
+                    box.error({
+                        code = E_NO_CONNECTION,
+                        reason = 'Missing required protocol features: ' ..
+                                 table.concat(missing, ', '),
+                    })
                 end
             end
-        elseif what == 'will_fetch_schema' then
-            return not opts.console
-        elseif what == 'fetch_connect_timeout' then
-            return opts.connect_timeout or DEFAULT_CONNECT_TIMEOUT
+            if not opts.fetch_schema then
+                remote.space = setmetatable({}, {
+                    __index = function(_, space_key)
+                        local id_or_name
+                        if type(space_key) == 'number' then
+                            id_or_name = 'id'
+                        elseif type(space_key) == 'string' then
+                            if not features.space_and_index_names then
+                                return nil
+                            end
+                            id_or_name = 'name'
+                        else
+                            return nil
+                        end
+                        local space = {[id_or_name] = space_key,
+                                       _id_or_name = space_key}
+                        space.index = setmetatable({}, {
+                            __index = function(_, idx_key)
+                                local id_or_name
+                                if type(idx_key) == 'number' then
+                                    id_or_name = 'id'
+                                elseif type(idx_key) == 'string' then
+                                    if not features.space_and_index_names then
+                                        return nil
+                                    end
+                                    id_or_name = 'name'
+                                else
+                                    return nil
+                                end
+                                local idx_wrapper = setmetatable({
+                                    [id_or_name] = idx_key,
+                                    _id_or_name = idx_key,
+                                    space = space
+                                }, remote._index_mt)
+                                space.index[idx_key] = idx_wrapper
+                                return idx_wrapper
+                            end})
+                        local space_wrapper = setmetatable(space,
+                                                           remote._space_mt)
+                        remote.space[space_key] = space_wrapper
+                        return space_wrapper
+                    end})
+            end
         elseif what == 'did_fetch_schema' then
             remote:_install_schema(...)
-        elseif what == 'reconnect_timeout' then
-            if type(opts.reconnect_after) == 'number' and
-               opts.reconnect_after > 0 then
-                return opts.reconnect_after
-            end
         elseif what == 'event' then
             local key, value = ...
             local state = remote._watchers and remote._watchers[key]
@@ -779,52 +413,67 @@ local function new_sm(host, port, opts, sock, greeting)
             end
         end
     end
-    -- @deprecated since 1.10
     if opts.console then
-        log.warn("Netbox console API is deprecated since 1.10, please use "..
-                 "require('console').connect() instead")
-        setmetatable(remote, console_mt)
+        box.error(box.error.ILLEGAL_PARAMS,
+                  "Netbox text protocol support was dropped, " ..
+                  "please use require('console').connect() instead")
     else
         setmetatable(remote, remote_mt)
         remote._space_mt = space_metatable(remote)
         remote._index_mt = index_metatable(remote)
-        if opts.call_16 then
-            remote.call = remote.call_16
-            remote.eval = remote.eval_16
-        end
     end
     remote._on_schema_reload = trigger.new("on_schema_reload")
+    remote._on_shutdown = trigger.new("on_shutdown")
     remote._on_disconnect = trigger.new("on_disconnect")
     remote._on_connect = trigger.new("on_connect")
     remote._is_connected = false
-    remote._transport = create_transport(host, port, user, password, callback,
-                                         sock, greeting)
-    remote._transport.start()
-    if opts.wait_connected ~= false then
-        remote._transport.wait_state('active', tonumber(opts.wait_connected))
-    end
-    -- Last stream ID used for this connection
+    -- Signaled when the state changes.
+    remote._state_cond = fiber.cond()
+    -- Last stream ID used for this connection.
     remote._last_stream_id = 0
-    return remote
-end
-
---
--- Wrap an existing connection into net.box API.
--- @param sock Connected socket.
--- @param greeting Decoded greeting, received from a server.
--- @param host Hostname to which @a connection is established.
--- @param port TCP port to which @a connection is established.
--- @param opts Options like reconnect_after, connect_timeout,
---        wait_connected, login, password, ...
---
--- @retval Net.box object.
---
-local function wrap(sock, greeting, host, port, opts)
-    if sock == nil or type(greeting) ~= 'table' then
-        error('Usage: netbox.wrap(socket, greeting, [opts])')
+    local weak_refs = setmetatable({callback = callback}, {__mode = 'v'})
+    -- Create a transport, adding auto-stop-on-GC feature.
+    -- The tricky part is the callback:
+    --  * callback references the transport (indirectly);
+    --  * worker fiber references the callback;
+    --  * fibers are GC roots - i.e. transport is never GC-ed!
+    -- We solve the issue by making the worker->callback ref weak.
+    -- Now it is necessary to have a strong ref to callback somewhere or
+    -- it is GC-ed prematurely. We store a strong reference in the remote
+    -- connection object.
+    local function weak_callback(...)
+        local callback = weak_refs.callback
+        if callback then return callback(...) end
+        -- The callback is responsible for handling graceful shutdown.
+        -- If it's garbage collected, the connection won't be closed on
+        -- receiving 'box.shutdown' event and so the server won't exit
+        -- until the connection object is garbage collected, which may
+        -- take forever. To avoid that, let's break the worker loop if
+        -- we see that the callback is unavailable.
+        weak_refs.transport:stop()
     end
-    opts = opts or {}
-    return new_sm(host, port, opts, sock, greeting)
+    remote._callback = callback
+    local transport = internal.new_transport(
+            uri_or_fd, user, password, weak_callback,
+            opts.connect_timeout, opts.reconnect_after,
+            opts.fetch_schema, opts.auth_type)
+    weak_refs.transport = transport
+    remote._transport = transport
+    remote._gc_hook = ffi.gc(ffi.new('char[1]'), function()
+        pcall(transport.stop, transport);
+    end)
+    if not opts._disable_graceful_shutdown then
+        remote:watch('box.shutdown', function(_, value)
+            if value then
+                graceful_shutdown(remote)
+            end
+        end)
+    end
+    transport:start()
+    if opts.wait_connected ~= false then
+        remote:wait_state('active', tonumber(opts.wait_connected))
+    end
+    return remote
 end
 
 --
@@ -833,12 +482,27 @@ end
 --        hostname:port@login:password. Host and port can be
 --        passed separately with login and password in the next
 --        parameter.
--- @param opts @Sa wrap().
+-- @param opts Options like reconnect_after, connect_timeout,
+--        wait_connected, login, password, ...
 --
 -- @retval Net.box object.
 --
 local function connect(...)
-    return new_sm(parse_connect_params(...))
+    local uri, opts = parse_connect_params(...)
+    check_param_table(opts, CONNECT_OPTION_TYPES)
+    return new_sm(uri, opts)
+end
+
+--
+-- Create a connection from a file descriptor number.
+--
+-- The file descriptor should point to a socket and be switched to
+-- the non-blocking mode.
+--
+local function from_fd(fd, opts)
+    check_param(fd, 'fd', 'number')
+    check_param_table(opts, CONNECT_OPTION_TYPES)
+    return new_sm(fd, opts or {})
 end
 
 local function check_remote_arg(remote, method)
@@ -849,14 +513,16 @@ local function check_remote_arg(remote, method)
 end
 
 local function check_call_args(args)
-    if args ~= nil and type(args) ~= 'table' then
+    if args ~= nil and type(args) ~= 'table' and
+       not msgpack.is_object(args) then
         error("Use remote:call(func_name, {arg1, arg2, ...}, opts) "..
               "instead of remote:call(func_name, arg1, arg2, ...)")
     end
 end
 
 local function check_eval_args(args)
-    if args ~= nil and type(args) ~= 'table' then
+    if args ~= nil and type(args) ~= 'table' and
+       not msgpack.is_object(args) then
         error("Use remote:eval(expression, {arg1, arg2, ...}, opts) "..
               "instead of remote:eval(expression, arg1, arg2, ...)")
     end
@@ -869,7 +535,10 @@ end
 
 local function stream_begin(stream, txn_opts, netbox_opts)
     check_remote_arg(stream, 'begin')
+    check_param_table(netbox_opts, REQUEST_OPTION_TYPES)
     local timeout
+    local txn_isolation
+    local is_sync
     if txn_opts then
         if type(txn_opts) ~= 'table' then
             error("txn_opts should be a table")
@@ -878,25 +547,107 @@ local function stream_begin(stream, txn_opts, netbox_opts)
         if timeout and (type(timeout) ~= "number" or timeout <= 0) then
             error("timeout must be a number greater than 0")
         end
+        txn_isolation = txn_opts.txn_isolation
+        if txn_isolation ~= nil then
+            txn_isolation =
+                box.internal.normalize_txn_isolation_level(txn_isolation)
+        end
+        is_sync = txn_opts.is_sync
+        if is_sync ~= nil and type(is_sync) ~= "boolean" then
+            error("is_sync must be a boolean")
+        end
+        if is_sync == false then
+            error("is_sync can only be true")
+        end
     end
-    local res = stream:_request(M_BEGIN, netbox_opts, nil,
-                                stream._stream_id, timeout)
+    local res = stream:_request('BEGIN', netbox_opts, nil,
+                                stream._stream_id, timeout, txn_isolation,
+                                is_sync)
     if netbox_opts and netbox_opts.is_async then
         return res
     end
 end
 
-local function stream_commit(stream, opts)
+-- A function that correctly orders commit options. This is done so that
+-- txn_opts is the second parameter (as in begin), and opts is the third
+-- parameter. This is done for backward compatibility.
+local function order_opts_commit(opts_1, opts_2)
+    if opts_1 == nil and opts_2 == nil then
+        return opts_1, opts_2
+    end
+    if type(opts_1) ~= 'table' and type(opts_2) ~= 'table' then
+        box.error(box.error.ILLEGAL_PARAMS, "options should be a table")
+    end
+
+    local new_opts_1 = opts_1
+    local new_opts_2 = opts_2
+
+    if opts_1 ~= nil and type(opts_1) == 'table' then
+        for i, _ in pairs(opts_1) do
+            for k, _ in pairs(REQUEST_OPTION_TYPES) do
+                if i == k then
+                    new_opts_1, new_opts_2 = opts_2, opts_1
+                    break
+                end
+            end
+        end
+    end
+
+    if opts_2 ~= nil and type(opts_2) == 'table' then
+        for i, _ in pairs(opts_2) do
+            for k, _ in pairs(REQUEST_OPTION_TYPES) do
+                if i == k then
+                    new_opts_1, new_opts_2 = opts_1, opts_2
+                    break
+                end
+            end
+        end
+    end
+    return new_opts_1, new_opts_2
+end
+
+local function stream_commit(stream, txn_opts, opts)
     check_remote_arg(stream, 'commit')
-    local res = stream:_request(M_COMMIT, opts, nil, stream._stream_id)
-    if opts and opts.is_async then
+    local new_txn_opts, new_opts = order_opts_commit(txn_opts, opts)
+    check_param_table(new_opts, REQUEST_OPTION_TYPES)
+
+    -- The options are in the wrong order or mixed up. Example:
+    -- stream:commit({opts})                => ok
+    -- stream:commit({txn_opts})            => ok
+    -- stream:commit({txn_opts}, {opts})    => ok
+    -- stream:commit({opts}, {txn_opts})    => error
+    -- stream:commit({txn_opts, opts})      => error
+    -- stream:commit({opts, txn_opts})      => error
+    -- The opts is netbox options. The txn_opts is transaction options.
+    if new_txn_opts and new_opts and new_txn_opts ~= txn_opts then
+        box.error(box.error.ILLEGAL_PARAMS, "options are either in the " ..
+                  "wrong order or mixed up")
+    end
+
+    local is_sync
+    if new_txn_opts then
+        if type(new_txn_opts) ~= 'table' then
+            box.error(box.error.ILLEGAL_PARAMS, "options should be a table")
+        end
+        is_sync = new_txn_opts.is_sync
+        if type(is_sync) ~= "boolean" and is_sync ~= nil then
+            box.error(box.error.ILLEGAL_PARAMS, "is_sync must be a boolean")
+        end
+        if is_sync == false then
+            box.error(box.error.ILLEGAL_PARAMS, "is_sync can only be true")
+        end
+    end
+    local res = stream:_request('COMMIT', new_opts, nil, stream._stream_id,
+                                is_sync)
+    if new_opts and new_opts.is_async then
         return res
     end
 end
 
 local function stream_rollback(stream, opts)
     check_remote_arg(stream, 'rollback')
-    local res = stream:_request(M_ROLLBACK, opts, nil, stream._stream_id)
+    check_param_table(opts, REQUEST_OPTION_TYPES)
+    local res = stream:_request('ROLLBACK', opts, nil, stream._stream_id)
     if opts and opts.is_async then
         return res
     end
@@ -911,14 +662,38 @@ function remote_methods:new_stream()
         commit = stream_commit,
         rollback = stream_rollback,
         _stream_id = self._last_stream_id,
-        space = setmetatable({
-            _stream_space_cache = {},
-            _stream = nil,
-        }, stream_spaces_mt),
         _conn = self,
         _schema_version = self.schema_version,
     }, { __index = self, __serialize = stream_serialize })
-    stream.space._stream = stream
+    local stream_space_cache = {}
+    local stream_spaces_serialize = function() return stream._conn.space end
+    -- When stream being created there are no spaces in it. When user try to
+    -- access some space in stream, we first of all compare _schema_version of
+    -- stream with schema_version from connection and if they are not equal, we
+    -- clear stream space cache and update it's schema_version. Then
+    -- we look for corresponding space in the connection. If it is
+    -- found we create same space for the stream but with corresponding
+    -- stream ID.
+    stream.space = setmetatable({}, {
+        __index = function(_, key)
+            if stream._schema_version ~= stream._conn.schema_version then
+                stream._schema_version = stream._conn.schema_version
+                stream_space_cache = {}
+            end
+            if stream_space_cache[key] then
+                return stream_space_cache[key]
+            end
+            local src = stream._conn.space[key]
+            if not src then
+                return nil
+            end
+            local res = stream_wrap_space(stream, src)
+            stream_space_cache[key] = res
+            return res
+        end,
+        __serialize = stream_spaces_serialize,
+        __autocomplete = stream_spaces_serialize,
+    })
     return stream
 end
 
@@ -952,7 +727,7 @@ function watcher_methods:_run()
         self._next = state.idle
         state.idle = self
         if not state.is_acknowledged then
-            self._conn._transport.watch(state.key)
+            self._conn._transport:watch(state.key)
             state.is_acknowledged = true
         end
     else
@@ -999,7 +774,7 @@ function watcher_methods:unregister()
     state.watcher_count = state.watcher_count - 1
     if state.watcher_count == 0 then
         -- No watchers left. Unsubscribe and drop the state.
-        conn._transport.unwatch(state.key)
+        conn._transport:unwatch(state.key)
         conn._watchers[state.key] = nil
     end
 end
@@ -1017,7 +792,7 @@ function remote_methods:watch(key, func)
         -- Install a trigger to resubscribe registered watchers on reconnect.
         self._on_connect(function(conn)
             for key, _ in pairs(conn._watchers) do
-                conn._transport.watch(key)
+                conn._transport:watch(key)
             end
         end)
     end
@@ -1046,7 +821,7 @@ function remote_methods:watch(key, func)
         -- We don't care whether the connection is active or not, because if
         -- the connection fails, we will resubscribe all registered watchers
         -- from the on_connect trigger.
-        self._transport.watch(key)
+        self._transport:watch(key)
         self._watchers[key] = state
     end
     local watcher = setmetatable({
@@ -1066,14 +841,28 @@ function remote_methods:watch(key, func)
     return watcher
 end
 
+function remote_methods:watch_once(key, opts)
+    check_remote_arg(self, 'watch_once')
+    if type(key) ~= 'string' then
+        box.error(E_PROC_LUA, 'key must be a string')
+    end
+    check_param_table(opts, REQUEST_OPTION_TYPES)
+    return self:_request('WATCH_ONCE', opts, nil, nil, key)
+end
+
 function remote_methods:close()
     check_remote_arg(self, 'close')
-    self._transport.stop()
+    self._transport:stop(true)
 end
 
 function remote_methods:on_schema_reload(...)
     check_remote_arg(self, 'on_schema_reload')
     return self._on_schema_reload(...)
+end
+
+function remote_methods:on_shutdown(...)
+    check_remote_arg(self, 'on_shutdown')
+    return self._on_shutdown(...)
 end
 
 function remote_methods:on_disconnect(...)
@@ -1093,29 +882,35 @@ end
 
 function remote_methods:wait_connected(timeout)
     check_remote_arg(self, 'wait_connected')
-    return self._transport.wait_state('active', timeout)
+    return self:wait_state('active', timeout)
 end
 
-function remote_methods:_request(method, opts, format, stream_id, ...)
+--
+-- Make a request, which throws an exception in case of critical errors
+-- (e.g. wrong API usage) and returns nil,err if there's connection related
+-- issues.
+--
+function remote_methods:_request_impl(method, opts, format, stream_id, ...)
+    method = internal.method[method]
+    assert(method ~= nil)
     local transport = self._transport
-    local on_push, on_push_ctx, buffer, skip_header, deadline
+    local thread_id
+    local on_push, on_push_ctx, buffer, skip_header, return_raw, deadline
     -- Extract options, set defaults, check if the request is
     -- async.
     if opts then
+        thread_id = opts._thread_id
         buffer = opts.buffer
         skip_header = opts.skip_header
+        return_raw = opts.return_raw
         if opts.is_async then
             if opts.on_push or opts.on_push_ctx then
                 error('To handle pushes in an async request use future:pairs()')
             end
-            local res, err =
-                transport.perform_async_request(buffer, skip_header, method,
-                                                table.insert, {}, format,
-                                                stream_id, ...)
-            if err then
-                box.error(err)
-            end
-            return res
+            return transport:perform_async_request(self, buffer, skip_header,
+                                                   return_raw, table.insert,
+                                                   {}, format, thread_id,
+                                                   stream_id, method, ...)
         end
         if opts.timeout then
             deadline = fiber_clock() + opts.timeout
@@ -1126,30 +921,53 @@ function remote_methods:_request(method, opts, format, stream_id, ...)
         on_push = on_push_sync_default
     end
     -- Execute synchronous request.
+    if self._fiber == fiber.self() then
+        error('Synchronous requests are not allowed in net.box trigger')
+    end
     local timeout = deadline and max(0, deadline - fiber_clock())
     if self.state ~= 'active' then
-        transport.wait_state('active', timeout)
+        self:wait_state('active', timeout)
         timeout = deadline and max(0, deadline - fiber_clock())
     end
-    local res, err = transport.perform_request(timeout, buffer, skip_header,
-                                               method, on_push, on_push_ctx,
-                                               format, stream_id, ...)
-    if err then
-        box.error(err)
-    end
+    local res, err = transport:perform_request(timeout, buffer, skip_header,
+                                               return_raw, on_push, on_push_ctx,
+                                               format, thread_id, stream_id,
+                                               method, ...)
     -- Try to wait until a schema is reloaded if needed.
     -- Regardless of reloading result, the main response is
     -- returned, since it does not depend on any schema things.
     if self.state == 'fetch_schema' then
         timeout = deadline and max(0, deadline - fiber_clock())
-        transport.wait_state('active', timeout)
+        self:wait_state('active', timeout)
+    end
+    return res, err
+end
+
+function remote_methods:_request(method, opts, format, stream_id, ...)
+    local res, err = self:_request_impl(method, opts, format, stream_id, ...)
+    if err then
+        box.error(err)
     end
     return res
 end
 
+function remote_methods:_inject(str, opts)
+    check_param_table(opts, REQUEST_OPTION_TYPES)
+    return self:_request('INJECT', opts, nil, nil, str)
+end
+
+function remote_methods:_next_sync()
+    return self._transport:next_sync()
+end
+
 function remote_methods:ping(opts)
     check_remote_arg(self, 'ping')
-    return (pcall(self._request, self, M_PING, opts, nil, self._stream_id))
+    check_param_table(opts, REQUEST_OPTION_TYPES)
+    if opts and opts.is_async then
+        error("conn:ping() doesn't support `is_async` argument")
+    end
+    local _, err = self:_request_impl('PING', opts, nil, self._stream_id)
+    return err == nil
 end
 
 function remote_methods:reload_schema()
@@ -1157,18 +975,12 @@ function remote_methods:reload_schema()
     self:ping()
 end
 
--- @deprecated since 1.7.4
-function remote_methods:call_16(func_name, ...)
-    check_remote_arg(self, 'call')
-    return (self:_request(M_CALL_16, nil, nil, self._stream_id,
-                          tostring(func_name), {...}))
-end
-
 function remote_methods:call(func_name, args, opts)
     check_remote_arg(self, 'call')
     check_call_args(args)
+    check_param_table(opts, REQUEST_OPTION_TYPES)
     args = args or {}
-    local res = self:_request(M_CALL_17, opts, nil, self._stream_id,
+    local res = self:_request('CALL', opts, nil, self._stream_id,
                               tostring(func_name), args)
     if type(res) ~= 'table' or opts and opts.is_async then
         return res
@@ -1176,18 +988,12 @@ function remote_methods:call(func_name, args, opts)
     return unpack(res)
 end
 
--- @deprecated since 1.7.4
-function remote_methods:eval_16(code, ...)
-    check_remote_arg(self, 'eval')
-    return unpack((self:_request(M_EVAL, nil, nil, self._stream_id,
-                                 code, {...})))
-end
-
 function remote_methods:eval(code, args, opts)
     check_remote_arg(self, 'eval')
     check_eval_args(args)
+    check_param_table(opts, REQUEST_OPTION_TYPES)
     args = args or {}
-    local res = self:_request(M_EVAL, opts, nil, self._stream_id, code, args)
+    local res = self:_request('EVAL', opts, nil, self._stream_id, code, args)
     if type(res) ~= 'table' or opts and opts.is_async then
         return res
     end
@@ -1199,7 +1005,8 @@ function remote_methods:execute(query, parameters, sql_opts, netbox_opts)
     if sql_opts ~= nil then
         box.error(box.error.UNSUPPORTED, "execute", "options")
     end
-    return self:_request(M_EXECUTE, netbox_opts, nil, self._stream_id,
+    check_param_table(netbox_opts, REQUEST_OPTION_TYPES)
+    return self:_request('EXECUTE', netbox_opts, nil, self._stream_id,
                          query, parameters or {}, sql_opts or {})
 end
 
@@ -1211,28 +1018,38 @@ function remote_methods:prepare(query, parameters, sql_opts, netbox_opts) -- lua
     if sql_opts ~= nil then
         box.error(box.error.UNSUPPORTED, "prepare", "options")
     end
-    return self:_request(M_PREPARE, netbox_opts, nil, self._stream_id, query)
+    check_param_table(netbox_opts, REQUEST_OPTION_TYPES)
+    return self:_request('PREPARE', netbox_opts, nil, self._stream_id, query)
 end
 
 function remote_methods:unprepare(query, parameters, sql_opts, netbox_opts)
     check_remote_arg(self, "unprepare")
     if type(query) ~= "number" then
-        box.error("query id is expected to be numeric")
+        box.error(box.error.ILLEGAL_PARAMS,
+                  "query id is expected to be numeric")
     end
     if sql_opts ~= nil then
         box.error(box.error.UNSUPPORTED, "unprepare", "options")
     end
-    return self:_request(M_UNPREPARE, netbox_opts, nil, self._stream_id,
+    check_param_table(netbox_opts, REQUEST_OPTION_TYPES)
+    return self:_request('UNPREPARE', netbox_opts, nil, self._stream_id,
                          query, parameters or {}, sql_opts or {})
 end
 
 function remote_methods:wait_state(state, timeout)
     check_remote_arg(self, 'wait_state')
-    return self._transport.wait_state(state, timeout)
+    local deadline = fiber_clock() + (timeout or TIMEOUT_INFINITY)
+    -- FYI: [] on a string is valid
+    repeat until self.state == state or state[self.state] or
+                 self.state == 'closed' or self.state == 'error' or
+                 (not self.opts.reconnect_after and
+                  self.state == 'graceful_shutdown') or
+                 not self._state_cond:wait(max(0, deadline - fiber_clock()))
+    return self.state == state or state[self.state] or false
 end
 
 function remote_methods:_install_schema(schema_version, spaces, indices,
-                                        collations)
+                                        collations, space_sequences)
     local sl, space_mt, index_mt = {}, self._space_mt, self._index_mt
     for _, space in pairs(spaces) do
         local name = space[3]
@@ -1248,6 +1065,7 @@ function remote_methods:_install_schema(schema_version, spaces, indices,
         end
         s.id = id
         s.name = name
+        s._id_or_name = id
         s.engine = engine
         s.field_count = field_count
         s.enabled = true
@@ -1255,7 +1073,10 @@ function remote_methods:_install_schema(schema_version, spaces, indices,
         s.temporary = false
         s.is_sync = false
         s._format = format
-        s._format_cdata = box.internal.new_tuple_format(format)
+        -- We pass `names_only=true` because format clauses received from IPROTO
+        -- can be incompatible with, for instance, the data types known on the
+        -- client.
+        s._format_cdata = box.internal.tuple_format.new(format, true)
         s.connection = self
         if #space > 5 then
             local opts = space[6]
@@ -1273,11 +1094,19 @@ function remote_methods:_install_schema(schema_version, spaces, indices,
         sl[name] = s
     end
 
+    local seql = {}
+    if space_sequences ~= nil then
+        for _, seq in ipairs(space_sequences) do
+            seql[seq[1]] = seq
+        end
+    end
+
     for _, index in pairs(indices) do
         local idx = {
             space   = index[1],
             id      = index[2],
             name    = index[3],
+            _id_or_name = index[2],
             type    = string.upper(index[4]),
             parts   = {},
         }
@@ -1329,6 +1158,17 @@ function remote_methods:_install_schema(schema_version, spaces, indices,
             idx.unique = not not index[OPTS].unique
         end
 
+        if idx.id == 0 then
+            local seq = seql[idx.space]
+            if seq ~= nil then
+                idx.sequence_id = seq[2]
+                idx.sequence_fieldno = seq[4] + 1
+                if seq[5] ~= '' then
+                    idx.sequence_path = seq[5]
+                end
+            end
+        end
+
         if sl[idx.space] ~= nil then
             sl[idx.space].index[idx.id] = idx
             sl[idx.space].index[idx.name] = idx
@@ -1339,39 +1179,11 @@ function remote_methods:_install_schema(schema_version, spaces, indices,
 
     self.schema_version = schema_version
     self.space = sl
-    self._on_schema_reload:run(self)
-end
-
--- console methods
-console_methods.close = remote_methods.close
-console_methods.on_schema_reload = remote_methods.on_schema_reload
-console_methods.on_disconnect = remote_methods.on_disconnect
-console_methods.on_connect = remote_methods.on_connect
-console_methods.is_connected = remote_methods.is_connected
-console_methods.wait_state = remote_methods.wait_state
-function console_methods:eval(line, timeout)
-    check_remote_arg(self, 'eval')
-    local err, res
-    local transport = self._transport
-    local pr = transport.perform_request
-    if self.state ~= 'active' then
-        local deadline = fiber_clock() + (timeout or TIMEOUT_INFINITY)
-        transport.wait_state('active', timeout)
-        timeout = max(0, deadline - fiber_clock())
+    local ok, err = pcall(self._on_schema_reload.run, self._on_schema_reload,
+                          self)
+    if not ok then
+        log.error(err)
     end
-    if self.protocol == 'Binary' then
-        local loader = 'return require("console").eval(...)'
-        res, err = pr(timeout, nil, false, M_EVAL, nil, nil, nil, nil, loader,
-                      {line})
-    else
-        assert(self.protocol == 'Lua console')
-        res, err = pr(timeout, nil, false, M_INJECT, nil, nil, nil, nil,
-                      line..'$EOF$\n')
-    end
-    if err then
-        box.error(err)
-    end
-    return res[1] or res
 end
 
 local function nothing_or_data(value)
@@ -1385,14 +1197,16 @@ space_metatable = function(remote)
 
     function methods:insert(tuple, opts)
         check_space_arg(self, 'insert')
-        return remote:_request(M_INSERT, opts, self._format_cdata,
-                               self._stream_id, self.id, tuple)
+        check_param_table(opts, REQUEST_OPTION_TYPES)
+        return remote:_request('INSERT', opts, self._format_cdata,
+                               self._stream_id, self._id_or_name, tuple)
     end
 
     function methods:replace(tuple, opts)
         check_space_arg(self, 'replace')
-        return remote:_request(M_REPLACE, opts, self._format_cdata,
-                               self._stream_id, self.id, tuple)
+        check_param_table(opts, REQUEST_OPTION_TYPES)
+        return remote:_request('REPLACE', opts, self._format_cdata,
+                               self._stream_id, self._id_or_name, tuple)
     end
 
     function methods:select(key, opts)
@@ -1412,8 +1226,10 @@ space_metatable = function(remote)
 
     function methods:upsert(key, oplist, opts)
         check_space_arg(self, 'upsert')
-        return nothing_or_data(remote:_request(M_UPSERT, opts, nil,
-                                               self._stream_id, self.id,
+        check_param_table(opts, REQUEST_OPTION_TYPES)
+        return nothing_or_data(remote:_request('UPSERT', opts, nil,
+                                               self._stream_id,
+                                               self._id_or_name,
                                                key, oplist))
     end
 
@@ -1438,125 +1254,131 @@ index_metatable = function(remote)
 
     function methods:select(key, opts)
         check_index_arg(self, 'select')
+        check_param_table(opts, REQUEST_OPTION_TYPES)
         local key_is_nil = (key == nil or
                             (type(key) == 'table' and #key == 0))
-        local iterator = check_iterator_type(opts, key_is_nil)
-        local offset = tonumber(opts and opts.offset) or 0
-        local limit = tonumber(opts and opts.limit) or 0xFFFFFFFF
-        return (remote:_request(M_SELECT, opts, self.space._format_cdata,
-                                self._stream_id, self.space.id, self.id,
-                                iterator, offset, limit, key))
+        local iterator, offset, limit, after, fetch_pos =
+            check_select_opts(opts, key_is_nil)
+        if (after ~= nil or fetch_pos)
+                and not remote.peer_protocol_features.pagination then
+            return box.error(box.error.UNSUPPORTED, "Remote server",
+                "pagination")
+        end
+
+        local res
+        local method = fetch_pos and 'SELECT_WITH_POS' or 'SELECT'
+        res = (remote:_request(method, opts, self.space._format_cdata,
+                               self._stream_id, self.space._id_or_name,
+                               self._id_or_name, iterator, offset, limit, key,
+                               after, fetch_pos))
+        if type(res) ~= 'table' or not fetch_pos or opts and opts.is_async then
+            return res
+        end
+        return unpack(res)
     end
 
     function methods:get(key, opts)
         check_index_arg(self, 'get')
+        check_param_table(opts, REQUEST_OPTION_TYPES)
         if opts and opts.buffer then
             error("index:get() doesn't support `buffer` argument")
         end
-        return nothing_or_data(remote:_request(M_GET, opts,
+        return nothing_or_data(remote:_request('GET', opts,
                                                self.space._format_cdata,
                                                self._stream_id,
-                                               self.space.id, self.id,
-                                               box.index.EQ, 0, 2, key))
+                                               self.space._id_or_name,
+                                               self._id_or_name, box.index.EQ,
+                                               0, 2, key, nil, false))
     end
 
     function methods:min(key, opts)
         check_index_arg(self, 'min')
+        check_param_table(opts, REQUEST_OPTION_TYPES)
         if opts and opts.buffer then
             error("index:min() doesn't support `buffer` argument")
         end
-        return nothing_or_data(remote:_request(M_MIN, opts,
+        return nothing_or_data(remote:_request('MIN', opts,
                                                self.space._format_cdata,
                                                self._stream_id,
-                                               self.space.id, self.id,
-                                               box.index.GE, 0, 1, key))
+                                               self.space._id_or_name,
+                                               self._id_or_name, box.index.GE,
+                                               0, 1, key, nil, false))
     end
 
     function methods:max(key, opts)
         check_index_arg(self, 'max')
+        check_param_table(opts, REQUEST_OPTION_TYPES)
         if opts and opts.buffer then
             error("index:max() doesn't support `buffer` argument")
         end
-        return nothing_or_data(remote:_request(M_MAX, opts,
+        return nothing_or_data(remote:_request('MAX', opts,
                                                self.space._format_cdata,
                                                self._stream_id,
-                                               self.space.id, self.id,
-                                               box.index.LE, 0, 1, key))
+                                               self.space._id_or_name,
+                                               self._id_or_name, box.index.LE,
+                                               0, 1, key, nil, false))
     end
 
     function methods:count(key, opts)
         check_index_arg(self, 'count')
+        check_param_table(opts, REQUEST_OPTION_TYPES)
         if opts and opts.buffer then
             error("index:count() doesn't support `buffer` argument")
         end
-        local code = string.format('box.space.%s.index.%s:count',
-                                   self.space.name, self.name)
-        return remote:_request(M_COUNT, opts, nil, self._stream_id,
+        local code = 'box.space[' .. (self.space.name ~= nil and
+                                      '"' .. self.space.name .. '"' or
+                                      self.space.id) ..
+                     '].index[' .. (self.name ~= nil and
+                                    '"' .. self.name .. '"' or self.id) ..
+                     ']:count'
+        return remote:_request('COUNT', opts, nil, self._stream_id,
                                code, { key, opts })
     end
 
     function methods:delete(key, opts)
         check_index_arg(self, 'delete')
-        return nothing_or_data(remote:_request(M_DELETE, opts,
+        check_param_table(opts, REQUEST_OPTION_TYPES)
+        return nothing_or_data(remote:_request('DELETE', opts,
                                                self.space._format_cdata,
-                                               self._stream_id, self.space.id,
-                                               self.id, key))
+                                               self._stream_id,
+                                               self.space._id_or_name,
+                                               self._id_or_name, key))
     end
 
     function methods:update(key, oplist, opts)
         check_index_arg(self, 'update')
-        return nothing_or_data(remote:_request(M_UPDATE, opts,
+        check_param_table(opts, REQUEST_OPTION_TYPES)
+        return nothing_or_data(remote:_request('UPDATE', opts,
                                                self.space._format_cdata,
-                                               self._stream_id, self.space.id,
-                                               self.id, key, oplist))
+                                               self._stream_id,
+                                               self.space._id_or_name,
+                                               self._id_or_name, key, oplist))
     end
 
     return { __index = methods, __metatable = false }
 end
 
-local this_module = {
-    create_transport = create_transport,
+this_module = {
     connect = connect,
     new = connect, -- Tarantool < 1.7.1 compatibility,
-    wrap = wrap,
-    establish_connection = establish_connection,
-    _method = { -- for tests
-        ping        = M_PING,
-        call_16     = M_CALL_16,
-        call_17     = M_CALL_17,
-        eval        = M_EVAL,
-        insert      = M_INSERT,
-        replace     = M_REPLACE,
-        delete      = M_DELETE,
-        update      = M_UPDATE,
-        upsert      = M_UPSERT,
-        select      = M_SELECT,
-        execute     = M_EXECUTE,
-        prepare     = M_PREPARE,
-        unprepare   = M_UNPREPARE,
-        get         = M_GET,
-        min         = M_MIN,
-        max         = M_MAX,
-        count       = M_COUNT,
-        begin       = M_BEGIN,
-        commit      = M_COMMIT,
-        rollback    = M_ROLLBACK,
-        inject      = M_INJECT,
-    }
+    from_fd = from_fd,
 }
 
 function this_module.timeout(timeout, ...)
     if type(timeout) == 'table' then timeout = ... end
     if not timeout then return this_module end
     local function timed_connect(...)
-        local host, port, opts = parse_connect_params(...)
+        local uri, opts = parse_connect_params(...)
         if opts.wait_connected ~= false then opts.wait_connected = timeout end
-        return connect(host, port, opts)
+        return connect(uri, opts)
     end
     return setmetatable({
         connect = timed_connect, new = timed_connect
     }, {__index = this_module})
 end
+
+-- net.box.self is available in the main thread only
+if fiber._internal.cord_is_main then
 
 local function rollback()
     if rawget(box, 'rollback') ~= nil then
@@ -1586,16 +1408,21 @@ this_module.self = {
     timeout = function(self) return self end,
     wait_connected = function(self) return true end,
     is_connected = function(self) return true end,
-    call = function(_box, proc_name, args)
-        check_remote_arg(_box, 'call')
+    call = function(__box, proc_name, args)
+        check_remote_arg(__box, 'call')
         check_call_args(args)
         args = args or {}
         proc_name = tostring(proc_name)
-        local status, proc, obj = pcall(package.loaded['box.internal'].
-            call_loadproc, proc_name)
+        if box.ctl.is_recovery_finished() then
+            local f = box.func[proc_name]
+            if f ~= nil then
+                return handle_eval_result(pcall(f.call, f, args))
+            end
+        end
+        local status, proc, obj = pcall(box.internal.call_loadproc, proc_name)
         if not status then
             rollback()
-            return box.error() -- re-throw
+            return error(proc) -- re-throw
         end
         if obj ~= nil then
             return handle_eval_result(pcall(proc, obj, unpack(args)))
@@ -1603,8 +1430,8 @@ this_module.self = {
             return handle_eval_result(pcall(proc, unpack(args)))
         end
     end,
-    eval = function(_box, expr, args)
-        check_remote_arg(_box, 'eval')
+    eval = function(__box, expr, args)
+        check_remote_arg(__box, 'eval')
         check_eval_args(args)
         args = args or {}
         local proc, errmsg = loadstring(expr)
@@ -1629,4 +1456,20 @@ setmetatable(this_module.self, {
     end
 })
 
-package.loaded['net.box'] = this_module
+else -- not cord_is_main
+
+this_module.self = setmetatable({}, {
+    __index = function(self, key)
+        if key == 'space' then
+            return {}
+        end
+        return function()
+            box.error(box.error.UNSUPPORTED,
+                      'application thread', 'net.box.self')
+        end
+    end,
+})
+
+end -- not cord_is_main
+
+return this_module

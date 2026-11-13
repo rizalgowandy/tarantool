@@ -64,7 +64,10 @@ extern "C" {
 	(b) = tmp;							\
 } while (0)
 
-#define DIV_ROUND_UP(n, d) (((n) + (d) - 1) / (d))
+#define DIV_ROUND_UP(n, d) ((n) / (d) + ((n) % (d) != 0))
+#define ROUND_UP_TO_POWER_OF_2(x, f) (((x) + ((f) - 1)) & ~((f) - 1))
+#define ROUND_DOWN(x, f) (((x) / (f)) * f)
+#define IS_POWER_OF_2(x) ((x) > 0 && ((x) & ((x) - 1)) == 0)
 
 /* Macros to define enum and corresponding strings. */
 #define ENUM0_MEMBER(s, ...) s,
@@ -94,16 +97,25 @@ extern "C" {
 #define STRN2ENUM(enum_name, str, len) ((enum enum_name) strnindex(enum_name##_strs, str, len, enum_name##_MAX))
 
 uint32_t
-strindex(const char **haystack, const char *needle, uint32_t hmax);
+strindex(const char *const *haystack, const char *needle, uint32_t hmax);
 
 uint32_t
-strnindex(const char **haystack, const char *needle, uint32_t len, uint32_t hmax);
+strnindex(const char *const *haystack, const char *needle, uint32_t len,
+	  uint32_t hmax);
 
 #define nelem(x)     (sizeof((x))/sizeof((x)[0]))
 #define field_sizeof(compound_type, field) sizeof(((compound_type *)NULL)->field)
 #ifndef lengthof
 #define lengthof(array) (sizeof (array) / sizeof ((array)[0]))
 #endif
+
+static inline void
+alloc_failure(const char *filename, int line, size_t size)
+{
+	fprintf(stderr, "Can't allocate %zu bytes at %s:%d",
+		size, filename, line);
+	exit(EXIT_FAILURE);
+}
 
 /**
  * An x* variant of a memory allocation function calls the original function
@@ -112,11 +124,8 @@ strnindex(const char **haystack, const char *needle, uint32_t len, uint32_t hmax
 #define xalloc_impl(size, func, args...)					\
 	({									\
 		void *ret = func(args);						\
-		if (unlikely(ret == NULL)) {					\
-			fprintf(stderr, "Can't allocate %zu bytes at %s:%d",	\
-				(size_t)(size), __FILE__, __LINE__);		\
-			exit(EXIT_FAILURE);					\
-		}								\
+		if (unlikely(ret == NULL))					\
+			alloc_failure(__FILE__, __LINE__, (size));		\
 		ret;								\
 	})
 
@@ -126,22 +135,98 @@ strnindex(const char **haystack, const char *needle, uint32_t len, uint32_t hmax
 #define xstrdup(s)		xalloc_impl(strlen((s)) + 1, strdup, (s))
 #define xstrndup(s, n)		xalloc_impl((n) + 1, strndup, (s), (n))
 
+/**
+ * Realloc callback that frees the block and returns NULL for a zero size.
+ * Allocation failures are returned to the caller instead of aborting.
+ * Unlike glibc, Darwin's realloc(ptr, 0) returns a new allocation.
+ */
+static inline void *
+realloc_with_free(void *ptr, size_t size)
+{
+	if (size == 0) {
+		free(ptr);
+		return NULL;
+	}
+	return (realloc)(ptr, size);
+}
+
+#define xaligned_alloc(size, align) \
+		xalloc_impl((size), aligned_alloc, (align), (size))
+#define xalloc_object(T) ({							\
+	(T *)xaligned_alloc(sizeof(T), alignof(T));				\
+})
+#define xalloc_array(T, count) ({						\
+	(T *)xaligned_alloc(sizeof(T) * (count), alignof(T));			\
+})
+#define xmempool_alloc(p)	xalloc_impl((p)->objsize, mempool_alloc, (p))
+#define xregion_alloc(p, size)	xalloc_impl((size), region_alloc, (p), (size))
+#define xregion_aligned_alloc(p, size, align) \
+		xalloc_impl((size), region_aligned_alloc, (p), (size), (align))
+#define xregion_join(p, size)	xalloc_impl((size), region_join, (p), (size))
+#define xibuf_alloc(p, size)	xalloc_impl((size), ibuf_alloc, (p), (size))
+#define xibuf_reserve(p, size)	xalloc_impl((size), ibuf_reserve, (p), (size))
+#define xruntime_memory_alloc(size) \
+	xalloc_impl((size), runtime_memory_alloc, (size))
+#define xlsregion_alloc(p, size, id) \
+	xalloc_impl((size), lsregion_alloc, (p), (size), (id))
+#define xlsregion_aligned_alloc(p, size, align, id) \
+	xalloc_impl((size), lsregion_aligned_alloc, (p), (size), (align), (id))
+#define xlsregion_alloc_object(lsregion, id, T) ({				\
+	(T *)xlsregion_aligned_alloc((lsregion), sizeof(T), alignof(T), (id));	\
+})
+#define xlsregion_reserve(p, size) \
+	xalloc_impl((size), lsregion_reserve, (p), (size))
+#define xregion_alloc_object(region, T) ({					\
+	(T *)xregion_aligned_alloc((region), sizeof(T), alignof(T));		\
+})
+#define xregion_alloc_array(region, T, count) ({				\
+	(T *)xregion_aligned_alloc((region), sizeof(T) * (count), alignof(T));\
+})
+
+#define xobuf_alloc(p, size)	xalloc_impl((size), obuf_alloc, (p), (size))
+#define xobuf_reserve(p, size)	xalloc_impl((size), obuf_reserve, (p), (size))
+
+#define xobuf_dup(p, src, size)							\
+	({									\
+		size_t ret = obuf_dup((p), (src), (size));			\
+		if (unlikely(ret != (size_t)(size)))				\
+			alloc_failure(__FILE__, __LINE__, (size));		\
+	})
+
+#define xslab_get(p, size)	xalloc_impl((size), slab_get, (p), (size))
+
 /** \cond public */
 
 /**
- * Feature test macroses for -std=c11 / -std=c++11
+ * Feature test macros for -std=c11 / -std=c++11
  *
  * Sic: clang aims to be gcc-compatible and thus defines __GNUC__
  */
 #ifndef __has_feature
 #  define __has_feature(x) 0
 #endif
+/**
+ * The special operator __has_builtin (operand) may be used in constant integer
+ * contexts and in preprocessor "#if" and "#elif" expressions to test whether
+ * the symbol named by its operand is recognized as a built-in function by GCC
+ * in the current language and conformance mode.
+ */
 #ifndef __has_builtin
 #  define __has_builtin(x) 0
 #endif
+/**
+ * The special operator __has_attribute (operand) may be used in "#if"
+ * and "#elif" expressions to test whether the attribute referenced by its
+ * operand is recognized by GCC.
+ */
 #ifndef __has_attribute
 #  define __has_attribute(x) 0
 #endif
+/**
+ * The special operator __has_cpp_attribute (operand) may be used in "#if" and
+ * "#elif" expressions in C++ code to test whether the attribute referenced by
+ * it operand is recognized by GCC.
+ */
 #ifndef __has_cpp_attribute
 #  define __has_cpp_attribute(x) 0
 #endif
@@ -158,12 +243,17 @@ strnindex(const char **haystack, const char *needle, uint32_t len, uint32_t hmax
  * You may use likely()/unlikely() to provide the compiler with branch
  * prediction information.
  */
-
 #if __has_builtin(__builtin_expect) || defined(__GNUC__)
 #  define likely(x)    __builtin_expect(!! (x),1)
 #  define unlikely(x)  __builtin_expect(!! (x),0)
 #else
 #  define likely(x)    (x)
+/**
+ * You may use likely()/unlikely() to provide the compiler with branch
+ * prediction information.
+ *
+ * @sa https://en.cppreference.com/w/cpp/language/attributes/likely
+ */
 #  define unlikely(x)  (x)
 #endif
 
@@ -211,8 +301,12 @@ strnindex(const char **haystack, const char *needle, uint32_t len, uint32_t hmax
  * including padding if any.
  */
 #ifndef offsetof
-#define offsetof(type, member) ((size_t) &((type *)0)->member)
-#endif
+#  if __has_builtin(__builtin_offsetof)
+#    define offsetof(type, member) __builtin_offsetof(type, member)
+#  else
+#    define offsetof(type, member) ((size_t)&((type *)0)->member)
+#  endif
+#endif /* offsetof */
 
 /**
  * This macro is used to retrieve an enclosing structure from a pointer to
@@ -229,10 +323,17 @@ strnindex(const char **haystack, const char *needle, uint32_t len, uint32_t hmax
  * specifiers to modify the alignment requirement of the object being
  * declared.
  *
- * Sic: alignas() doesn't work on anonymous strucrs on gcc < 4.9
+ * Sic: alignas() doesn't work on anonymous structs on gcc < 4.9
  *
- * \example struct obuf { int a; int b; alignas(16) int c; };
+ * Example:
+ *
+ * \code
+ * struct obuf { int a; int b; alignas(16) int c; };
+ * \endcode
  */
+#if defined(__cplusplus)
+#  include <stdalign.h>
+#endif
 #if !defined(alignas) && !defined(__alignas_is_defined)
 #  if __has_feature(c_alignas) || (defined(__GNUC__) && __GNUC__ >= 5)
 #    include <stdalign.h>
@@ -244,27 +345,31 @@ strnindex(const char **haystack, const char *needle, uint32_t len, uint32_t hmax
 #  endif
 #endif
 
-/**
- * C11/C++11 operator. Returns the alignment, in bytes, required for any
- * instance of the type indicated by type-id, which is either complete type,
- * an array type, or a reference type.
- */
 #if !defined(alignof) && !defined(__alignof_is_defined)
 #  if __has_feature(c_alignof) || (defined(__GNUC__) && __GNUC__ >= 5)
 #    include <stdalign.h>
 #  elif defined(__GNUC__)
 #    define alignof(_T) __alignof(_T)
+/*! @cond Doxygen_Suppress */
 #    define __alignof_is_defined 1
+/*! @endcond */
 #  else
+/**
+ * C11/C++11 operator. Returns the alignment, in bytes, required for any
+ * instance of the type indicated by type-id, which is either complete type,
+ * an array type, or a reference type.
+ */
 #    define alignof(_T) offsetof(struct { char c; _T member; }, member)
+/*! @cond Doxygen_Suppress */
 #    define __alignof_is_defined 1
+/*! @endcond */
 #  endif
 #endif
 
 /** Built-ins }}} */
 
 /**
- * Compiler-indepedent function attributes.
+ * Compiler-independent function attributes.
  *
  * \see https://gcc.gnu.org/onlinedocs/gcc/Type-Attributes.html
  * \see http://clang.llvm.org/docs/AttributeReference.html#function-attributes
@@ -279,7 +384,11 @@ strnindex(const char **haystack, const char *needle, uint32_t len, uint32_t hmax
  * variable may exist solely for use in an assert() statement, which makes
  * the local variable unused when NDEBUG is defined.
  *
- * \example int fun(MAYBE_UNUSED int unused_arg);
+ * Example:
+ *
+ * \code
+ * int fun(MAYBE_UNUSED int unused_arg);
+ * \endcode
  */
 #if defined(__cplusplus) && __has_cpp_attribute(maybe_unused)
 #  define MAYBE_UNUSED [[maybe_unused]]
@@ -294,7 +403,11 @@ strnindex(const char **haystack, const char *needle, uint32_t len, uint32_t hmax
  * the function call appears as a potentially-evaluated discarded-value
  * expression that is not explicitly cast to void.
  *
- * \example NODISCARD int function() { return -1 };
+ * Example:
+ *
+ * \code
+ * NODISCARD int function() { return -1 };
+ * \endcode
  */
 #if defined(__cplusplus) && __has_cpp_attribute(nodiscard)
 #  define NODISCARD [[nodiscard]]
@@ -308,7 +421,11 @@ strnindex(const char **haystack, const char *needle, uint32_t len, uint32_t hmax
  * This function attribute prevents a function from being considered for
  * inlining.
  *
- * \example NOINLINE int function() { return 0; };
+ * Example:
+ *
+ * \code
+ * NOINLINE int function() { return 0; };
+ * \endcode
  */
 #if __has_attribute(noinline) || defined(__GNUC__)
 #  define NOINLINE __attribute__((noinline))
@@ -317,11 +434,32 @@ strnindex(const char **haystack, const char *needle, uint32_t len, uint32_t hmax
 #endif
 
 /**
+ * Adds the 'always_inline' attribute to the function if it's supported. This
+ * attribute forces the function to be inlined if it's possible. If it's not,
+ * this results in a diagnostic.
+ *
+ * Example:
+ *
+ * \code
+ * ALWAYS_INLINE int function() { return 0; }
+ * \endcode
+ */
+#if __has_attribute(always_inline) || defined(__GNUC__)
+#  define ALWAYS_INLINE inline __attribute__((always_inline))
+#else
+#  define ALWAYS_INLINE inline
+#endif
+
+/**
  * A function declared as NORETURN shall not return to its caller.
  * The compiler will generate a diagnostic for a function declared as
  * NORETURN that appears to be capable of returning to its caller.
  *
- * \example NORETURN void abort();
+ * Example:
+ *
+ * \code
+ * NORETURN void abort();
+ * \endcode
  */
 #if defined(__cplusplus) && __has_cpp_attribute(noreturn)
 #  define NORETURN [[noreturn]]
@@ -377,7 +515,11 @@ strnindex(const char **haystack, const char *needle, uint32_t len, uint32_t hmax
  * useful to save data size because of the relatively high cost of
  * unaligned access on some architectures.
  *
- * \example struct PACKED name { char a; int b; };
+ * Example:
+ *
+ * \code
+ * struct PACKED name { char a; int b; };
+ * \endcode
  */
 #if __has_attribute(packed) || defined(__GNUC__)
 #  define PACKED  __attribute__((packed))
@@ -385,6 +527,17 @@ strnindex(const char **haystack, const char *needle, uint32_t len, uint32_t hmax
 #  define PACKED __packed
 #else
 #  define PACKED
+#endif
+
+/**
+ * NO_SANITIZE_ADDRESS attribute disables AddressSanitizer for a given function.
+ * The attribute may not be supported by old compilers, but they do not support
+ * ASAN as well, so it's safe to define the attribute only if ASAN is enabled.
+ */
+#if __has_feature(address_sanitizer)
+#  define NO_SANITIZE_ADDRESS __attribute__((no_sanitize_address))
+#else
+#  define NO_SANITIZE_ADDRESS
 #endif
 
 /** Function Attributes }}} */
@@ -416,17 +569,35 @@ strnindex(const char **haystack, const char *needle, uint32_t len, uint32_t hmax
 
 void close_all_xcpt(int fdc, ...);
 
-void __gcov_flush();
+#if (defined(__GNUC__) && __GNUC__ >= 11) || \
+	(defined(__clang__) && __clang_major__ >= 12)
+/** Import __gcov_dump function. */
+void
+__gcov_dump(void);
 
-/**
- * Async-signal-safe implementation of printf(), to
- * be able to write messages into the error log
- * inside a signal handler.
- */
-ssize_t
-fdprintf(int fd, const char *format, ...) __attribute__((format(printf, 2, 3)));
+/** Import __gcov_reset function. */
+void
+__gcov_reset(void);
 
-char *
+static inline void
+gcov_flush(void)
+{
+	__gcov_dump();
+	__gcov_reset();
+}
+#else
+/** Import __gcov_flush function. */
+void
+__gcov_flush(void);
+
+static inline void
+gcov_flush(void)
+{
+	__gcov_flush();
+}
+#endif
+
+const char *
 find_path(const char *argv0);
 
 char *
@@ -487,14 +658,20 @@ size_t
 strlcpy(char *dst, const char *src, size_t size);
 #endif
 
+#ifndef HAVE_STRLCAT
 /**
- * Check that @a str is valid utf-8 sequence and can be printed
- * unescaped.
- * @param str string
- * @param length string length
+ * Append the null-terminated string @a src to the end of @a dst string.
+ * Unlike @a strncat the resulting string is always null-terminated.
+ *
+ * @param dst destination buffer and the first input string
+ * @param src the second input string
+ * @param size destination buffer size
+ *
+ * @return the total length of the string, that it is trying to create
  */
-int
-utf8_check_printable(const char *str, size_t length);
+size_t
+strlcat(char *dst, const char *src, size_t size);
+#endif
 
 #ifndef HAVE_MEMMEM
 /* Declare memmem(). */
@@ -520,10 +697,70 @@ int clock_gettime(uint32_t clock_id, struct timespec *tp);
 #endif
 
 /**
+ * Returns the escaped string if the given character should be escaped when
+ * encoded in JSON or NULL otherwise.
+ */
+static inline const char *
+json_escape_char(char c)
+{
+	extern const char *const json_char2escape[];
+	extern bool json_escape_forward_slash;
+	if (c == '/' && json_escape_forward_slash)
+		return "\\/";
+	return json_char2escape[(unsigned char)c];
+}
+
+/**
+ * Returns the escaped string if the given character should be escaped when
+ * encoded for syslog according to RFC 3164 or NULL otherwise.
+ */
+static inline const char *
+syslog_escape_char(char c)
+{
+	extern const char *const syslog_char2escape[];
+	return syslog_char2escape[(unsigned char)c];
+}
+
+/**
+ * Returns the escaped string if the given character should be escaped when
+ * encoded for syslog according to RFC 3164 and JSON or NULL otherwise.
+ */
+static inline const char *
+json_syslog_escape_char(char c)
+{
+	return json_escape_char(c) != NULL ?
+		json_escape_char(c) : syslog_escape_char(c);
+}
+
+/**
  * Escape special characters in @a data to @a buf
  */
 int
 json_escape(char *buf, int size, const char *data);
+
+/**
+ * Escape special characters in @a data to @a buf for JSON and syslog.
+ */
+int
+json_syslog_escape(char *buf, int size, const char *data);
+
+/**
+ * Escape special characters in @a buf inplace
+ */
+int
+json_escape_inplace(char *buf, int size);
+
+/**
+ * Escape characters in @a buf inplace according to RFC 3164 for syslog.
+ */
+int
+syslog_escape_inplace(char *buf, int size);
+
+/**
+ * Escape characters in @a buf inplace for syslog and JSON.
+ */
+int
+json_syslog_escape_inplace(char *buf, int size);
 
 /**
  * Helper macro to handle easily snprintf() result
@@ -539,6 +776,70 @@ json_escape(char *buf, int size, const char *data);
 		_buf = NULL, _size = 0;						\
 	}									\
 } while(0)
+
+/**
+ * Helper macro for stringization via snprintf-function `func` to dynamically
+ * allocated tt_static_buf().
+ *   - requires "tt_static.h".
+ *   - crops:
+ *     - max(strlen(result)) = TT_STATIC_BUF_LEN - 1.
+ *     - appends num of skipped bytes if crops.
+ *   - returns TOSTR_ERRRES_TEXT() message if `func` fails.
+ */
+#define TOSTR_ERRRES_TEXT(func) "<TOSTR(" #func ") err>"
+#define TOSTR_CROP_SUFFIX "<more ~%db>"
+#define TOSTR(func, ...) \
+({ \
+	char *_buf = tt_static_buf(); \
+	int _res = func(_buf, TT_STATIC_BUF_LEN, ##__VA_ARGS__); \
+	if (_res < 0) { \
+		_buf = (char *)TOSTR_ERRRES_TEXT(func); \
+	} else if (_res >= TT_STATIC_BUF_LEN) { \
+		int _more = _res - (TT_STATIC_BUF_LEN - 1) + \
+			    lengthof(TOSTR_CROP_SUFFIX); \
+		_res = snprintf(NULL, 0, TOSTR_CROP_SUFFIX, _more); \
+		if (_res > 0) { \
+			snprintf(_buf + (TT_STATIC_BUF_LEN - 1) - _res, \
+				 _res + 1, TOSTR_CROP_SUFFIX, _more); \
+		} \
+	} \
+	_buf; \
+})
+
+/**
+ * Helper macro for stringization via snprintf-function `func` to dynamically
+ * allocated buffer. Static allocator is used for allocations.
+ *   - requires "small/static.h".
+ *   - calculate allocation size in a cost of additional call to `func`.
+ *   - returns TOSTR_ERRRES_TEXT() message if `func` or allocation fails.
+ */
+#define TOSTR_DEBUG(func, ...) \
+({ \
+	char *_buf; \
+	do { \
+		/* Calc size. */ \
+		int _buf_size = func(NULL, 0, ##__VA_ARGS__); \
+		if (_buf_size < 0) { \
+			_buf = (char *)TOSTR_ERRRES_TEXT(func); \
+			break; \
+		} \
+		/* Allocate. */ \
+		_buf = (char *)static_alloc(_buf_size + 1); \
+		if (_buf == NULL) { \
+			_buf = (char *)TOSTR_ERRRES_TEXT(func); \
+			break; \
+		} \
+		/* Printing. */ \
+		int _res = func(_buf, _buf_size + 1, ##__VA_ARGS__); \
+		if (_res < 0) { \
+			_buf = (char *)TOSTR_ERRRES_TEXT(func); \
+			break; \
+		} \
+		/* Check consistensy between 1st and 2nd func call. */ \
+		assert(_res == _buf_size); \
+	} while (0); \
+	_buf; \
+})
 
 #define COMPARE_RESULT(a, b) (a < b ? -1 : a > b)
 
@@ -575,6 +876,17 @@ double_compare_int64(double lhs, int64_t rhs, int k)
 }
 
 /**
+ * Compare two operands as unt32_t.
+ * Needed for qsort.
+ */
+static inline int
+cmp_u32(const void *_a, const void *_b)
+{
+	const uint32_t *a = (const uint32_t *)_a, *b = (const uint32_t *)_b;
+	return COMPARE_RESULT(*a, *b);
+}
+
+/**
  * Compare two operands as int64_t.
  * Needed for qsort.
  */
@@ -598,8 +910,116 @@ is_exp_of_two(unsigned n)
 void
 thread_sleep(double sec);
 
+/**
+ * Returns the value associated with an environment variable \a name. The value
+ * is copied onto the buffer, which's either user-provided (when \a buf != NULL)
+ * or dynamically allocated.
+ *
+ * \return buf  in case \a buf != NULL, and strlen(value) < \a buf_size.
+ *         ptr  a pointer to dynamically allocated memory, which has to be freed
+ *              manually, in case \a buf == NULL and strlen(value) < internal
+ *              hard limit.
+ *         NULL in case no value is found.
+ *              in case buf != NULL and strlen(value) >= \a buf_size.
+ *              in case buf == NULL and strlen(value) >= internal limit.
+ *
+ * When a non-null pointer is returned, it's guaranteed to contain a
+ * null-terminated string. The string is a copy of the corresponding environment
+ * variable in all cases, except when `getenv_safe` is run concurrently with
+ * `setenv`.
+ * In that case the buffer might contain:
+ * - an old variable value,
+ * - a new value, truncated to not exceed old value length,
+ * - garbage, truncated to not exceed old value length
+ * Hence the user has to validate the returns.
+ */
+char *
+getenv_safe(const char *name, char *buf, size_t buf_size);
+
+/**
+ * Returns the null-terminated string converted to lower case in-place.
+ */
+char *
+strtolower(char *s);
+
+/**
+ * Returns a copy of the null-terminated string converted to lower case: the
+ * result is dynamically allocated using `xmalloc`.
+ */
+char *
+strtolowerdup(const char *s);
+
+/** Returns the null-terminated string converted to upper case in-place. */
+char *
+strtoupper(char *s);
+
+/**
+ * Returns a copy of the null-terminated string converted to upper case. The
+ * result is dynamically allocated using `xmalloc`.
+ */
+char *
+strtoupperdup(const char *s);
+
 #if !defined(__cplusplus) && !defined(static_assert)
 # define static_assert _Static_assert
+#endif
+
+/** Asserts that a global variable has a given type. */
+#define STATIC_ASSERT_VAR_TYPE(var, type)				\
+MAYBE_UNUSED static inline void						\
+var##_assert_type(void)							\
+{									\
+	const type *p = &(var);						\
+	(void)p;							\
+}
+
+/** Like assert() but evaluates the given expression even if NDEBUG is set. */
+#ifndef NDEBUG
+# define VERIFY(expr) assert(expr)
+#else
+# define VERIFY(expr) ((void)(expr))
+#endif
+
+#ifndef NDEBUG
+/**
+ * Execute a CPU instruction that results in the SIGILL signal.
+ */
+static inline void
+illegal_instruction(void)
+{
+	#ifdef __x86_64__
+		__asm__("ud2");
+	#elif __aarch64__
+		/*
+		 * GNU Assembler older than 2.35 doesn't support the "udf #0"
+		 * mnemonic, thus use the machine code of that instruction.
+		 */
+		__asm__(".inst 0x00000000");
+	#else
+		#error unsupported architecture
+	#endif
+}
+#endif
+
+#ifdef ENABLE_ASAN
+# include <sanitizer/lsan_interface.h>
+# define LSAN_IGNORE_OBJECT(ptr) __lsan_ignore_object(ptr)
+
+/**
+ * Disable leak sanitizer. Leak check will not be performed on Tarantool
+ * exit.
+ */
+void
+lsan_turn_off(void);
+
+#else
+# define LSAN_IGNORE_OBJECT(ptr) ((void)ptr)
+
+static inline void
+lsan_turn_off(void)
+{
+}
+
 #endif
 
 #if defined(__cplusplus)

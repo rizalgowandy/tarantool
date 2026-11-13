@@ -61,7 +61,10 @@ restart:
 			f->caller->flags |= FIBER_IS_READY;
 			assert(f->caller->caller == &cord->sched);
 		}
+		fiber_set_system(fiber(), false);
 		cmsg_deliver(msg);
+		fiber_set_system(fiber(), true);
+		fiber_check_gc();
 		/*
 		 * Normally fibers die after their function
 		 * returns, and they call on_stop() triggers. The
@@ -130,11 +133,17 @@ fiber_pool_cb(ev_loop *loop, struct ev_watcher *watcher, int events)
 			f = rlist_shift_entry(&pool->idle, struct fiber, state);
 			fiber_call(f);
 		} else if (pool->size < pool->max_size) {
-			f = fiber_new(cord_name(cord()), fiber_pool_f);
-			if (f == NULL) {
-				diag_log();
-				break;
-			}
+			/*
+			 * We don't want fibers to be cancellable by client
+			 * while they are in the pool. However system flag is
+			 * reset during processing message from pool endpoint
+			 * so that fiber is made cancellable back.
+			 *
+			 * If some message processing should not be cancellable
+			 * by client then it can just set system flag during
+			 * it's execution.
+			 */
+			f = fiber_new_system("pool", fiber_pool_f);
 			fiber_start(f, pool);
 		} else {
 			/**
@@ -175,26 +184,21 @@ fiber_pool_create(struct fiber_pool *pool, const char *name, int max_pool_size,
 }
 
 void
-fiber_pool_destroy(struct fiber_pool *pool)
+fiber_pool_shutdown(struct fiber_pool *pool)
 {
-	/** Endpoint has connected pipes or unfetched messages */
 	cbus_endpoint_destroy(&pool->endpoint, NULL);
-	/**
-	 * At this point all messages are started to execution because last
-	 * cbus poison message was fired (endpoint_destroy condition).
-	 * We won't to have new messages from cbus and can send wakeup
-	 * to each idle fiber. In this case idle fiber can not fetch any
-	 * new message and will exit. We adjust idle_timeout to.
-	 */
-	pool->idle_timeout = 0;
-	struct fiber *idle_fiber;
-	rlist_foreach_entry(idle_fiber, &pool->idle, state)
-		fiber_wakeup(idle_fiber);
+	struct fiber *idle_fiber, *tmp;
+	rlist_foreach_entry_safe(idle_fiber, &pool->idle, state, tmp)
+		fiber_cancel(idle_fiber);
 	/**
 	 * Just wait on fiber exit condition until all fibers are done
 	 */
 	while (pool->size > 0)
 		fiber_cond_wait(&pool->worker_cond);
-	fiber_cond_destroy(&pool->worker_cond);
 }
 
+void
+fiber_pool_destroy(struct fiber_pool *pool)
+{
+	fiber_cond_destroy(&pool->worker_cond);
+}

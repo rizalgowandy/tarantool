@@ -30,27 +30,29 @@
  */
 #include "engine.h"
 
-#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
 #include <string.h>
-#include <small/rlist.h>
 
-RLIST_HEAD(engines);
+#include "errinj.h"
+#include "fiber.h"
 
-/**
- * For simplicity, assume that the engine count can't exceed
- * the value of this constant.
- */
-enum { MAX_ENGINE_COUNT = 10 };
+struct engine *engines[MAX_ENGINE_COUNT + 1];
+enum recovery_state recovery_state = RECOVERY_NOT_STARTED;
 
-/** Register engine instance. */
-void engine_register(struct engine *engine)
+/** Number of registered engines. */
+static int engine_count;
+
+void
+engine_register(struct engine *engine)
 {
-	static int n_engines;
-	rlist_add_tail_entry(&engines, engine, link);
-	engine->id = n_engines++;
+	assert(engine_count < MAX_ENGINE_COUNT);
+	assert((engine->flags & ENGINE_BYPASS_TX) != 0 ||
+	       engine_count < MAX_TX_ENGINE_COUNT);
+	engine->id = engine_count++;
+	engines[engine->id] = engine;
 }
 
-/** Find engine by name. */
 struct engine *
 engine_by_name(const char *name)
 {
@@ -65,34 +67,40 @@ engine_by_name(const char *name)
 void
 engine_shutdown(void)
 {
-	struct engine *engine, *tmp;
-	rlist_foreach_entry_safe(engine, &engines, link, tmp) {
+	struct engine *engine;
+	engine_foreach(engine)
 		engine->vtab->shutdown(engine);
-	}
 }
 
 void
-engine_switch_to_ro(void)
+engine_free(void)
 {
 	struct engine *engine;
-	engine_foreach(engine)
-		engine->vtab->switch_to_ro(engine);
+	for (int i = 0; i < engine_count; i++) {
+		engine = engines[i];
+		engines[i] = NULL;
+		engine->vtab->free(engine);
+	}
+	engine_count = 0;
 }
 
 int
 engine_bootstrap(void)
 {
+	recovery_state = INITIAL_RECOVERY;
 	struct engine *engine;
 	engine_foreach(engine) {
 		if (engine->vtab->bootstrap(engine) != 0)
 			return -1;
 	}
+	recovery_state = FINISHED_RECOVERY;
 	return 0;
 }
 
 int
 engine_begin_initial_recovery(const struct vclock *recovery_vclock)
 {
+	recovery_state = INITIAL_RECOVERY;
 	struct engine *engine;
 	engine_foreach(engine) {
 		if (engine->vtab->begin_initial_recovery(engine,
@@ -105,6 +113,7 @@ engine_begin_initial_recovery(const struct vclock *recovery_vclock)
 int
 engine_begin_final_recovery(void)
 {
+	recovery_state = FINAL_RECOVERY;
 	struct engine *engine;
 	engine_foreach(engine) {
 		if (engine->vtab->begin_final_recovery(engine) != 0)
@@ -127,6 +136,7 @@ engine_begin_hot_standby(void)
 int
 engine_end_recovery(void)
 {
+	recovery_state = FINISHED_RECOVERY;
 	/*
 	 * For all new spaces created after recovery is complete,
 	 * when the primary key is added, enable all keys.
@@ -140,13 +150,21 @@ engine_end_recovery(void)
 }
 
 int
-engine_begin_checkpoint(bool is_scheduled)
+engine_begin_checkpoint(const struct engine_checkpoint_params *params)
 {
+	int csw = fiber()->csw;
 	struct engine *engine;
 	engine_foreach(engine) {
-		if (engine->vtab->begin_checkpoint(engine, is_scheduled) < 0)
+		if (engine->vtab->begin_checkpoint(engine, params) < 0)
 			return -1;
 	}
+	/*
+	 * No yields are allowed. Otherwise something might be changed in any
+	 * of the spaces or in a global state of any sort by another fiber, and
+	 * the engines would suddenly be building their checkpoint on different
+	 * states of the instance.
+	 */
+	VERIFY(fiber()->csw == csw);
 	return 0;
 }
 
@@ -194,19 +212,11 @@ engine_backup(const struct vclock *vclock, engine_backup_cb cb, void *cb_arg)
 int
 engine_prepare_join(struct engine_join_ctx *ctx)
 {
-	ctx->array = calloc(MAX_ENGINE_COUNT, sizeof(void *));
-	if (ctx->array == NULL) {
-		diag_set(OutOfMemory, MAX_ENGINE_COUNT * sizeof(void *),
-			 "malloc", "engine join context");
-		return -1;
-	}
-	int i = 0;
+	ctx->data = xcalloc(MAX_ENGINE_COUNT, sizeof(void *));
 	struct engine *engine;
 	engine_foreach(engine) {
-		assert(i < MAX_ENGINE_COUNT);
-		if (engine->vtab->prepare_join(engine, &ctx->array[i]) != 0)
+		if (engine->vtab->prepare_join(engine, ctx) != 0)
 			goto fail;
-		i++;
 	}
 	return 0;
 fail:
@@ -217,12 +227,12 @@ fail:
 int
 engine_join(struct engine_join_ctx *ctx, struct xstream *stream)
 {
-	int i = 0;
+	ERROR_INJECT_YIELD(ERRINJ_ENGINE_JOIN_DELAY);
+
 	struct engine *engine;
 	engine_foreach(engine) {
-		if (engine->vtab->join(engine, ctx->array[i], stream) != 0)
+		if (engine->vtab->join(engine, ctx, stream) != 0)
 			return -1;
-		i++;
 	}
 	return 0;
 }
@@ -230,14 +240,11 @@ engine_join(struct engine_join_ctx *ctx, struct xstream *stream)
 void
 engine_complete_join(struct engine_join_ctx *ctx)
 {
-	int i = 0;
 	struct engine *engine;
 	engine_foreach(engine) {
-		if (ctx->array[i] != NULL)
-			engine->vtab->complete_join(engine, ctx->array[i]);
-		i++;
+		engine->vtab->complete_join(engine, ctx);
 	}
-	free(ctx->array);
+	free(ctx->data);
 }
 
 void
@@ -259,16 +266,26 @@ engine_reset_stat(void)
 
 /* {{{ Virtual method stubs */
 
-int
-generic_engine_prepare_join(struct engine *engine, void **ctx)
+struct engine_read_view *
+generic_engine_create_read_view(struct engine *engine,
+				const struct read_view_opts *opts)
 {
 	(void)engine;
-	*ctx = NULL;
+	(void)opts;
+	unreachable();
+	return NULL;
+}
+
+int
+generic_engine_prepare_join(struct engine *engine, struct engine_join_ctx *ctx)
+{
+	ctx->data[engine->id] = NULL;
 	return 0;
 }
 
 int
-generic_engine_join(struct engine *engine, void *ctx, struct xstream *stream)
+generic_engine_join(struct engine *engine, struct engine_join_ctx *ctx,
+		    struct xstream *stream)
 {
 	(void)engine;
 	(void)ctx;
@@ -277,18 +294,17 @@ generic_engine_join(struct engine *engine, void *ctx, struct xstream *stream)
 }
 
 void
-generic_engine_complete_join(struct engine *engine, void *ctx)
+generic_engine_complete_join(struct engine *engine, struct engine_join_ctx *ctx)
 {
 	(void)engine;
 	(void)ctx;
 }
 
-int
+void
 generic_engine_begin(struct engine *engine, struct txn *txn)
 {
 	(void)engine;
 	(void)txn;
-	return 0;
 }
 
 int
@@ -331,9 +347,27 @@ generic_engine_rollback(struct engine *engine, struct txn *txn)
 }
 
 void
-generic_engine_switch_to_ro(struct engine *engine)
+generic_engine_destroy_savepoint(void *engine_savepoint)
+{
+	(void)engine_savepoint;
+}
+
+void
+generic_engine_send_to_read_view(struct engine *engine, struct txn *txn,
+				 int64_t psn)
 {
 	(void)engine;
+	(void)txn;
+	(void)psn;
+	unreachable();
+}
+
+void
+generic_engine_abort_with_conflict(struct engine *engine, struct txn *txn)
+{
+	(void)engine;
+	(void)txn;
+	unreachable();
 }
 
 int
@@ -374,10 +408,11 @@ generic_engine_end_recovery(struct engine *engine)
 }
 
 int
-generic_engine_begin_checkpoint(struct engine *engine, bool is_scheduled)
+generic_engine_begin_checkpoint(struct engine *engine,
+				const struct engine_checkpoint_params *params)
 {
 	(void)engine;
-	(void)is_scheduled;
+	(void)params;
 	return 0;
 }
 
@@ -442,6 +477,12 @@ generic_engine_check_space_def(struct space_def *def)
 {
 	(void)def;
 	return 0;
+}
+
+void
+generic_engine_shutdown(struct engine *engine)
+{
+	(void)engine;
 }
 
 /* }}} */

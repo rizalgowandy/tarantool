@@ -95,8 +95,6 @@ enum {
 int
 sql_initialize(void)
 {
-	int rc = 0;
-
 	/* If the following assert() fails on some obscure processor/compiler
 	 * combination, the work-around is to set the correct pointer
 	 * size at compile-time using -DSQL_PTRSIZE=n compile-time option
@@ -110,12 +108,6 @@ sql_initialize(void)
 	 */
 	if (sqlGlobalConfig.isInit)
 		return 0;
-
-	/* If rc is not 0 at this point, then the malloc
-	 * subsystem could not be initialized.
-	 */
-	if (rc != 0)
-		return rc;
 
 	/* Do the rest of the initialization
 	 * that we will be able to handle recursive calls into
@@ -161,7 +153,7 @@ sql_initialize(void)
  *
  * The sz parameter is the number of bytes in each lookaside slot.
  * The cnt parameter is the number of slots.  If pStart is NULL the
- * space for the lookaside memory is obtained from sql_malloc().
+ * space for the lookaside memory is obtained from malloc().
  * If pStart is not NULL then it is sz*cnt bytes of memory to use for
  * the lookaside memory.
  */
@@ -176,7 +168,7 @@ setupLookaside(sql * db, void *pBuf, int sz, int cnt)
 	 * both at the same time.
 	 */
 	if (db->lookaside.bMalloced)
-		sql_free(db->lookaside.pStart);
+		free(db->lookaside.pStart);
 	/* The size of a lookaside slot after ROUNDDOWN8 needs to be larger
 	 * than a pointer to be useful.
 	 */
@@ -189,9 +181,7 @@ setupLookaside(sql * db, void *pBuf, int sz, int cnt)
 		sz = 0;
 		pStart = 0;
 	} else if (pBuf == 0) {
-		pStart = sqlMalloc(sz * cnt);	/* IMP: R-61949-35727 */
-		if (pStart)
-			cnt = sqlMallocSize(pStart) / sz;
+		pStart = xmalloc(sz * cnt);
 	} else {
 		pStart = pBuf;
 	}
@@ -220,16 +210,6 @@ setupLookaside(sql * db, void *pBuf, int sz, int cnt)
 	return 0;
 }
 
-void
-sql_row_count(struct sql_context *context, int argc, struct Mem *argv)
-{
-	(void)argc;
-	(void)argv;
-	sql *db = sql_context_db_handle(context);
-	assert(db->nChange >= 0);
-	sql_result_uint(context, db->nChange);
-}
-
 /*
  * Close all open savepoints.
  * This procedure is trivial as savepoints are allocated on the "region" and
@@ -239,24 +219,6 @@ void
 sqlCloseSavepoints(Vdbe * pVdbe)
 {
 	pVdbe->anonymous_savepoint = NULL;
-}
-
-/*
- * Rollback all database files.  If tripCode is not 0, then
- * any write cursors are invalidated ("tripped" - as in "tripping a circuit
- * breaker") and made to return tripCode if there are any further
- * attempts to use that cursor.  Read cursors remain open and valid
- * but are "saved" in case the table pages are moved around.
- */
-void
-sqlRollbackAll(Vdbe * pVdbe)
-{
-	sql *db = pVdbe->db;
-
-	/* If one has been configured, invoke the rollback-hook callback */
-	if (db->xRollbackCallback && (!pVdbe->auto_commit)) {
-		db->xRollbackCallback(db->pRollbackArg);
-	}
 }
 
 /*
@@ -311,54 +273,6 @@ static const int aHardLimit[] = {
 #error SQL_MAX_TRIGGER_DEPTH must be at least 1
 #endif
 
-/*
- * Change the value of a limit.  Report the old value.
- * If an invalid limit index is supplied, report -1.
- * Make no changes but still report the old value if the
- * new limit is negative.
- *
- * A new lower limit does not shrink existing constructs.
- * It merely prevents new constructs that exceed the limit
- * from forming.
- */
-int
-sql_limit(sql * db, int limitId, int newLimit)
-{
-	int oldLimit;
-
-	/* EVIDENCE-OF: R-30189-54097 For each limit category SQL_LIMIT_NAME
-	 * there is a hard upper bound set at compile-time by a C preprocessor
-	 * macro called SQL_MAX_NAME. (The "_LIMIT_" in the name is changed to
-	 * "_MAX_".)
-	 */
-	assert(aHardLimit[SQL_LIMIT_LENGTH] == SQL_MAX_LENGTH);
-	assert(aHardLimit[SQL_LIMIT_SQL_LENGTH] == SQL_MAX_SQL_LENGTH);
-	assert(aHardLimit[SQL_LIMIT_COLUMN] == SQL_MAX_COLUMN);
-	assert(aHardLimit[SQL_LIMIT_EXPR_DEPTH] == SQL_MAX_EXPR_DEPTH);
-	assert(aHardLimit[SQL_LIMIT_COMPOUND_SELECT] ==
-	       SQL_MAX_COMPOUND_SELECT);
-	assert(aHardLimit[SQL_LIMIT_VDBE_OP] == SQL_MAX_VDBE_OP);
-	assert(aHardLimit[SQL_LIMIT_FUNCTION_ARG] ==
-	       SQL_MAX_FUNCTION_ARG);
-	assert(aHardLimit[SQL_LIMIT_ATTACHED] == SQL_MAX_ATTACHED);
-	assert(aHardLimit[SQL_LIMIT_LIKE_PATTERN_LENGTH] ==
-	       SQL_MAX_LIKE_PATTERN_LENGTH);
-	assert(aHardLimit[SQL_LIMIT_TRIGGER_DEPTH] ==
-	       SQL_MAX_TRIGGER_DEPTH);
-
-	if (limitId < 0 || limitId >= SQL_N_LIMIT) {
-		return -1;
-	}
-	oldLimit = db->aLimit[limitId];
-	if (newLimit >= 0) {	/* IMP: R-52476-28732 */
-		if (newLimit > aHardLimit[limitId]) {
-			newLimit = aHardLimit[limitId];	/* IMP: R-51463-25634 */
-		}
-		db->aLimit[limitId] = newLimit;
-	}
-	return oldLimit;	/* IMP: R-53341-35419 */
-}
-
 /**
  * This routine does the work of initialization of main
  * SQL connection instance.
@@ -375,27 +289,17 @@ sql_init_db(sql **out_db)
 		return -1;
 
 	/* Allocate the sql data structure */
-	db = sqlMallocZero(sizeof(sql));
-	if (db == NULL) {
-		*out_db = NULL;
-		return -1;
-	}
+	db = xcalloc(1, sizeof(*db));
 	db->magic = SQL_MAGIC_BUSY;
 
 	db->pVfs = sql_vfs_find(0);
 
 	assert(sizeof(db->aLimit) == sizeof(aHardLimit));
 	memcpy(db->aLimit, aHardLimit, sizeof(db->aLimit));
-	db->aLimit[SQL_LIMIT_COMPOUND_SELECT] = SQL_DEFAULT_COMPOUND_SELECT;
 	db->szMmap = sqlGlobalConfig.szMmap;
 	db->nMaxSorterMmap = 0x7FFFFFFF;
 
 	db->magic = SQL_MAGIC_OPEN;
-	if (db->mallocFailed) {
-		sql_free(db);
-		*out_db = NULL;
-		return -1;
-	}
 
 	/* Enable the lookaside-malloc subsystem */
 	setupLookaside(db, 0, LOOKASIDE_SLOT_SIZE, LOOKASIDE_SLOT_NUMBER);

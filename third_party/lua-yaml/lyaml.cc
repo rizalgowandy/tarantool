@@ -46,15 +46,15 @@ extern "C" {
 #include <lj_state.h>
 
 #include "yaml.h"
-#include "b64.h"
 } /* extern "C" */
+
+#include "base64.h"
 #include "lua/utils.h"
 #include "lua/serializer.h"
 #include "lib/core/decimal.h"
-#include "diag.h"
-#include "tt_static.h"
 #include "mp_extension_types.h" /* MP_DECIMAL, MP_UUID */
-#include "uuid/tt_uuid.h" /* tt_uuid_to_string(), UUID_STR_LEN */
+#include "tt_uuid.h" /* tt_uuid_to_string(), UUID_STR_LEN */
+#include "tweaks.h"
 
 #define LUAYAML_TAG_PREFIX "tag:yaml.org,2002:"
 
@@ -98,7 +98,24 @@ struct lua_yaml_dumper {
 
    lua_State *outputL;
    luaL_Buffer yamlbuf;
+   int reftable_index;
 };
+
+/**
+ * By default, all strings that contain '\n' are encoded in the block scalar
+ * style. Setting this flag to false, makes the encoder use default yaml style
+ * with excessive newlines for all strins without "\n\n" substring. This is a
+ * compatibility-only feature.
+ */
+static bool yaml_pretty_multiline = true;
+TWEAK_BOOL(yaml_pretty_multiline);
+
+/**
+ * If this flag is set, a binary data field will be decoded to a plain Lua
+ * string, not a varbinary object.
+ */
+static bool yaml_decode_binary_as_string = false;
+TWEAK_BOOL(yaml_decode_binary_as_string);
 
 /**
  * Verify whether a string represents a boolean literal in YAML.
@@ -146,6 +163,54 @@ yaml_is_null(const char *str, size_t len)
       return true;
    if (len == 4 && memcmp(str, "null", 4) == 0)
       return true;
+   return false;
+}
+
+/**
+ * Verify whether a string represents a number literal in YAML.
+ *
+ * Non-standard:
+ *
+ * False-positives:
+ * - 'inf', 'nan' literals despite the case are parsed as numbers
+ *   (the standard specifies only 'inf', 'Inf', 'INF', 'nan',
+ *   'NaN', 'NAN').
+ * - 'infinity' (ignoring case) is considered a number.
+ * - Binary literals ('0b...') are considered numbers.
+ *
+ * Bugs:
+ * - Octal numbers are not supported.
+ *
+ * This function is used only in encoding for wrapping strings
+ * containing number literals in quotes to make YAML parser
+ * handle them as strings. It means false-positives will lead to
+ * extra quotation marks and are not dangerous at all.
+ *
+ * @param str Literal to check.
+ * @param len Length of @a str.
+ *
+ * @retval Whether @a str represents a number value.
+ */
+static inline bool
+yaml_is_number(const char *str, size_t len, struct lua_State *L)
+{
+   /*
+    * TODO: Should be implemented with the literal parser
+    * instead of using strtod() and lua_isnumber().
+    * Using parser will make it possible to remove the third
+    * argument.
+    */
+   if (len == 0)
+      return false;
+
+   if (lua_isnumber(L, -1))
+      return true;
+
+   char *endptr = NULL;
+   fpconv_strtod(str, &endptr);
+   if (endptr == str + len)
+      return true;
+
    return false;
 }
 
@@ -269,7 +334,14 @@ static void load_scalar(struct lua_yaml_loader *loader) {
          lua_pushboolean(loader->L, value);
          return;
       } else if (!strcmp(tag, "binary")) {
-         frombase64(loader->L, (const unsigned char *)str, length);
+         int bufsize = base64_decode_bufsize(length);
+         char *buf = (char *)xmalloc(bufsize);
+         int size = base64_decode(str, length, buf, bufsize);
+         if (yaml_decode_binary_as_string)
+            lua_pushlstring(loader->L, buf, size);
+         else
+            luaT_pushvarbinary(loader->L, buf, size);
+         free(buf);
          return;
       }
    }
@@ -502,6 +574,8 @@ usage_error:
 static int dump_node(struct lua_yaml_dumper *dumper);
 
 static yaml_char_t *get_yaml_anchor(struct lua_yaml_dumper *dumper) {
+   if (lua_type(dumper->L, -1) != LUA_TTABLE)
+      return NULL;
    const char *s = "";
    lua_pushvalue(dumper->L, -1);
    lua_rawget(dumper->L, dumper->anchortable_index);
@@ -531,11 +605,9 @@ static yaml_char_t *get_yaml_anchor(struct lua_yaml_dumper *dumper) {
    return (yaml_char_t *)s;
 }
 
-static int dump_table(struct lua_yaml_dumper *dumper, struct luaL_field *field){
+static int dump_table(struct lua_yaml_dumper *dumper, struct luaL_field *field,
+                      yaml_char_t *anchor){
    yaml_event_t ev;
-   yaml_char_t *anchor = get_yaml_anchor(dumper);
-
-   if (anchor && !*anchor) return 1;
 
    yaml_mapping_style_t yaml_style = (field->compact)
       ? (YAML_FLOW_MAPPING_STYLE) : YAML_BLOCK_MAPPING_STYLE;
@@ -558,13 +630,10 @@ static int dump_table(struct lua_yaml_dumper *dumper, struct luaL_field *field){
           yaml_emitter_emit(&dumper->emitter, &ev) != 0 ? 1 : 0;
 }
 
-static int dump_array(struct lua_yaml_dumper *dumper, struct luaL_field *field){
+static int dump_array(struct lua_yaml_dumper *dumper, struct luaL_field *field,
+                      yaml_char_t *anchor){
    unsigned i;
    yaml_event_t ev;
-   yaml_char_t *anchor = get_yaml_anchor(dumper);
-
-   if (anchor && !*anchor)
-      return 1;
 
    yaml_sequence_style_t yaml_style = (field->compact)
       ? (YAML_FLOW_SEQUENCE_STYLE) : YAML_BLOCK_SEQUENCE_STYLE;
@@ -614,14 +683,20 @@ static int dump_node(struct lua_yaml_dumper *dumper)
 {
    size_t len = 0;
    const char *str = "";
+   const char *force_literal_substring = yaml_pretty_multiline ? "\n" : "\n\n";
    yaml_char_t *tag = NULL;
    yaml_event_t ev;
    yaml_scalar_style_t style = YAML_PLAIN_SCALAR_STYLE;
    int is_binary = 0;
-   char buf[FPCONV_G_FMT_BUFSIZE];
+   char buf[DT_IVAL_TO_STRING_BUFSIZE];
    struct luaL_field field;
    bool unused;
    (void) unused;
+
+   luaT_reftable_serialize(dumper->L, dumper->reftable_index);
+   yaml_char_t *anchor = get_yaml_anchor(dumper);
+   if (anchor && !*anchor)
+      return 1;
 
    int top = lua_gettop(dumper->L);
    luaL_checkfield(dumper->L, dumper->cfg, top, &field);
@@ -649,13 +724,15 @@ static int dump_node(struct lua_yaml_dumper *dumper)
       len = strlen(buf);
       break;
    case MP_ARRAY:
-      return dump_array(dumper, &field);
+      return dump_array(dumper, &field, anchor);
    case MP_MAP:
-      return dump_table(dumper, &field);
+      return dump_table(dumper, &field, anchor);
    case MP_STR:
-      str = lua_tolstring(dumper->L, -1, &len);
+      str = field.sval.data;
+      len = field.sval.len;
+
       if (yaml_is_null(str, len) || yaml_is_bool(str, len, &unused) ||
-          lua_isnumber(dumper->L, -1)) {
+          yaml_is_number(str, len, dumper->L)) {
          /*
           * The string is convertible to a null, a boolean or
           * a number, quote it to preserve its type.
@@ -664,24 +741,24 @@ static int dump_node(struct lua_yaml_dumper *dumper)
          break;
       }
       style = YAML_ANY_SCALAR_STYLE; // analyze_string(dumper, str, len, &is_binary);
-      if (utf8_check_printable(str, len)) {
-         if (yaml_is_flow_mode(dumper)) {
-            style = YAML_SINGLE_QUOTED_SCALAR_STYLE;
-         } else if (strstr(str, "\n\n") != 0) {
-            /*
-             * Tarantool-specific: use literal style for string
-             * with empty lines.
-             * Useful for tutorial().
-             */
-            style = YAML_LITERAL_SCALAR_STYLE;
-         }
-         break;
+      if (yaml_is_flow_mode(dumper)) {
+         style = YAML_SINGLE_QUOTED_SCALAR_STYLE;
+      } else if (strstr(str, force_literal_substring) != NULL) {
+         /*
+          * Tarantool-specific: use literal block style for either every
+          * multiline string or string containing "\n\n" depending on compat
+          * setup.
+          * Useful for tutorial().
+          */
+         style = YAML_LITERAL_SCALAR_STYLE;
       }
-      /* Fall through */
+      break;
    case MP_BIN:
       is_binary = 1;
-      tobase64(dumper->L, -1);
-      str = lua_tolstring(dumper->L, -1, &len);
+      len = base64_encode_bufsize(field.sval.len, BASE64_NOWRAP);
+      str = (char *)xmalloc(len);
+      len = base64_encode(field.sval.data, field.sval.len, (char *)str, len,
+                          BASE64_NOWRAP);
       tag = (yaml_char_t *) LUAYAML_TAG_PREFIX "binary";
       break;
    case MP_BOOL:
@@ -712,21 +789,30 @@ static int dump_node(struct lua_yaml_dumper *dumper)
          str = field.errorval->errmsg;
          len = strlen(str);
          break;
+      case MP_DATETIME:
+         len = datetime_snprint(buf, sizeof(buf), field.dateval);
+         str = buf;
+         break;
+      case MP_INTERVAL:
+         len = interval_snprint(buf, sizeof(buf), field.interval);
+         str = buf;
+         break;
       default:
          assert(0); /* checked by luaL_checkfield() */
       }
       break;
     }
 
+   int rc = 1;
    if (!yaml_scalar_event_initialize(&ev, NULL, tag, (unsigned char *)str, len,
                                      !is_binary, !is_binary, style) ||
        !yaml_emitter_emit(&dumper->emitter, &ev))
-      return 0;
+      rc = 0;
 
    if (is_binary)
-      lua_pop(dumper->L, 1);
+      free((void *)str);
 
-   return 1;
+   return rc;
 }
 
 static void dump_document(struct lua_yaml_dumper *dumper) {
@@ -752,9 +838,12 @@ static int append_output(void *arg, unsigned char *buf, size_t len) {
 }
 
 static void find_references(struct lua_yaml_dumper *dumper) {
-   int newval = -1, type = lua_type(dumper->L, -1);
-   if (type != LUA_TTABLE)
-      return;
+   int newval = -1;
+
+   lua_pushvalue(dumper->L, -1); /* push copy of table */
+   luaT_reftable_serialize(dumper->L, dumper->reftable_index);
+   if (lua_type(dumper->L, -1) != LUA_TTABLE)
+      goto done;
 
    lua_pushvalue(dumper->L, -1); /* push copy of table */
    lua_rawget(dumper->L, dumper->anchortable_index);
@@ -769,7 +858,7 @@ static void find_references(struct lua_yaml_dumper *dumper) {
       lua_rawset(dumper->L, dumper->anchortable_index);
    }
    if (newval)
-      return;
+      goto done;
 
    /* recursively process other table values */
    lua_pushnil(dumper->L);
@@ -778,6 +867,17 @@ static void find_references(struct lua_yaml_dumper *dumper) {
       lua_pop(dumper->L, 1);
       find_references(dumper); /* find references on key */
    }
+
+done:
+   /*
+    * Pop the serialized object, leave the original object on top
+    * of the Lua stack.
+    *
+    * NB: It is important for the cycle above: it assumes that
+    * table keys are not changed in the recursive call. Otherwise
+    * it would feed an incorrect key to lua_next().
+    */
+   lua_pop(dumper->L, 1);
 }
 
 int
@@ -824,12 +924,16 @@ lua_yaml_encode(lua_State *L, struct luaL_serializer *serializer,
    lua_newtable(L);
    dumper.anchortable_index = lua_gettop(L);
    dumper.anchor_number = 0;
+
+   luaT_reftable_new(L, dumper.cfg, 1);
+   dumper.reftable_index = lua_gettop(L);
+
    lua_pushvalue(L, 1); /* push copy of arg we're processing */
    find_references(&dumper);
    dump_document(&dumper);
    if (dumper.error)
       goto error;
-   lua_pop(L, 2); /* pop copied arg and anchor table */
+   lua_pop(L, 3); /* pop copied arg and anchor/ref tables */
 
    if (!yaml_stream_end_event_initialize(&ev) ||
        !yaml_emitter_emit(&dumper.emitter, &ev) ||

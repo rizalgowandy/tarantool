@@ -34,6 +34,25 @@
 #include "sql/sqlInt.h"
 #include "sql/sqlLimit.h"
 #include "sql/vdbe.h"
+#include "sql/vdbeInt.h"
+#include "mp_interval.h"
+#include "mp_datetime.h"
+#include "mp_decimal.h"
+#include "mp_uuid.h"
+
+int
+sql_bind(struct Vdbe *stmt, const struct sql_bind *bind, uint32_t bind_count)
+{
+	assert(stmt != NULL);
+	uint32_t pos = 1;
+	for (uint32_t i = 0; i < bind_count; pos = ++i + 1) {
+		if (sql_bind_column(stmt, &bind[i], pos) != 0)
+			return -1;
+	}
+	stmt->bind_count = bind_count;
+	stmt->bind = bind;
+	return 0;
+}
 
 const char *
 sql_bind_name(const struct sql_bind *bind)
@@ -99,19 +118,39 @@ sql_bind_decode(struct sql_bind *bind, int i, const char **packet)
 	case MP_BIN:
 		bind->s = mp_decode_bin(packet, &bind->bytes);
 		break;
-	case MP_EXT:
+	case MP_EXT: {
+		int8_t ext_type;
+		uint32_t size = mp_decode_extl(packet, &ext_type);
+		switch (ext_type) {
+		case MP_UUID:
+			VERIFY(uuid_unpack(packet, size, &bind->uuid) != NULL);
+			break;
+		case MP_DECIMAL:
+			VERIFY(decimal_unpack(packet, size,
+					      &bind->dec) != NULL);
+			break;
+		case MP_DATETIME:
+			VERIFY(datetime_unpack(packet, size,
+					       &bind->dt) != NULL);
+			break;
+		case MP_INTERVAL:
+			VERIFY(interval_unpack(packet, size,
+					       &bind->itv) != NULL);
+			break;
+		default:
+			diag_set(ClientError, ER_SQL_BIND_TYPE, "USERDATA",
+				 sql_bind_name(bind));
+			return -1;
+		}
+		bind->ext_type = ext_type;
+		break;
+	}
+	case MP_ARRAY:
+	case MP_MAP:
 		bind->s = *packet;
 		mp_next(packet);
 		bind->bytes = *packet - bind->s;
 		break;
-	case MP_ARRAY:
-		diag_set(ClientError, ER_SQL_BIND_TYPE, "ARRAY",
-			 sql_bind_name(bind));
-		return -1;
-	case MP_MAP:
-		diag_set(ClientError, ER_SQL_BIND_TYPE, "MAP",
-			 sql_bind_name(bind));
-		return -1;
 	default:
 		unreachable();
 	}
@@ -137,13 +176,8 @@ sql_bind_list_decode(const char *data, struct sql_bind **out_bind)
 	}
 	struct region *region = &fiber()->gc;
 	uint32_t used = region_used(region);
-	size_t size;
-	struct sql_bind *bind = region_alloc_array(region, typeof(bind[0]),
-						   bind_count, &size);
-	if (bind == NULL) {
-		diag_set(OutOfMemory, size, "region_alloc_array", "bind");
-		return -1;
-	}
+	struct sql_bind *bind = xregion_alloc_array(region, typeof(bind[0]),
+						    bind_count);
 	for (uint32_t i = 0; i < bind_count; ++i) {
 		if (sql_bind_decode(&bind[i], i, &data) != 0) {
 			region_truncate(region, used);
@@ -155,8 +189,7 @@ sql_bind_list_decode(const char *data, struct sql_bind **out_bind)
 }
 
 int
-sql_bind_column(struct sql_stmt *stmt, const struct sql_bind *p,
-		uint32_t pos)
+sql_bind_column(struct Vdbe *stmt, const struct sql_bind *p, uint32_t pos)
 {
 	if (p->name != NULL) {
 		pos = sql_bind_parameter_lindex(stmt, p->name, p->name_len);
@@ -168,36 +201,49 @@ sql_bind_column(struct sql_stmt *stmt, const struct sql_bind *p,
 	}
 	switch (p->type) {
 	case MP_INT:
-		return sql_bind_int64(stmt, pos, p->i64);
 	case MP_UINT:
-		return sql_bind_uint64(stmt, pos, p->u64);
+		return sql_bind_type(stmt, pos, "integer");
 	case MP_BOOL:
-		return sql_bind_boolean(stmt, pos, p->b);
+	case MP_NIL:
+		return sql_bind_type(stmt, pos, "boolean");
 	case MP_DOUBLE:
 	case MP_FLOAT:
-		return sql_bind_double(stmt, pos, p->d);
-	case MP_STR:
-		/*
-		 * Parameters are allocated within message pack,
-		 * received from the iproto thread. IProto thread
-		 * now is waiting for the response and it will not
-		 * free the packet until sql_stmt_finalize. So
-		 * there is no need to copy the packet and we can
-		 * use SQL_STATIC.
-		 */
-		return sql_bind_text64(stmt, pos, p->s, p->bytes, SQL_STATIC);
-	case MP_NIL:
-		return sql_bind_null(stmt, pos);
+		return sql_bind_type(stmt, pos, "numeric");
 	case MP_BIN:
-		return sql_bind_blob64(stmt, pos, (const void *) p->s, p->bytes,
-				       SQL_STATIC);
+	case MP_STR:
+		return sql_bind_type(stmt, pos, "text");
+	case MP_ARRAY:
+		return sql_bind_type(stmt, pos, "array");
+	case MP_MAP:
+		return sql_bind_type(stmt, pos, "map");
 	case MP_EXT:
-		assert(p->ext_type == MP_UUID || p->ext_type == MP_DECIMAL);
-		if (p->ext_type == MP_UUID)
-			return sql_bind_uuid(stmt, pos, &p->uuid);
-		return sql_bind_dec(stmt, pos, &p->dec);
+		switch (p->ext_type) {
+		case MP_UUID:
+			return sql_bind_type(stmt, pos, "uuid");
+		case MP_DECIMAL:
+			return sql_bind_type(stmt, pos, "decimal");
+		case MP_DATETIME:
+			return sql_bind_type(stmt, pos, "datetime");
+		case MP_INTERVAL:
+			return sql_bind_type(stmt, pos, "interval");
+		default:
+			unreachable();
+		}
 	default:
 		unreachable();
+	}
+	return 0;
+}
+
+uint32_t
+sql_bind_lookup(const struct sql_bind *bind, uint32_t bind_count,
+		const char *name)
+{
+	for (uint32_t i = 0; i < bind_count; i++) {
+		uint32_t len = bind[i].name_len;
+		if (bind[i].name != NULL &&
+		    strncmp(name, bind[i].name, len) == 0 && name[len] == 0)
+			return i + 1;
 	}
 	return 0;
 }

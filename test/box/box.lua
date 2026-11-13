@@ -1,5 +1,6 @@
 #!/usr/bin/env tarantool
 local os = require('os')
+local tarantool = require('tarantool')
 
 local msgpack = require('msgpack')
 
@@ -19,6 +20,40 @@ local _hide = {
     replication_sync_timeout=1, memtx_allocator=1
 }
 
+local _enterprise_keys = {
+    quiver_dir = true,
+    quiver_memory = true,
+    quiver_run_size = true,
+    audit_log = true,
+    audit_nonblock = true,
+    audit_format = true,
+    audit_filter = true,
+    audit_spaces = true,
+    audit_extract_key = true,
+    flightrec_enabled = true,
+    flightrec_logs_size = true,
+    flightrec_logs_max_msg_size = true,
+    flightrec_logs_log_level = true,
+    flightrec_metrics_interval = true,
+    flightrec_metrics_period = true,
+    flightrec_requests_size = true,
+    flightrec_requests_max_req_size = true,
+    flightrec_requests_max_res_size = true,
+    auth_delay = true,
+    auth_retries = true,
+    disable_guest = true,
+    secure_erasing = true,
+    password_lifetime_days = true,
+    password_min_length = true,
+    password_enforce_uppercase = true,
+    password_enforce_lowercase = true,
+    password_enforce_digits = true,
+    password_enforce_specialchars = true,
+    password_history_length = true,
+    wal_ext = true,
+    wal_retention_period = true,
+}
+
 function cfg_filter(data)
     if type(data)~='table' then return data end
     local keys = {}
@@ -28,7 +63,14 @@ function cfg_filter(data)
     table.sort(keys)
     local result = {}
     for _,k in pairs(keys) do
-        table.insert(result, {k, _hide[k] and '<hidden>' or cfg_filter(data[k])})
+        -- Hide Tarantool Enterprise Edition configuration keys if tests
+        -- are run by a Tarantool Enterprise binary so that common tests
+        -- have the same output between Community and Enterprise editions.
+        if tarantool.package ~= 'Tarantool Enterprise' or
+           not _enterprise_keys[k] then
+            table.insert(result, {k, _hide[k] and '<hidden>' or
+                                  cfg_filter(data[k])})
+        end
     end
     return result
 end

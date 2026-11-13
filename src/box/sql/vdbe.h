@@ -70,8 +70,15 @@ struct VdbeOp {
 		int i;		/* Integer value if p4type==P4_INT32 */
 		void *p;	/* Generic pointer */
 		char *z;	/* Pointer to data for string (char array) types */
-		i64 *pI64;	/* Used when p4type is P4_INT64/UINT64 */
-		double *pReal;	/* Used when p4type is P4_REAL */
+		/**
+		 * Used to store values of type INT64 (if p4type is P4_INT64)
+		 * and UINT64 (if id p4type is P4_UINT64).
+		 */
+		int64_t i64;
+		/**
+		 * Used to store values of type DOUBLE (if p4type is P4_REAL).
+		 */
+		double real;
 		/**
 		 * A pointer to function implementation.
 		 * Used when p4type is P4_FUNC.
@@ -86,8 +93,6 @@ struct VdbeOp {
 		int (*xAdvance) (BtCursor *, int *);
 		/** Used when p4type is P4_KEYINFO. */
 		struct sql_key_info *key_info;
-		/** Used when p4type is P4_SPACEPTR. */
-		struct space *space;
 		/**
 		 * Used to apply types when making a record, or
 		 * doing a cast.
@@ -102,13 +107,6 @@ struct VdbeOp {
 	} p4;
 #ifdef SQL_ENABLE_EXPLAIN_COMMENTS
 	char *zComment;		/* Comment to improve readability */
-#endif
-#ifdef VDBE_PROFILE
-	u32 cnt;		/* Number of times this instruction was executed */
-	u64 cycles;		/* Total time spent executing this instruction */
-#endif
-#ifdef SQL_VDBE_COVERAGE
-	int iSrcLine;		/* Source-code line that generated this opcode */
 #endif
 };
 typedef struct VdbeOp VdbeOp;
@@ -129,7 +127,8 @@ struct SubProgram {
  * Allowed values of VdbeOp.p4type
  */
 #define P4_NOTUSED    0		/* The P4 parameter is not used */
-#define P4_DYNAMIC  (-1)	/* Pointer to a string obtained from sqlMalloc() */
+/* Pointer to a string obtained from sql_xmalloc(). */
+#define P4_DYNAMIC  (-1)
 #define P4_STATIC   (-2)	/* Pointer to a static string */
 #define P4_COLLSEQ  (-3)	/* P4 is a pointer to a CollSeq structure */
 /** P4 is a pointer to a func structure. */
@@ -137,7 +136,6 @@ struct SubProgram {
 /** P4 is a pointer to a decimal. */
 #define P4_DEC      (-5)
 #define P4_MEM      (-7)	/* P4 is a pointer to a Mem*    structure */
-#define P4_TRANSIENT  0		/* P4 is a pointer to a transient string */
 #define P4_REAL     (-9)	/* P4 is a 64-bit floating point value */
 #define P4_INT64    (-10)	/* P4 is a 64-bit signed integer */
 #define P4_UINT64   (-8)	/* P4 is a 64-bit signed integer */
@@ -149,7 +147,6 @@ struct SubProgram {
 #define P4_BOOL     (-17)	/* P4 is a bool value */
 #define P4_PTR      (-18)	/* P4 is a generic pointer */
 #define P4_KEYINFO  (-19)       /* P4 is a pointer to sql_key_info structure. */
-#define P4_SPACEPTR (-20)       /* P4 is a space pointer */
 
 /* Error message codes for OP_Halt */
 #define P5_ConstraintNotNull 1
@@ -200,12 +197,22 @@ int sqlVdbeAddOp0(Vdbe *, int);
 int sqlVdbeAddOp1(Vdbe *, int, int);
 int sqlVdbeAddOp2(Vdbe *, int, int, int);
 int sqlVdbeGoto(Vdbe *, int);
-int sqlVdbeLoadString(Vdbe *, int, const char *);
 void sqlVdbeMultiLoad(Vdbe *, int, const char *, ...);
 int sqlVdbeAddOp3(Vdbe *, int, int, int, int);
 int sqlVdbeAddOp4(Vdbe *, int, int, int, int, const char *zP4, int);
-int sqlVdbeAddOp4Dup8(Vdbe *, int, int, int, int, const u8 *, int);
 int sqlVdbeAddOp4Int(Vdbe *, int, int, int, int, int);
+
+/** Add an opcode that includes the p4 value as a 64-bit integer. */
+int
+sql_vdbe_add_op4_int64(Vdbe *, int, int, int, int64_t);
+
+/** Add an opcode that includes the p4 value as a 64-bit unsigned. */
+int
+sql_vdbe_add_op4_uint64(Vdbe *, int, int, int, int64_t);
+
+/** Add an opcode that includes the p4 value as a double. */
+int
+sql_vdbe_add_op4_real(Vdbe *, int, int, int, double);
 void sqlVdbeEndCoroutine(Vdbe *, int);
 void sqlVdbeChangeOpcode(Vdbe *, u32 addr, u8);
 void sqlVdbeChangeP1(Vdbe *, u32 addr, int P1);
@@ -215,7 +222,11 @@ void sqlVdbeChangeP5(Vdbe *, int P5);
 void sqlVdbeJumpHere(Vdbe *, int addr);
 int sqlVdbeChangeToNoop(Vdbe *, int addr);
 int sqlVdbeDeletePriorOpcode(Vdbe *, u8 op);
-void sqlVdbeChangeP4(Vdbe *, int addr, const char *zP4, int N);
+
+/** Change P4 of VDBE opcode. The `type` is the P4_* type of the value. */
+void
+sqlVdbeChangeP4(struct Vdbe *p, int addr, const char *zP4, int type);
+
 void sqlVdbeAppendP4(Vdbe *, void *pP4, int p4type);
 
 VdbeOp *sqlVdbeGetOp(Vdbe *, int);
@@ -226,12 +237,10 @@ void
 vdbe_metadata_delete(struct Vdbe *v);
 
 void sqlVdbeDelete(Vdbe *);
-void sqlVdbeClearObject(sql *, Vdbe *);
 void sqlVdbeMakeReady(Vdbe *, Parse *);
 int sqlVdbeFinalize(Vdbe *);
 void sqlVdbeResolveLabel(Vdbe *, int);
 int sqlVdbeCurrentAddr(Vdbe *);
-void sqlVdbeResetStepResult(Vdbe *);
 void sqlVdbeRewind(Vdbe *);
 int sqlVdbeReset(Vdbe *);
 void sqlVdbeSetNumCols(Vdbe *, int);
@@ -261,12 +270,13 @@ int
 vdbe_metadata_set_col_span(struct Vdbe *p, int idx, const char *span);
 
 void sqlVdbeCountChanges(Vdbe *);
-sql *sqlVdbeDb(Vdbe *);
-void sqlVdbeSetSql(Vdbe *, const char *z, int n);
-void sqlVdbeSwap(Vdbe *, Vdbe *);
-VdbeOp *sqlVdbeTakeOpArray(Vdbe *, int *, int *);
-sql_value *sqlVdbeGetBoundValue(Vdbe *, int);
-char *sqlVdbeExpandSql(Vdbe *, const char *);
+
+/** Remember the SQL string for a prepared statement. */
+void
+sqlVdbeSetSql(struct Vdbe *vdbe, const char *z);
+
+struct VdbeOp *
+sqlVdbeTakeOpArray(struct Vdbe *p, int *pnOp);
 
 /**
  * Perform unpacking of provided message pack.
@@ -279,69 +289,35 @@ void sqlVdbeRecordUnpackMsgpack(struct key_def *key_def,
 				    const void *msgpack,
 				    struct UnpackedRecord *dest);
 
-int sqlVdbeRecordCompare(struct sql *db, int key_count,
-			     const void *key1, UnpackedRecord *key2);
-UnpackedRecord *sqlVdbeAllocUnpackedRecord(struct sql *,
-					       struct key_def *);
+/**
+ * This routine is used to allocate sufficient space for an UnpackedRecord
+ * structure large enough to be used with sqlVdbeRecordUnpack() if
+ * the first argument is a pointer to key_def structure.
+ *
+ * The space is either allocated using sql_xmalloc() or from within
+ * the unaligned buffer passed via the second and third arguments (presumably
+ * stack space). If the former, then *ppFree is set to a pointer that should
+ * be eventually freed by the caller using sql_xfree(). Or, if the
+ * allocation comes from the pSpace/szSpace buffer, *ppFree is set to NULL
+ * before returning.
+ *
+ * Does not return NULL.
+ */
+struct UnpackedRecord *
+sqlVdbeAllocUnpackedRecord(struct key_def *key_def);
+
 void sqlVdbeLinkSubProgram(Vdbe *, SubProgram *);
 
 /* Use SQL_ENABLE_COMMENTS to enable generation of extra comments on
  * each VDBE opcode.
- *
- * Use the SQL_ENABLE_MODULE_COMMENTS macro to see some extra no-op
- * comments in VDBE programs that show key decision points in the code
- * generator.
  */
 #ifdef SQL_ENABLE_EXPLAIN_COMMENTS
 void sqlVdbeComment(Vdbe *, const char *, ...);
 #define VdbeComment(X)  sqlVdbeComment X
 void sqlVdbeNoopComment(Vdbe *, const char *, ...);
 #define VdbeNoopComment(X)  sqlVdbeNoopComment X
-#ifdef SQL_ENABLE_MODULE_COMMENTS
-#define VdbeModuleComment(X)  sqlVdbeNoopComment X
-#else
-#define VdbeModuleComment(X)
-#endif
 #else
 #define VdbeComment(X) (void) 0
 #define VdbeNoopComment(X) (void) 0
-#define VdbeModuleComment(X) (void) 0
-#endif
-
-/*
- * The VdbeCoverage macros are used to set a coverage testing point
- * for VDBE branch instructions.  The coverage testing points are line
- * numbers in the sql.c source file.  VDBE branch coverage testing
- * only works with an amalagmation build.  That's ok since a VDBE branch
- * coverage build designed for testing the test suite only.  No application
- * should ever ship with VDBE branch coverage measuring turned on.
- *
- *    VdbeCoverage(v)                  // Mark the previously coded instruction
- *                                     // as a branch
- *
- *    VdbeCoverageIf(v, conditional)   // Mark previous if conditional true
- *
- *    VdbeCoverageAlwaysTaken(v)       // Previous branch is always taken
- *
- *    VdbeCoverageNeverTaken(v)        // Previous branch is never taken
- *
- * Every VDBE branch operation must be tagged with one of the macros above.
- * If not, then when "make test" is run with -DSQL_VDBE_COVERAGE and
- * -DSQL_DEBUG then an ALWAYS() will fail in the vdbeTakeBranch()
- * routine in vdbe.c, alerting the developer to the missed tag.
- */
-#ifdef SQL_VDBE_COVERAGE
-void sqlVdbeSetLineNumber(Vdbe *, int);
-#define VdbeCoverage(v) sqlVdbeSetLineNumber(v,__LINE__)
-#define VdbeCoverageIf(v,x) if(x)sqlVdbeSetLineNumber(v,__LINE__)
-#define VdbeCoverageAlwaysTaken(v) sqlVdbeSetLineNumber(v,2);
-#define VdbeCoverageNeverTaken(v) sqlVdbeSetLineNumber(v,1);
-#define VDBE_OFFSET_LINENO(x) (__LINE__+x)
-#else
-#define VdbeCoverage(v)
-#define VdbeCoverageIf(v,x)
-#define VdbeCoverageAlwaysTaken(v)
-#define VdbeCoverageNeverTaken(v)
-#define VDBE_OFFSET_LINENO(x) 0
 #endif
 #endif				/* SQL_VDBE_H */

@@ -42,14 +42,17 @@
 #include "fiber.h"
 
 const char *sort_order_strs[] = { "asc", "desc", "undef" };
+static_assert(lengthof(sort_order_strs) == sort_order_MAX,
+	      "Each enum value should have a string associated.");
 
 const struct key_part_def key_part_def_default = {
 	0,
 	field_type_MAX,
+	{ 0 },
 	COLL_NONE,
 	false,
 	ON_CONFLICT_ACTION_DEFAULT,
-	SORT_ORDER_ASC,
+	SORT_ORDER_UNDEF,
 	NULL,
 	false
 };
@@ -61,6 +64,7 @@ part_type_by_name_wrapper(const char *str, uint32_t len)
 }
 
 #define PART_OPT_TYPE		 "type"
+#define PART_OPT_SCALE		 "scale"
 #define PART_OPT_FIELD		 "field"
 #define PART_OPT_COLLATION	 "collation"
 #define PART_OPT_NULLABILITY	 "is_nullable"
@@ -72,6 +76,8 @@ part_type_by_name_wrapper(const char *str, uint32_t len)
 const struct opt_def part_def_reg[] = {
 	OPT_DEF_ENUM(PART_OPT_TYPE, field_type, struct key_part_def, type,
 		     part_type_by_name_wrapper),
+	OPT_DEF(PART_OPT_SCALE, OPT_INT64, struct key_part_def,
+		type_params.scale),
 	OPT_DEF(PART_OPT_FIELD, OPT_UINT32, struct key_part_def, fieldno),
 	OPT_DEF(PART_OPT_COLLATION, OPT_UINT32, struct key_part_def, coll_id),
 	OPT_DEF(PART_OPT_NULLABILITY, OPT_BOOL, struct key_part_def,
@@ -136,11 +142,7 @@ struct key_def *
 key_def_dup(const struct key_def *src)
 {
 	size_t sz = key_def_copy_size(src);
-	struct key_def *res = malloc(sz);
-	if (res == NULL) {
-		diag_set(OutOfMemory, sz, "malloc", "res");
-		return NULL;
-	}
+	struct key_def *res = xmalloc(sz);
 	key_def_copy_impl(res, src, sz);
 	return res;
 }
@@ -148,6 +150,7 @@ key_def_dup(const struct key_def *src)
 void
 key_def_delete(struct key_def *def)
 {
+	TRASH(def);
 	free(def);
 }
 
@@ -158,6 +161,10 @@ key_def_set_func(struct key_def *def)
 	key_def_set_hash_func(def);
 	key_def_set_extract_func(def);
 }
+
+#define key_def_error(part_no, errmsg)				\
+	diag_set(ClientError, ER_WRONG_INDEX_PARTS,			\
+		 (unsigned)((part_no) + TUPLE_INDEX_BASE), (errmsg))
 
 static int
 key_def_set_part_path(struct key_def *def, uint32_t part_no, const char *path,
@@ -203,9 +210,7 @@ key_def_set_part_path(struct key_def *def, uint32_t part_no, const char *path,
 		   json_path_cmp(path, multikey_path_len, def->multikey_path,
 				 def->multikey_path_len,
 				 TUPLE_INDEX_BASE) != 0) {
-		diag_set(ClientError, ER_WRONG_INDEX_OPTIONS,
-			 part_no + TUPLE_INDEX_BASE,
-			 "incompatable multikey index path");
+		key_def_error(part_no, "incompatible multikey index path");
 		return -1;
 	}
 
@@ -224,10 +229,8 @@ key_def_set_part_path(struct key_def *def, uint32_t part_no, const char *path,
 				      multikey_path_suffix_len,
 				      TUPLE_INDEX_BASE) !=
 	    multikey_path_suffix_len) {
-		diag_set(ClientError, ER_WRONG_INDEX_OPTIONS,
-			 part_no + TUPLE_INDEX_BASE,
-			 "no more than one array index placeholder [*] is "
-			 "allowed in JSON path");
+		key_def_error(part_no, "no more than one array index "
+			      "placeholder [*] is allowed in JSON path");
 		return -1;
 	}
 	return 0;
@@ -235,7 +238,9 @@ key_def_set_part_path(struct key_def *def, uint32_t part_no, const char *path,
 
 static int
 key_def_set_part(struct key_def *def, uint32_t part_no, uint32_t fieldno,
-		 enum field_type type, enum on_conflict_action nullable_action,
+		 enum field_type type,
+		 const union field_type_params *type_params,
+		 enum on_conflict_action nullable_action,
 		 bool exclude_null, struct coll *coll, uint32_t coll_id,
 		 enum sort_order sort_order, const char *path,
 		 uint32_t path_len, char **path_pool, int32_t offset_slot,
@@ -250,9 +255,11 @@ key_def_set_part(struct key_def *def, uint32_t part_no, uint32_t fieldno,
 	def->parts[part_no].exclude_null = exclude_null;
 	def->parts[part_no].fieldno = fieldno;
 	def->parts[part_no].type = type;
+	def->parts[part_no].type_params = *type_params;
 	def->parts[part_no].coll = coll;
 	def->parts[part_no].coll_id = coll_id;
-	def->parts[part_no].sort_order = sort_order;
+	def->parts[part_no].sort_order = sort_order == SORT_ORDER_DESC ?
+					 SORT_ORDER_DESC : SORT_ORDER_ASC;
 	def->parts[part_no].offset_slot_cache = offset_slot;
 	def->parts[part_no].format_epoch = format_epoch;
 	column_mask_set_fieldno(&def->column_mask, fieldno);
@@ -261,8 +268,9 @@ key_def_set_part(struct key_def *def, uint32_t part_no, uint32_t fieldno,
 
 struct key_def *
 key_def_new(const struct key_part_def *parts, uint32_t part_count,
-	    bool for_func_index)
+	    unsigned flags)
 {
+	assert(part_count > 0);
 	size_t sz = 0;
 	for (uint32_t i = 0; i < part_count; i++)
 		sz += parts[i].path != NULL ? strlen(parts[i].path) : 0;
@@ -275,7 +283,8 @@ key_def_new(const struct key_part_def *parts, uint32_t part_count,
 
 	def->part_count = part_count;
 	def->unique_part_count = part_count;
-	def->for_func_index = for_func_index;
+	def->for_func_index = (flags & KEY_DEF_FOR_FUNC_INDEX) != 0;
+	def->is_unordered = (flags & KEY_DEF_UNORDERED) != 0;
 	/* A pointer to the JSON paths data in the new key_def. */
 	char *path_pool = (char *)def + key_def_sizeof(part_count, 0);
 	for (uint32_t i = 0; i < part_count; i++) {
@@ -284,14 +293,19 @@ key_def_new(const struct key_part_def *parts, uint32_t part_count,
 		if (part->coll_id != COLL_NONE) {
 			struct coll_id *coll_id = coll_by_id(part->coll_id);
 			if (coll_id == NULL) {
-				diag_set(ClientError, ER_WRONG_INDEX_OPTIONS,
-					 i + 1, "collation was not found by ID");
+				key_def_error(i, "collation not found by id");
 				goto error;
 			}
 			coll = coll_id->coll;
 		}
+		if (def->is_unordered && part->sort_order != SORT_ORDER_UNDEF) {
+			key_def_error(i, "unordered indexes do not support"
+				      " sort_order");
+			goto error;
+		}
 		uint32_t path_len = part->path != NULL ? strlen(part->path) : 0;
 		if (key_def_set_part(def, i, part->fieldno, part->type,
+				     &part->type_params,
 				     part->nullable_action, part->exclude_null,
 				     coll, part->coll_id,
 				     part->sort_order, part->path, path_len,
@@ -299,7 +313,7 @@ key_def_new(const struct key_part_def *parts, uint32_t part_count,
 				     0) != 0)
 			goto error;
 	}
-	if (for_func_index) {
+	if (def->for_func_index) {
 		if (def->has_json_paths) {
 			diag_set(ClientError, ER_UNSUPPORTED,
 				 "Functional index", "json paths");
@@ -320,7 +334,7 @@ error:
 	return NULL;
 }
 
-int
+void
 key_def_dump_parts(const struct key_def *def, struct key_part_def *parts,
 		   struct region *region)
 {
@@ -329,17 +343,15 @@ key_def_dump_parts(const struct key_def *def, struct key_part_def *parts,
 		struct key_part_def *part_def = &parts[i];
 		part_def->fieldno = part->fieldno;
 		part_def->type = part->type;
+		part_def->type_params = part->type_params;
 		part_def->is_nullable = key_part_is_nullable(part);
 		part_def->exclude_null = part->exclude_null;
 		part_def->nullable_action = part->nullable_action;
 		part_def->coll_id = part->coll_id;
+		part_def->sort_order = def->is_unordered ? SORT_ORDER_UNDEF :
+							   part->sort_order;
 		if (part->path != NULL) {
-			char *path = region_alloc(region, part->path_len + 1);
-			if (path == NULL) {
-				diag_set(OutOfMemory, part->path_len + 1,
-					 "region", "part_def->path");
-				return -1;
-			}
+			char *path = xregion_alloc(region, part->path_len + 1);
 			memcpy(path, part->path, part->path_len);
 			path[part->path_len] = '\0';
 			part_def->path = path;
@@ -347,7 +359,6 @@ key_def_dump_parts(const struct key_def *def, struct key_part_def *parts,
 			part_def->path = NULL;
 		}
 	}
-	return 0;
 }
 
  /* {{{ Module API helpers */
@@ -373,6 +384,11 @@ key_def_set_internal_part(struct key_part_def *internal_part,
 			 part->field_type);
 		return -1;
 	}
+	if (field_type_is_fixed_decimal[internal_part->type]) {
+		diag_set(ClientError, ER_UNSUPPORTED, "box_key_def_new_v2",
+			 "fixed point decimal types");
+		return -1;
+	}
 
 	/* Set internal_part->{is_nullable,nullable_action}. */
 	bool is_nullable = (part->flags & BOX_KEY_PART_DEF_IS_NULLABLE) ==
@@ -384,6 +400,10 @@ key_def_set_internal_part(struct key_part_def *internal_part,
 	internal_part->exclude_null =
 		(part->flags & BOX_KEY_PART_DEF_EXCLUDE_NULL)
 		== BOX_KEY_PART_DEF_EXCLUDE_NULL;
+	internal_part->sort_order =
+		(part->flags & BOX_KEY_PART_DEF_SORT_ORDER_DESC) ==
+		BOX_KEY_PART_DEF_SORT_ORDER_DESC ?
+		SORT_ORDER_DESC : SORT_ORDER_ASC;
 
 	/* Set internal_part->coll_id. */
 	if (part->collation != NULL) {
@@ -436,11 +456,19 @@ box_key_def_new(uint32_t *fields, uint32_t *types, uint32_t part_count)
 	key_def->part_count = part_count;
 	key_def->unique_part_count = part_count;
 
+	union field_type_params type_params = {0};
 	for (uint32_t item = 0; item < part_count; ++item) {
+		enum field_type type = (enum field_type)types[item];
+		if (field_type_is_fixed_decimal[type]) {
+			diag_set(ClientError, ER_UNSUPPORTED, "box_key_def_new",
+				 "fixed point decimal types");
+			key_def_delete(key_def);
+			return NULL;
+		}
 		if (key_def_set_part(key_def, item, fields[item],
-				     (enum field_type)types[item],
+				     type, &type_params,
 				     ON_CONFLICT_ACTION_DEFAULT, false, NULL,
-				     COLL_NONE, SORT_ORDER_ASC, NULL, 0, NULL,
+				     COLL_NONE, SORT_ORDER_UNDEF, NULL, 0, NULL,
 				     TUPLE_OFFSET_SLOT_NIL, 0) != 0) {
 			key_def_delete(key_def);
 			return NULL;
@@ -498,8 +526,7 @@ box_key_def_new_v2(box_key_part_def_t *parts, uint32_t part_count)
 			min_field_count = parts[i].fieldno;
 	}
 
-	struct key_def *key_def = key_def_new(internal_parts, part_count,
-					      false);
+	struct key_def *key_def = key_def_new(internal_parts, part_count, 0);
 	region_truncate(region, region_svp);
 	if (key_def == NULL)
 		return NULL;
@@ -555,8 +582,11 @@ box_key_def_dump_parts(const box_key_def_t *key_def, uint32_t *part_count_ptr)
 			part_def->flags |= BOX_KEY_PART_DEF_IS_NULLABLE;
 		if (part->exclude_null)
 			part_def->flags |= BOX_KEY_PART_DEF_EXCLUDE_NULL;
+		if (part->sort_order == SORT_ORDER_DESC)
+			part_def->flags |= BOX_KEY_PART_DEF_SORT_ORDER_DESC;
 		assert(part->type >= 0 && part->type < field_type_MAX);
 		part_def->field_type = field_type_strs[part->type];
+		assert(!field_type_is_fixed_decimal[part->type]);
 
 		/* Set part->collation. */
 		if (part->coll_id != COLL_NONE) {
@@ -691,10 +721,15 @@ key_part_cmp(const struct key_part *parts1, uint32_t part_count1,
 	uint32_t part_count = MIN(part_count1, part_count2);
 	const struct key_part *end = parts1 + part_count;
 	for (; part1 != end; part1++, part2++) {
+		int rc;
 		if (part1->fieldno != part2->fieldno)
 			return part1->fieldno < part2->fieldno ? -1 : 1;
 		if ((int) part1->type != (int) part2->type)
 			return (int) part1->type < (int) part2->type ? -1 : 1;
+		if (field_type_is_fixed_decimal[part1->type] &&
+		    part1->type_params.scale != part2->type_params.scale)
+			return part1->type_params.scale <
+					part2->type_params.scale ? -1 : 1;
 		if (part1->coll != part2->coll)
 			return (uintptr_t) part1->coll <
 			       (uintptr_t) part2->coll ? -1 : 1;
@@ -705,9 +740,9 @@ key_part_cmp(const struct key_part *parts1, uint32_t part_count1,
 			       key_part_is_nullable(part2) ? -1 : 1;
 		if (part1->exclude_null != part2->exclude_null)
 			return part1->exclude_null < part2->exclude_null ? -1 : 1;
-		int rc = json_path_cmp(part1->path, part1->path_len,
-				       part2->path, part2->path_len,
-				       TUPLE_INDEX_BASE);
+		rc = json_path_cmp(part1->path, part1->path_len,
+				   part2->path, part2->path_len,
+				   TUPLE_INDEX_BASE);
 		if (rc != 0)
 			return rc;
 	}
@@ -744,6 +779,9 @@ key_def_snprint_parts(char *buf, int size, const struct key_part_def *parts,
 		assert(part->type < field_type_MAX);
 		SNPRINT(total, snprintf, buf, size, "[%d, '%s'",
 			(int)part->fieldno, field_type_strs[part->type]);
+		if (field_type_is_fixed_decimal[part->type])
+			SNPRINT(total, snprintf, buf, size, ", scale=%" PRId64,
+				part->type_params.scale);
 		if (part->path != NULL) {
 			SNPRINT(total, snprintf, buf, size, ", path='%s'",
 				part->path);
@@ -762,7 +800,9 @@ key_def_sizeof_parts(const struct key_part_def *parts, uint32_t part_count)
 	size_t size = 0;
 	for (uint32_t i = 0; i < part_count; i++) {
 		const struct key_part_def *part = &parts[i];
-		int count = 2;
+		int count = 3;
+		if (field_type_is_fixed_decimal[part->type])
+			count++;
 		if (part->coll_id != COLL_NONE)
 			count++;
 		if (part->is_nullable)
@@ -777,6 +817,17 @@ key_def_sizeof_parts(const struct key_part_def *parts, uint32_t part_count)
 		assert(part->type < field_type_MAX);
 		size += mp_sizeof_str(strlen(PART_OPT_TYPE));
 		size += mp_sizeof_str(strlen(field_type_strs[part->type]));
+		if (field_type_is_fixed_decimal[part->type]) {
+			size += mp_sizeof_str(strlen(PART_OPT_SCALE));
+			if (part->type_params.scale < 0)
+				size += mp_sizeof_int(part->type_params.scale);
+			else
+				size += mp_sizeof_uint(part->type_params.scale);
+		}
+		assert(part->sort_order < sort_order_MAX);
+		size += mp_sizeof_str(strlen(PART_OPT_SORT_ORDER));
+		size += mp_sizeof_str(
+			strlen(sort_order_strs[part->sort_order]));
 		if (part->coll_id != COLL_NONE) {
 			size += mp_sizeof_str(strlen(PART_OPT_COLLATION));
 			size += mp_sizeof_uint(part->coll_id);
@@ -803,7 +854,9 @@ key_def_encode_parts(char *data, const struct key_part_def *parts,
 {
 	for (uint32_t i = 0; i < part_count; i++) {
 		const struct key_part_def *part = &parts[i];
-		int count = 2;
+		int count = 3;
+		if (field_type_is_fixed_decimal[part->type])
+			count++;
 		if (part->coll_id != COLL_NONE)
 			count++;
 		if (part->is_nullable)
@@ -821,6 +874,22 @@ key_def_encode_parts(char *data, const struct key_part_def *parts,
 		assert(part->type < field_type_MAX);
 		const char *type_str = field_type_strs[part->type];
 		data = mp_encode_str(data, type_str, strlen(type_str));
+		if (field_type_is_fixed_decimal[part->type]) {
+			data = mp_encode_str(data, PART_OPT_SCALE,
+					     strlen(PART_OPT_SCALE));
+			if (part->type_params.scale < 0)
+				data = mp_encode_int(data,
+						     part->type_params.scale);
+			else
+				data = mp_encode_uint(data,
+						      part->type_params.scale);
+		}
+		data = mp_encode_str(data, PART_OPT_SORT_ORDER,
+				     strlen(PART_OPT_SORT_ORDER));
+		assert(part->sort_order < sort_order_MAX);
+		const char *sort_order_str = sort_order_strs[part->sort_order];
+		data = mp_encode_str(data, sort_order_str,
+				     strlen(sort_order_str));
 		if (part->coll_id != COLL_NONE) {
 			data = mp_encode_str(data, PART_OPT_COLLATION,
 					     strlen(PART_OPT_COLLATION));
@@ -862,31 +931,26 @@ key_def_decode_parts_166(struct key_part_def *parts, uint32_t part_count,
 	for (uint32_t i = 0; i < part_count; i++) {
 		struct key_part_def *part = &parts[i];
 		if (mp_typeof(**data) != MP_ARRAY) {
-			diag_set(ClientError, ER_WRONG_INDEX_PARTS,
-				 "expected an array");
+			key_def_error(i, "expected an array");
 			return -1;
 		}
 		uint32_t item_count = mp_decode_array(data);
 		if (item_count < 1) {
-			diag_set(ClientError, ER_WRONG_INDEX_PARTS,
-				 "expected a non-empty array");
+			key_def_error(i, "expected a non-empty array");
 			return -1;
 		}
 		if (item_count < 2) {
-			diag_set(ClientError, ER_WRONG_INDEX_PARTS,
-				 "a field type is missing");
+			key_def_error(i, "field type is missing");
 			return -1;
 		}
 		if (mp_typeof(**data) != MP_UINT) {
-			diag_set(ClientError, ER_WRONG_INDEX_PARTS,
-				 "field id must be an integer");
+			key_def_error(i, "field id must be an integer");
 			return -1;
 		}
 		*part = key_part_def_default;
 		part->fieldno = (uint32_t) mp_decode_uint(data);
 		if (mp_typeof(**data) != MP_STR) {
-			diag_set(ClientError, ER_WRONG_INDEX_PARTS,
-				 "field type must be a string");
+			key_def_error(i, "field type must be a string");
 			return -1;
 		}
 		uint32_t len;
@@ -895,8 +959,7 @@ key_def_decode_parts_166(struct key_part_def *parts, uint32_t part_count,
 			mp_next(data);
 		part->type = field_type_by_name(str, len);
 		if (part->type == field_type_MAX) {
-			diag_set(ClientError, ER_WRONG_INDEX_PARTS,
-				 "unknown field type");
+			key_def_error(i, "unknown field type");
 			return -1;
 		}
 		part->is_nullable = (part->fieldno < field_count ?
@@ -904,7 +967,12 @@ key_def_decode_parts_166(struct key_part_def *parts, uint32_t part_count,
 				     key_part_def_default.is_nullable);
 		part->exclude_null = false;
 		part->coll_id = COLL_NONE;
+		part->sort_order = SORT_ORDER_UNDEF;
 		part->path = NULL;
+		if (field_type_is_fixed_decimal[part->type]) {
+			key_def_error(i, "scale is not specified");
+			return -1;
+		}
 	}
 	return 0;
 }
@@ -921,29 +989,28 @@ key_def_decode_parts(struct key_part_def *parts, uint32_t part_count,
 	for (uint32_t i = 0; i < part_count; i++) {
 		struct key_part_def *part = &parts[i];
 		if (mp_typeof(**data) != MP_MAP) {
-			diag_set(ClientError, ER_WRONG_INDEX_OPTIONS,
-				 i + TUPLE_INDEX_BASE,
-				 "index part is expected to be a map");
+			key_def_error(i, "expected a map");
 			return -1;
 		}
 		int opts_count = mp_decode_map(data);
 		*part = key_part_def_default;
+		part->type_params.scale = INT64_MAX;
 		bool is_action_missing = true;
 		uint32_t  action_literal_len = strlen("nullable_action");
 		for (int j = 0; j < opts_count; ++j) {
 			if (mp_typeof(**data) != MP_STR) {
-				diag_set(ClientError, ER_WRONG_INDEX_OPTIONS,
-					 i + TUPLE_INDEX_BASE,
-					 "key must be a string");
+				key_def_error(
+					i, "expected a map with string keys");
 				return -1;
 			}
 			uint32_t key_len;
 			const char *key = mp_decode_str(data, &key_len);
-			if (opts_parse_key(part, part_def_reg, key, key_len, data,
-					   ER_WRONG_INDEX_OPTIONS,
-					   i + TUPLE_INDEX_BASE, region,
-					   false) != 0)
+			if (opts_parse_key(part, part_def_reg, key, key_len,
+					   data, region, false) != 0) {
+				key_def_error(
+					i, diag_last_error(diag_get())->errmsg);
 				return -1;
+			}
 			if (is_action_missing &&
 			    key_len == action_literal_len &&
 			    memcmp(key, "nullable_action",
@@ -956,18 +1023,14 @@ key_def_decode_parts(struct key_part_def *parts, uint32_t part_count,
 				: ON_CONFLICT_ACTION_DEFAULT;
 		}
 		if (part->type == field_type_MAX) {
-			diag_set(ClientError, ER_WRONG_INDEX_OPTIONS,
-				 i + TUPLE_INDEX_BASE,
-				 "index part: unknown field type");
+			key_def_error(i, "unknown field type");
 			return -1;
 		}
 		if (part->coll_id != COLL_NONE &&
 		    part->type != FIELD_TYPE_STRING &&
 		    part->type != FIELD_TYPE_SCALAR) {
-			diag_set(ClientError, ER_WRONG_INDEX_OPTIONS,
-				 i + 1,
-				 "collation is reasonable only for "
-				 "string and scalar parts");
+			key_def_error(i, "collation is only reasonable for "
+				      "'string' and 'scalar' parts");
 			return -1;
 		}
 		if (!((part->is_nullable && part->nullable_action ==
@@ -975,24 +1038,33 @@ key_def_decode_parts(struct key_part_def *parts, uint32_t part_count,
 		      || (!part->is_nullable
 			  && part->nullable_action !=
 			  ON_CONFLICT_ACTION_NONE))) {
-			diag_set(ClientError, ER_WRONG_INDEX_OPTIONS,
-				 i + TUPLE_INDEX_BASE,
-				 "index part: conflicting nullability and "
-				 "nullable action properties");
+			key_def_error(i, "conflicting nullability and "
+				      "nullable action properties");
 			return -1;
 		}
 		if (part->sort_order == sort_order_MAX) {
-			diag_set(ClientError, ER_WRONG_INDEX_OPTIONS,
-				 i + TUPLE_INDEX_BASE,
-				 "index part: unknown sort order");
+			key_def_error(i, "unknown sort order");
 			return -1;
 		}
 		if (part->path != NULL &&
 		    json_path_validate(part->path, strlen(part->path),
 				       TUPLE_INDEX_BASE) != 0) {
-			diag_set(ClientError, ER_WRONG_INDEX_OPTIONS,
-				 i + TUPLE_INDEX_BASE, "invalid path");
+			key_def_error(i, "invalid path");
 			return -1;
+		}
+		if (field_type_is_fixed_decimal[part->type]) {
+			if (part->type_params.scale == INT64_MAX) {
+				key_def_error(i, "scale is not specified");
+				return -1;
+			}
+		} else {
+			if (part->type_params.scale != INT64_MAX) {
+				key_def_error(i,
+					      "scale makes sense only for"
+					      " fixed-point decimals");
+				return -1;
+			}
+			part->type_params.scale = 0;
 		}
 	}
 	return 0;
@@ -1001,10 +1073,12 @@ key_def_decode_parts(struct key_part_def *parts, uint32_t part_count,
 const struct key_part *
 key_def_find_by_fieldno(const struct key_def *key_def, uint32_t fieldno)
 {
-	struct key_part part;
-	memset(&part, 0, sizeof(struct key_part));
-	part.fieldno = fieldno;
-	return key_def_find(key_def, &part);
+	const struct key_part *part = key_def->parts;
+	const struct key_part *end = part + key_def->part_count;
+	for (; part != end; part++)
+		if (part->fieldno == fieldno)
+			return part;
+	return NULL;
 }
 
 const struct key_part *
@@ -1090,12 +1164,7 @@ key_def_merge(const struct key_def *first, const struct key_def *second)
 	}
 
 	sz = key_def_sizeof(new_part_count, sz);
-	struct key_def *new_def;
-	new_def = (struct key_def *)calloc(1, sz);
-	if (new_def == NULL) {
-		diag_set(OutOfMemory, sz, "malloc", "new_def");
-		return NULL;
-	}
+	struct key_def *new_def = xcalloc(1, sz);
 	new_def->part_count = new_part_count;
 	new_def->unique_part_count = new_part_count;
 	new_def->is_nullable = first->is_nullable || second->is_nullable;
@@ -1105,6 +1174,7 @@ key_def_merge(const struct key_def *first, const struct key_def *second)
 				      second->has_optional_parts;
 	new_def->is_multikey = first->is_multikey || second->is_multikey;
 	new_def->for_func_index = first->for_func_index;
+	new_def->is_unordered = first->is_unordered;
 	new_def->func_index_func = first->func_index_func;
 
 	/* JSON paths data in the new key_def. */
@@ -1116,7 +1186,8 @@ key_def_merge(const struct key_def *first, const struct key_def *second)
 	end = part + first->part_count;
 	for (; part != end; part++) {
 		if (key_def_set_part(new_def, pos++, part->fieldno, part->type,
-				     part->nullable_action, part->exclude_null, part->coll,
+				     &part->type_params, part->nullable_action,
+				     part->exclude_null, part->coll,
 				     part->coll_id, part->sort_order,
 				     part->path, part->path_len, &path_pool,
 				     part->offset_slot_cache,
@@ -1133,7 +1204,8 @@ key_def_merge(const struct key_def *first, const struct key_def *second)
 		if (!key_def_can_merge(first, part))
 			continue;
 		if (key_def_set_part(new_def, pos++, part->fieldno, part->type,
-				     part->nullable_action, part->exclude_null, part->coll,
+				     &part->type_params, part->nullable_action,
+				     part->exclude_null, part->coll,
 				     part->coll_id, part->sort_order,
 				     part->path, part->path_len, &path_pool,
 				     part->offset_slot_cache,
@@ -1156,16 +1228,10 @@ key_def_find_pk_in_cmp_def(const struct key_def *cmp_def,
 	size_t region_svp = region_used(region);
 
 	/* First, dump primary key parts as is. */
-	size_t size;
-	struct key_part_def *parts =
-		region_alloc_array(region, typeof(parts[0]), pk_def->part_count,
-				   &size);
-	if (parts == NULL) {
-		diag_set(OutOfMemory, size, "region_alloc_array", "parts");
-		goto out;
-	}
-	if (key_def_dump_parts(pk_def, parts, region) != 0)
-		goto out;
+	struct key_part_def *parts = xregion_alloc_array(
+			region, typeof(parts[0]), pk_def->part_count);
+	key_def_dump_parts(pk_def, parts, region);
+
 	/*
 	 * Second, update field numbers to match the primary key
 	 * parts in a secondary key.
@@ -1179,8 +1245,7 @@ key_def_find_pk_in_cmp_def(const struct key_def *cmp_def,
 	}
 
 	/* Finally, allocate the new key definition. */
-	extracted_def = key_def_new(parts, pk_def->part_count, false);
-out:
+	extracted_def = key_def_new(parts, pk_def->part_count, 0);
 	region_truncate(region, region_svp);
 	return extracted_def;
 }
@@ -1192,12 +1257,42 @@ key_validate_parts(const struct key_def *key_def, const char *key,
 {
 	for (uint32_t i = 0; i < part_count; i++) {
 		const struct key_part *part = &key_def->parts[i];
-		if (key_part_validate(part->type, key, i,
+		if (key_part_validate(part->type, &part->type_params, key, i,
 				      key_part_is_nullable(part) &&
 				      allow_nullable))
 			return -1;
 		mp_next(&key);
 	}
 	*key_end = key;
+	return 0;
+}
+
+int
+key_part_validate(enum field_type key_type,
+		  const union field_type_params *type_params, const char *key,
+		  uint32_t field_no, bool is_nullable)
+{
+	if (unlikely(!field_mp_type_is_compatible(key_type, key, is_nullable))) {
+		diag_set(ClientError, ER_KEY_PART_TYPE, field_no,
+			 field_type_strs[key_type]);
+		return -1;
+	}
+	if (field_type_is_fixed_int(key_type)) {
+		char mp_min[16], mp_max[16];
+		if (!field_mp_is_in_fixed_int_range(
+				key_type, key, mp_min, mp_max, NULL)) {
+			diag_set(ClientError, ER_KEY_PART_VALUE_OUT_OF_RANGE,
+				 field_no, field_type_strs[key_type], key,
+				 mp_min, mp_max);
+			return -1;
+		}
+	}
+	if (field_type_is_fixed_decimal[key_type] &&
+	    !field_mp_fits_fixed_point_decimal(key_type, type_params->scale,
+					       key)) {
+		diag_set(ClientError, ER_KEY_PART_IRREPRESENTABLE_VALUE,
+			 field_no, key);
+		return -1;
+	}
 	return 0;
 }

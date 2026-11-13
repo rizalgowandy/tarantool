@@ -32,13 +32,16 @@
  */
 
 #include <sys/uio.h>
-#include "unit.h"
 #include "vy_stmt.h"
 #include "small/rlist.h"
 #include "small/lsregion.h"
 #include "vy_mem.h"
 #include "vy_cache.h"
+#include "vy_history.h"
 #include "vy_read_view.h"
+
+#define UNIT_TAP_COMPATIBLE 1
+#include "unit.h"
 
 #define vyend 99999999
 #define MAX_FIELDS_COUNT 100
@@ -51,9 +54,15 @@
 #define STMT_TEMPLATE_DEFERRED_DELETE(lsn, type, ...) \
 STMT_TEMPLATE_FLAGS(lsn, type, VY_STMT_DEFERRED_DELETE, __VA_ARGS__)
 
+#define STMT_TEMPLATE_SKIP_READ(lsn, type, ...) \
+STMT_TEMPLATE_FLAGS(lsn, type, VY_STMT_SKIP_READ, __VA_ARGS__)
+
 extern struct vy_stmt_env stmt_env;
+extern struct tuple_format *key_format;
 extern struct vy_mem_env mem_env;
 extern struct vy_cache_env cache_env;
+extern struct mempool history_node_pool;
+extern struct vy_stmt_counter dummy_count;
 
 #if defined(__cplusplus)
 extern "C" {
@@ -142,19 +151,6 @@ vy_cache_insert_templates_chain(struct vy_cache *cache,
 void
 vy_cache_on_write_template(struct vy_cache *cache, struct tuple_format *format,
 			   const struct vy_stmt_template *templ);
-
-/**
- * Create a list of read views using the specified vlsns.
- *
- * @param rlist[out] Result list of read views.
- * @param rvs[out] Read views array.
- * @param vlsns Array of read view lsns, sorted in ascending
- *        order.
- * @param count Size of the @vlsns.
- */
-void
-init_read_views_list(struct rlist *rlist, struct vy_read_view *rvs,
-		     const int *vlsns, int count);
 
 /**
  * Create vy_mem with the specified key_def, using the @region as

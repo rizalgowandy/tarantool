@@ -79,14 +79,18 @@ struct coll {
 	 * copied. Sort keys may be compared using strcmp().
 	 */
 	coll_hint_f hint;
-	/** Reference counter. */
-	int refs;
 	/**
 	 * Formatted string with collation properties, that
 	 * completely describes how the collation works.
 	 */
 	const char fingerprint[0];
 };
+
+/** Unicode collation. */
+extern struct coll *unicode_coll;
+
+/** Unicode case-insensitive collation. */
+extern struct coll *unicode_ci_coll;
 
 /**
  * Return true if a key part using the second collation can be
@@ -109,17 +113,6 @@ coll_can_merge(const struct coll *first, const struct coll *second);
  */
 struct coll *
 coll_new(const struct coll_def *def);
-
-/** Increment reference counter. */
-static inline void
-coll_ref(struct coll *coll)
-{
-	++coll->refs;
-}
-
-/** Decrement reference counter. Delete when 0. */
-void
-coll_unref(struct coll *coll);
 
 /** Initialize collations subsystem. */
 void

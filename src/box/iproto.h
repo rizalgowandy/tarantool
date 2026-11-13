@@ -32,6 +32,14 @@
  */
 
 #include <stddef.h>
+#include <stdint.h>
+
+#include "box/box.h"
+
+struct uri_set;
+struct session;
+struct user;
+struct iostream;
 
 #if defined(__cplusplus)
 extern "C" {
@@ -94,11 +102,18 @@ void
 iproto_reset_stat(void);
 
 /**
- * String representation of the address served by
- * iproto. To be shown in box.info.
+ * Return count of the addresses currently served by iproto.
+ */
+int
+iproto_addr_count(void);
+
+/**
+ * Return representation of the address served by iproto by
+ * it's @a idx. @a buf should have at least SERVICE_NAME_MAXLEN
+ * size.
  */
 const char *
-iproto_bound_address(char *buf);
+iproto_addr_str(char *buf, int idx);
 
 int
 iproto_rmean_foreach(void *cb, void *cb_ctx);
@@ -110,21 +125,120 @@ iproto_rmean_foreach(void *cb, void *cb_ctx);
 int
 iproto_thread_rmean_foreach(int thread_id, void *cb, void *cb_ctx);
 
-#if defined(__cplusplus)
-} /* extern "C" */
+/**
+ * Sets an IPROTO request handler with the provided callback, destructor and
+ * context for the given request type.
+ * Passing a NULL callback resets the corresponding request handler.
+ * Returns 0 on success, a non-zero value on error (diagnostic is set).
+ */
+int
+iproto_override(uint32_t req_type, iproto_handler_t cb,
+		iproto_handler_destroy_t destroy, void *ctx);
+
+/**
+ * Lets IPROTO threads know that there's a function with the given name
+ * in the current request-serving thread (tx or app).
+ *
+ * If a function is registered by any request-serving thread, IPROTO threads
+ * will route IPROTO_CALL requests for this function only to the threads where
+ * it was registered, evenly balancing the load among them.
+ */
+void
+iproto_register_func(const char *name);
+
+/**
+ * Cancels the effect of iproto_register_func().
+ */
+void
+iproto_unregister_func(const char *name);
 
 void
 iproto_init(int threads_count);
 
 int
-iproto_listen(const char *uri);
+iproto_listen(const struct uri_set *uri_set);
 
-void
+int
 iproto_set_msg_max(int iproto_msg_max);
+
+/**
+ * Creates a new IPROTO session over the given IO stream. Doesn't yield.
+ * Set the output parameter sid to the sid of newly created session.
+ *
+ * The IO stream must refer to a non-blocking socket but this isn't enforced by
+ * this function. If it isn't so, the new connection may not work as expected.
+ *
+ * If the user argument isn't NULL, the new session will be authenticated as
+ * the specified user. Otherwise, it will be authenticated as guest.
+ *
+ * The function takes ownership of the passed IO stream by moving it to the
+ * new IPROTO connection (see iostream_move) except for error case.
+ *
+ * Essentially, this function passes the IO stream to the callback invoked
+ * by an IPROTO thread upon accepting a new connection on a listening socket.
+ * The callback creates a new IPROTO connection, attaches it to the given
+ * session, then sends the greeting message and starts processing requests as
+ * usual. All of this is done asynchronously by an IPROTO thread.
+ *
+ * Returns 0 on success, and -1 otherwise (diagnostic is set).
+ */
+int
+iproto_session_new(struct iostream *io, struct user *user, uint64_t *sid);
+
+/**
+ * Sends a packet with the given header and body over the IPROTO session's
+ * socket.
+ * On success, a packet is written to the session's output buffer, which is
+ * flushed asynchronously using Kharon.
+ * Returns 0 on success, a non-zero value otherwise (diagnostic is set).
+ */
+int
+iproto_session_send(struct session *session,
+		    const char *header, const char *header_end,
+		    const char *body, const char *body_end);
 
 void
 iproto_free(void);
 
+/**
+ * Drop all current connections. That is stop IO and cancel all inprogress
+ * requests. Return when the requests are finished and connection is freed.
+ * Concurrent calls are serialized.
+ *
+ * Drop can be interrupted by cancelling fiber or on timeout. In this case
+ * failure result code is returned. The function can be called again after
+ * failure.
+ *
+ * Return:
+ *   0 - success
+ *  -1 - failure (diag is set)
+ */
+int
+iproto_drop_connections(double timeout);
+
+/**
+ * The same is iproto_drop_connections, but if stale_only is set,
+ * only the connections that correspond to the uris that are not being
+ * listened will be dropped.
+ */
+int
+iproto_drop_connections_ex(double timeout, bool stale_only);
+
+/**
+ * Prepare for freeing resources in iproto_free while TX event loop is still
+ * running.
+ *
+ * If not finished in given timeout then failure result code is returned.
+ *
+ * Return:
+ *   0 - success
+ *  -1 - failure (diag is set)
+ */
+int
+iproto_shutdown(double timeout);
+
+#if defined(__cplusplus)
+} /* extern "C" */
 #endif /* defined(__cplusplus) */
 
 #endif

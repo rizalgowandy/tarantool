@@ -210,6 +210,20 @@ local function test_uuid(test, s)
     rt(test, s, uuid.new(), 'cdata')
 end
 
+local function test_datetime(test, s)
+    local datetime = require('datetime')
+    test:plan(16)
+
+    rt(test, s, datetime.new(), 'cdata')
+    rt(test, s, datetime.new{year = -5879609}, 'cdata')
+    rt(test, s, datetime.new{year = -300}, 'cdata')
+    rt(test, s, datetime.new{year = 0}, 'cdata')
+    rt(test, s, datetime.new{year = 1000}, 'cdata')
+    rt(test, s, datetime.new{year = 2000}, 'cdata')
+    rt(test, s, datetime.new{year = 10000}, 'cdata')
+    rt(test, s, datetime.new{year = 5879611}, 'cdata')
+end
+
 local function test_boolean(test, s)
     test:plan(4)
 
@@ -222,7 +236,7 @@ local function test_boolean(test, s)
 end
 
 local function test_string(test, s)
-    test:plan(8)
+    test:plan(11)
     rt(test, s, "")
     rt(test, s, "abcde")
     rt(test, s, "Кудыкины горы") -- utf-8
@@ -231,6 +245,9 @@ local function test_string(test, s)
     rt(test, s, '$a\t $')
     rt(test, s, [[$a\t $]])
     rt(test, s, [[$a\\t $]])
+    rt(test, s, '9e123456789')
+    rt(test, s, 'infinity')
+    rt(test, s, 'NaN')
 end
 
 local function test_nil(test, s)
@@ -427,6 +444,12 @@ local function test_depth(test, s)
     for _ = 1, max_depth + 1 do t = {t} end
     local ok = pcall(s.encode, t)
     test:ok(not ok, "too deep encode depth")
+    -- In our CI normally LSAN do not report as a leak the memory allocated
+    -- using malloc due to suppression 'leak:libc.so*' in asan/lsan.supp.
+    -- But unexpectedly if stack trace depth is large as in this case
+    -- (>128 frames) then suppression does not work and CI breaks. Let's
+    -- run garbage collector to avoid this particular leak.
+    collectgarbage()
 
     s.cfg({encode_max_depth = max_depth + 1})
     ok = pcall(s.encode, t)
@@ -495,7 +518,7 @@ end
 
 local function test_error(test, s)
     test:plan(4)
-    local err = box.error.new(box.error.ILLEGAL_PARAMS, 'test')
+    local err = box.error.new(box.error.UNSUPPORTED, 'foo', 'bar')
     err:set_prev(box.error.new(box.error.UNKNOWN))
     local encode_error_as_ext = msgpack.cfg.encode_error_as_ext
     local encode_load_metatables = msgpack.cfg.encode_load_metatables
@@ -513,7 +536,7 @@ local function test_error(test, s)
     }
     local err2 = s.decode(s.encode(err))
     test:is(type(err2), 'string', 'encode/decode error as str - type')
-    test:is(err2, 'Illegal parameters, test',
+    test:is(err2, 'foo does not support bar',
             'encode/decode error as str - value')
     msgpack.cfg{
         encode_error_as_ext = encode_error_as_ext,
@@ -532,6 +555,7 @@ return {
     test_ucdata = test_ucdata;
     test_decimal = test_decimal;
     test_uuid = test_uuid;
+    test_datetime = test_datetime;
     test_depth = test_depth;
     test_decode_buffer = test_decode_buffer;
     test_error = test_error;

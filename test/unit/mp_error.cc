@@ -28,18 +28,22 @@
  * THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  */
-#include "unit.h"
 #include "exception.h"
 #include "fiber.h"
 #include "memory.h"
 #include "msgpuck.h"
 #include "mp_extension_types.h"
+#include "random.h"
 #include "tt_static.h"
 #include "small/ibuf.h"
 #include "mpstream/mpstream.h"
+#include "tt_uuid.h"
 
 #include "box/error.h"
 #include "box/mp_error.h"
+
+#define UNIT_TAP_COMPATIBLE 1
+#include "unit.h"
 
 enum {
 	MP_ERROR_STACK = 0x00
@@ -84,18 +88,16 @@ const char *standard_errors[] = {
 	"CollationError",
 	"SwimError",
 	"CryptoError",
+	"SSLError",
+	"FileFormatError",
+	"EncodeError",
+	"DecodeError",
 };
 
 enum {
 	TEST_STANDARD_ERRORS_NUM =
 		sizeof(standard_errors) / sizeof(standard_errors[0]),
 };
-
-static inline char *
-mp_encode_str0(char *data, const char *str)
-{
-	return mp_encode_str(data, str, strlen(str));
-}
 
 /** Note, not the same as mp_encode_error(). */
 static char *
@@ -349,7 +351,7 @@ test_decode_unknown_type()
 	const char *pos = buffer;
 	struct error *unpacked = error_unpack(&pos, len);
 	error_ref(unpacked);
-	err.code = 0;
+	err.code = 1;
 	err.type = "ClientError";
 	ok(error_is_eq_mp_error(unpacked, &err), "check SomeNewError");
 	error_unref(unpacked);
@@ -362,7 +364,7 @@ void
 test_fail_not_enough_fields()
 {
 	header();
-	plan(2);
+	plan(4);
 	char buffer[2048];
 	memset(buffer, 0, sizeof(buffer));
 
@@ -382,9 +384,15 @@ test_fail_not_enough_fields()
 	uint32_t len = data - buffer;
 	const char *pos = buffer;
 	struct error *unpacked = error_unpack(&pos, len);
+	error_ref(unpacked);
 
-	is(unpacked, NULL, "check not enough additional fields");
-	ok(!diag_is_empty(diag_get()), "error about parsing problem is set");
+	isnt(unpacked, NULL, "check lack of fields");
+	is(strcmp(error_get_str(unpacked, "object_type"), err.ad_object_type),
+	   0, "object type");
+	is(strcmp(error_get_str(unpacked, "access_type"), err.ad_access_type),
+	   0, "access type");
+	is(error_get_str(unpacked, "object_name"), NULL, "object name");
+	error_unref(unpacked);
 	check_plan();
 	footer();
 }
@@ -450,6 +458,71 @@ test_unknown_additional_fields()
 	ok(error_is_eq_mp_error(unpacked, &err),
 	   "check unknown additional field");
 	error_unref(unpacked);
+
+	check_plan();
+	footer();
+}
+
+static void
+test_payload(void)
+{
+	header();
+	plan(13);
+	char buffer[2048];
+	memset(buffer, 0, sizeof(buffer));
+
+	struct error *e = new ClientError();
+	error_ref(e);
+	e->code = 42;
+	e->saved_errno = 1;
+	error_format_msg(e, "msg");
+	error_set_location(e, "file", 2);
+	error_set_str(e, "key1", "1");
+	error_set_uint(e, "key2", 1);
+	error_set_int(e, "key3", -1);
+	error_set_double(e, "key4", 1.5);
+	error_set_bool(e, "key5", true);
+	struct tt_uuid uuid;
+	tt_uuid_create(&uuid);
+	error_set_uuid(e, "key6", &uuid);
+	char mp[128];
+	size_t mp_size = mp_format(mp, lengthof(mp), "[%d, %s]", 7, "bye");
+	error_set_mp(e, "key7", mp, mp_size);
+
+	mp_encode_error(buffer, e);
+	error_unref(e);
+
+	int8_t type;
+	const char *data = buffer;
+	uint32_t len = mp_decode_extl(&data, &type);
+	e = error_unpack(&data, len);
+	error_ref(e);
+
+	is(e->code, 42, "code");
+	is(e->saved_errno, 1, "errno");
+	is(strcmp(e->errmsg, "msg"), 0, "msg");
+	is(e->line, 2, "line");
+	is(strcmp(e->file, "file"), 0, "file");
+	is(strcmp(error_get_str(e, "key1"), "1"), 0, "key str");
+	uint64_t val_uint;
+	ok(error_get_uint(e, "key2", &val_uint) && val_uint == 1, "key uint");
+	int64_t val_int;
+	ok(error_get_int(e, "key3", &val_int) && val_int == -1, "key int");
+	double val_dbl;
+	ok(error_get_double(e, "key4", &val_dbl) && val_dbl == 1.5,
+	   "key double");
+	bool val_bool;
+	ok(error_get_bool(e, "key5", &val_bool) && val_bool, "key bool");
+	struct tt_uuid val_uuid;
+	ok(error_get_uuid(e, "key6", &val_uuid) &&
+	   tt_uuid_is_equal(&uuid, &val_uuid), "key uuid");
+	uint32_t val_mp_size;
+	const char *val_mp = error_get_mp(e, "key7", &val_mp_size);
+	ok(val_mp_size == mp_size, "key msgpack size");
+	ok(val_mp != NULL &&
+	   memcmp(val_mp, mp, mp_size) == 0, "key msgpack data");
+
+	error_unref(e);
 
 	check_plan();
 	footer();
@@ -551,7 +624,7 @@ test_mp_print(void)
 
 	struct error *e1 = BuildClientError("file1", 1, 0);
 	error_ref(e1);
-	struct error *e2 = BuildCustomError("file2", 4, "type", 5);
+	struct error *e2 = BuildCustomError("file2", 4, "type", 5, "");
 	struct error *e3 = BuildAccessDeniedError("file3", 6, "field1",
 						  "field2", "field3", "field4");
 	error_set_prev(e1, e2);
@@ -570,7 +643,10 @@ test_mp_print(void)
 				"\"file\": \"file1\", "
 				"\"message\": \"Unknown error\", "
 				"\"errno\": 0, "
-				"\"code\": 0"
+				"\"code\": 0, "
+				"\"fields\": {"
+					"\"name\": \"UNKNOWN\""
+				"}"
 			"}, "
 			"{"
 				"\"type\": \"CustomError\", "
@@ -595,7 +671,8 @@ test_mp_print(void)
 				"\"fields\": {"
 					"\"object_type\": \"field2\", "
 					"\"object_name\": \"field3\", "
-					"\"access_type\": \"field1\""
+					"\"access_type\": \"field1\", "
+					"\"user\": \"field4\""
 				"}"
 			"}"
 		"]"
@@ -635,7 +712,8 @@ test_mp_print(void)
 				"\"file\": \"file1\", "
 				"\"message\": \"Unknown error\", "
 				"\"errno\": 0, "
-				"\"code\": 0"
+				"\"code\": 0, "
+				"\"fields\": {...}"
 			"}, "
 			"{"
 				"\"type\": \"CustomError\", "
@@ -723,7 +801,8 @@ int
 main(void)
 {
 	header();
-	plan(6);
+	plan(7);
+	random_init();
 	memory_init();
 	fiber_init(fiber_c_invoke);
 
@@ -732,10 +811,12 @@ main(void)
 	test_fail_not_enough_fields();
 	test_unknown_fields();
 	test_unknown_additional_fields();
+	test_payload();
 	test_mp_print();
 
 	fiber_free();
 	memory_free();
+	random_free();
 	footer();
 	return check_plan();
 }

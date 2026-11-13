@@ -31,6 +31,7 @@
  * SUCH DAMAGE.
  */
 #include <stddef.h>
+#include "trivia/util.h"
 #if defined(__cplusplus)
 extern "C" {
 #endif /* defined(__cplusplus) */
@@ -40,13 +41,31 @@ extern "C" {
 #define typeof __typeof__
 #endif
 
-struct stailq_entry {
-	struct stailq_entry *next;
+/** Forward declaration. */
+struct PACKED stailq_entry;
+
+/**
+ * An auxiliary structure that helps things work with unaligned objects.
+ */
+struct PACKED stailq_entry_ptr {
+	/** Just pointer that the structure wraps. */
+	struct stailq_entry *value;
+};
+
+/**
+ * Stailq link. Used as a field in a structure that is supposed to
+ * be stailq item.
+ */
+struct PACKED stailq_entry {
+	/** Next stail entry. */
+	struct stailq_entry_ptr next;
 };
 
 struct stailq {
-	struct stailq_entry *first;
-	struct stailq_entry **last;
+	/** First stailq entry. */
+	struct stailq_entry_ptr first;
+	/** Pointer to the next field of the last entry. */
+	struct stailq_entry_ptr *last;
 };
 
 /**
@@ -56,8 +75,17 @@ struct stailq {
 inline static void
 stailq_create(struct stailq *head)
 {
-	head->first = NULL;
+	head->first.value = NULL;
 	head->last = &head->first;
+}
+
+/**
+ * return TRUE if list is empty
+ */
+static inline int
+stailq_empty(struct stailq *head)
+{
+	return head->first.value == NULL;
 }
 
 /**
@@ -67,9 +95,9 @@ inline static void
 stailq_add(struct stailq *head, struct stailq_entry *item)
 {
 	item->next = head->first;
-	if (item->next == NULL)
+	if (item->next.value == NULL)
 		head->last = &item->next;
-	head->first = item;
+	head->first.value = item;
 }
 
 /**
@@ -78,10 +106,12 @@ stailq_add(struct stailq *head, struct stailq_entry *item)
 inline static struct stailq_entry *
 stailq_shift(struct stailq *head)
 {
-	struct stailq_entry *shift = head->first;
-	if ((head->first = head->first->next) == NULL)
+	assert(!stailq_empty(head));
+	struct stailq_entry_ptr shift = head->first;
+	head->first = head->first.value->next;
+	if (head->first.value == NULL)
 		head->last = &head->first;
-	return shift;
+	return shift.value;
 }
 
 /**
@@ -90,8 +120,8 @@ stailq_shift(struct stailq *head)
 inline static void
 stailq_add_tail(struct stailq *head, struct stailq_entry *item)
 {
-	item->next = NULL;
-	*head->last = item;
+	item->next.value = NULL;
+	(*head->last).value = item;
 	head->last = &item->next;
 }
 
@@ -103,8 +133,8 @@ stailq_insert(struct stailq *head, struct stailq_entry *item,
 	      struct stailq_entry *prev)
 {
 	item->next = prev->next;
-	prev->next = item;
-	if (item->next == NULL)
+	prev->next.value = item;
+	if (item->next.value == NULL)
 		head->last = &item->next;
 }
 
@@ -114,7 +144,7 @@ stailq_insert(struct stailq *head, struct stailq_entry *item,
 inline static struct stailq_entry *
 stailq_first(struct stailq *head)
 {
-	return head->first;
+	return head->first.value;
 }
 
 /**
@@ -133,16 +163,7 @@ stailq_last(struct stailq *head)
 inline static struct stailq_entry *
 stailq_next(struct stailq_entry *item)
 {
-	return item->next;
-}
-
-/**
- * return TRUE if list is empty
- */
-inline static int
-stailq_empty(struct stailq *head)
-{
-	return head->first == NULL;
+	return item->next.value;
 }
 
 /*
@@ -185,11 +206,12 @@ stailq_cut_tail(struct stailq *head, struct stailq_entry *last,
 		tail->first = last->next;
 		tail->last = head->last;
 		head->last = &last->next;
-		last->next = NULL;
+		last->next.value = NULL;
 	} else {
 		tail->first = head->first;
-		tail->last = head->first != NULL ? head->last : &tail->first;
-		head->first = NULL;
+		tail->last = head->first.value != NULL ? head->last
+				: &tail->first;
+		head->first.value = NULL;
 		head->last = &head->first;
 	}
 }
@@ -256,7 +278,18 @@ stailq_cut_tail(struct stailq *head, struct stailq_entry *last,
  * foreach through list
  */
 #define stailq_foreach(item, head)					\
-	for (item = stailq_first(head); item; item = item->next)
+	for (item = stailq_first(head); item; item = item->next.value)
+
+/**
+ * stailq initializer
+ */
+#define STAILQ_INITIALIZER(name) { { NULL }, &(name).first }
+
+/**
+ * allocate and init stailq
+ */
+#define STAILQ(name)	\
+	struct stailq name = STAILQ_INITIALIZER(name)
 
 #if defined(__cplusplus)
 } /* extern "C" */

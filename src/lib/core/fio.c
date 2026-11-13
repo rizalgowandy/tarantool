@@ -29,8 +29,10 @@
  * SUCH DAMAGE.
  */
 #include "fio.h"
+#include "trivia/config.h"
 
 #include <sys/types.h>
+#include <fcntl.h>
 
 #include <string.h>
 #include <unistd.h>
@@ -43,10 +45,32 @@
 #include <say.h>
 #include "tt_static.h"
 
+int
+fio_fsync(int fd)
+{
+#if defined(__APPLE__)
+	return fcntl(fd, F_FULLFSYNC);
+#else
+	return fsync(fd);
+#endif
+}
+
+int
+fio_fdatasync(int fd)
+{
+#if defined(__APPLE__)
+	return fio_fsync(fd);
+#elif defined(HAVE_FDATASYNC)
+	return fdatasync(fd);
+#else
+	return fio_fsync(fd);
+#endif
+}
+
 const char *
 fio_filename(int fd)
 {
-#ifdef TARGET_OS_LINUX
+#if TARGET_OS_LINUX
 	int save_errno = errno;
 
 	char *proc_path = tt_static_buf();

@@ -4,9 +4,13 @@
 
 #include "box/watcher.h"
 #include "fiber.h"
+#include "lua/utils.h"
+#include "lualib.h"
 #include "memory.h"
 #include "tarantool_ev.h"
 #include "trivia/util.h"
+
+#define UNIT_TAP_COMPATIBLE 1
 #include "unit.h"
 
 #define TEST_TIMEOUT 5
@@ -140,12 +144,18 @@ test_watcher_key_equal(struct test_watcher *w, const char *key)
 }
 
 static bool
+test_value_equal(const char *data, const char *data_end, const char *value)
+{
+	size_t data_size = data_end - data;
+	return ((value == NULL && data == NULL && data_end == NULL) ||
+		(value != NULL && strlen((value)) == data_size &&
+		 strncmp(value, data, data_size) == 0));
+}
+
+static bool
 test_watcher_value_equal(struct test_watcher *w, const char *value)
 {
-	size_t data_size = w->data_end - w->data;
-	return ((value == NULL && w->data == NULL && w->data_end == NULL) ||
-		(value != NULL && strlen((value)) == data_size &&
-		 strncmp(value, w->data, data_size) == 0));
+	return test_value_equal(w->data, w->data_end, value);
 }
 
 #define test_watcher_check_args(w, key, value)				\
@@ -160,6 +170,13 @@ test_broadcast(const char *key, const char *value)
 	box_broadcast(key, strlen(key), value,
 		      value != NULL ? value + strlen(value) : NULL);
 }
+
+#define test_watch_once(key, value)					\
+do {									\
+	const char *data, *data_end;					\
+	data = box_watch_once((key), strlen(key), &data_end);		\
+	ok(test_value_equal(data, data_end, value), "value");		\
+} while (0)
 
 /**
  * Checks that watchers are invoked with correct arguments on broadcast.
@@ -453,13 +470,16 @@ test_parallel(void)
 }
 
 /**
+ * Checks that all functions are callable and work as usual after
+ * box_watcher_shutdown() except no notification are delivired.
+ *
  * Checks that box_watcher_free() properly unregisters all watchers.
  */
 static void
 test_free(void)
 {
 	header();
-	plan(7);
+	plan(17);
 
 	test_broadcast("foo", "bar");
 	test_broadcast("fuzz", "buzz");
@@ -480,17 +500,69 @@ test_free(void)
 	test_watcher_check_run_count(&w2, 1);
 	test_watcher_check_run_count(&w3, 1);
 
+	box_watcher_shutdown();
+
+	struct test_watcher w4, w5;
+	test_watcher_create(&w4);
+	test_watcher_create(&w5);
+
+	test_watcher_register(&w4, "foo");
+	test_watcher_register_with_flags(&w5, "foo", WATCHER_RUN_ASYNC);
+	test_watcher_check_run_count(&w4, 0);
+	test_watcher_check_run_count(&w5, 0);
+	test_watch_once("foo", "bar");
+
+	test_broadcast("foo", NULL);
+	test_watcher_check_run_count(&w1, 1);
+	test_watcher_check_run_count(&w2, 1);
+	test_watcher_check_run_count(&w3, 1);
+	test_watcher_check_run_count(&w4, 0);
+	test_watcher_check_run_count(&w5, 0);
+	test_watch_once("foo", NULL);
+
+	test_watcher_resume_sleeping(&w3);
 	box_watcher_free();
 
 	test_watcher_check_destroy_count(&w1, 1);
 	test_watcher_check_destroy_count(&w2, 1);
-	test_watcher_check_destroy_count(&w3, 0);
-	test_watcher_resume_sleeping(&w3);
 	test_watcher_check_destroy_count(&w3, 1);
+	test_watcher_check_destroy_count(&w4, 1);
+	test_watcher_check_destroy_count(&w5, 1);
 
 	test_watcher_destroy(&w1);
 	test_watcher_destroy(&w2);
 	test_watcher_destroy(&w3);
+	test_watcher_destroy(&w4);
+	test_watcher_destroy(&w5);
+
+	check_plan();
+	footer();
+}
+
+static void
+test_value(void)
+{
+	header();
+	plan(8);
+
+	test_watch_once("foo", NULL);
+	test_watch_once("fuzz", NULL);
+
+	test_broadcast("foo", "bar");
+	test_broadcast("fuzz", "buzz");
+
+	test_watch_once("foo", "bar");
+	test_watch_once("fuzz", "buzz");
+
+	test_broadcast("foo", NULL);
+
+	test_watch_once("foo", NULL);
+	test_watch_once("fuzz", "buzz");
+
+	test_broadcast("fuzz", NULL);
+
+	test_watch_once("foo", NULL);
+	test_watch_once("fuzz", NULL);
 
 	check_plan();
 	footer();
@@ -500,7 +572,7 @@ static int
 main_f(va_list ap)
 {
 	header();
-	plan(8);
+	plan(9);
 	box_watcher_init();
 	test_basic();
 	test_async();
@@ -509,6 +581,7 @@ main_f(va_list ap)
 	test_ack();
 	test_ack_unregistered();
 	test_parallel();
+	test_value();
 	test_free(); /* must be last */
 	test_result = check_plan();
 	footer();
@@ -519,6 +592,10 @@ main_f(va_list ap)
 int
 main()
 {
+	struct lua_State *L = luaL_newstate();
+	luaL_openlibs(L);
+	tarantool_L = L;
+
 	memory_init();
 	fiber_init(fiber_c_invoke);
 	struct fiber *f = fiber_new("main", main_f);
@@ -526,5 +603,8 @@ main()
 	ev_run(loop(), 0);
 	fiber_free();
 	memory_free();
+
+	lua_close(L);
+	tarantool_L = NULL;
 	return test_result;
 }

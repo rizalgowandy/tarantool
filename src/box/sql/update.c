@@ -56,14 +56,12 @@ sqlUpdate(Parse * pParse,		/* The parser context */
 	int addrTop = 0;	/* VDBE instruction address of the start of the loop */
 	WhereInfo *pWInfo;	/* Information about the WHERE clause */
 	Vdbe *v;		/* The virtual database engine */
-	sql *db;		/* The database structure */
 	int *aXRef = 0;		/* aXRef[i] is the index in pChanges->a[] of the
 				 * an expression for the i-th column of the table.
 				 * aXRef[i]==-1 if the i-th column is not changed.
 				 */
 	NameContext sNC;	/* The name-context to resolve expressions in */
 	int okOnePass;		/* True for one-pass algorithm without the FIFO */
-	int hasFK;		/* True if foreign key processing is required */
 	int labelBreak;		/* Jump here to break out of UPDATE loop */
 	int labelContinue;	/* Jump here to continue next step of UPDATE loop */
 
@@ -84,10 +82,8 @@ sqlUpdate(Parse * pParse,		/* The parser context */
 	/* Count of changed rows. Match aXRef items != -1. */
 	int upd_cols_cnt = 0;
 
-	db = pParse->db;
-	if (pParse->is_aborted || db->mallocFailed) {
+	if (pParse->is_aborted)
 		goto update_cleanup;
-	}
 	assert(pTabList->nSrc == 1);
 
 	/* Locate the table which we want to update.
@@ -120,13 +116,9 @@ sqlUpdate(Parse * pParse,		/* The parser context */
 	int pk_cursor = pParse->nTab++;
 	pTabList->a[0].iCursor = pk_cursor;
 	struct index *pPk = space_index(space, 0);
-	aXRef = region_alloc_array(&pParse->region, typeof(aXRef[0]),
-				   def->field_count, &i);
-	if (aXRef == NULL) {
-		diag_set(OutOfMemory, i, "region_alloc_array", "aXRef");
-		goto update_cleanup;
-	}
-	memset(aXRef, -1, i);
+	aXRef = xregion_alloc_array(&pParse->region, typeof(aXRef[0]),
+				    def->field_count);
+	memset(aXRef, -1, sizeof(aXRef[0]) * def->field_count);
 
 	/* Initialize the name-context */
 	memset(&sNC, 0, sizeof(sNC));
@@ -142,35 +134,24 @@ sqlUpdate(Parse * pParse,		/* The parser context */
 		if (sqlResolveExprNames(&sNC, pChanges->a[i].pExpr)) {
 			goto update_cleanup;
 		}
-		for (j = 0; j < (int)def->field_count; j++) {
-			if (strcmp(def->fields[j].name,
-				   pChanges->a[i].zName) == 0) {
-				if (pPk &&
-				    sql_space_column_is_in_pk(space, j))
-					is_pk_modified = true;
-				if (aXRef[j] != -1) {
-					const char *err =
-						"set id list: duplicate "\
-						"column name %s";
-					err = tt_sprintf(err,
-							 pChanges->a[i].zName);
-					diag_set(ClientError,
-						 ER_SQL_PARSER_GENERIC,
-						 err);
-					pParse->is_aborted = true;
-					goto update_cleanup;
-				}
-				aXRef[j] = i;
-				upd_cols_cnt++;
-				break;
-			}
-		}
-		if (j >= (int)def->field_count) {
+		uint32_t fieldno = sql_fieldno_by_item(space, &pChanges->a[i]);
+		if (fieldno == UINT32_MAX) {
 			diag_set(ClientError, ER_NO_SUCH_FIELD_NAME_IN_SPACE,
 				 pChanges->a[i].zName, def->name);
 			pParse->is_aborted = true;
 			goto update_cleanup;
 		}
+		if (pPk != NULL && sql_space_column_is_in_pk(space, fieldno))
+			is_pk_modified = true;
+		if (aXRef[fieldno] != -1) {
+			diag_set(ClientError, ER_SQL_PARSER_GENERIC,
+				 tt_sprintf("set id list: duplicate column "
+					    "name %s", pChanges->a[i].zName));
+			pParse->is_aborted = true;
+			goto update_cleanup;
+		}
+		aXRef[fieldno] = i;
+		upd_cols_cnt++;
 	}
 	/*
 	 * The SET expressions are not actually used inside the
@@ -178,19 +159,16 @@ sqlUpdate(Parse * pParse,		/* The parser context */
 	 */
 	pTabList->a[0].colUsed = 0;
 
-	hasFK = fk_constraint_is_required(space, aXRef);
-
 	/* Begin generating code. */
 	v = sqlGetVdbe(pParse);
 	if (v == NULL)
 		goto update_cleanup;
 	sqlVdbeCountChanges(v);
-	sql_set_multi_write(pParse, true);
 
 	/* Allocate required registers. */
 	regOldPk = regNewPk = ++pParse->nMem;
 
-	if (is_pk_modified || trigger != NULL || hasFK != 0) {
+	if (is_pk_modified || trigger != NULL) {
 		regOld = pParse->nMem + 1;
 		pParse->nMem += def->field_count;
 		regNewPk = ++pParse->nMem;
@@ -232,13 +210,10 @@ sqlUpdate(Parse * pParse,		/* The parser context */
 		info = sql_space_info_new_from_space_def(def);
 	else
 		info = sql_space_info_new_from_index_def(pPk->def, false);
-	if (info == NULL) {
-		pParse->is_aborted = true;
-		goto update_cleanup;
-	}
 	/* Address of the OpenEphemeral instruction. */
 	int addrOpen = sqlVdbeAddOp4(v, OP_OpenTEphemeral, reg_eph, 0, 0,
 				     (char *)info, P4_DYNAMIC);
+	sqlVdbeAddOp3(v, OP_IteratorOpen, iEph, 0, reg_eph);
 
 	pWInfo = sqlWhereBegin(pParse, pTabList, pWhere, 0, 0,
 				   WHERE_ONEPASS_DESIRED, pk_cursor);
@@ -259,6 +234,7 @@ sqlUpdate(Parse * pParse,		/* The parser context */
 
 	if (okOnePass) {
 		sqlVdbeChangeToNoop(v, addrOpen);
+		sqlVdbeChangeToNoop(v, addrOpen + 1);
 		nKey = pk_part_count;
 		regKey = iPk;
 	} else {
@@ -274,6 +250,8 @@ sqlUpdate(Parse * pParse,		/* The parser context */
 	 */
 	sqlWhereEnd(pWInfo);
 
+	int64_t reg = ++pParse->nMem;
+	sqlVdbeAddOp2(v, OP_OpenSpace, (int)reg, space->def->id);
 	labelBreak = sqlVdbeMakeLabel(v);
 	/* Top of the update loop */
 	if (okOnePass) {
@@ -286,7 +264,6 @@ sqlUpdate(Parse * pParse,		/* The parser context */
 		}
 	} else {
 		labelContinue = sqlVdbeMakeLabel(v);
-		sqlVdbeAddOp3(v, OP_IteratorOpen, iEph, 0, reg_eph);
 		sqlVdbeAddOp2(v, OP_Rewind, iEph, labelBreak);
 		addrTop = sqlVdbeAddOp2(v, OP_RowData, iEph, regKey);
 		sqlVdbeAddOp4Int(v, OP_NotFound, pk_cursor, labelContinue,
@@ -298,18 +275,18 @@ sqlUpdate(Parse * pParse,		/* The parser context */
 	 * then regNewPk is the same register as regOldPk, which is
 	 * already populated.
 	 */
-	assert(is_pk_modified || trigger != NULL || hasFK != 0 ||
-	       regOldPk == regNewPk);
+	assert(is_pk_modified || trigger != NULL || regOldPk == regNewPk);
 
 	/* Compute the old pre-UPDATE content of the row being changed, if that
 	 * information is needed
 	 */
-	if (is_pk_modified || hasFK != 0 || trigger != NULL) {
+	if (is_pk_modified || trigger != NULL) {
 		assert(space != NULL);
-		uint64_t oldmask = hasFK ? space->fk_constraint_mask : 0;
-		oldmask |= sql_trigger_colmask(pParse, trigger, pChanges, 0,
-					       TRIGGER_BEFORE | TRIGGER_AFTER,
-					       space, on_error);
+		uint64_t oldmask = sql_trigger_colmask(pParse, trigger,
+						       pChanges, false,
+						       TRIGGER_BEFORE |
+						       TRIGGER_AFTER, space,
+						       on_error);
 		for (i = 0; i < (int)def->field_count; i++) {
 			if (column_mask_fieldno_is_set(oldmask, i) ||
 			    sql_space_column_is_in_pk(space, i)) {
@@ -335,7 +312,7 @@ sqlUpdate(Parse * pParse,		/* The parser context */
 	 * may have modified them). So not loading those that are not going to
 	 * be used eliminates some redundant opcodes.
 	 */
-	uint64_t newmask = sql_trigger_colmask(pParse, trigger, pChanges, 1,
+	uint64_t newmask = sql_trigger_colmask(pParse, trigger, pChanges, true,
 					       TRIGGER_BEFORE, space, on_error);
 	for (i = 0; i < (int)def->field_count; i++) {
 		j = aXRef[i];
@@ -398,10 +375,6 @@ sqlUpdate(Parse * pParse,		/* The parser context */
 		assert(regOldPk > 0);
 		vdbe_emit_constraint_checks(pParse, space, regNewPk + 1,
 					    on_error, labelContinue, aXRef);
-		/* Do FK constraint checks. */
-		if (hasFK) {
-			fk_constraint_emit_check(pParse, space, regOldPk, 0, aXRef);
-		}
 		if (on_error == ON_CONFLICT_ACTION_REPLACE) {
 			/*
 			 * Delete the index entries associated with the
@@ -415,13 +388,10 @@ sqlUpdate(Parse * pParse,		/* The parser context */
 			sqlVdbeAddOp2(v, OP_Delete, pk_cursor, 0);
 			sqlVdbeJumpHere(v, not_found_lbl);
 		}
-		if (hasFK) {
-			fk_constraint_emit_check(pParse, space, 0, regNewPk, aXRef);
-		}
 		if (on_error == ON_CONFLICT_ACTION_REPLACE) {
-			 vdbe_emit_insertion_completion(v, space, regNew,
-							space->def->field_count,
-							on_error, 0);
+			vdbe_emit_insertion_completion(v, reg, regNew,
+						       space->def->field_count,
+						       on_error, 0);
 
 		} else {
 			int key_reg;
@@ -436,9 +406,7 @@ sqlUpdate(Parse * pParse,		/* The parser context */
 
 			/* Prepare array of changed fields. */
 			uint32_t upd_cols_sz = upd_cols_cnt * sizeof(uint32_t);
-			uint32_t *upd_cols = sqlDbMallocRaw(db, upd_cols_sz);
-			if (upd_cols == NULL)
-				goto update_cleanup;
+			uint32_t *upd_cols = sql_xmalloc(upd_cols_sz);
 			upd_cols_cnt = 0;
 			for (uint32_t i = 0; i < def->field_count; i++) {
 				if (aXRef[i] == -1)
@@ -450,18 +418,10 @@ sqlUpdate(Parse * pParse,		/* The parser context */
 					0, (const char *)upd_cols, P4_DYNAMIC);
 			u16 pik_flags = OPFLAG_NCHANGE;
 			SET_CONFLICT_FLAG(pik_flags, on_error);
-			sqlVdbeAddOp4(v, OP_Update, regNew, key_reg,
-					  upd_cols_reg, (char *)space,
-					  P4_SPACEPTR);
+			sqlVdbeAddOp4Int(v, OP_Update, regNew, key_reg,
+					 upd_cols_reg, reg);
 			sqlVdbeChangeP5(v, pik_flags);
 		}
-		/*
-		 * Do any ON CASCADE, SET NULL or SET DEFAULT
-		 * operations required to handle rows that refer
-		 * via a foreign key to the row just updated.
-		 */
-		if (hasFK)
-			fk_constraint_emit_actions(pParse, space, regOldPk, aXRef);
 	}
 
 	vdbe_code_row_trigger(pParse, trigger, TK_UPDATE, pChanges,
@@ -476,13 +436,12 @@ sqlUpdate(Parse * pParse,		/* The parser context */
 	} else {
 		sqlVdbeResolveLabel(v, labelContinue);
 		sqlVdbeAddOp2(v, OP_Next, iEph, addrTop);
-		VdbeCoverage(v);
 	}
 	sqlVdbeResolveLabel(v, labelBreak);
 
  update_cleanup:
-	sqlSrcListDelete(db, pTabList);
-	sql_expr_list_delete(db, pChanges);
-	sql_expr_delete(db, pWhere, false);
+	sqlSrcListDelete(pTabList);
+	sql_expr_list_delete(pChanges);
+	sql_expr_delete(pWhere);
 	return;
 }

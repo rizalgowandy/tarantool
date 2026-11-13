@@ -1,13 +1,15 @@
 #include "salad/stailq.h"
 #include <stdio.h>
 #include <stdarg.h>
+
+#define UNIT_TAP_COMPATIBLE 1
 #include "unit.h"
 
 #define PLAN		75
 
 #define ITEMS		7
 
-struct test {
+struct PACKED test {
 	char ch;
 	int  no;
 	struct stailq_entry next;

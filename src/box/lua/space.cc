@@ -28,13 +28,17 @@
  * THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  */
-#include "box/ck_constraint.h"
+#include "box/lua/func_adapter.h"
+#include "box/lua/trigger.h"
 #include "box/lua/space.h"
 #include "box/lua/tuple.h"
+#include "box/lua/tuple_format.h"
 #include "box/lua/key_def.h"
 #include "box/sql/sqlLimit.h"
+#include "lua/msgpack.h"
 #include "lua/utils.h"
 #include "lua/trigger.h"
+#include "box/box.h"
 
 extern "C" {
 	#include <lua.h>
@@ -45,9 +49,11 @@ extern "C" {
 #include "box/func.h"
 #include "box/func_def.h"
 #include "box/space.h"
+#include "box/memtx_space.h"
 #include "box/schema.h"
 #include "box/user_def.h"
 #include "box/tuple.h"
+#include "box/tuple_constraint.h"
 #include "box/txn.h"
 #include "box/sequence.h"
 #include "box/coll_id_cache.h"
@@ -56,160 +62,412 @@ extern "C" {
 #include "vclock/vclock.h"
 
 /**
- * Trigger function for all spaces
+ * Set/Reset/Get a temporary trigger to an event associated with space by id.
+ * Argument event_fmt is a format string for the event name - it must expect
+ * one uint32_t value as an argument.
  */
 static int
-lbox_push_txn_stmt(struct lua_State *L, void *event)
+lbox_space_reset_trigger(struct lua_State *L, uint32_t space_id,
+			 const char *event_fmt)
 {
-	struct txn_stmt *stmt = txn_current_stmt((struct txn *) event);
-
-	if (stmt->old_tuple) {
-		luaT_pushtuple(L, stmt->old_tuple);
-	} else {
-		lua_pushnil(L);
-	}
-	if (stmt->new_tuple) {
-		luaT_pushtuple(L, stmt->new_tuple);
-	} else {
-		lua_pushnil(L);
-	}
-	/* @todo: maybe the space object has to be here */
-	lua_pushstring(L, stmt->space->def->name);
-	/* operation type: INSERT/UPDATE/UPSERT/REPLACE/DELETE */
-	lua_pushstring(L, iproto_type_name(stmt->type));
-	return 4;
-}
-
-static int
-lbox_pop_txn_stmt(struct lua_State *L, int nret, void *event)
-{
-	struct txn_stmt *stmt = txn_current_stmt((struct txn *) event);
-
-	if (nret < 1) {
-		/* No return value - nothing to do. */
-		return 0;
-	}
-	int top = lua_gettop(L) - nret + 1;
-	struct tuple *result = luaT_istuple(L, top);
-	if (result == NULL && !lua_isnil(L, top) && !luaL_isnull(L, top)) {
-		/* Invalid return value - raise error. */
-		diag_set(ClientError, ER_BEFORE_REPLACE_RET,
-			 lua_typename(L, lua_type(L, top)));
-		return -1;
-	}
-
-	/* Update the new tuple. */
-	if (result != NULL)
-		tuple_ref(result);
-	if (stmt->new_tuple != NULL)
-		tuple_unref(stmt->new_tuple);
-	stmt->new_tuple = result;
-	return 0;
+	const char *event_name = tt_sprintf(event_fmt, space_id);
+	struct event *event = event_get(event_name, true);
+	assert(event != NULL);
+	return luaT_event_reset_trigger_with_flags(
+		L, 2, event, EVENT_TRIGGER_IS_TEMPORARY);
 }
 
 /**
- * Set/Reset/Get space.on_replace trigger
+ * Set/Reset/Get space on_replace trigger. If space runs recovery triggers,
+ * associated recovery trigger is set as well but it does not affect returned
+ * value. The new trigger is bound by id.
  */
 static int
 lbox_space_on_replace(struct lua_State *L)
 {
 	int top = lua_gettop(L);
-
 	if (top < 1 || !lua_istable(L, 1)) {
-		luaL_error(L,
-	   "usage: space:on_replace(function | nil, [function | nil])");
+		luaL_error(L, "usage: space:on_replace(function | nil, "
+			   "[function | nil], [string])");
 	}
 	lua_getfield(L, 1, "id"); /* Get space id. */
 	uint32_t id = lua_tonumber(L, lua_gettop(L));
 	struct space *space = space_cache_find_xc(id);
 	lua_pop(L, 1);
 
-	return lbox_trigger_reset(L, 3, &space->on_replace,
-				  lbox_push_txn_stmt, NULL);
+	if (space->run_recovery_triggers) {
+		const char *fmt = "box.space[%u].on_recovery_replace";
+		lbox_space_reset_trigger(L, id, fmt);
+		lua_settop(L, top);
+	}
+	const char *fmt = "box.space[%u].on_replace";
+	return lbox_space_reset_trigger(L, id, fmt);
 }
 
 /**
- * Set/Reset/Get space.before_replace trigger
+ * Set/Reset/Get space before_replace trigger. If space runs recovery triggers,
+ * associated recovery trigger is set as well but it does not affect returned
+ * value. The new trigger is bound by id.
  */
 static int
 lbox_space_before_replace(struct lua_State *L)
 {
 	int top = lua_gettop(L);
-
 	if (top < 1 || !lua_istable(L, 1)) {
-		luaL_error(L,
-	   "usage: space:before_replace(function | nil, [function | nil])");
+		luaL_error(L, "usage: space:before_replace(function | nil, "
+			   "[function | nil], [string])");
 	}
 	lua_getfield(L, 1, "id"); /* Get space id. */
 	uint32_t id = lua_tonumber(L, lua_gettop(L));
 	struct space *space = space_cache_find_xc(id);
 	lua_pop(L, 1);
 
-	return lbox_trigger_reset(L, 3, &space->before_replace,
-				  lbox_push_txn_stmt, lbox_pop_txn_stmt);
+	if (space->run_recovery_triggers) {
+		const char *fmt = "box.space[%u].before_recovery_replace";
+		lbox_space_reset_trigger(L, id, fmt);
+		lua_settop(L, top);
+	}
+	const char *fmt = "box.space[%u].before_replace";
+	return lbox_space_reset_trigger(L, id, fmt);
 }
 
 /**
- * Make ck_constraints available in Lua, via ck_constraint[]
- * array for space table by given index i.
- * Updata a ck_constraint table in the parent space table object
- * on the Lua stack.
+ * Create constraint field in lua space object, given by index i in lua stack.
+ * If the space has no constraints, there will be no constraint field.
  */
 static void
-lbox_push_ck_constraint(struct lua_State *L, struct space *space, int i)
+lbox_push_space_constraint(struct lua_State *L, struct space *space, int i)
 {
-	lua_getfield(L, i, "ck_constraint");
-	if (lua_isnil(L, -1)) {
-		lua_pop(L, 1);
-		lua_pushstring(L, "ck_constraint");
-		lua_newtable(L);
-		lua_settable(L, i);
-		lua_getfield(L, i, "ck_constraint");
-	} else {
+	assert(i >= 0);
+	struct tuple_format *fmt = space->format;
+	uint32_t constraint_count = 0;
+	for (size_t k = 0; k < fmt->constraint_count; k++) {
+		struct tuple_constraint *c = &fmt->constraint[k];
+		if (c->def.type == CONSTR_FUNC)
+			constraint_count++;
+	}
+	if (constraint_count == 0) {
+		/* No constraints - no field. */
 		lua_pushnil(L);
-		while (lua_next(L, -2) != 0) {
-			size_t name_len;
-			const char *name = lua_tolstring(L, -2, &name_len);
-			/*
-			 * Remove ck_constraint only if it was
-			 * deleted.
-			 */
-			if (space_ck_constraint_by_name(space, name,
-					(uint32_t)name_len) == NULL) {
-				lua_pushlstring(L, name, name_len);
-				lua_pushnil(L);
-				lua_settable(L, -5);
-			}
-			lua_pop(L, 1);
-		}
+		lua_setfield(L, i, "constraint");
+		return;
 	}
-	struct ck_constraint *ck_constraint = NULL;
-	rlist_foreach_entry(ck_constraint, &space->ck_constraint, link) {
-		lua_getfield(L, i, ck_constraint->def->name);
-		if (lua_isnil(L, -1)) {
-			lua_pop(L, 1);
-			lua_pushstring(L, ck_constraint->def->name);
-			lua_newtable(L);
+
+	lua_newtable(L);
+	for (size_t k = 0; k < fmt->constraint_count; k++) {
+		if (fmt->constraint[k].def.type != CONSTR_FUNC)
+			continue;
+		lua_pushnumber(L, fmt->constraint[k].def.func.id);
+		lua_setfield(L, -2, fmt->constraint[k].def.name);
+	}
+	lua_setfield(L, i, "constraint");
+}
+
+/**
+ * Helper function of lbox_push_space_foreign_key.
+ * Push a value @a def to the top of lua stack @a L.
+ * ID-defined fields are converted to one-based index.
+ */
+static void
+lbox_push_field_id(struct lua_State *L,
+		   struct tuple_constraint_field_id *def)
+{
+	if (def->name_len == 0)
+		lua_pushnumber(L, def->id + 1);
+	else
+		lua_pushstring(L, def->name);
+}
+
+/**
+ * Create foreign_key field in lua space object, given by index i in lua stack.
+ * If the space has no foreign keys, there will be no foreign_key field.
+ */
+static void
+lbox_push_space_foreign_key(struct lua_State *L, struct space *space, int i)
+{
+	assert(i >= 0);
+	struct tuple_format *fmt = space->format;
+	uint32_t foreign_key_count = 0;
+	for (size_t k = 0; k < fmt->constraint_count; k++) {
+		struct tuple_constraint *c = &fmt->constraint[k];
+		if (c->def.type == CONSTR_FKEY)
+			foreign_key_count++;
+	}
+	if (foreign_key_count == 0) {
+		/* No foreign keys - no field. */
+		lua_pushnil(L);
+		lua_setfield(L, i, "foreign_key");
+		return;
+	}
+
+	lua_newtable(L);
+	for (size_t k = 0; k < fmt->constraint_count; k++) {
+		struct tuple_constraint *c = &fmt->constraint[k];
+		if (c->def.type != CONSTR_FKEY)
+			continue;
+
+		lua_newtable(L);
+		if (c->def.fkey.space_id == 0) {
+			/* No space id - no field. */
+			lua_pushnil(L);
+		} else {
+			lua_pushnumber(L, c->def.fkey.space_id);
+		}
+		lua_setfield(L, -2, "space");
+		lua_newtable(L);
+		for (uint32_t j = 0; j < c->def.fkey.field_mapping_size; j++) {
+			struct tuple_constraint_fkey_field_mapping *m =
+				&c->def.fkey.field_mapping[j];
+			lbox_push_field_id(L, &m->local_field);
+			lbox_push_field_id(L, &m->foreign_field);
 			lua_settable(L, -3);
-			lua_getfield(L, -1, ck_constraint->def->name);
-			assert(!lua_isnil(L, -1));
 		}
-
-		lua_pushstring(L, ck_constraint->def->name);
-		lua_setfield(L, -2, "name");
-
-		lua_pushnumber(L, space->def->id);
-		lua_setfield(L, -2, "space_id");
-
-		lua_pushstring(L, ck_constraint->def->expr_str);
-		lua_setfield(L, -2, "expr");
-
-		lua_pushboolean(L, ck_constraint->def->is_enabled);
-		lua_setfield(L, -2, "is_enabled");
-
-		lua_setfield(L, -2, ck_constraint->def->name);
+		lua_setfield(L, -2, "field");
+		lua_setfield(L, -2, fmt->constraint[k].def.name);
 	}
-	lua_pop(L, 1);
+	lua_setfield(L, i, "foreign_key");
+}
+
+/**
+ * index.parts:extract_key(tuple)
+ * Stack: [1] unused; [2] tuple.
+ * key_def is passed in the upvalue.
+ */
+static int
+lbox_index_parts_extract_key(struct lua_State *L)
+{
+	if (lua_gettop(L) != 2)
+		return luaL_error(L, "Usage: index.parts:extract_key(tuple)");
+	return luaT_key_def_extract_key(L, lua_upvalueindex(1));
+}
+
+/**
+ * index.parts:validate_key(key)
+ * Stack: [1] unused; [2] key.
+ * key_def is passed in the upvalue.
+ */
+static int
+lbox_index_parts_validate_key(struct lua_State *L)
+{
+	if (lua_gettop(L) != 2)
+		return luaL_error(L, "Usage: index.parts:validate_key(key)");
+	return luaT_key_def_validate_key(L, lua_upvalueindex(1));
+}
+
+/**
+ * index.parts:validate_full_key(key)
+ * Stack: [1] unused; [2] key.
+ * key_def is passed in the upvalue.
+ */
+static int
+lbox_index_parts_validate_full_key(struct lua_State *L)
+{
+	if (lua_gettop(L) != 2)
+		return luaL_error(L, "Usage: index.parts:validate_full_key("
+				     "key)");
+	return luaT_key_def_validate_full_key(L, lua_upvalueindex(1));
+}
+
+/**
+ * index.parts:validate_tuple(key)
+ * Stack: [1] unused; [2] tuple.
+ * key_def is passed in the upvalue.
+ */
+static int
+lbox_index_parts_validate_tuple(struct lua_State *L)
+{
+	if (lua_gettop(L) != 2)
+		return luaL_error(L, "Usage: index.parts:validate_tuple("
+				     "tuple)");
+	return luaT_key_def_validate_tuple(L, lua_upvalueindex(1));
+}
+
+/**
+ * index.parts:compare(tuple_a, tuple_b)
+ * Stack: [1] unused; [2] tuple_a; [3] tuple_b.
+ * key_def is passed in the upvalue.
+ */
+static int
+lbox_index_parts_compare(struct lua_State *L)
+{
+	if (lua_gettop(L) != 3) {
+		return luaL_error(L, "Usage: index.parts:compare("
+				     "tuple_a, tuple_b)");
+	}
+	return luaT_key_def_compare(L, lua_upvalueindex(1));
+}
+
+/**
+ * index.parts:compare_with_key(tuple, key)
+ * Stack: [1] unused; [2] tuple; [3] key.
+ * key_def is passed in the upvalue.
+ */
+static int
+lbox_index_parts_compare_with_key(struct lua_State *L)
+{
+	if (lua_gettop(L) != 3) {
+		return luaL_error(L, "Usage: index.parts:compare_with_key("
+				     "tuple, key)");
+	}
+	return luaT_key_def_compare_with_key(L, lua_upvalueindex(1));
+}
+
+/**
+ * index.parts:compare_keys(key_a, key_b)
+ * Stack: [1] unused; [2] key_a; [3] key_b.
+ * key_def is passed in the upvalue.
+ */
+static int
+lbox_index_parts_compare_keys(struct lua_State *L)
+{
+	if (lua_gettop(L) != 3) {
+		return luaL_error(L, "Usage: index.parts:compare_keys("
+				     "key_a, key_b)");
+	}
+	return luaT_key_def_compare_keys(L, lua_upvalueindex(1));
+}
+
+/**
+ * index.parts:merge(second_index_parts)
+ * Stack: [1] unused; [2] second_index_parts.
+ * First key_def is passed in the upvalue.
+ */
+static int
+lbox_index_parts_merge(struct lua_State *L)
+{
+	int idx_b;
+	struct key_def *key_def_b;
+	if (lua_gettop(L) != 2) {
+		return luaL_error(L, "Usage: index.parts:merge("
+				     "second_index_parts)");
+	}
+	lua_pushcfunction(L, lbox_key_def_new);
+	lua_replace(L, 1);
+	/*
+	 * Stack:
+	 * [1] lbox_key_def_new
+	 * [2] second_index_parts (first argument for lbox_key_def_new)
+	 */
+	if (lua_pcall(L, 1, 1, 0) != 0)
+		goto key_def_b_error;
+	/*
+	 * Stack:
+	 * [1] key_def_b
+	 */
+	idx_b = 1;
+	key_def_b = luaT_is_key_def(L, idx_b);
+	if (key_def_b == NULL)
+		goto key_def_b_error;
+	return luaT_key_def_merge(L, lua_upvalueindex(1), idx_b);
+
+key_def_b_error:
+	return luaL_error(L,
+			  "Can't create key_def from the second index.parts");
+}
+
+/**
+ * Populate __index metamethod of index_object.parts table with the methods,
+ * which work like require('key_def').new(index_object.parts) methods.
+ * Each method is implemented as a C closure, associated with `struct key_def'.
+ */
+static void
+luaT_add_index_parts_methods(struct lua_State *L, const struct key_def *key_def)
+{
+	/* Metatable. */
+	lua_newtable(L);
+	/* __index */
+	lua_newtable(L);
+	int idx_index = lua_gettop(L);
+
+	luaT_push_key_def(L, key_def);
+	int idx_key_def = lua_gettop(L);
+
+	lua_pushvalue(L, idx_key_def);
+	lua_pushcclosure(L, &lbox_index_parts_extract_key, 1);
+	lua_setfield(L, idx_index, "extract_key");
+
+	lua_pushvalue(L, idx_key_def);
+	lua_pushcclosure(L, &lbox_index_parts_validate_key, 1);
+	lua_setfield(L, idx_index, "validate_key");
+
+	lua_pushvalue(L, idx_key_def);
+	lua_pushcclosure(L, &lbox_index_parts_validate_full_key, 1);
+	lua_setfield(L, idx_index, "validate_full_key");
+
+	lua_pushvalue(L, idx_key_def);
+	lua_pushcclosure(L, &lbox_index_parts_validate_tuple, 1);
+	lua_setfield(L, idx_index, "validate_tuple");
+
+	lua_pushvalue(L, idx_key_def);
+	lua_pushcclosure(L, &lbox_index_parts_compare, 1);
+	lua_setfield(L, idx_index, "compare");
+
+	lua_pushvalue(L, idx_key_def);
+	lua_pushcclosure(L, &lbox_index_parts_compare_with_key, 1);
+	lua_setfield(L, idx_index, "compare_with_key");
+
+	lua_pushvalue(L, idx_key_def);
+	lua_pushcclosure(L, &lbox_index_parts_compare_keys, 1);
+	lua_setfield(L, idx_index, "compare_keys");
+
+	lua_pushvalue(L, idx_key_def);
+	lua_pushcclosure(L, &lbox_index_parts_merge, 1);
+	lua_setfield(L, idx_index, "merge");
+
+	lua_pop(L, 1); /* key_def */
+	lua_setfield(L, -2, "__index");
+	lua_setmetatable(L, -2);
+}
+
+/**
+ * Push array with covered fields on Lua stack. Implicitly covered fields are
+ * added, the array is sorted.
+ */
+static void
+luaT_push_covered_fields(struct lua_State *L, struct index_def *def)
+{
+	struct region *gc = &fiber()->gc;
+	size_t gc_svp = region_used(gc);
+	uint32_t field_count = def->opts.covered_field_count +
+			       def->cmp_def->part_count;
+	uint32_t *fields = xregion_alloc_array(gc, typeof(*fields),
+					       field_count);
+	memcpy(fields, def->opts.covered_fields,
+	       sizeof(*fields) * def->opts.covered_field_count);
+	for (uint32_t i = 0; i < def->cmp_def->part_count; i++)
+		fields[i + def->opts.covered_field_count] =
+					def->cmp_def->parts[i].fieldno;
+	qsort(fields, field_count, sizeof(*fields), cmp_u32);
+	lua_newtable(L);
+	for (uint32_t i = 0; i < field_count; i++) {
+		lua_pushnumber(L, i + 1);
+		lua_pushnumber(L, fields[i] + 1);
+		lua_settable(L, -3);
+	}
+	region_truncate(gc, gc_svp);
+}
+
+/**
+ * Push array with aggregates on Lua stack.
+ */
+static void
+luaT_push_aggregates(struct lua_State *L, struct index_def *def)
+{
+	const char *aggregates = def->opts.aggregates;
+	luamp_decode(L, luaL_msgpack_default, &aggregates);
+	/* Shift all fields to 1-indexation. */
+	int top = lua_gettop(L);
+	uint32_t count = lua_objlen(L, -1);
+	for (uint32_t i = 1; i <= count; i++) {
+		lua_pushinteger(L, i);
+		lua_gettable(L, -2);
+		assert(lua_istable(L, -1));
+		lua_getfield(L, -1, "field");
+		int field = lua_tonumber(L, -1);
+		lua_pushnumber(L, field + 1);
+		lua_setfield(L, -3, "field");
+		lua_settop(L, top);
+	}
 }
 
 /**
@@ -234,12 +492,17 @@ lbox_fillspace(struct lua_State *L, struct space *space, int i)
 
 	/* space.group_id */
 	lua_pushstring(L, "is_local");
-	lua_pushboolean(L, space_group_id(space) == GROUP_LOCAL);
+	lua_pushboolean(L, space_is_local(space));
 	lua_settable(L, i);
 
-	/* space.is_temp */
+	/* space.temporary */
 	lua_pushstring(L, "temporary");
-	lua_pushboolean(L, space_is_temporary(space));
+	lua_pushboolean(L, space_is_data_temporary(space));
+	lua_settable(L, i);
+
+	/* space.type */
+	lua_pushstring(L, "type");
+	lua_pushstring(L, space_type_name(space->def->opts.type));
 	lua_settable(L, i);
 
 	/* space.name */
@@ -261,15 +524,33 @@ lbox_fillspace(struct lua_State *L, struct space *space, int i)
 	lua_pushboolean(L, space_index(space, 0) != 0);
 	lua_settable(L, i);
 
+	/* space.state table */
+	lua_pushstring(L, "state");
+	lua_createtable(L, 0, 1);
+	lua_pushboolean(L, space_is_sync(space));
+	lua_setfield(L, -2, "is_sync");
+	lua_settable(L, i);
+
 	/* space:on_replace */
 	lua_pushstring(L, "on_replace");
 	lua_pushcfunction(L, lbox_space_on_replace);
+	lua_settable(L, i);
+
+	/* space.format_object */
+	lua_pushstring(L, "format_object");
+	luaT_push_tuple_format(L, space->format);
 	lua_settable(L, i);
 
 	/* space:before_replace */
 	lua_pushstring(L, "before_replace");
 	lua_pushcfunction(L, lbox_space_before_replace);
 	lua_settable(L, i);
+
+	if (space_is_vinyl(space)) {
+		lua_pushstring(L, "defer_deletes");
+		lua_pushboolean(L, space->def->opts.defer_deletes);
+		lua_settable(L, i);
+	}
 
 	lua_getfield(L, i, "index");
 	if (lua_isnil(L, -1)) {
@@ -343,7 +624,7 @@ lbox_fillspace(struct lua_State *L, struct space *space, int i)
 			lua_setfield(L, -2, "dimension");
 		}
 		if (space_is_memtx(space) && index_def->type == TREE) {
-			lua_pushboolean(L, index_opts->hint);
+			lua_pushboolean(L, index_opts->hint == INDEX_HINT_ON);
 			lua_setfield(L, -2, "hint");
 		} else {
 			lua_pushnil(L);
@@ -379,9 +660,19 @@ lbox_fillspace(struct lua_State *L, struct space *space, int i)
 		lua_setfield(L, -2, "name");
 
 		lua_pushstring(L, "parts");
-		luaT_push_key_def(L, index_def->key_def);
-
+		luaT_push_key_def_parts(L, index_def->key_def);
+		luaT_add_index_parts_methods(L, index_def->key_def);
 		lua_settable(L, -3); /* space.index[k].parts */
+
+		if (index_def->opts.covered_fields != NULL) {
+			luaT_push_covered_fields(L, index_def);
+			lua_setfield(L, -2, "covers");
+		}
+
+		if (index_def->opts.aggregates != NULL) {
+			luaT_push_aggregates(L, index_def);
+			lua_setfield(L, -2, "aggregates");
+		}
 
 		lua_pushstring(L, "sequence_id");
 		if (k == 0 && space->sequence != NULL) {
@@ -444,7 +735,8 @@ lbox_fillspace(struct lua_State *L, struct space *space, int i)
 
 	lua_pop(L, 1); /* pop the index field */
 
-	lbox_push_ck_constraint(L, space, i);
+	lbox_push_space_constraint(L, space, i);
+	lbox_push_space_foreign_key(L, space, i);
 
 	lua_getfield(L, LUA_GLOBALSINDEX, "box");
 	lua_pushstring(L, "schema");
@@ -472,6 +764,26 @@ box_lua_space_new(struct lua_State *L, struct space *space)
 		lua_setfield(L, -2, "space");
 		lua_getfield(L, -1, "space");
 	}
+	/*
+	 * We can have the following conditions here:
+	 * a) The space is totally new (e. g. on new space creation).
+	 * b) The space is replaced (e. g. on index update).
+	 * c) The space is updated (e. g. on sequence update).
+	 * d) The space is reverted (e. g. on space drop rollback).
+	 *
+	 * - In case a) we need to create new box.space.<id|name> entries.
+	 * - In cases b) and c) we need to update the existing box.space.<id>
+	 *   entry, drop the old box.space.<name> and create a new one.
+	 * - In case d) we need to restore the original box.space.<id|name>
+	 *   entries, but let's only restore the box.space.<id> entry and
+	 *   perform the same actions as for b) and c) - it won't change the
+	 *   visible behavior but will make the code simpler.
+	 */
+	if (space->lua_ref != LUA_NOREF) {
+		/* We have either case c) or d). */
+		lua_rawgeti(L, LUA_REGISTRYINDEX, space->lua_ref);
+		lua_rawseti(L, -2, space_id(space));
+	}
 	lua_rawgeti(L, -1, space_id(space));
 	if (lua_isnil(L, -1)) {
 		/*
@@ -492,6 +804,18 @@ box_lua_space_new(struct lua_State *L, struct space *space)
 	}
 	lbox_fillspace(L, space, lua_gettop(L));
 	lua_setfield(L, -2, space_name(space));
+
+	if (space->lua_ref == LUA_NOREF) {
+		/*
+		 * Save the reference to the box.space[id] to restore
+		 * the exactly same object on the space drop rollback.
+		 * It prevents the situations when old references to
+		 * the space go out of sync with the space which had
+		 * been rolled back. For more information see #9120.
+		 */
+		lua_rawgeti(L, -1, space_id(space));
+		space->lua_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+	}
 
 	lua_pop(L, 2); /* box, space */
 }
@@ -527,9 +851,7 @@ box_lua_space_new_or_delete(struct trigger *trigger, void *event)
 	return 0;
 }
 
-static struct trigger on_alter_space_in_lua = {
-	RLIST_LINK_INITIALIZER, box_lua_space_new_or_delete, NULL, NULL
-};
+static TRIGGER(on_alter_space_in_lua, box_lua_space_new_or_delete);
 
 /**
  * Make a tuple or a table Lua object by map.
@@ -606,6 +928,59 @@ usage_error:
 	return luaL_error(L, "Usage: space:frommap(map, opts)");
 }
 
+/**
+ * Push to Lua stack a table with the statistics on the memory usage by tuples
+ * of the space.
+ */
+static int
+lbox_space_stat(struct lua_State *L)
+{
+	int argc = lua_gettop(L);
+	if (argc != 1 || !lua_istable(L, 1))
+		luaL_error(L, "Usage: space:stat()");
+
+	lua_getfield(L, 1, "id");
+	uint32_t id = (int)lua_tointeger(L, -1);
+	struct space *space = space_by_id(id);
+	if (space == NULL) {
+		lua_pushnil(L);
+		lua_pushfstring(L, "Space with id '%d' doesn't exist", id);
+		return 2;
+	}
+
+	if (!space_is_memtx(space)) {
+		lua_newtable(L);
+		return 1;
+	}
+	struct memtx_space *memtx_space = (struct memtx_space *)space;
+
+	lua_newtable(L); /* Result table. */
+	lua_newtable(L); /* result.tuple */
+
+	for (int i = TUPLE_ARENA_MEMTX; i <= TUPLE_ARENA_MALLOC; i++) {
+		enum tuple_arena_type type = (enum tuple_arena_type)i;
+		struct tuple_info *stat = &memtx_space->tuple_stat[type];
+		lua_newtable(L);
+
+		lua_pushnumber(L, stat->data_size);
+		lua_setfield(L, -2, "data_size");
+
+		lua_pushnumber(L, stat->header_size);
+		lua_setfield(L, -2, "header_size");
+
+		lua_pushnumber(L, stat->field_map_size);
+		lua_setfield(L, -2, "field_map_size");
+
+		lua_pushnumber(L, stat->waste_size);
+		lua_setfield(L, -2, "waste_size");
+
+		lua_setfield(L, -2, tuple_arena_type_strs[i]);
+	}
+	lua_setfield(L, -2, "tuple");
+
+	return 1;
+}
+
 void
 box_lua_space_init(struct lua_State *L)
 {
@@ -663,10 +1038,16 @@ box_lua_space_init(struct lua_State *L)
 	lua_setfield(L, -2, "VSEQUENCE_ID");
 	lua_pushnumber(L, BOX_SPACE_SEQUENCE_ID);
 	lua_setfield(L, -2, "SPACE_SEQUENCE_ID");
+	lua_pushnumber(L, BOX_VSPACE_SEQUENCE_ID);
+	lua_setfield(L, -2, "VSPACE_SEQUENCE_ID");
 	lua_pushnumber(L, BOX_FUNC_INDEX_ID);
 	lua_setfield(L, -2, "FUNC_INDEX_ID");
 	lua_pushnumber(L, BOX_SESSION_SETTINGS_ID);
 	lua_setfield(L, -2, "SESSION_SETTINGS_ID");
+	lua_pushnumber(L, BOX_GC_CONSUMERS_ID);
+	lua_setfield(L, -2, "GC_CONSUMERS_ID");
+	lua_pushnumber(L, BOX_RECOVERY_POINT_ID);
+	lua_setfield(L, -2, "RECOVERY_POINT_ID");
 	lua_pushnumber(L, BOX_SYSTEM_ID_MIN);
 	lua_setfield(L, -2, "SYSTEM_ID_MIN");
 	lua_pushnumber(L, BOX_SYSTEM_ID_MAX);
@@ -681,6 +1062,8 @@ box_lua_space_init(struct lua_State *L)
 	lua_setfield(L, -2, "GUEST_ID");
 	lua_pushnumber(L, PUBLIC);
 	lua_setfield(L, -2, "PUBLIC_ROLE_ID");
+	lua_pushnumber(L, REPLICATION);
+	lua_setfield(L, -2, "REPLICATION_ROLE_ID");
 	lua_pushnumber(L, SUPER);
 	lua_setfield(L, -2, "SUPER_ROLE_ID");
 	lua_pushnumber(L, BOX_INDEX_MAX);
@@ -701,12 +1084,22 @@ box_lua_space_init(struct lua_State *L)
 	lua_setfield(L, -2, "REPLICA_MAX");
 	lua_pushnumber(L, SQL_BIND_PARAMETER_MAX);
 	lua_setfield(L, -2, "SQL_BIND_PARAMETER_MAX");
+	lua_pushnumber(L, BOX_SPACE_ID_TEMPORARY_MIN);
+	lua_setfield(L, -2, "SPACE_ID_TEMPORARY_MIN");
 	lua_pop(L, 2); /* box, schema */
 
 	static const struct luaL_Reg space_internal_lib[] = {
 		{"frommap", lbox_space_frommap},
+		{"stat", lbox_space_stat},
 		{NULL, NULL}
 	};
-	luaL_register(L, "box.internal.space", space_internal_lib);
+	luaL_findtable(L, LUA_GLOBALSINDEX, "box.internal.space", 0);
+	luaL_setfuncs(L, space_internal_lib, 0);
 	lua_pop(L, 1);
+}
+
+void
+box_lua_space_free(void)
+{
+	trigger_clear(&on_alter_space_in_lua);
 }

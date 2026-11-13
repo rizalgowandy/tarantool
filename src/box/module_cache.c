@@ -18,9 +18,11 @@
 #include "fiber.h"
 #include "errinj.h"
 #include "module_cache.h"
+#include "tt_static.h"
 
 #include "box/error.h"
 #include "box/port.h"
+#include "box/integrity.h"
 
 #include "lua/utils.h"
 #include "libeio/eio.h"
@@ -33,7 +35,7 @@ static struct mh_strnptr_t *module_cache = NULL;
 static struct module *
 cache_find(const char *str, size_t len)
 {
-	mh_int_t e = mh_strnptr_find_inp(module_cache, str, len);
+	mh_int_t e = mh_strnptr_find_str(module_cache, str, len);
 	if (e == mh_end(module_cache))
 		return NULL;
 	return mh_strnptr_node(module_cache, e)->val;
@@ -45,7 +47,7 @@ cache_update(struct module *m)
 	const char *str = m->package;
 	size_t len = m->package_len;
 
-	mh_int_t e = mh_strnptr_find_inp(module_cache, str, len);
+	mh_int_t e = mh_strnptr_find_str(module_cache, str, len);
 	if (e == mh_end(module_cache))
 		panic("module: failed to update cache: %s", str);
 
@@ -79,7 +81,7 @@ cache_del(struct module *m)
 	const char *str = m->package;
 	size_t len = m->package_len;
 
-	mh_int_t e = mh_strnptr_find_inp(module_cache, str, len);
+	mh_int_t e = mh_strnptr_find_str(module_cache, str, len);
 	if (e != mh_end(module_cache)) {
 		struct module *v = mh_strnptr_node(module_cache, e)->val;
 		if (v == m) {
@@ -144,8 +146,9 @@ find_package(const char *package, size_t package_len,
 	struct lua_State *L = tarantool_L;
 	int top = lua_gettop(L);
 	if (luaT_cpcall(L, lpackage_search, &ctx) != 0) {
-		diag_set(ClientError, ER_LOAD_MODULE, ctx.package_len,
-			 ctx.package, lua_tostring(L, -1));
+		diag_set(ClientError, ER_LOAD_MODULE,
+			 tt_cstr(ctx.package, ctx.package_len),
+			 lua_tostring(L, -1));
 		lua_settop(L, top);
 		return -1;
 	}
@@ -261,7 +264,7 @@ module_attr_fill(struct module_attr *attr, struct stat *st)
 	attr->st_dev	= (uint64_t)st->st_dev;
 	attr->st_ino	= (uint64_t)st->st_ino;
 	attr->st_size	= (uint64_t)st->st_size;
-#ifdef TARGET_OS_DARWIN
+#if TARGET_OS_DARWIN
 	attr->tv_sec	= (uint64_t)st->st_mtimespec.tv_sec;
 	attr->tv_nsec	= (uint64_t)st->st_mtimespec.tv_nsec;
 #else
@@ -296,14 +299,15 @@ module_new(const char *package, size_t package_len,
 
 	memcpy(m->package, package, package_len);
 	m->package[package_len] = 0;
-
-	const char *tmpdir = getenv("TMPDIR");
-	if (tmpdir == NULL)
-		tmpdir = "/tmp";
+	char *tmpdir = getenv_safe("TMPDIR", NULL, 0);
+	char *print_dir = tmpdir;
+	if (print_dir == NULL)
+		print_dir = "/tmp";
 
 	char dir_name[PATH_MAX];
 	int rc = snprintf(dir_name, sizeof(dir_name),
-			  "%s/tntXXXXXX", tmpdir);
+			  "%s/tntXXXXXX", print_dir);
+	free(tmpdir);
 	if (rc < 0 || (size_t)rc >= sizeof(dir_name)) {
 		diag_set(SystemError, "failed to generate path to tmp dir");
 		goto error;
@@ -321,6 +325,12 @@ module_new(const char *package, size_t package_len,
 		      dir_name, (int)package_len, package);
 	if (rc < 0 || (size_t)rc >= sizeof(dir_name)) {
 		diag_set(SystemError, "failed to generate path to dso");
+		goto error;
+	}
+
+	if (!integrity_verify_file(source_path, NULL, 0)) {
+		diag_set(SystemError, "integrity check failed for module %s",
+			 source_path);
 		goto error;
 	}
 
@@ -362,8 +372,8 @@ module_new(const char *package, size_t package_len,
 	if (rmdir(dir_name) != 0)
 		say_warn("failed to delete temporary dir: %s", dir_name);
 	if (m->handle == NULL) {
-		diag_set(ClientError, ER_LOAD_MODULE, package_len,
-			  package, dlerror());
+		diag_set(ClientError, ER_LOAD_MODULE,
+			 tt_cstr(package, package_len), dlerror());
 		goto error;
 	}
 

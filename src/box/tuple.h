@@ -31,11 +31,9 @@
  * SUCH DAMAGE.
  */
 #include "trivia/util.h"
-#include "say.h"
 #include "diag.h"
-#include "error.h"
-#include "uuid/tt_uuid.h" /* tuple_field_uuid */
 #include "tt_static.h"
+#include "tt_uuid.h"
 #include "tuple_format.h"
 
 #if defined(__cplusplus)
@@ -50,11 +48,11 @@ struct key_part;
  * A format for standalone tuples allocated on runtime arena.
  * \sa tuple_new().
  */
-extern struct tuple_format *tuple_format_runtime;
+extern __thread struct tuple_format *tuple_format_runtime;
 
 /** Initialize tuple library */
-int
-tuple_init(field_name_hash_f hash);
+void
+tuple_init(void);
 
 /** Cleanup tuple library */
 void
@@ -75,6 +73,23 @@ tuple_arena_create(struct slab_arena *arena, struct quota *quota,
 void
 tuple_arena_destroy(struct slab_arena *arena);
 
+/**
+ * Creates a new format for standalone tuples.
+ * Tuples created with the new format are allocated from the runtime arena.
+ * In contrast to the preallocated tuple_format_runtime, which has no
+ * information about fields, the new format uses the field definitions from the
+ * Msgpack encoded format clause.
+ *
+ * In some cases (formats received over IPROTO or formats for read views) we
+ * only need to get the 'name' field options and ignore the rest, hence the
+ * `names_only` flag is provided.
+ *
+ * On success, returns the new format. On error, returns NULL and sets diag.
+ */
+struct tuple_format *
+runtime_tuple_format_new(const char *format_data, size_t format_data_len,
+			 bool names_only);
+
 /** \cond public */
 
 typedef struct tuple_format box_tuple_format_t;
@@ -85,7 +100,7 @@ typedef struct tuple_format box_tuple_format_t;
  * Each Tuple has associated format (class). Default format is used to
  * create tuples which are not attach to any particular space.
  */
-box_tuple_format_t *
+API_EXPORT box_tuple_format_t *
 box_tuple_format_default(void);
 
 /**
@@ -110,7 +125,7 @@ typedef struct tuple box_tuple_t;
  * \retval 0 always
  * \sa box_tuple_unref()
  */
-int
+API_EXPORT int
 box_tuple_ref(box_tuple_t *tuple);
 
 /**
@@ -119,25 +134,34 @@ box_tuple_ref(box_tuple_t *tuple);
  * \param tuple a tuple
  * \sa box_tuple_ref()
  */
-void
+API_EXPORT void
 box_tuple_unref(box_tuple_t *tuple);
 
 /**
  * Return the number of fields in tuple (the size of MsgPack Array).
  * \param tuple a tuple
  */
-uint32_t
+API_EXPORT uint32_t
 box_tuple_field_count(box_tuple_t *tuple);
+
+/**
+ * Return the pointer to the raw tuple MsgPack Array data.
+ * \param tuple tuple.
+ * \param bsize will be set to the number of bytes of raw MsgPack data if not
+ *        NULL provided
+ */
+API_EXPORT const char *
+box_tuple_data(box_tuple_t *tuple, size_t *bsize);
 
 /**
  * Return the number of bytes used to store internal tuple data (MsgPack Array).
  * \param tuple a tuple
  */
-size_t
+API_EXPORT size_t
 box_tuple_bsize(box_tuple_t *tuple);
 
 /**
- * Dump raw MsgPack data to the memory byffer \a buf of size \a size.
+ * Dump raw MsgPack data to the memory buffer \a buf of size \a size.
  *
  * Store tuple fields in the memory buffer.
  * \retval -1 on error.
@@ -146,7 +170,7 @@ box_tuple_bsize(box_tuple_t *tuple);
  * If buffer size is not enough then the return value is the number of bytes
  * which would have been written if enough space had been available.
  */
-ssize_t
+API_EXPORT ssize_t
 box_tuple_to_buf(box_tuple_t *tuple, char *buf, size_t size);
 
 /**
@@ -154,7 +178,7 @@ box_tuple_to_buf(box_tuple_t *tuple, char *buf, size_t size);
  * \param tuple tuple
  * \return tuple_format
  */
-box_tuple_format_t *
+API_EXPORT box_tuple_format_t *
 box_tuple_format(box_tuple_t *tuple);
 
 /**
@@ -167,9 +191,40 @@ box_tuple_format(box_tuple_t *tuple);
  * \retval NULL if i >= box_tuple_field_count(tuple)
  * \retval msgpack otherwise
  */
-const char *
+API_EXPORT const char *
 box_tuple_field(box_tuple_t *tuple, uint32_t fieldno);
 
+/**
+ * Return a raw tuple field in the MsgPack format pointed by
+ * a JSON path.
+ *
+ * The JSON path includes the outmost field. For example, "c" in
+ * ["a", ["b", "c"], "d"] can be accessed using "[2][2]" path (if
+ * index_base is 1, as in Lua). If index_base is set to 0, the
+ * same field will be pointed by the "[1][1]" path.
+ *
+ * The first JSON path token may be a field name if the tuple
+ * has associated format with named fields. A field of a nested
+ * map can be accessed in the same way: "foo.bar" or ".foo.bar".
+ *
+ * The return value is valid until the tuple is destroyed, see
+ * box_tuple_ref().
+ *
+ * Return NULL if the field does not exist or if the JSON path is
+ * malformed or invalid. Multikey JSON path token [*] is treated
+ * as invalid in this context.
+ *
+ * \param tuple a tuple
+ * \param path a JSON path
+ * \param path_len a length of @a path
+ * \param index_base 0 if array element indexes in @a path are
+ *        zero-based (like in C) or 1 if they're one-based (like
+ *        in Lua)
+ * \retval a pointer to a field data if the field exists or NULL
+ */
+API_EXPORT const char *
+box_tuple_field_by_path(box_tuple_t *tuple, const char *path,
+			uint32_t path_len, int index_base);
 /**
  * Tuple iterator
  */
@@ -203,26 +258,26 @@ typedef struct tuple_iterator box_tuple_iterator_t;
  *
  * \post box_tuple_position(it) == 0
  */
-box_tuple_iterator_t *
+API_EXPORT box_tuple_iterator_t *
 box_tuple_iterator(box_tuple_t *tuple);
 
 /**
- * Destroy and free tuple iterator
+ * Destroy and free tuple iterator.
  */
-void
+API_EXPORT void
 box_tuple_iterator_free(box_tuple_iterator_t *it);
 
 /**
  * Return zero-based next position in iterator.
  * That is, this function return the field id of field that will be
- * returned by the next call to box_tuple_next(it). Returned value is zero
- * after initialization or rewind and box_tuple_field_count(tuple)
+ * returned by the next call to box_tuple_next(). Returned value is zero
+ * after initialization or rewind and box_tuple_field_count()
  * after the end of iteration.
  *
  * \param it tuple iterator
  * \returns position.
  */
-uint32_t
+API_EXPORT uint32_t
 box_tuple_position(box_tuple_iterator_t *it);
 
 /**
@@ -231,14 +286,14 @@ box_tuple_position(box_tuple_iterator_t *it);
  * \param it tuple iterator
  * \post box_tuple_position(it) == 0
  */
-void
+API_EXPORT void
 box_tuple_rewind(box_tuple_iterator_t *it);
 
 /**
  * Seek the tuple iterator.
  *
  * The returned buffer is valid until next call to box_tuple_* API.
- * Requested fieldno returned by next call to box_tuple_next(it).
+ * Requested fieldno returned by next call to box_tuple_next().
  *
  * \param it tuple iterator
  * \param fieldno - zero-based position in MsgPack array.
@@ -246,7 +301,7 @@ box_tuple_rewind(box_tuple_iterator_t *it);
  * \post box_tuple_position(it) == box_tuple_field_count(tuple) if returned
  * value is NULL.
  */
-const char *
+API_EXPORT const char *
 box_tuple_seek(box_tuple_iterator_t *it, uint32_t fieldno);
 
 /**
@@ -256,11 +311,11 @@ box_tuple_seek(box_tuple_iterator_t *it, uint32_t fieldno);
  * \param it tuple iterator.
  * \retval NULL if there are no more fields.
  * \retval MsgPack otherwise
- * \pre box_tuple_position(it) is zerod-based id of returned field
+ * \pre box_tuple_position(it) is zero-based id of returned field
  * \post box_tuple_position(it) == box_tuple_field_count(tuple) if returned
  * value is NULL.
  */
-const char *
+API_EXPORT const char *
 box_tuple_next(box_tuple_iterator_t *it);
 
 /**
@@ -274,13 +329,50 @@ box_tuple_next(box_tuple_iterator_t *it);
  * \pre data, end is valid MsgPack Array
  * \sa \code box.tuple.new(data) \endcode
  */
-box_tuple_t *
+API_EXPORT box_tuple_t *
 box_tuple_new(box_tuple_format_t *format, const char *data, const char *end);
 
-box_tuple_t *
+/**
+ * Update a tuple.
+ *
+ * Function returns a copy of tuple with updated fields.
+ * Pay attention that original tuple is left without changes.
+ *
+ * @param tuple Tuple to update.
+ * @param expr MessagePack array of operations.
+ * @param expr_end End of the @a expr.
+ *
+ * @retval NULL The tuple was not updated.
+ * @retval box_tuple_t A copy of original tuple with updated fields.
+ *
+ * @sa box_update()
+ */
+API_EXPORT box_tuple_t *
 box_tuple_update(box_tuple_t *tuple, const char *expr, const char *expr_end);
 
-box_tuple_t *
+/**
+ * Update a tuple.
+ *
+ * The same as box_tuple_update(), but ignores errors. In case of an error the
+ * tuple is left intact, but an error message is printed. Only client errors are
+ * ignored, such as a bad field type, or wrong field index/name. System errors,
+ * such as OOM, are not ignored and raised just like with a normal
+ * box_tuple_update(). Note that only bad operations are ignored. All correct
+ * operations are applied.
+ *
+ * Despite the function name (upsert, update and insert), the function does not
+ * insert any tuple.
+ *
+ * @param tuple Tuple to update.
+ * @param expr MessagePack array of operations.
+ * @param expr_end End of the @a expr.
+ *
+ * @retval NULL The tuple was not updated.
+ * @retval box_tuple_t A copy of original tuple with updated fields.
+ *
+ * @sa box_upsert()
+ */
+API_EXPORT box_tuple_t *
 box_tuple_upsert(box_tuple_t *tuple, const char *expr, const char *expr_end);
 
 /**
@@ -291,10 +383,35 @@ box_tuple_upsert(box_tuple_t *tuple, const char *expr, const char *expr_end);
  * @retval  0 The tuple is valid.
  * @retval -1 The tuple is invalid.
  */
-int
+API_EXPORT int
 box_tuple_validate(box_tuple_t *tuple, box_tuple_format_t *format);
 
 /** \endcond public */
+
+/**
+ * Tuple flags. Each value is a position of corresponding bit in
+ * tuple->flags member.
+ */
+enum tuple_flag {
+	/**
+	 * Flag that shows that the tuple has more references in separate
+	 * external storage, see @sa tuple_upload_refs and tuple_acquire_refs.
+	 * For private use only.
+	 */
+	TUPLE_HAS_UPLOADED_REFS = 0,
+	/**
+	 * The tuple (if it's found in index for example) could be invisible
+	 * for current transactions. The flag means that the tuple must
+	 * be clarified by transaction engine.
+	 */
+	TUPLE_IS_DIRTY = 1,
+	/**
+	 * The tuple belongs to a data-temporary space so it can be freed
+	 * immediately while a snapshot is in progress.
+	 */
+	TUPLE_IS_TEMPORARY = 2,
+	tuple_flag_MAX,
+};
 
 /**
  * An atom of Tarantool storage. Represents MsgPack Array.
@@ -319,18 +436,8 @@ struct PACKED tuple
 	 * tuple_ref_init, tuple_ref, tuple_unref instead.
 	 */
 	uint8_t local_refs;
-	/**
-	 * Flag that shows that the tuple has more references in separate
-	 * external storage, see @sa tuple_upload_refs and tuple_acquire_refs.
-	 * For private use only.
-	 */
-	bool has_uploaded_refs : 1;
-	/**
-	 * The tuple (if it's found in index for example) could be invisible
-	 * for current transactions. The flag means that the tuple must
-	 * be clarified by transaction engine.
-	 */
-	bool is_dirty : 1;
+	/** Tuple flags (e.g. see TUPLE_HAS_UPLOADED_REFS). */
+	uint8_t flags;
 	/** Format identifier. */
 	uint16_t format_id;
 	/**
@@ -358,6 +465,67 @@ struct PACKED tuple
 };
 
 static_assert(sizeof(struct tuple) == 10, "Just to be sure");
+
+/** Type of the arena where the tuple is allocated. */
+enum tuple_arena_type {
+	TUPLE_ARENA_MEMTX = 0,
+	TUPLE_ARENA_MALLOC = 1,
+	TUPLE_ARENA_RUNTIME = 2,
+	tuple_arena_type_MAX
+};
+
+/** Arena type names. */
+extern const char *tuple_arena_type_strs[tuple_arena_type_MAX];
+
+/** Information about the tuple. */
+struct tuple_info {
+	/** Size of the MsgPack data. See also tuple_bsize(). */
+	size_t data_size;
+	/** Header size depends on the engine and on the compact/bulky mode. */
+	size_t header_size;
+	/** Size of the field_map. See also field_map_build_size(). */
+	size_t field_map_size;
+	/** The amount of excess memory used to store the tuple in mempool. */
+	size_t waste_size;
+	/** Type of the arena where the tuple is allocated. */
+	enum tuple_arena_type arena_type;
+};
+
+/** Fill `info' with the information about the `tuple'. */
+static inline void
+tuple_info(struct tuple *tuple, struct tuple_info *info)
+{
+	struct tuple_format *format = tuple_format_by_id(tuple->format_id);
+	format->vtab.tuple_info(format, tuple, info);
+}
+
+static_assert(DIV_ROUND_UP(tuple_flag_MAX, 8) <=
+	      sizeof(((struct tuple *)0)->flags),
+	      "enum tuple_flag doesn't fit into tuple->flags");
+
+/** Set flag of the tuple. */
+static inline void
+tuple_set_flag(struct tuple *tuple, enum tuple_flag flag)
+{
+	assert(flag < tuple_flag_MAX);
+	tuple->flags |= (1 << flag);
+}
+
+/** Test if tuple has a flag. */
+static inline bool
+tuple_has_flag(struct tuple *tuple, enum tuple_flag flag)
+{
+	assert(flag < tuple_flag_MAX);
+	return (tuple->flags & (1 << flag)) != 0;
+}
+
+/** Clears tuple flag. */
+static inline void
+tuple_clear_flag(struct tuple *tuple, enum tuple_flag flag)
+{
+	assert(flag < tuple_flag_MAX);
+	tuple->flags &= ~(1 << flag);
+}
 
 enum {
 	/** Maximal value of tuple::local_refs. */
@@ -401,6 +569,47 @@ tuple_can_be_compact(uint16_t data_offset, uint32_t bsize)
 }
 
 /**
+ * Partially initializes a tuple, without touching `data_offset_bsize_raw' and
+ * `bsize_bulky'.
+ *
+ * @param tuple - Tuple to initialize.
+ * @param refs - initial reference count to set.
+ * @param format_id - see member description in struct tuple.
+ */
+static inline void
+tuple_create_base(struct tuple *tuple, uint8_t refs, uint16_t format_id)
+{
+	tuple->local_refs = refs;
+	tuple->flags = 0;
+	tuple->format_id = format_id;
+}
+
+/**
+ * Initializes `data_offset_bsize_raw' and `bsize_bulky' of a tuple.
+ *
+ * @param tuple - Tuple to initialize.
+ * @param data_offset - see member description in struct tuple.
+ * @param bsize - see member description in struct tuple.
+ * @param make_compact - construct compact tuple, see description in tuple.
+ */
+static inline void
+tuple_set_data_offset_bsize(struct tuple *tuple, uint16_t data_offset,
+			    uint32_t bsize, bool make_compact)
+{
+	assert(data_offset <= INT16_MAX);
+	if (make_compact) {
+		assert(tuple_can_be_compact(data_offset, bsize));
+		uint16_t combined = 0x8000;
+		combined |= data_offset << 8;
+		combined |= bsize;
+		tuple->data_offset_bsize_raw = combined;
+	} else {
+		tuple->data_offset_bsize_raw = data_offset;
+		tuple->bsize_bulky = bsize;
+	}
+}
+
+/**
  * Initialize a tuple. Must be called right after allocation of a new tuple.
  * Should only be called for newly created uninitialized tuples.
  * If the tuple copied from another tuple and only initialization of reference
@@ -413,27 +622,13 @@ tuple_can_be_compact(uint16_t data_offset, uint32_t bsize)
  * @param data_offset - see member description in struct tuple.
  * @param bsize - see member description in struct tuple.
  * @param make_compact - construct compact tuple, see description in tuple.
- * @return 0 on success, -1 on error (diag is set).
  */
 static inline void
 tuple_create(struct tuple *tuple, uint8_t refs, uint16_t format_id,
 	     uint16_t data_offset, uint32_t bsize, bool make_compact)
 {
-	assert(data_offset <= INT16_MAX);
-	tuple->local_refs = refs;
-	tuple->has_uploaded_refs = false;
-	tuple->is_dirty = false;
-	tuple->format_id = format_id;
-	if (make_compact) {
-		assert(tuple_can_be_compact(data_offset, bsize));
-		uint16_t combined = 0x8000;
-		combined |= data_offset << 8;
-		combined |= bsize;
-		tuple->data_offset_bsize_raw = combined;
-	} else {
-		tuple->data_offset_bsize_raw = data_offset;
-		tuple->bsize_bulky = bsize;
-	}
+	tuple_create_base(tuple, refs, format_id);
+	tuple_set_data_offset_bsize(tuple, data_offset, bsize, make_compact);
 }
 
 /**
@@ -448,7 +643,7 @@ static inline void
 tuple_ref_init(struct tuple *tuple, uint8_t refs)
 {
 	tuple->local_refs = refs;
-	tuple->has_uploaded_refs = false;
+	tuple_clear_flag(tuple, TUPLE_HAS_UPLOADED_REFS);
 }
 
 /**
@@ -583,21 +778,13 @@ tuple_snprint(char *buf, int size, struct tuple *tuple);
 
 /**
  * Format a tuple into string using a static buffer.
+ * Crops at TT_STATIC_BUF_LEN.
  * Useful for debugger. Example: [1, 2, "string"]
  * @param tuple to format
  * @return formatted null-terminated string
  */
 const char *
 tuple_str(struct tuple *tuple);
-
-/**
- * Format msgpack into string using a static buffer.
- * Useful for debugger. Example: [1, 2, "string"]
- * @param msgpack to format
- * @return formatted null-terminated string
- */
-const char *
-mp_str(const char *data);
 
 /**
  * Get the format of the tuple.
@@ -610,6 +797,13 @@ tuple_format(struct tuple *tuple)
 	struct tuple_format *format = tuple_format_by_id(tuple->format_id);
 	assert(tuple_format_id(format) == tuple->format_id);
 	return format;
+}
+
+/** Check that some fields in tuple are compressed */
+static inline bool
+tuple_is_compressed(struct tuple *tuple)
+{
+        return tuple_format(tuple)->is_compressed;
 }
 
 /**
@@ -636,46 +830,11 @@ tuple_new(struct tuple_format *format, const char *data, const char *end)
 static inline void
 tuple_delete(struct tuple *tuple)
 {
-	say_debug("%s(%p)", __func__, tuple);
 	assert(tuple->local_refs == 0);
-	assert(!tuple->has_uploaded_refs);
-	assert(!tuple->is_dirty);
+	assert(!tuple_has_flag(tuple, TUPLE_HAS_UPLOADED_REFS));
+	assert(!tuple_has_flag(tuple, TUPLE_IS_DIRTY));
 	struct tuple_format *format = tuple_format(tuple);
 	format->vtab.tuple_delete(format, tuple);
-}
-
-/** Tuple chunk memory object. */
-struct tuple_chunk {
-	/** The payload size. Needed to perform memory release.*/
-	uint32_t data_sz;
-	/** Metadata object payload. */
-	char data[0];
-};
-
-/** Calculate the size of tuple_chunk object by given data_sz. */
-static inline uint32_t
-tuple_chunk_sz(uint32_t data_sz)
-{
-	return sizeof(struct tuple_chunk) + data_sz;
-}
-
-/**
- * Allocate a new tuple_chunk for given tuple and data and
- * return a pointer to it's payload section.
- */
-static inline const char *
-tuple_chunk_new(struct tuple *tuple, const char *data, uint32_t data_sz)
-{
-	struct tuple_format *format = tuple_format(tuple);
-	return format->vtab.tuple_chunk_new(format, tuple, data, data_sz);
-}
-
-/** Free a tuple_chunk allocated for given tuple and data. */
-static inline void
-tuple_chunk_delete(struct tuple *tuple, const char *data)
-{
-	struct tuple_format *format = tuple_format(tuple);
-	format->vtab.tuple_chunk_delete(format, data);
 }
 
 /**
@@ -738,6 +897,9 @@ tuple_field_count(struct tuple *tuple)
  *                      with NULL.
  * @param path The path to process.
  * @param path_len The length of the @path.
+ * @param index_base 0 if array element indexes in @a path are
+ *        zero-based (like in C) or 1 if they're one-based (like
+ *        in Lua).
  * @param multikey_idx The multikey index hint - index of
  *                     multikey index key to retrieve when array
  *                     index placeholder "[*]" is met.
@@ -746,7 +908,7 @@ tuple_field_count(struct tuple *tuple)
  */
 int
 tuple_go_to_path(const char **data, const char *path, uint32_t path_len,
-		 int multikey_idx);
+		 int index_base, int multikey_idx);
 
 /**
  * Propagate @a field to MessagePack(field)[index].
@@ -764,12 +926,14 @@ tuple_field_go_to_index(const char **field, uint64_t index);
  * @param[in][out] field Field to propagate.
  * @param key Key to propagate to.
  * @param len Length of @a key.
+ * @param field_key Pointer to key in @a field.
  *
  * @retval  0 Success, the index was found.
  * @retval -1 Not found.
  */
 int
-tuple_field_go_to_key(const char **field, const char *key, int len);
+tuple_field_go_to_key(const char **field, const char *key, int len,
+		      const char **field_key);
 
 /**
  * Get tuple field by field index, relative JSON path and
@@ -777,8 +941,12 @@ tuple_field_go_to_key(const char **field, const char *key, int len);
  * @param format Tuple format.
  * @param tuple MessagePack tuple's body.
  * @param field_map Tuple field map.
+ * @param fieldno The index of a root field.
  * @param path Relative JSON path to field.
  * @param path_len Length of @a path.
+ * @param index_base 0 if array element indexes in @a path are
+ *        zero-based (like in C) or 1 if they're one-based (like
+ *        in Lua).
  * @param offset_slot_hint The pointer to a variable that contains
  *                         an offset slot. May be NULL.
  *                         If specified AND value by pointer is
@@ -794,7 +962,8 @@ static inline const char *
 tuple_field_raw_by_path(struct tuple_format *format, const char *tuple,
 			const uint32_t *field_map, uint32_t fieldno,
 			const char *path, uint32_t path_len,
-			int32_t *offset_slot_hint, int multikey_idx)
+			int index_base, int32_t *offset_slot_hint,
+			int multikey_idx)
 {
 	int32_t offset_slot;
 	if (offset_slot_hint != NULL &&
@@ -810,23 +979,14 @@ tuple_field_raw_by_path(struct tuple_format *format, const char *tuple,
 			return tuple;
 		}
 		field = tuple_format_field_by_path(format, fieldno, path,
-						   path_len);
+						   path_len, index_base);
 		assert(field != NULL || path != NULL);
 		if (path != NULL && field == NULL)
 			goto parse;
 		offset_slot = field->offset_slot;
 		if (offset_slot == TUPLE_OFFSET_SLOT_NIL)
 			goto parse;
-		if (offset_slot_hint != NULL) {
-			*offset_slot_hint = offset_slot;
-			/*
-			 * Hint is never requested for a multikey field without
-			 * providing a concrete multikey index.
-			 */
-			assert(!field->is_multikey_part ||
-			       multikey_idx != MULTIKEY_NONE);
-		} else if (field->is_multikey_part &&
-			   multikey_idx == MULTIKEY_NONE) {
+		if (field->is_multikey_part && multikey_idx == MULTIKEY_NONE) {
 			/*
 			 * When the field is multikey, the offset slot points
 			 * not at the data. It points at 'extra' array of
@@ -835,8 +995,21 @@ tuple_field_raw_by_path(struct tuple_format *format, const char *tuple,
 			 * not known when the field is accessed not in an index.
 			 * For example, in an application's Lua code by a JSON
 			 * path.
+			 *
+			 * Also, JSON tree has an interesting property. Imagine
+			 * having a field with path '[1][*]' in the tree. Then,
+			 * when looking for a field '[1][1]' (or '[1]["abc"]',
+			 * the second key can be anything), the field with path
+			 * '[1][*]' will be returned since '*' is actually
+			 * wildcard. Hence, if the format is stale and there are
+			 * no multikey fields in actual format, we can obtain
+			 * here a multikey field even if we didn't search for it
+			 * and multikey_idx will be MULTIKEY_NONE in this case.
+			 * Offset slot of such field should be skipped.
 			 */
 			goto parse;
+		} else if (offset_slot_hint != NULL) {
+			*offset_slot_hint = offset_slot;
 		}
 offset_slot_access:
 		/* Indexed field */
@@ -856,7 +1029,7 @@ parse:
 			mp_next(&tuple);
 		if (path != NULL &&
 		    unlikely(tuple_go_to_path(&tuple, path, path_len,
-					      multikey_idx) != 0))
+					      index_base, multikey_idx) != 0))
 			return NULL;
 	}
 	return tuple;
@@ -934,13 +1107,17 @@ tuple_field(struct tuple *tuple, uint32_t fieldno)
  * @param path Full JSON path to field.
  * @param path_len Length of @a path.
  * @param path_hash Hash of @a path.
+ * @param index_base 0 if array element indexes in @a path are
+ *        zero-based (like in C) or 1 if they're one-based (like
+ *        in Lua).
  *
  * @retval field data if field exists or NULL
  */
 const char *
 tuple_field_raw_by_full_path(struct tuple_format *format, const char *tuple,
 			     const uint32_t *field_map, const char *path,
-			     uint32_t path_len, uint32_t path_hash);
+			     uint32_t path_len, uint32_t path_hash,
+			     int index_base);
 
 /**
  * Get a tuple field pointed to by an index part and multikey
@@ -957,18 +1134,23 @@ tuple_field_raw_by_part(struct tuple_format *format, const char *data,
 			const uint32_t *field_map,
 			struct key_part *part, int multikey_idx)
 {
-	if (unlikely(part->format_epoch != format->epoch)) {
-		assert(format->epoch != 0);
-		part->format_epoch = format->epoch;
-		/*
-		 * Clear the offset slot cache, since it's stale.
-		 * The cache will be reset by the lookup.
-		 */
-		part->offset_slot_cache = TUPLE_OFFSET_SLOT_NIL;
+	int32_t *offset_slot_cache = NULL;
+	if (cord_is_main()) {
+		offset_slot_cache = &part->offset_slot_cache;
+		if (unlikely(part->format_epoch != format->epoch)) {
+			assert(format->epoch != 0);
+			part->format_epoch = format->epoch;
+			/*
+			 * Clear the offset slot cache, since it's stale.
+			 * The cache will be reset by the lookup.
+			 */
+			*offset_slot_cache = TUPLE_OFFSET_SLOT_NIL;
+		}
 	}
 	return tuple_field_raw_by_path(format, data, field_map, part->fieldno,
 				       part->path, part->path_len,
-				       &part->offset_slot_cache, multikey_idx);
+				       TUPLE_INDEX_BASE,
+				       offset_slot_cache, multikey_idx);
 }
 
 /**
@@ -1015,7 +1197,7 @@ tuple_multikey_count(struct tuple *tuple, struct key_def *key_def)
 }
 
 /**
- * @brief Tuple Interator
+ * @brief Tuple iterator
  */
 struct tuple_iterator {
 	/** @cond false **/
@@ -1282,7 +1464,9 @@ static inline int
 tuple_field_uuid(struct tuple *tuple, int fieldno, struct tt_uuid *out)
 {
 	const char *value = tuple_field_cstr(tuple, fieldno);
-	if (value == NULL || tt_uuid_from_string(value, out) != 0) {
+	if (value == NULL)
+		return -1;
+	if (tt_uuid_from_string(value, out) != 0) {
 		diag_set(ClientError, ER_INVALID_UUID, value);
 		return -1;
 	}
@@ -1326,7 +1510,7 @@ tuple_unref(struct tuple *tuple)
 {
 	assert(tuple->local_refs >= 1);
 	if (--tuple->local_refs == 0) {
-		if (unlikely(tuple->has_uploaded_refs))
+		if (unlikely(tuple_has_flag(tuple, TUPLE_HAS_UPLOADED_REFS)))
 			tuple_acquire_refs(tuple);
 		else
 			tuple_delete(tuple);
@@ -1339,7 +1523,7 @@ tuple_unref(struct tuple *tuple)
 size_t
 tuple_bigref_tuple_count();
 
-extern struct tuple *box_tuple_last;
+extern __thread struct tuple *box_tuple_last;
 
 /**
  * Convert internal `struct tuple` to public `box_tuple_t`.
@@ -1385,4 +1569,3 @@ tuple_field_u32_xc(struct tuple *tuple, uint32_t fieldno)
 #endif /* defined(__cplusplus) */
 
 #endif /* TARANTOOL_BOX_TUPLE_H_INCLUDED */
-

@@ -29,16 +29,22 @@
  * SUCH DAMAGE.
  */
 #include "schema.h"
-#include "func.h"
 #include "sequence.h"
-#include "tuple.h"
 #include "assoc.h"
 #include "alter.h"
+#include "box.h"
 #include "scoped_guard.h"
 #include "user.h"
 #include "vclock/vclock.h"
 #include "fiber.h"
+#include "session.h"
 #include "memtx_tx.h"
+#include "txn.h"
+#include "engine.h"
+#include "version.h"
+#include "event.h"
+#include "port.h"
+#include "tt_static.h"
 
 /**
  * @module Data Dictionary
@@ -55,211 +61,160 @@
  * it.
  */
 
-/** All existing spaces. */
-static struct mh_i32ptr_t *spaces;
-static struct mh_strnptr_t *spaces_by_name;
-static struct mh_i32ptr_t *funcs;
-static struct mh_strnptr_t *funcs_by_name;
 static struct mh_i32ptr_t *sequences;
 /** Public change counter. On its update clients need to fetch
  *  new space data from the instance. */
-uint32_t schema_version = 0;
-/**
- * Internal change counter. Grows faster, than the public one,
- * because we need to remember when to update pointers to already
- * non-existent space objects on space:truncate() operation.
- */
-uint32_t space_cache_version = 0;
+uint64_t schema_version = 0;
 
 /** Persistent version of the schema, stored in _schema["version"]. */
 uint32_t dd_version_id = 0;
 
-struct rlist on_schema_init = RLIST_HEAD_INITIALIZER(on_schema_init);
+/** Most recent dd_version_id known to this build. */
+static uint32_t latest_dd_version_id = 0;
+
+/** Fiber that is currently running a schema upgrade. */
+static struct fiber *schema_upgrade_fiber;
+
 struct rlist on_alter_space = RLIST_HEAD_INITIALIZER(on_alter_space);
 struct rlist on_alter_sequence = RLIST_HEAD_INITIALIZER(on_alter_sequence);
 struct rlist on_alter_func = RLIST_HEAD_INITIALIZER(on_alter_func);
 
 struct entity_access entity_access;
 
-bool
-space_is_system(struct space *space)
-{
-	return space->def->id > BOX_SYSTEM_ID_MIN &&
-		space->def->id < BOX_SYSTEM_ID_MAX;
-}
+STRS(schema_feature, SCHEMA_FEATURES);
+#define SCHEMA_FEATURE_MEMBER(t, n, a, b, c) {a, b, c},
+const struct version schema_feature_version[schema_feature_MAX] = {
+	SCHEMA_FEATURES(SCHEMA_FEATURE_MEMBER)
+};
 
-/** Return space by its number */
-struct space *
-space_by_id(uint32_t id)
-{
-	mh_int_t space = mh_i32ptr_find(spaces, id, NULL);
-	if (space == mh_end(spaces))
-		return NULL;
-	return (struct space *) mh_i32ptr_node(spaces, space)->val;
-}
-
-/** Return space by its name */
-struct space *
-space_by_name(const char *name)
-{
-	mh_int_t space = mh_strnptr_find_inp(spaces_by_name, name,
-					     strlen(name));
-	if (space == mh_end(spaces_by_name))
-		return NULL;
-	return (struct space *)mh_strnptr_node(spaces_by_name, space)->val;
-}
-
-/** Return current schema version */
-uint32_t
+API_EXPORT uint64_t
 box_schema_version(void)
 {
 	return schema_version;
 }
 
-/**
- * Visit all spaces and apply 'func'.
- */
-int
-space_foreach(int (*func)(struct space *sp, void *udata), void *udata)
+/** Called from Lua via FFI to get the current schema version. */
+extern "C" uint32_t
+box_dd_version_id(void)
 {
-	mh_int_t i;
-	struct space *space;
-	char key[6];
-	assert(mp_sizeof_uint(BOX_SYSTEM_ID_MIN) <= sizeof(key));
-	mp_encode_uint(key, BOX_SYSTEM_ID_MIN);
+	return dd_version_id;
+}
 
-	/*
-	 * Make sure we always visit system spaces first,
-	 * in order from lowest space id to the highest..
-	 * This is essential for correctly recovery from the
-	 * snapshot, and harmless otherwise.
-	 */
-	space = space_by_id(BOX_SPACE_ID);
-	struct index *pk = space ? space_index(space, 0) : NULL;
-	if (pk) {
-		struct iterator *it = index_create_iterator(pk, ITER_GE,
-							    key, 1);
-		if (it == NULL)
-			return -1;
-		int rc;
-		struct tuple *tuple;
-		while ((rc = iterator_next(it, &tuple)) == 0 && tuple != NULL) {
-			uint32_t id;
-			if (tuple_field_u32(tuple, BOX_SPACE_FIELD_ID, &id) != 0)
-				continue;
-			space = space_cache_find(id);
-			if (space == NULL)
-				continue;
-			if (! space_is_system(space))
-				break;
-			rc = func(space, udata);
-			if (rc != 0)
-				break;
-		}
-		iterator_delete(it);
-		if (rc != 0)
-			return -1;
+/** Called from Lua via FFI to get latest_dd_version_id. */
+extern "C" uint32_t
+box_latest_dd_version_id(void)
+{
+	return latest_dd_version_id;
+}
+
+/** Called from Lua via FFI to init latest_dd_version_id. */
+extern "C" void
+box_init_latest_dd_version_id(uint32_t version_id)
+{
+	assert(version_id != 0);
+	assert(latest_dd_version_id == 0);
+	latest_dd_version_id = version_id;
+}
+
+/**
+ * Returns true and sets diag if the schema needs upgrade.
+ * Called from Lua via FFI.
+ */
+extern "C" bool
+box_schema_needs_upgrade(void)
+{
+	assert(latest_dd_version_id != 0);
+	return dd_version_id < latest_dd_version_id;
+}
+
+/**
+ * Should be called before starting a schema upgrade in the current fiber.
+ * Returns 0 on success. Sets diag and returns -1 if a schema upgrade is
+ * already running in another fiber.
+ *
+ * This function is required to enable DDL operations with an old schema,
+ * which is necessary to perform a schema upgrade. The calling fiber must
+ * call box_schema_upgrade_end() upon the schema upgrade completion.
+ *
+ * Called from Lua via FFI.
+ */
+extern "C" int
+box_schema_upgrade_begin(void)
+{
+	if (schema_upgrade_fiber != NULL) {
+		assert(schema_upgrade_fiber != fiber());
+		diag_set(ClientError, ER_SCHEMA_UPGRADE_IN_PROGRESS);
+		return -1;
 	}
-
-	mh_foreach(spaces, i) {
-		space = (struct space *) mh_i32ptr_node(spaces, i)->val;
-		if (space_is_system(space))
-			continue;
-		if (func(space, udata) != 0)
-			return -1;
-	}
-
+	schema_upgrade_fiber = fiber();
 	return 0;
 }
 
-void
-space_cache_replace(struct space *old_space, struct space *new_space)
+/**
+ * Called from Lua via FFI upon completion of a schema upgrade.
+ * See box_schema_upgrade_begin().
+ */
+extern "C" void
+box_schema_upgrade_end(void)
 {
-	assert(new_space != NULL || old_space != NULL);
-	if (new_space != NULL) {
-		/*
-		 * If the replaced space has a different name, we
-		 * must explicitly delete it from @spaces_by_name
-		 * cache. Note, since a space id never changes, we
-		 * don't need to do so for @spaces cache.
-		 */
-		struct space *old_space_by_name = NULL;
-		if (old_space != NULL && strcmp(space_name(old_space),
-						space_name(new_space)) != 0) {
-			const char *name = space_name(old_space);
-			mh_int_t k = mh_strnptr_find_inp(spaces_by_name, name,
-							 strlen(name));
-			assert(k != mh_end(spaces_by_name));
-			old_space_by_name = (struct space *)
-				mh_strnptr_node(spaces_by_name, k)->val;
-			mh_strnptr_del(spaces_by_name, k, NULL);
-		}
-		/*
-		 * Insert @new_space into @spaces cache, replacing
-		 * @old_space if it's not NULL.
-		 */
-		const struct mh_i32ptr_node_t node_p = { space_id(new_space),
-							 new_space };
-		struct mh_i32ptr_node_t old, *p_old = &old;
-		mh_i32ptr_put(spaces, &node_p, &p_old, NULL);
-		struct space *old_space_by_id = p_old != NULL ?
-				(struct space *)p_old->val : NULL;
-		assert(old_space_by_id == old_space);
-		(void)old_space_by_id;
-		/*
-		 * Insert @new_space into @spaces_by_name cache.
-		 */
-		const char *name = space_name(new_space);
-		uint32_t name_len = strlen(name);
-		uint32_t name_hash = mh_strn_hash(name, name_len);
-		const struct mh_strnptr_node_t node_s = { name, name_len,
-							  name_hash, new_space };
-		struct mh_strnptr_node_t old_s, *p_old_s = &old_s;
-		mh_strnptr_put(spaces_by_name, &node_s, &p_old_s, NULL);
-		if (old_space_by_name == NULL && p_old_s != NULL)
-			old_space_by_name = (struct space *)p_old_s->val;
-		assert(old_space_by_name == old_space);
-		(void)old_space_by_name;
-	} else {
-		/*
-		 * Delete @old_space from @spaces cache.
-		 */
-		mh_int_t k = mh_i32ptr_find(spaces, space_id(old_space), NULL);
-		assert(k != mh_end(spaces));
-		struct space *old_space_by_id =
-			(struct space *)mh_i32ptr_node(spaces, k)->val;
-		assert(old_space_by_id == old_space);
-		(void)old_space_by_id;
-		mh_i32ptr_del(spaces, k, NULL);
-		/*
-		 * Delete @old_space from @spaces_by_name cache.
-		 */
-		const char *name = space_name(old_space);
-		k = mh_strnptr_find_inp(spaces_by_name, name, strlen(name));
-		assert(k != mh_end(spaces_by_name));
-		struct space *old_space_by_name =
-			(struct space *)mh_strnptr_node(spaces_by_name, k)->val;
-		assert(old_space_by_name == old_space);
-		(void)old_space_by_name;
-		mh_strnptr_del(spaces_by_name, k, NULL);
-	}
-	space_cache_version++;
+	assert(schema_upgrade_fiber == fiber());
+	schema_upgrade_fiber = NULL;
+}
 
-	if (trigger_run(&on_alter_space, new_space != NULL ?
-					 new_space : old_space) != 0) {
-		diag_log();
-		panic("Can't update space cache");
-	}
+bool
+dd_check_is_disabled(void)
+{
+	/*
+	 * We disable data dictionary checks in the following scenarios:
+	 *  - in the fiber that is currently running a schema upgrade or
+	 *    downgrade so that it can perform DDL operations required to
+	 *    modify the schema, in particular drop a system space;
+	 *  - in the applier fiber so that it can replicate changes done by
+	 *    a schema upgrade on the master;
+	 *  - during bootstrap so that DDL operations can be performed when
+	 *    generating new bootstrap snapshot;
+	 *  - during recovery so that DDL records written to the WAL can be
+	 *    replayed.
+	 */
+	return fiber() == schema_upgrade_fiber ||
+	       current_session()->type == SESSION_TYPE_APPLIER ||
+	       !box_is_configured() || recovery_state != FINISHED_RECOVERY;
+}
 
-	if (old_space != NULL)
-		space_invalidate(old_space);
+int
+schema_check_feature(enum schema_feature feature)
+{
+	if (dd_check_is_disabled())
+		return 0;
+	struct version v = schema_feature_version[feature];
+	uint32_t id = version_id(v.major, v.minor, v.patch);
+	if (dd_version_id < id) {
+		diag_set(ClientError, ER_SCHEMA_NEEDS_UPGRADE,
+			 version_id_to_string(dd_version_id),
+			 schema_feature_strs[feature],
+			 version_id_to_string(id));
+		return -1;
+	}
+	return 0;
 }
 
 static int
 on_replace_dd_system_space(struct trigger *trigger, void *event)
 {
 	(void) trigger;
-	struct txn *txn = (struct txn *) event;
+	struct txn_stmt *stmt = (struct txn_stmt *)event;
+	struct txn *txn = stmt->txn;
+	if (txn->space_on_replace_triggers_depth > 1) {
+		diag_set(ClientError, ER_UNSUPPORTED,
+			 "Space on_replace trigger", "DDL operations");
+		return -1;
+	}
+	/*
+	 * In general it's unsafe to execute a DDL operation with an old schema
+	 * so we only allow it for schema upgrade.
+	 */
+	if (schema_check_feature(SCHEMA_FEATURE_DDL_BEFORE_UPGRADE) != 0)
+		return -1;
 	memtx_tx_acquire_ddl(txn);
 	return 0;
 }
@@ -271,7 +226,12 @@ sc_space_new(uint32_t id, const char *name,
 	     uint32_t key_part_count,
 	     struct trigger *replace_trigger)
 {
-	struct key_def *key_def = key_def_new(key_parts, key_part_count, false);
+	struct space_def *def = space_def_new(id, ADMIN, 0, name, strlen(name),
+					      "memtx", strlen("memtx"),
+					      &space_opts_default,
+					      NULL, 0, NULL, 0);
+	auto def_guard = make_scoped_guard([=] { space_def_delete(def); });
+	struct key_def *key_def = key_def_new(key_parts, key_part_count, 0);
 	if (key_def == NULL)
 		diag_raise();
 	auto key_def_guard =
@@ -280,17 +240,13 @@ sc_space_new(uint32_t id, const char *name,
 						    0 /* index id */,
 						    "primary", /* name */
 						    strlen("primary"),
+						    def->name, /* space name */
+						    def->engine_name,
 						    TREE /* index type */,
 						    &index_opts_default,
 						    key_def, NULL);
-	if (index_def == NULL)
-		diag_raise();
 	auto index_def_guard =
 		make_scoped_guard([=] { index_def_delete(index_def); });
-	struct space_def *def =
-		space_def_new_xc(id, ADMIN, 0, name, strlen(name), "memtx",
-				 strlen("memtx"), &space_opts_default, NULL, 0);
-	auto def_guard = make_scoped_guard([=] { space_def_delete(def); });
 	struct rlist key_list;
 	rlist_create(&key_list);
 	rlist_add_entry(&key_list, index_def, link);
@@ -362,6 +318,18 @@ schema_find_id(uint32_t system_space_id, uint32_t index_id,
 }
 
 /**
+ * Runs on_schema_init triggers.
+ */
+static void
+run_on_schema_init_triggers(void)
+{
+	struct event *event = event_get("box.ctl.on_schema_init", false);
+	if (event == NULL)
+		return;
+	event_run_triggers_no_fail(event, NULL);
+}
+
+/**
  * Initialize a prototype for the two mandatory data
  * dictionary spaces and create a cache entry for them.
  * When restoring data from the snapshot these spaces
@@ -374,11 +342,7 @@ schema_init(void)
 	for (uint32_t i = 0; i < lengthof(key_parts); i++)
 		key_parts[i] = key_part_def_default;
 
-	/* Initialize the space cache. */
-	spaces = mh_i32ptr_new();
-	spaces_by_name = mh_strnptr_new();
-	funcs = mh_i32ptr_new();
-	funcs_by_name = mh_strnptr_new();
+	func_cache_init();
 	sequences = mh_i32ptr_new();
 	/*
 	 * Create surrogate space objects for the mandatory system
@@ -395,6 +359,9 @@ schema_init(void)
 	key_parts[0].type = FIELD_TYPE_STRING;
 	sc_space_new(BOX_SCHEMA_ID, "_schema", key_parts, 1,
 		     &on_replace_schema);
+	struct space *schema = space_by_id(BOX_SCHEMA_ID);
+	assert(schema != NULL);
+	trigger_add(&schema->before_replace, &before_replace_schema);
 
 	/* _collation - collation description. */
 	key_parts[0].fieldno = 0;
@@ -405,6 +372,9 @@ schema_init(void)
 	/* _space - home for all spaces. */
 	sc_space_new(BOX_SPACE_ID, "_space", key_parts, 1,
 		     &alter_space_on_replace_space);
+	struct space *space = space_by_id(BOX_SPACE_ID);
+	assert(space != NULL);
+	trigger_add(&space->before_replace, &alter_space_before_replace_space);
 
 	/* _truncate - auxiliary space for triggering space truncation. */
 	sc_space_new(BOX_TRUNCATE_ID, "_truncate", key_parts, 1,
@@ -452,6 +422,9 @@ schema_init(void)
 	key_parts[1].type = FIELD_TYPE_UNSIGNED;
 	sc_space_new(BOX_INDEX_ID, "_index", key_parts, 2,
 		     &alter_space_on_replace_index);
+	struct space *index = space_by_id(BOX_INDEX_ID);
+	assert(index != NULL);
+	trigger_add(&index->before_replace, &alter_space_before_replace_index);
 
 	/* _fk_сonstraint - foreign keys constraints. */
 	key_parts[0].fieldno = 0; /* constraint name */
@@ -459,7 +432,7 @@ schema_init(void)
 	key_parts[1].fieldno = 1; /* child space */
 	key_parts[1].type = FIELD_TYPE_UNSIGNED;
 	sc_space_new(BOX_FK_CONSTRAINT_ID, "_fk_constraint", key_parts, 2,
-		     &on_replace_fk_constraint);
+		     NULL);
 
 	/* _ck_сonstraint - check constraints. */
 	key_parts[0].fieldno = 0; /* space id */
@@ -467,7 +440,7 @@ schema_init(void)
 	key_parts[1].fieldno = 1; /* constraint name */
 	key_parts[1].type = FIELD_TYPE_STRING;
 	sc_space_new(BOX_CK_CONSTRAINT_ID, "_ck_constraint", key_parts, 2,
-		     &on_replace_ck_constraint);
+		     NULL);
 
 	/* _func_index - check constraints. */
 	key_parts[0].fieldno = 0; /* space id */
@@ -497,9 +470,9 @@ schema_init(void)
 		struct space_opts opts = space_opts_default;
 		opts.group_id = GROUP_LOCAL;
 		struct space_def *def;
-		def = space_def_new_xc(BOX_VINYL_DEFERRED_DELETE_ID, ADMIN, 0,
-				       name, strlen(name), engine,
-				       strlen(engine), &opts, NULL, 0);
+		def = space_def_new(BOX_VINYL_DEFERRED_DELETE_ID, ADMIN, 0,
+				    name, strlen(name), engine,
+				    strlen(engine), &opts, NULL, 0, NULL, 0);
 		auto def_guard = make_scoped_guard([=] {
 			space_def_delete(def);
 		});
@@ -513,33 +486,14 @@ schema_init(void)
 	 * Run the triggers right after creating all the system
 	 * space stubs.
 	 */
-	trigger_run(&on_schema_init, NULL);
+	run_on_schema_init_triggers();
 }
 
 void
 schema_free(void)
 {
-	if (spaces == NULL)
-		return;
-	while (mh_size(spaces) > 0) {
-		mh_int_t i = mh_first(spaces);
+	func_cache_destroy();
 
-		struct space *space = (struct space *)
-				mh_i32ptr_node(spaces, i)->val;
-		space_cache_replace(space, NULL);
-		space_delete(space);
-	}
-	mh_i32ptr_delete(spaces);
-	mh_strnptr_delete(spaces_by_name);
-	while (mh_size(funcs) > 0) {
-		mh_int_t i = mh_first(funcs);
-
-		struct func *func = ((struct func *)
-				     mh_i32ptr_node(funcs, i)->val);
-		func_cache_delete(func->def->fid);
-		func_delete(func);
-	}
-	mh_i32ptr_delete(funcs);
 	while (mh_size(sequences) > 0) {
 		mh_int_t i = mh_first(sequences);
 
@@ -548,53 +502,6 @@ schema_free(void)
 		sequence_cache_delete(seq->def->id);
 	}
 	mh_i32ptr_delete(sequences);
-}
-
-void
-func_cache_insert(struct func *func)
-{
-	assert(func_by_id(func->def->fid) == NULL);
-	assert(func_by_name(func->def->name, strlen(func->def->name)) == NULL);
-	const struct mh_i32ptr_node_t node = { func->def->fid, func };
-	mh_i32ptr_put(funcs, &node, NULL, NULL);
-	size_t def_name_len = strlen(func->def->name);
-	uint32_t name_hash = mh_strn_hash(func->def->name, def_name_len);
-	const struct mh_strnptr_node_t strnode = {
-		func->def->name, def_name_len, name_hash, func };
-	mh_strnptr_put(funcs_by_name, &strnode, NULL, NULL);
-}
-
-void
-func_cache_delete(uint32_t fid)
-{
-	mh_int_t k = mh_i32ptr_find(funcs, fid, NULL);
-	if (k == mh_end(funcs))
-		return;
-	struct func *func = (struct func *)
-		mh_i32ptr_node(funcs, k)->val;
-	mh_i32ptr_del(funcs, k, NULL);
-	k = mh_strnptr_find_inp(funcs_by_name, func->def->name,
-				strlen(func->def->name));
-	if (k != mh_end(funcs))
-		mh_strnptr_del(funcs_by_name, k, NULL);
-}
-
-struct func *
-func_by_id(uint32_t fid)
-{
-	mh_int_t func = mh_i32ptr_find(funcs, fid, NULL);
-	if (func == mh_end(funcs))
-		return NULL;
-	return (struct func *) mh_i32ptr_node(funcs, func)->val;
-}
-
-struct func *
-func_by_name(const char *name, uint32_t name_len)
-{
-	mh_int_t func = mh_strnptr_find_inp(funcs_by_name, name, name_len);
-	if (func == mh_end(funcs_by_name))
-		return NULL;
-	return (struct func *) mh_strnptr_node(funcs_by_name, func)->val;
 }
 
 int
@@ -665,66 +572,3 @@ sequence_cache_delete(uint32_t id)
 	if (k != mh_end(sequences))
 		mh_i32ptr_del(sequences, k, NULL);
 }
-
-const char *
-schema_find_name(enum schema_object_type type, uint32_t object_id)
-{
-	switch (type) {
-	case SC_UNIVERSE:
-	case SC_ENTITY_SPACE:
-	case SC_ENTITY_FUNCTION:
-	case SC_ENTITY_SEQUENCE:
-	case SC_ENTITY_ROLE:
-	case SC_ENTITY_USER:
-		return "";
-	case SC_SPACE:
-		{
-			struct space *space = space_by_id(object_id);
-			if (space != NULL)
-				return space->def->name;
-			diag_set(ClientError, ER_NO_SUCH_SPACE,
-				 tt_sprintf("%d", object_id));
-			break;
-		}
-	case SC_FUNCTION:
-		{
-			struct func *func = func_by_id(object_id);
-			if (func != NULL)
-				return func->def->name;
-			diag_set(ClientError, ER_NO_SUCH_FUNCTION,
-				 tt_sprintf("%d", object_id));
-			break;
-		}
-	case SC_SEQUENCE:
-		{
-			struct sequence *seq = sequence_by_id(object_id);
-			if (seq != NULL)
-				return seq->def->name;
-			diag_set(ClientError, ER_NO_SUCH_SEQUENCE,
-				 tt_sprintf("%d", object_id));
-			break;
-		}
-	case SC_ROLE:
-		{
-			struct user *role = user_by_id(object_id);
-			if (role != NULL)
-				return role->def->name;
-			diag_set(ClientError, ER_NO_SUCH_ROLE,
-				 tt_sprintf("%d", object_id));
-			break;
-		}
-	case SC_USER:
-		{
-			struct user *user = user_by_id(object_id);
-			if (user != NULL)
-				return user->def->name;
-			diag_set(ClientError, ER_NO_SUCH_USER,
-				 tt_sprintf("%d", object_id));
-			break;
-		}
-	default:
-		unreachable();
-	}
-	return NULL;
-}
-

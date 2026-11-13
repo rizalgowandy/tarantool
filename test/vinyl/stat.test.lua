@@ -92,6 +92,7 @@ function gstat()
     st.regulator = nil
     st.scheduler.dump_time = nil
     st.scheduler.compaction_time = nil
+    st.memory.level0 = nil
     return st
 end;
 
@@ -107,6 +108,7 @@ test_run:cmd("setopt delimiter ''");
 -- initially stats are empty
 istat()
 gstat()
+box.stat.vinyl().memory.level0 == 0
 
 --
 -- Index statistics.
@@ -221,9 +223,10 @@ gstat().scheduler.compaction_input == istat().disk.compaction.input.bytes
 gstat().scheduler.compaction_output == istat().disk.compaction.output.bytes
 
 -- use memory
-st = gstat()
+st = box.stat.vinyl().memory.level0
 put(1)
-stat_diff(gstat(), st, 'memory.level0')
+diff = box.stat.vinyl().memory.level0 - st
+diff > 1000 and diff < 1100
 
 -- use cache
 st = gstat()
@@ -322,6 +325,10 @@ _ = s:select({20}, {iterator = 'GT'})
 stat_diff(gstat(), st, 'tx')
 box.commit()
 stat_diff(gstat(), st, 'tx')
+
+-- free tuples pinned by Lua
+_ = nil
+_ = collectgarbage()
 
 -- box.stat.reset
 box.stat.reset()

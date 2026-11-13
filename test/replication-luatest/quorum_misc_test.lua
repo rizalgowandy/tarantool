@@ -1,15 +1,14 @@
 local t = require('luatest')
 local log = require('log')
 local fio = require('fio')
-local Cluster =  require('test.luatest_helpers.cluster')
-local asserts = require('test.luatest_helpers.asserts')
-local helpers = require('test.luatest_helpers')
-local COUNT = 100
+local Cluster =  require('luatest.replica_set')
+local server = require('luatest.server')
 
 local pg = t.group('quorum_misc', {{engine = 'memtx'}, {engine = 'vinyl'}})
 
+local COUNT = 100
+
 pg.before_each(function(cg)
-    local engine = cg.params.engine
     cg.cluster = Cluster:new({})
     local box_cfg = {
         replication_timeout = 0.1;
@@ -17,40 +16,38 @@ pg.before_each(function(cg)
         replication_sync_lag = 0.01;
         replication_connect_quorum = 3;
         replication = {
-            helpers.instance_uri('quorum', 1);
-            helpers.instance_uri('quorum', 2);
-            helpers.instance_uri('quorum', 3);
+            server.build_listen_uri('quorum1', cg.cluster.id);
+            server.build_listen_uri('quorum2', cg.cluster.id);
+            server.build_listen_uri('quorum3', cg.cluster.id);
         };
     }
-    cg.quorum1 = cg.cluster:build_server({alias = 'quorum1', engine = engine, box_cfg = box_cfg})
-    cg.quorum2 = cg.cluster:build_server({alias = 'quorum2', engine = engine, box_cfg = box_cfg})
-    cg.quorum3 = cg.cluster:build_server({alias = 'quorum3', engine = engine, box_cfg = box_cfg})
+    cg.quorum1 = cg.cluster:build_server({alias = 'quorum1', box_cfg = box_cfg})
+    cg.quorum2 = cg.cluster:build_server({alias = 'quorum2', box_cfg = box_cfg})
+    cg.quorum3 = cg.cluster:build_server({alias = 'quorum3', box_cfg = box_cfg})
 
     local box_cfg = {
         replication_timeout = 0.05,
         replication_connect_timeout = 10,
         replication_connect_quorum = 1,
-        replication = {helpers.instance_uri('replica_quorum'),
-                       helpers.instance_uri('replica_quorum', 1),
-                       helpers.instance_uri('replica_quorum', 2)}
+        replication = {server.build_listen_uri('replica_quorum', cg.cluster.id),
+                       server.build_listen_uri('replica_quorum1',
+                           cg.cluster.id),
+                       server.build_listen_uri('replica_quorum2',
+                           cg.cluster.id)}
     }
-    cg.replica_quorum = cg.cluster:build_server({alias = 'replica_quorum', engine = engine, box_cfg = box_cfg})
+    cg.replica_quorum = cg.cluster:build_server({alias = 'replica_quorum',
+                                                 box_cfg = box_cfg})
 
     pcall(log.cfg, {level = 6})
 
 end)
 
 pg.after_each(function(cg)
-    cg.cluster.servers = nil
     cg.cluster:drop()
 end)
 
 pg.before_test('test_quorum_during_reconfiguration', function(cg)
     cg.cluster:add_server(cg.replica_quorum)
-end)
-
-pg.after_test('test_quorum_during_reconfiguration', function(cg)
-    cg.cluster:drop({cg.replica_quorum})
 end)
 
 pg.test_quorum_during_reconfiguration = function(cg)
@@ -65,7 +62,7 @@ pg.test_quorum_during_reconfiguration = function(cg)
                     }
                 })
     end
-    local nonexistent_uri = helpers.instance_uri('replica_quorum', 1)
+    local nonexistent_uri = server.build_listen_uri('nonexistent_uri')
     t.helpers.retrying({timeout = 10},
         function()
             -- If replication_connect_quorum was ignored here, the instance
@@ -86,12 +83,12 @@ function(cg)
     cg.cluster:add_server(cg.quorum2)
     cg.cluster:add_server(cg.quorum3)
     cg.cluster:start()
-    local bootstrap_function = function()
-        box.schema.space.create('test', {engine = os.getenv('TARANTOOL_ENGINE')})
+    local bootstrap_function = function(params)
+        box.schema.space.create('test', {engine = params.engine})
         box.space.test:create_index('primary')
     end
-    cg.cluster:exec_on_leader(bootstrap_function)
-    asserts:wait_fullmesh({cg.quorum1, cg.quorum2, cg.quorum3})
+    cg.cluster:get_leader():exec(bootstrap_function, {cg.params})
+    cg.cluster:wait_for_fullmesh()
     t.helpers.retrying({timeout = 10},
         function()
             cg.quorum2:eval(

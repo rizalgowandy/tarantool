@@ -36,7 +36,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <assert.h>
-#include "say.h"
+#include <errno.h>
+
+#include "error_payload.h"
 
 #if defined(__cplusplus)
 extern "C" {
@@ -69,7 +71,6 @@ typedef void (*error_f)(struct error *e);
 struct error {
 	error_f destroy;
 	error_f raise;
-	error_f log;
 	const struct type_info *type;
 	/**
 	 * Reference counting is basically required since
@@ -87,12 +88,20 @@ struct error {
 	 * to the standard library, then it is 0.
 	 */
 	int saved_errno;
+	/** Error code. Shortest possible description of error's reason. */
+	int code;
+	/** Key-value storage with error's dynamic fields. */
+	struct error_payload payload;
 	/** Line number. */
 	unsigned line;
-	/* Source file name. */
+	/** Source file name. */
 	char file[DIAG_FILENAME_MAX];
-	/* Error description. */
-	char errmsg[DIAG_ERRMSG_MAX];
+	/**
+	 * Error description. Points to the static buffer `errmsg_buf' if the
+	 * message fits into it, or to the dynamic buffer otherwise.
+	 */
+	char *errmsg;
+	char errmsg_buf[DIAG_ERRMSG_MAX];
 	/**
 	 * Link to the cause and effect of given error. The cause
 	 * creates the effect:
@@ -117,6 +126,105 @@ error_ref(struct error *e);
 
 void
 error_unref(struct error *e);
+
+static inline const char *
+error_get_str(const struct error *e, const char *name)
+{
+	return error_payload_get_str(&e->payload, name);
+}
+
+static inline void
+error_set_str(struct error *e, const char *name, const char *value)
+{
+	error_payload_set_str(&e->payload, name, value);
+}
+
+static inline bool
+error_get_uint(const struct error *e, const char *name, uint64_t *value)
+{
+	return error_payload_get_uint(&e->payload, name, value);
+}
+
+static inline void
+error_set_uint(struct error *e, const char *name, uint64_t value)
+{
+	error_payload_set_uint(&e->payload, name, value);
+}
+
+static inline bool
+error_get_int(const struct error *e, const char *name, int64_t *value)
+{
+	return error_payload_get_int(&e->payload, name, value);
+}
+
+static inline void
+error_set_int(struct error *e, const char *name, int64_t value)
+{
+	error_payload_set_int(&e->payload, name, value);
+}
+
+static inline bool
+error_get_double(const struct error *e, const char *name, double *value)
+{
+	return error_payload_get_double(&e->payload, name, value);
+}
+
+static inline void
+error_set_double(struct error *e, const char *name, double value)
+{
+	error_payload_set_double(&e->payload, name, value);
+}
+
+static inline bool
+error_get_bool(const struct error *e, const char *name, bool *value)
+{
+	return error_payload_get_bool(&e->payload, name, value);
+}
+
+static inline void
+error_set_bool(struct error *e, const char *name, bool value)
+{
+	error_payload_set_bool(&e->payload, name, value);
+}
+
+static inline bool
+error_get_uuid(const struct error *e, const char *name, struct tt_uuid *value)
+{
+	return error_payload_get_uuid(&e->payload, name, value);
+}
+
+static inline void
+error_set_uuid(struct error *e, const char *name, const struct tt_uuid *value)
+{
+	error_payload_set_uuid(&e->payload, name, value);
+}
+
+static inline const char *
+error_get_mp(const struct error *e, const char *name, uint32_t *size)
+{
+	return error_payload_get_mp(&e->payload, name, size);
+}
+
+static inline void
+error_set_mp(struct error *e, const char *name, const char *src, uint32_t size)
+{
+	error_payload_set_mp(&e->payload, name, src, size);
+}
+
+static inline void
+error_clear_field(struct error *e, const char *name)
+{
+	error_payload_clear(&e->payload, name);
+}
+
+static inline void
+error_move_payload(struct error *e, struct error_payload *src)
+{
+	error_payload_move(&e->payload, src);
+}
+
+const struct error_field *
+error_find_field(const struct error *e, const char *name);
 
 /**
  * Unlink error from its effect. For instance:
@@ -152,30 +260,36 @@ error_unlink_effect(struct error *e)
 int
 error_set_prev(struct error *e, struct error *prev);
 
-NORETURN static inline void
-error_raise(struct error *e)
-{
-	e->raise(e);
-	unreachable();
-}
-
-static inline void
-error_log(struct error *e)
-{
-	e->log(e);
-}
+/** Log error. */
+void
+error_log(const struct error *e);
 
 void
-error_create(struct error *e,
-	     error_f create, error_f raise, error_f log,
-	     const struct type_info *type, const char *file,
-	     unsigned line);
+error_create(struct error *e, error_f create, error_f raise,
+	     const struct type_info *type, const char *file, unsigned line);
+
+void
+error_set_location(struct error *e, const char *file, int line);
 
 void
 error_format_msg(struct error *e, const char *format, ...);
 
 void
 error_vformat_msg(struct error *e, const char *format, va_list ap);
+
+void
+error_append_msg(struct error *e, const char *format, ...);
+
+/*
+ * Print error string representation into the buffer. If string
+ * does not fit into the buffer then it is truncated and
+ * zero terminated.
+ *
+ * Return the size of the string (without trancation, 0-termination
+ * is not accounted).
+ */
+int
+error_to_string(const struct error *e, char *buf, int size);
 
 /**
  * Diagnostics Area - a container for errors
@@ -297,14 +411,6 @@ diag_last_error(struct diag *diag)
 struct diag *
 diag_get(void);
 
-NORETURN static inline void
-diag_raise(void)
-{
-	struct error *e = diag_last_error(diag_get());
-	assert(e != NULL);
-	error_raise(e);
-}
-
 static inline void
 diag_log(void)
 {
@@ -319,6 +425,8 @@ BuildOutOfMemory(const char *file, unsigned line, size_t amount,
 		 const char *object);
 struct error *
 BuildFiberIsCancelled(const char *file, unsigned line);
+struct error *
+BuildFiberSliceIsExceeded(const char *file, unsigned line);
 struct error *
 BuildTimedOut(const char *file, unsigned line);
 struct error *
@@ -337,41 +445,64 @@ struct error *
 BuildCryptoError(const char *file, unsigned line, const char *format, ...);
 struct error *
 BuildRaftError(const char *file, unsigned line, const char *format, ...);
-
-struct index_def;
-
 struct error *
-BuildUnsupportedIndexFeature(const char *file, unsigned line,
-			     struct index_def *index_def, const char *what);
+BuildEncodeError(const char *file, unsigned line, const char *format,
+		 const char *details);
+struct error *
+BuildDecodeError(const char *file, unsigned line, const char *format,
+		 const char *details);
+
+/**
+ * Allocate and create new FileFormatError. In case of OOM return OutOfMemory.
+ */
+struct error *
+BuildFileFormatError(const char *file, unsigned line, const char *format, ...);
+
 struct error *
 BuildSocketError(const char *file, unsigned line, const char *socketname,
 		 const char *format, ...);
 
-#define diag_set_detailed(file, line, class, ...) do {			\
+#define diag_set_detailed(file, line, class, ...) ({			\
 	/* Preserve the original errno. */                              \
 	int save_errno = errno;                                         \
-	say_debug("%s at %s:%i", #class, file, line);			\
 	struct error *e;						\
 	e = Build##class(file, line, ##__VA_ARGS__);			\
 	diag_set_error(diag_get(), e);					\
 	/* Restore the errno which might have been reset.  */           \
 	errno = save_errno;                                             \
-} while (0)
+	e;								\
+})
 
 #define diag_set(...)							\
 	diag_set_detailed(__FILE__, __LINE__, __VA_ARGS__)
 
-#define diag_add(class, ...) do {					\
+#define diag_add(class, ...) ({						\
 	int save_errno = errno;						\
-	say_debug("%s at %s:%i", #class, __FILE__, __LINE__);		\
 	struct error *e;						\
 	e = Build##class(__FILE__, __LINE__, ##__VA_ARGS__);		\
 	diag_add_error(diag_get(), e);					\
 	errno = save_errno;						\
-} while (0)
+	e;								\
+})
 
 #if defined(__cplusplus)
 } /* extern "C" */
+
+NORETURN static inline void
+error_raise(struct error *e)
+{
+	e->raise(e);
+	unreachable();
+}
+
+NORETURN static inline void
+diag_raise(void)
+{
+	struct error *e = diag_last_error(diag_get());
+	assert(e != NULL);
+	error_raise(e);
+}
+
 #endif /* defined(__cplusplus) */
 
 #endif /* TARANTOOL_LIB_CORE_DIAG_H_INCLUDED */

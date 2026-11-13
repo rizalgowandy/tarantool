@@ -63,6 +63,27 @@ struct vy_read_iterator {
 	 * checked to match the search key.
 	 */
 	bool need_check_eq;
+	/**
+	 * Set if (a) the iterator hasn't returned anything yet and (b) there
+	 * may be at most one tuple equal to the search key and the iterator
+	 * will return it if it exists (i.e. it's GE/LE/EQ/REQ). This flag
+	 * enables the optimization that skips deeper read sources if a tuple
+	 * exactly matching the search key is found.
+	 */
+	bool check_exact_match;
+	/** Set to true on the first iteration. */
+	bool is_started;
+	/**
+	 * Set to true if the statement that is about to be added to
+	 * the cache is the first one matching the iteration criteria.
+	 * See vy_read_iterator_cache_add().
+	 */
+	bool is_first_cached;
+	/**
+	 * LSN of the cache chain link following the last cached statement.
+	 * Used by vy_read_iterator_cache_add().
+	 */
+	int64_t cache_link_lsn;
 	/** Last statement returned by vy_read_iterator_next(). */
 	struct vy_entry last;
 	/**
@@ -128,12 +149,25 @@ struct vy_read_iterator {
  * @param iterator_type Type of the iterator that determines order
  *                      of the iteration.
  * @param key           Key for the iteration.
+ * @param last          Key to start the iteration after. Note, the iterator
+ *                      takes ownership of the entry: it will unref the entry
+ *                      when it's no longer needed.
  * @param rv            Read view.
  */
 void
+vy_read_iterator_open_after(struct vy_read_iterator *itr, struct vy_lsm *lsm,
+			    struct vy_tx *tx, enum iterator_type iterator_type,
+			    struct vy_entry key, struct vy_entry last,
+			    const struct vy_read_view **rv);
+
+static inline void
 vy_read_iterator_open(struct vy_read_iterator *itr, struct vy_lsm *lsm,
 		      struct vy_tx *tx, enum iterator_type iterator_type,
-		      struct vy_entry key, const struct vy_read_view **rv);
+		      struct vy_entry key, const struct vy_read_view **rv)
+{
+	vy_read_iterator_open_after(itr, lsm, tx, iterator_type, key,
+				    vy_entry_none(), rv);
+}
 
 /**
  * Get the next statement with another key, or start the iterator,
@@ -151,6 +185,8 @@ vy_read_iterator_next(struct vy_read_iterator *itr, struct vy_entry *result);
  * Add the last tuple returned by the read iterator to the cache.
  * @param itr   Read iterator
  * @param entry Last tuple returned by the iterator.
+ * @param skipped_lsn Max LSN among all full statements skipped because
+ *                    they didn't match the partial tuple key.
  *
  * We use a separate function for populating the cache rather than
  * doing that right in vy_read_iterator_next() so that we can store
@@ -162,9 +198,14 @@ vy_read_iterator_next(struct vy_read_iterator *itr, struct vy_entry *result);
  *   to the partial tuple returned by the iterator.
  * - Call vy_read_iterator_cache_add() on the full tuple to add
  *   the result to the cache.
+ *
+ * The skipped_lsn is used for the cache chain link. Basically, it's the max
+ * LSN over all deferred DELETE statements that fall between the previous and
+ * the current cache nodes.
  */
 void
-vy_read_iterator_cache_add(struct vy_read_iterator *itr, struct vy_entry entry);
+vy_read_iterator_cache_add(struct vy_read_iterator *itr, struct vy_entry entry,
+			   int64_t skipped_lsn);
 
 /**
  * Close the iterator and free resources.

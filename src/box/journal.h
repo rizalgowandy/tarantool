@@ -33,6 +33,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "salad/stailq.h"
+#include "vclock/vclock.h"
 #include "fiber.h"
 
 #if defined(__cplusplus)
@@ -40,9 +41,29 @@ extern "C" {
 #endif /* defined(__cplusplus) */
 
 struct xrow_header;
+struct journal;
+struct journal_checkpoint;
 struct journal_entry;
 
-typedef void (*journal_write_async_f)(struct journal_entry *entry);
+typedef void
+(*journal_on_write_f)(struct journal_entry *entry);
+
+typedef int
+(*journal_submit_f)(struct journal *journal, struct journal_entry *entry);
+
+typedef int
+(*journal_sync_f)(struct journal *journal, struct vclock *out);
+
+typedef void
+(*journal_on_cascading_rollback_f)(void);
+
+typedef int
+(*journal_begin_checkpoint_f)(struct journal *journal,
+			      struct journal_checkpoint *out);
+
+typedef void
+(*journal_commit_checkpoint_f)(struct journal *journal,
+			       const struct journal_checkpoint *out);
 
 enum {
 	/** Entry didn't attempt a journal write. */
@@ -54,6 +75,8 @@ enum {
 	 * entry.
 	 */
 	JOURNAL_ENTRY_ERR_CASCADE = -3,
+	/** Rollback due to fiber waiting for WAL is cancelled. */
+	JOURNAL_ENTRY_ERR_CANCELLED = -4,
 	/**
 	 * Anchor for the structs built on top of journal entry so as they
 	 * could introduce their own unique errors. Set to a big value in
@@ -93,14 +116,21 @@ struct journal_entry {
 	void *complete_data;
 	/** Flags that should be set for the last entry row. */
 	uint8_t flags;
-	/**
-	 * Asynchronous write completion function.
-	 */
-	journal_write_async_f write_async_cb;
+	/** Write completion function. */
+	journal_on_write_f on_write;
 	/**
 	 * Approximate size of this request when encoded.
 	 */
 	size_t approx_len;
+	/**
+	 * Set to true when execution of a batch that contains this
+	 * journal entry is completed.
+	 */
+	bool is_complete;
+	/**
+	 * Fiber which put the request in journal queue.
+	 */
+	struct fiber *fiber;
 	/**
 	 * The number of rows in the request.
 	 */
@@ -111,6 +141,25 @@ struct journal_entry {
 	struct xrow_header *rows[];
 };
 
+/**
+ * Journal checkpoint corresponds to a persisted consistent state of the whole
+ * instance which it can be recovered from.
+ */
+struct journal_checkpoint {
+	/**
+	 * VClock of the last record written to the journal at the moment of the
+	 * checkpoint creation.
+	 */
+	struct vclock vclock;
+	/**
+	 * Total size of journal entries written since the last checkpoint. In
+	 * an on-disk implementation of the journal it can be used, for
+	 * instance, for seeing how far away has the storage progressed since
+	 * the last checkpoint.
+	 */
+	int64_t tail_size;
+};
+
 struct region;
 
 /**
@@ -118,16 +167,17 @@ struct region;
  */
 static inline void
 journal_entry_create(struct journal_entry *entry, size_t n_rows,
-		     size_t approx_len,
-		     journal_write_async_f write_async_cb,
+		     size_t approx_len, journal_on_write_f on_write,
 		     void *complete_data)
 {
-	entry->write_async_cb	= write_async_cb;
+	entry->on_write = on_write;
 	entry->complete_data	= complete_data;
 	entry->approx_len	= approx_len;
 	entry->n_rows		= n_rows;
 	entry->res		= JOURNAL_ENTRY_ERR_UNKNOWN;
 	entry->flags		= 0;
+	entry->is_complete = false;
+	entry->fiber = NULL;
 }
 
 /**
@@ -137,7 +187,7 @@ journal_entry_create(struct journal_entry *entry, size_t n_rows,
  */
 struct journal_entry *
 journal_entry_new(size_t n_rows, struct region *region,
-		  journal_write_async_f write_async_cb,
+		  journal_on_write_f on_write,
 		  void *complete_data);
 
 /**
@@ -152,14 +202,8 @@ struct journal_queue {
 	int64_t max_size;
 	/** Current approximate size of journal queue. */
 	int64_t size;
-	/**
-	 * The fibers waiting for some space to free in journal queue.
-	 * Once some space is freed they will be waken up in the same order they
-	 * entered the queue.
-	 */
-	struct rlist waiters;
-	/** How many waiters there are in a queue. */
-	int waiter_count;
+	/** The requests waiting in journal queue. */
+	struct stailq requests;
 };
 
 /** A single queue for all journal instances. */
@@ -172,45 +216,29 @@ extern struct journal_queue journal_queue;
  */
 struct journal {
 	/** Asynchronous write */
-	int (*write_async)(struct journal *journal,
-			   struct journal_entry *entry);
-
-	/** Synchronous write */
-	int (*write)(struct journal *journal,
-		     struct journal_entry *entry);
+	journal_submit_f submit;
+	/** Ensure all the currently queued requests are written. */
+	journal_sync_f sync;
+	/** Begin a journal checkpoint. */
+	journal_begin_checkpoint_f begin_checkpoint;
+	/** Finish a journal checkpoint. */
+	journal_commit_checkpoint_f commit_checkpoint;
 };
 
 /** Wake the journal queue up. */
 void
 journal_queue_wakeup(void);
 
-/**
- * Check whether anyone is waiting for the journal queue to empty. If there are
- * other waiters we must go after them to preserve write order.
- */
-static inline bool
-journal_queue_has_waiters(void)
-{
-	return journal_queue.waiter_count != 0;
-}
-
-/**
- * Check whether any of the queue size limits is reached.
- * If the queue is full, we must wait for some of the entries to be written
- * before proceeding with a new asynchronous write request.
- */
-static inline bool
-journal_queue_is_full(void)
-{
-	return journal_queue.size >= journal_queue.max_size;
-}
-
 /** Yield until there's some space in the journal queue. */
-void
-journal_queue_wait(void);
+int
+journal_queue_wait(struct journal_entry *entry);
 
-/** Empty the queue by waking everyone in it up and put self to queue tail. */
-void
+/**
+ * Make sure the volatile journal queue is emptied (either sent to WAL or rolled
+ * back). Keep in mind that it doesn't guarantee the success of the flushed
+ * entries.
+ */
+int
 journal_queue_flush(void);
 
 /** Set maximal journal queue size in bytes. */
@@ -236,17 +264,20 @@ journal_queue_on_complete(const struct journal_entry *entry)
 	assert(journal_queue.size >= 0);
 }
 
+/** Rollback all txns waiting in queue. */
+void
+journal_queue_rollback(void);
+
 /**
  * Complete asynchronous write.
  */
 static inline void
 journal_async_complete(struct journal_entry *entry)
 {
-	assert(entry->write_async_cb != NULL);
-
+	assert(entry->on_write != NULL);
+	entry->is_complete = true;
 	journal_queue_on_complete(entry);
-
-	entry->write_async_cb(entry);
+	entry->on_write(entry);
 }
 
 /**
@@ -254,19 +285,24 @@ journal_async_complete(struct journal_entry *entry)
  * points at a concrete implementation of the journal.
  */
 extern struct journal *current_journal;
-
 /**
- * Write a single entry to the journal in synchronous way.
- *
- * @return 0 if write was processed by a backend or -1 in case of an error.
+ * The callback invoked when the journal is about to perform a cascading
+ * rollback. It is expected that all the newer txns which might be prepared but
+ * not yet visible to the journal would get rolled back as well when this
+ * callback is fired.
  */
-static inline int
-journal_write(struct journal_entry *entry)
-{
-	journal_queue_flush();
-	journal_queue_on_append(entry);
+extern journal_on_cascading_rollback_f journal_on_cascading_rollback;
 
-	return current_journal->write(current_journal, entry);
+/** Write a single row in a blocking way. */
+int
+journal_write_row(struct xrow_header *row);
+
+/** Checks whether journal_write_submit() call will yield. */
+static inline bool
+journal_queue_would_block(void)
+{
+	return journal_queue.size > journal_queue.max_size ||
+	       !stailq_empty(&journal_queue.requests);
 }
 
 /**
@@ -275,12 +311,50 @@ journal_write(struct journal_entry *entry)
  * @return 0 if write was queued to a backend or -1 in case of an error.
  */
 static inline int
-journal_write_try_async(struct journal_entry *entry)
+journal_write_submit(struct journal_entry *entry)
 {
-	journal_queue_wait();
+	if (journal_queue_wait(entry) != 0)
+		return -1;
+	/*
+	 * We cannot account entry after write. If journal is synchronous
+	 * the journal_queue_on_complete() is called in submit().
+	 */
 	journal_queue_on_append(entry);
+	if (current_journal->submit(current_journal, entry) != 0) {
+		journal_queue_on_complete(entry);
+		journal_queue_rollback();
+		return -1;
+	}
+	return 0;
+}
 
-	return current_journal->write_async(current_journal, entry);
+/** Write a single entry to the journal in synchronous way. */
+static inline int
+journal_write(struct journal_entry *entry)
+{
+	if (journal_write_submit(entry) != 0)
+		return -1;
+	while (!entry->is_complete)
+		fiber_yield();
+	return 0;
+}
+
+static inline int
+journal_sync(struct vclock *out)
+{
+	return current_journal->sync(current_journal, out);
+}
+
+static inline int
+journal_begin_checkpoint(struct journal_checkpoint *out)
+{
+	return current_journal->begin_checkpoint(current_journal, out);
+}
+
+static inline void
+journal_commit_checkpoint(const struct journal_checkpoint *c)
+{
+	current_journal->commit_checkpoint(current_journal, c);
 }
 
 /**
@@ -311,20 +385,20 @@ journal_set(struct journal *new_journal)
 }
 
 static inline void
-journal_create(struct journal *journal,
-	       int (*write_async)(struct journal *journal,
-				  struct journal_entry *entry),
-	       int (*write)(struct journal *journal,
-			    struct journal_entry *entry))
+journal_create(struct journal *journal, journal_submit_f submit,
+	       journal_sync_f sync, journal_begin_checkpoint_f begin_checkpoint,
+	       journal_commit_checkpoint_f commit_checkpoint)
 {
-	journal->write_async	= write_async;
-	journal->write		= write;
+	journal->submit = submit;
+	journal->sync = sync;
+	journal->begin_checkpoint = begin_checkpoint;
+	journal->commit_checkpoint = commit_checkpoint;
 }
 
 static inline bool
 journal_is_initialized(struct journal *journal)
 {
-	return journal->write != NULL;
+	return journal->submit != NULL;
 }
 
 #if defined(__cplusplus)

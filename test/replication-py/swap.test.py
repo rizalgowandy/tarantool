@@ -1,10 +1,7 @@
 from __future__ import print_function
 
 import os
-import tarantool
 from lib.tarantool_server import TarantoolServer
-import re
-import yaml
 
 REPEAT = 20
 ID_BEGIN = 0
@@ -43,7 +40,7 @@ master.uri = "{}:{}@{}".format(LOGIN, PASSWORD, master.iproto.uri)
 os.putenv("MASTER", master.uri)
 
 # replica server
-replica = TarantoolServer()
+replica = TarantoolServer(server.ini)
 replica.script = "replication-py/replica.lua"
 replica.vardir = server.vardir
 replica.deploy()

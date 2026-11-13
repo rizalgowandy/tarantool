@@ -37,6 +37,7 @@
 #include "field_def.h"
 #include "coll_id.h"
 #include "tuple_compare.h"
+#include "fiber.h"
 
 #if defined(__cplusplus)
 extern "C" {
@@ -57,13 +58,20 @@ struct key_part_def {
 	uint32_t fieldno;
 	/** Type of the tuple field. */
 	enum field_type type;
+	/** Extra parameters for parametric types like decimal32 etc. */
+	union field_type_params type_params;
 	/** Collation ID for string comparison. */
 	uint32_t coll_id;
 	/** True if a key part can store NULLs. */
 	bool is_nullable;
 	/** Action to perform if NULL constraint failed. */
 	enum on_conflict_action nullable_action;
-	/** Part sort order. */
+	/**
+	 * Part sort order. key_part_def can have "undef" sort order, but when
+	 * key_part is created, the "undef" sort order is translated to "asc",
+	 * so, unlike key_part_def, only "asc" and "desc" values are possible
+	 * in the key_part.
+	 */
 	enum sort_order sort_order;
 	/**
 	 * JSON path to indexed data, relative to the field number,
@@ -83,6 +91,8 @@ struct key_part {
 	uint32_t fieldno;
 	/** Type of the tuple field */
 	enum field_type type;
+	/** Extra parameters for parametric types like decimal32 etc. */
+	union field_type_params type_params;
 	/** Collation ID for string comparison. */
 	uint32_t coll_id;
 	/** Collation definition for string comparison */
@@ -150,19 +160,18 @@ typedef int (*tuple_compare_t)(struct tuple *tuple_a,
 typedef char *(*tuple_extract_key_t)(struct tuple *tuple,
 				     struct key_def *key_def,
 				     int multikey_idx,
-				     uint32_t *key_size);
+				     uint32_t *key_size,
+				     struct region *region);
 /** @copydoc tuple_extract_key_raw() */
 typedef char *(*tuple_extract_key_raw_t)(const char *data,
 					 const char *data_end,
 					 struct key_def *key_def,
 					 int multikey_idx,
-					 uint32_t *key_size);
+					 uint32_t *key_size,
+					 struct region *region);
 /** @copydoc tuple_hash() */
 typedef uint32_t (*tuple_hash_t)(struct tuple *tuple,
 				 struct key_def *key_def);
-/** @copydoc key_hash() */
-typedef uint32_t (*key_hash_t)(const char *key,
-				struct key_def *key_def);
 /** @copydoc tuple_hint() */
 typedef hint_t (*tuple_hint_t)(struct tuple *tuple,
 			       struct key_def *key_def);
@@ -182,8 +191,6 @@ struct key_def {
 	tuple_extract_key_raw_t tuple_extract_key_raw;
 	/** @see tuple_hash() */
 	tuple_hash_t tuple_hash;
-	/** @see key_hash() */
-	key_hash_t key_hash;
 	/** @see tuple_hint() */
 	tuple_hint_t tuple_hint;
 	/** @see key_hint() */
@@ -209,6 +216,8 @@ struct key_def {
 	bool is_multikey;
 	/** True if it is a functional index key definition. */
 	bool for_func_index;
+	/** True if it is unordered index key definition. */
+	bool is_unordered;
 	/**
 	 * True, if some key parts can be absent in a tuple. These
 	 * fields assumed to be MP_NIL.
@@ -274,7 +283,6 @@ struct key_def {
  * @param src Original key_def.
  *
  * @retval not NULL Duplicate of src.
- * @retval     NULL Memory error.
  */
 struct key_def *
 key_def_dup(const struct key_def *src);
@@ -305,33 +313,37 @@ typedef struct key_def box_key_def_t;
 enum {
 	BOX_KEY_PART_DEF_IS_NULLABLE = 1 << 0,
 	BOX_KEY_PART_DEF_EXCLUDE_NULL = 1 << 1,
+	BOX_KEY_PART_DEF_SORT_ORDER_DESC = 1 << 2,
 };
 
 /**
- * It is recommended to verify size of <box_key_part_def_t>
+ * It is recommended to verify size of box_key_part_def_t
  * against this constant on the module side at build time.
  * Example:
  *
- * | #if !defined(__cplusplus) && !defined(static_assert)
- * | #define static_assert _Static_assert
- * | #endif
- * |
- * | (slash)*
- * |  * Verify that <box_key_part_def_t> has the same size when
- * |  * compiled within tarantool and within the module.
- * |  *
- * |  * It is important, because the module allocates an array of key
- * |  * parts and passes it to <box_key_def_new_v2>() tarantool
- * |  * function.
- * |  *(slash)
- * | static_assert(sizeof(box_key_part_def_t) == BOX_KEY_PART_DEF_T_SIZE,
- * |               "sizeof(box_key_part_def_t)");
+ * \code
+ * #if !defined(__cplusplus) && !defined(static_assert)
+ * #define static_assert _Static_assert
+ * #endif
+ *
+ * (slash)*
+ *  * Verify that box_key_part_def_t has the same size when
+ *  * compiled within tarantool and within the module.
+ *  *
+ *  * It is important, because the module allocates an array of key
+ *  * parts and passes it to box_key_def_new_v2() tarantool
+ *  * function.
+ *  *(slash)
+ * static_assert(sizeof(box_key_part_def_t) == BOX_KEY_PART_DEF_T_SIZE,
+ *               "sizeof(box_key_part_def_t)");
+ * \endcode
  *
  * This snippet is not part of module.h, because portability of
  * static_assert() / _Static_assert() is dubious. It should be
  * decision of a module author how portable its code should be.
  */
 enum {
+	/** The constant. */
 	BOX_KEY_PART_DEF_T_SIZE = 64,
 };
 
@@ -339,22 +351,22 @@ enum {
  * Public representation of a key part definition.
  *
  * Usage: Allocate an array of such key parts, initialize each
- * key part (call <box_key_part_def_create>() and set necessary
- * fields), pass the array into <box_key_def_new_v2>() function.
+ * key part (call box_key_part_def_create() and set necessary
+ * fields), pass the array into box_key_def_new_v2() function.
  *
- * Important: A module should call <box_key_part_def_create>()
+ * Important: A module should call box_key_part_def_create()
  * to initialize the structure with default values. There is no
  * guarantee that all future default values for fields and flags
  * will be remain the same.
  *
- * The idea of separation from internal <struct key_part_def> is
+ * The idea of separation from internal "struct key_part_def" is
  * to provide stable API and ABI for modules.
  *
  * New fields may be added into the end of the structure in later
  * tarantool versions. Also new flags may be introduced within
- * <flags> field. <collation> cannot be changed to a union (to
+ * \a flags field. \a collation cannot be changed to a union (to
  * reuse for some other value), because it is verified even for
- * a non-string key part by <box_key_def_new_v2>().
+ * a non-string key part by box_key_def_new_v2().
  *
  * Fields that are unknown at given tarantool version are ignored
  * in general, but filled with zeros when initialized.
@@ -385,7 +397,7 @@ typedef union PACKED {
 		 *
 		 * => key: ["bar"]
 		 *
-		 * Note: When the path is given, <field_type>
+		 * Note: When the path is given, \a field_type
 		 * means type of the nested field.
 		 */
 		const char *path;
@@ -402,7 +414,7 @@ typedef union PACKED {
  *
  * May be used for tuple format creation and/or tuple comparison.
  *
- * \sa <box_key_def_new_v2>().
+ * \sa box_key_def_new_v2()
  *
  * \param fields array with key field identifiers
  * \param types array with key field types (see enum field_type)
@@ -418,17 +430,18 @@ box_key_def_new(uint32_t *fields, uint32_t *types, uint32_t part_count);
  *  | Field       | Default value   | Details |
  *  | ----------- | --------------- | ------- |
  *  | fieldno     | 0               |         |
- *  | flags       | <default flags> |         |
+ *  | flags       |\a default flags |         |
  *  | field_type  | NULL            | [^1]    |
  *  | collation   | NULL            |         |
  *  | path        | NULL            |         |
  *
  * Default flag values are the following:
  *
- *  | Flag                          | Default value |
- *  | ----------------------------- | ------------- |
- *  | BOX_KEY_PART_DEF_IS_NULLABLE  | 0 (unset)     |
- *  | BOX_KEY_PART_DEF_EXCLUDE_NULL | 0 (unset)     |
+ *  | Flag                             | Default value |
+ *  | -------------------------------- | ------------- |
+ *  | BOX_KEY_PART_DEF_IS_NULLABLE     | 0 (unset)     |
+ *  | BOX_KEY_PART_DEF_EXCLUDE_NULL    | 0 (unset)     |
+ *  | BOX_KEY_PART_DEF_SORT_ORDER_DESC | 0 (unset)     |
  *
  * Default values of fields and flags are permitted to be changed
  * in future tarantool versions. However we should be VERY
@@ -438,10 +451,10 @@ box_key_def_new(uint32_t *fields, uint32_t *types, uint32_t part_count);
  * validation, key extraction, comparisons and so on.
  *
  * All trailing padding bytes are set to zero. The same for
- * unknown <flags> bits.
+ * unknown \a flags bits.
  *
- * [^1]: <box_key_def_new_v2>() does not accept NULL as a
- *       <field_type>, so it should be filled explicitly.
+ * [^1]: box_key_def_new_v2() does not accept NULL as a
+ *       \a field_type, so it should be filled explicitly.
  */
 API_EXPORT void
 box_key_part_def_create(box_key_part_def_t *part);
@@ -449,14 +462,14 @@ box_key_part_def_create(box_key_part_def_t *part);
 /**
  * Create a key_def from given key parts.
  *
- * Unlike <box_key_def_new>() this function allows to define
+ * Unlike box_key_def_new() this function allows to define
  * nullability, collation and other options for each key part.
  *
- * <box_key_part_def_t> fields that are unknown at given tarantool
- * version are ignored. The same for unknown <flags> bits.
+ * box_key_part_def_t fields that are unknown at given tarantool
+ * version are ignored. The same for unknown \a flags bits.
  *
  * In case of an error set a diag and return NULL.
- * @sa <box_error_last>().
+ * @sa box_error_last()
  */
 API_EXPORT box_key_def_t *
 box_key_def_new_v2(box_key_part_def_t *parts, uint32_t part_count);
@@ -466,7 +479,6 @@ box_key_def_new_v2(box_key_part_def_t *parts, uint32_t part_count);
  * @param key_def Original key_def.
  *
  * @retval not NULL Duplicate of src.
- * @retval     NULL Memory error.
  */
 API_EXPORT box_key_def_t *
 box_key_def_dup(const box_key_def_t *key_def);
@@ -484,13 +496,13 @@ box_key_def_delete(box_key_def_t *key_def);
  *
  * The function allocates key parts and storage for pointer fields
  * (e.g. collation names) on the box region.
- * @sa <box_region_truncate>().
+ * @sa box_region_truncate()
  *
- * <box_key_part_def_t> fields that are unknown at given tarantool
- * version are set to zero. The same for unknown <flags> bits.
+ * box_key_part_def_t fields that are unknown at given tarantool
+ * version are set to zero. The same for unknown \a flags bits.
  *
  * In case of an error set a diag and return NULL.
- * @sa <box_error_last>().
+ * @sa box_error_last()
  */
 API_EXPORT box_key_part_def_t *
 box_key_def_dump_parts(const box_key_def_t *key_def, uint32_t *part_count_ptr);
@@ -505,7 +517,7 @@ box_key_def_dump_parts(const box_key_def_t *key_def, uint32_t *part_count_ptr);
  * @retval -1  The tuple is invalid.
  *
  * In case of an invalid tuple set a diag and return -1.
- * @sa <box_error_last>().
+ * @sa box_error_last()
  */
 API_EXPORT int
 box_key_def_validate_tuple(box_key_def_t *key_def, box_tuple_t *tuple);
@@ -522,11 +534,10 @@ box_key_def_validate_tuple(box_key_def_t *key_def, box_tuple_t *tuple);
 API_EXPORT int
 box_tuple_compare(box_tuple_t *tuple_a, box_tuple_t *tuple_b,
 		  box_key_def_t *key_def);
-
 /**
  * @brief Compare tuple with key using the key definition.
- * @param tuple tuple
- * @param key key with MessagePack array header
+ * @param tuple_a tuple
+ * @param key_b key with MessagePack array header
  * @param key_def key definition
  *
  * @retval 0  if key_fields(tuple) == parts(key)
@@ -550,7 +561,7 @@ box_tuple_compare_with_key(box_tuple_t *tuple_a, const char *key_b,
  * @retval NULL      Memory error.
  *
  * In case of an error set a diag and return NULL.
- * @sa <box_error_last>().
+ * @sa box_error_last()
  */
 API_EXPORT box_key_def_t *
 box_key_def_merge(const box_key_def_t *first, const box_key_def_t *second);
@@ -558,7 +569,7 @@ box_key_def_merge(const box_key_def_t *first, const box_key_def_t *second);
 /**
  * Extract key from tuple by given key definition and return
  * buffer allocated on the box region with this key.
- * @sa <box_region_truncate>().
+ * @sa box_region_truncate()
  *
  * This function has O(n) complexity, where n is the number of key
  * parts.
@@ -572,7 +583,7 @@ box_key_def_merge(const box_key_def_t *first, const box_key_def_t *second);
  * @retval NULL      Memory allocation error.
  *
  * In case of an error set a diag and return NULL.
- * @sa <box_error_last>().
+ * @sa box_error_last()
  */
 API_EXPORT char *
 box_key_def_extract_key(box_key_def_t *key_def, box_tuple_t *tuple,
@@ -598,7 +609,7 @@ box_key_def_extract_key(box_key_def_t *key_def, box_tuple_t *tuple,
  * @retval -1  The key is invalid.
  *
  * In case of an invalid key set a diag and return -1.
- * @sa <box_error_last>().
+ * @sa box_error_last()
  */
 API_EXPORT int
 box_key_def_validate_key(const box_key_def_t *key_def, const char *key,
@@ -611,7 +622,7 @@ box_key_def_validate_key(const box_key_def_t *key_def, const char *key,
  * respect to nullability.
  *
  * Imposes the same parts count in @a key as in @a key_def.
- * Absense of trailing key parts fails the check.
+ * Absence of trailing key parts fails the check.
  *
  * Note: nil is accepted for nullable fields, but only for them.
  *
@@ -623,7 +634,7 @@ box_key_def_validate_key(const box_key_def_t *key_def, const char *key,
  * @retval -1  The key is invalid.
  *
  * In case of an invalid key set a diag and return -1.
- * @sa <box_error_last>().
+ * @sa box_error_last()
  */
 API_EXPORT int
 box_key_def_validate_full_key(const box_key_def_t *key_def, const char *key,
@@ -648,20 +659,24 @@ key_def_sizeof(uint32_t part_count, uint32_t path_pool_size)
 	       path_pool_size;
 }
 
+enum key_def_new_flags {
+	KEY_DEF_FOR_FUNC_INDEX = 1 << 0,
+	KEY_DEF_UNORDERED = 1 << 1,
+};
+
 /**
  * Allocate a new key_def with the given part count
  * and initialize its parts.
  */
 struct key_def *
 key_def_new(const struct key_part_def *parts, uint32_t part_count,
-	    bool for_func_index);
+	    unsigned flags);
 
 /**
  * Dump part definitions of the given key def.
  * The region is used for allocating JSON paths, if any.
- * Return -1 on memory allocation error, 0 on success.
  */
-int
+void
 key_def_dump_parts(const struct key_def *def, struct key_part_def *parts,
 		   struct region *region);
 
@@ -713,7 +728,9 @@ key_def_decode_parts(struct key_part_def *parts, uint32_t part_count,
 		     uint32_t field_count, struct region *region);
 
 /**
- * Returns the part in index_def->parts for the specified fieldno.
+ * Returns the first part in index_def->parts for the specified fieldno.
+ * The part is returned regardless of whether it is indexed by JSON path or not.
+ *
  * If fieldno is not in index_def->parts returns NULL.
  */
 const struct key_part *
@@ -815,6 +832,22 @@ key_def_has_collation(const struct key_def *key_def)
 }
 
 /**
+ * Return true if any part of @a key_def is descending.
+ * @param key_def key_def
+ * @retval true if the key_def has descending parts
+ * @retval false otherwise
+ */
+static inline bool
+key_def_has_desc_parts(struct key_def *key_def)
+{
+	for (uint32_t part_id = 0; part_id < key_def->part_count; part_id++) {
+		if (key_def->parts[part_id].sort_order == SORT_ORDER_DESC)
+			return true;
+	}
+	return false;
+}
+
+/**
  * Return the first field type which can't be compared if @a key_def
  * has such. Otherwise return field_type_MAX value.
  */
@@ -835,23 +868,17 @@ key_def_incomparable_type(const struct key_def *key_def)
 /**
  * @brief Checks if \a field_type (MsgPack) is compatible \a type (KeyDef).
  * @param type KeyDef type
+ * @param type_params parametrized types parameters
  * @param key Pointer to MsgPack field to be tested.
  * @param field_no - a field number (is used to store an error message)
  *
  * @retval 0  mp_type is valid.
  * @retval -1 mp_type is invalid.
  */
-static inline int
-key_part_validate(enum field_type key_type, const char *key,
-		  uint32_t field_no, bool is_nullable)
-{
-	if (unlikely(!field_mp_type_is_compatible(key_type, key, is_nullable))) {
-		diag_set(ClientError, ER_KEY_PART_TYPE, field_no,
-			 field_type_strs[key_type]);
-		return -1;
-	}
-	return 0;
-}
+int
+key_part_validate(enum field_type key_type,
+		  const union field_type_params *type_params, const char *key,
+		  uint32_t field_no, bool is_nullable);
 
 /**
  * Compare two key part arrays.
@@ -879,6 +906,30 @@ bool
 tuple_key_contains_null(struct tuple *tuple, struct key_def *def,
 			int multikey_idx);
 
+/** Slow path of tuple_key_is_excluded(). */
+bool
+tuple_key_is_excluded_slow(struct tuple *tuple, struct key_def *def,
+			   int multikey_idx);
+
+/**
+ * Check if a tuple should be excluded from an index.
+ * @param tuple Tuple to check.
+ * @param def Key definition to check the tuple against.
+ * @param multikey_idx Multikey index hint.
+ * @retval true if the tuple key should be excluded from the index.
+ *
+ * We exclude a tuple if any of its key fields contains null and
+ * the index has the 'exclude_null' flag set.
+ */
+static inline bool
+tuple_key_is_excluded(struct tuple *tuple, struct key_def *def,
+		      int multikey_idx)
+{
+	if (likely(!def->has_exclude_null))
+		return false;
+	return tuple_key_is_excluded_slow(tuple, def, multikey_idx);
+}
+
 /**
  * Check that tuple fields match with given key definition
  * key_def.
@@ -892,8 +943,29 @@ int
 tuple_validate_key_parts(struct key_def *key_def, struct tuple *tuple);
 
 /**
+ * Check that raw tuple fields match with given key definition.
+ *
+ * @retval 0  The tuple is valid.
+ * @retval -1 The tuple is invalid.
+ */
+int
+tuple_validate_key_parts_raw(struct key_def *key_def, const char *tuple);
+
+/**
+ * Same as tuple_extract_key but accept region to allocate result on.
+ */
+static inline char *
+tuple_extract_key_to_region(struct tuple *tuple, struct key_def *key_def,
+			    int multikey_idx, uint32_t *key_size,
+			    struct region *region)
+{
+	return key_def->tuple_extract_key(tuple, key_def, multikey_idx,
+					  key_size, region);
+}
+
+/**
  * Extract key from tuple by given key definition and return
- * buffer allocated on box_txn_alloc with this key. This function
+ * it on fiber gc. This function
  * has O(n) complexity, where n is the number of key parts.
  * @param tuple - tuple from which need to extract key
  * @param key_def - definition of key that need to extract
@@ -907,8 +979,20 @@ static inline char *
 tuple_extract_key(struct tuple *tuple, struct key_def *key_def,
 		  int multikey_idx, uint32_t *key_size)
 {
-	return key_def->tuple_extract_key(tuple, key_def, multikey_idx,
-					  key_size);
+	return tuple_extract_key_to_region(tuple, key_def, multikey_idx,
+					   key_size, &fiber()->gc);
+}
+
+/**
+ * Same as tuple_extract_key_raw but accept region to allocate result on.
+ */
+static inline char *
+tuple_extract_key_raw_to_region(const char *data, const char *data_end,
+				struct key_def *key_def, int multikey_idx,
+				uint32_t *key_size, struct region *region)
+{
+	return key_def->tuple_extract_key_raw(data, data_end, key_def,
+					      multikey_idx, key_size, region);
 }
 
 /**
@@ -930,15 +1014,29 @@ tuple_extract_key_raw(const char *data, const char *data_end,
 		      struct key_def *key_def, int multikey_idx,
 		      uint32_t *key_size)
 {
-	return key_def->tuple_extract_key_raw(data, data_end, key_def,
-					      multikey_idx, key_size);
+	return tuple_extract_key_raw_to_region(data, data_end, key_def,
+					       multikey_idx, key_size,
+					       &fiber()->gc);
 }
 
 /**
+ * @brief Compare two fields parts using a type definition
+ * @param field_a field
+ * @param field_b field
+ * @param field_type field type definition
+ * @retval 0  if field_a == field_b
+ * @retval <0 if field_a < field_b
+ * @retval >0 if field_a > field_b
+ */
+int
+tuple_compare_field(const char *field_a, const char *field_b,
+		    int8_t type, struct coll *coll);
+
+/**
  * Compare keys using the key definition and comparison hints.
- * @param key_a key parts with MessagePack array header
+ * @param key_a key parts without MessagePack array header
  * @param key_a_hint comparison hint of @a key_a
- * @param key_b key_parts with MessagePack array header
+ * @param key_b key_parts without MessagePack array header
  * @param key_b_hint comparison hint of @a key_b
  * @param key_def key definition
  *
@@ -947,8 +1045,8 @@ tuple_extract_key_raw(const char *data, const char *data_end,
  * @retval >0 if key_a > key_b
  */
 int
-key_compare(const char *key_a, hint_t key_a_hint,
-	    const char *key_b, hint_t key_b_hint,
+key_compare(const char *key_a, uint32_t part_count_a, hint_t key_a_hint,
+	    const char *key_b, uint32_t part_count_b, hint_t key_b_hint,
 	    struct key_def *key_def);
 
 /**
@@ -995,6 +1093,9 @@ tuple_compare_with_key(struct tuple *tuple, hint_t tuple_hint,
 					       part_count, key_hint, key_def);
 }
 
+uint32_t
+tuple_hash_null(uint32_t *ph1, uint32_t *pcarry);
+
 /**
  * Compute hash of a tuple field.
  * @param ph1 - pointer to running hash
@@ -1038,16 +1139,25 @@ tuple_hash(struct tuple *tuple, struct key_def *key_def)
 }
 
 /**
+ * Calculates a hash value for a multikey tuple entry, consistently with
+ * key_hash() of the extracted key.
+ * @param tuple - a tuple
+ * @param key_def - key_def for field description
+ * @param multikey_idx - multikey index of the entry
+ * @return - hash value
+ */
+uint32_t
+tuple_hash_multikey(struct tuple *tuple, struct key_def *key_def,
+		    int multikey_idx);
+
+/**
  * Calculate a common hash value for a key
  * @param key - full key (msgpack fields w/o array marker)
  * @param key_def - key_def for field description
  * @return - hash value
  */
-static inline uint32_t
-key_hash(const char *key, struct key_def *key_def)
-{
-	return key_def->key_hash(key, key_def);
-}
+uint32_t
+key_hash(const char *key, struct key_def *key_def);
 
  /*
  * Get comparison hint for a tuple.

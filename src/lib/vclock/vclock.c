@@ -45,13 +45,13 @@ vclock_follow(struct vclock *vclock, uint32_t replica_id, int64_t lsn)
 	int64_t prev_lsn = vclock_get(vclock, replica_id);
 	assert(lsn > prev_lsn);
 	/* Easier add each time than check. */
-	vclock->map |= 1 << replica_id;
+	vclock->map |= 1U << replica_id;
 	vclock->lsn[replica_id] = lsn;
 	vclock->signature += lsn - prev_lsn;
 	return prev_lsn;
 }
 
-static int
+int
 vclock_snprint(char *buf, int size, const struct vclock *vclock)
 {
 	int total = 0;
@@ -73,10 +73,8 @@ vclock_snprint(char *buf, int size, const struct vclock *vclock)
 const char *
 vclock_to_string(const struct vclock *vclock)
 {
-	char *buf = tt_static_buf();
-	if (vclock_snprint(buf, TT_STATIC_BUF_LEN, vclock) < 0)
-		return "<failed to format vclock>";
-	return buf;
+	assert(TT_STATIC_BUF_LEN > VCLOCK_STR_LEN_MAX);
+	return TOSTR(vclock_snprint, vclock);
 }
 
 size_t
@@ -130,7 +128,7 @@ vclock_from_string(struct vclock *vclock, const char *str)
 			    replica_id >= VCLOCK_MAX ||
 			    vclock_get(vclock, replica_id) > 0)
 				goto error;
-			vclock->map |= 1 << replica_id;
+			vclock->map |= 1U << replica_id;
 			vclock->lsn[replica_id] = lsn;
 			goto comma;
 		}
@@ -173,6 +171,38 @@ vclockset_node_compare(const struct vclock *a, const struct vclock *b)
 	if (res == VCLOCK_ORDER_UNDEFINED)
 		return 0;
 	return res;
+}
+
+int64_t
+vclock_nth_element(const struct vclock *vclock, uint32_t n)
+{
+	if (n >= vclock_size(vclock))
+		return -1;
+	struct vclock_iterator it1, it2;
+
+	vclock_iterator_init(&it1, vclock);
+	vclock_foreach(&it1, vc1) {
+		uint32_t le = 0, leq = 0;
+		vclock_iterator_init(&it2, vclock);
+		vclock_foreach(&it2, vc2) {
+			le += vc2.lsn < vc1.lsn;
+			leq += vc2.lsn <= vc1.lsn;
+		}
+		if (le <= n && n < leq)
+			return vc1.lsn;
+	}
+	unreachable();
+}
+
+int
+vclock_count_ge(const struct vclock *vclock, int64_t lsn)
+{
+	int count = 0;
+	struct vclock_iterator it;
+	vclock_iterator_init(&it, vclock);
+	vclock_foreach(&it, vc1)
+		count += vc1.lsn >= lsn;
+	return count;
 }
 
 rb_gen(, vclockset_, vclockset_t, struct vclock, link, vclockset_node_compare);

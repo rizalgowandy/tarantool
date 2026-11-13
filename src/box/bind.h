@@ -40,11 +40,12 @@ extern "C" {
 #include <stdlib.h>
 
 #include "msgpuck.h"
-#include "decimal.h"
-#include "uuid/tt_uuid.h"
+#include "core/decimal.h"
 #include "mp_extension_types.h"
+#include "tt_uuid.h"
+#include "datetime.h"
 
-struct sql_stmt;
+struct Vdbe;
 
 /**
  * Name and value of an SQL prepared statement parameter.
@@ -74,6 +75,10 @@ struct sql_bind {
 		const char *s;
 		struct tt_uuid uuid;
 		decimal_t dec;
+		/** DATETIME value. */
+		struct datetime dt;
+		/** INTERVAL value. */
+		struct interval itv;
 	};
 };
 
@@ -114,17 +119,16 @@ int
 sql_bind_decode(struct sql_bind *bind, int i, const char **packet);
 
 /**
- * Bind SQL parameter value to its position.
+ * Bind SQL parameter type to its position.
  * @param stmt Prepared statement.
- * @param p Parameter value.
+ * @param p Parameter value contained by the type.
  * @param pos Ordinal bind position.
  *
  * @retval  0 Success.
  * @retval -1 SQL error.
  */
 int
-sql_bind_column(struct sql_stmt *stmt, const struct sql_bind *p,
-		uint32_t pos);
+sql_bind_column(struct Vdbe *stmt, const struct sql_bind *p, uint32_t pos);
 
 /**
  * Bind parameter values to the prepared statement.
@@ -135,18 +139,16 @@ sql_bind_column(struct sql_stmt *stmt, const struct sql_bind *p,
  * @retval  0 Success.
  * @retval -1 Client or memory error.
  */
-static inline int
-sql_bind(struct sql_stmt *stmt, const struct sql_bind *bind,
-	 uint32_t bind_count)
-{
-	assert(stmt != NULL);
-	uint32_t pos = 1;
-	for (uint32_t i = 0; i < bind_count; pos = ++i + 1) {
-		if (sql_bind_column(stmt, &bind[i], pos) != 0)
-			return -1;
-	}
-	return 0;
-}
+int
+sql_bind(struct Vdbe *stmt, const struct sql_bind *bind, uint32_t bind_count);
+
+/**
+ * This function finds the position among bind variables
+ * whose name matches the specified one.
+ */
+uint32_t
+sql_bind_lookup(const struct sql_bind *bind, uint32_t bind_count,
+		const char *name);
 
 #if defined(__cplusplus)
 } /* extern "C" { */

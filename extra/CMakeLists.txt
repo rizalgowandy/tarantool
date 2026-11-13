@@ -1,6 +1,3 @@
-add_subdirectory(dist)
-add_subdirectory(luarocks)
-
 if (TARGET_OS_DARWIN)
 	# NOTE: need add execution 'plutil -lint org.tarantool.tarantool.plist
 	# to check syntax of plist file.
@@ -16,7 +13,7 @@ if (TARGET_OS_DARWIN)
 	configure_file(dmg/postflight.in postflight @ONLY)
 	configure_file(org.tarantool.in ${LUANCHD_PLIST} @ONLY)
 	# chmod +x 644
-	install (FILES ${CMAKE_BINARY_DIR}/extra/${LUANCHD_PLIST}
+	install (FILES ${PROJECT_BINARY_DIR}/extra/${LUANCHD_PLIST}
                  DESTINATION share/tarantool
          PERMISSIONS
          OWNER_READ OWNER_WRITE

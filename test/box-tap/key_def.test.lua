@@ -9,16 +9,17 @@ local key_def_lib = require('key_def')
 
 local usage_error = 'Bad params, use: key_def.new({' ..
                     '{fieldno = fieldno, type = type' ..
+                    '[, scale = <number>]' ..
                     '[, is_nullable = <boolean>]' ..
                     '[, exclude_null = <boolean>]' ..
+                    '[, sort_order = <string>]' ..
                     '[, path = <string>]' ..
                     '[, collation_id = <number>]' ..
                     '[, collation = <string>]}, ...}'
 
-local function coll_not_found(fieldno, collation)
+local function coll_not_found(collation)
     if type(collation) == 'number' then
-        return ('Wrong index options (field %d): ' ..
-               'collation was not found by ID'):format(fieldno)
+        return 'Wrong index part 1: collation not found by id'
     end
 
     return ('Unknown collation: "%s"'):format(collation)
@@ -30,6 +31,12 @@ local function set_key_part_defaults(parts)
         res[i] = table.copy(part)
         if res[i].is_nullable == nil then
             res[i].is_nullable = false
+        end
+        if res[i].exclude_null == nil then
+            res[i].exclude_null = false
+        end
+        if res[i].sort_order == nil then
+            res[i].sort_order = 'asc'
         end
     end
     return res
@@ -62,7 +69,7 @@ local key_def_new_cases = {
             type = 'string',
             collation_id = 2,
         }},
-        exp_err = coll_not_found(1, 2),
+        exp_err = coll_not_found(2),
     },
     {
         'Try to use collation before box.cfg{}',
@@ -71,7 +78,7 @@ local key_def_new_cases = {
             type = 'string',
             collation = 'unicode_ci',
         }},
-        exp_err = coll_not_found(1, 'unicode_ci'),
+        exp_err = coll_not_found('unicode_ci'),
     },
     function()
         -- For collations.
@@ -95,7 +102,7 @@ local key_def_new_cases = {
             type = 'string',
             collation_id = 999,
         }},
-        exp_err = coll_not_found(1, 999),
+        exp_err = coll_not_found(999),
     },
     {
         'Unknown collation name',
@@ -120,6 +127,15 @@ local key_def_new_cases = {
         'Two parameters',
         params = {{}, {}},
         exp_err = usage_error,
+    },
+    {
+        'Unknown sort order',
+        parts = {{
+            fieldno = 1,
+            type = 'string',
+            sort_order = 'invalid',
+        }},
+        exp_err = 'Unknown sort order: "invalid"',
     },
     {
         'Invalid JSON path',
@@ -183,7 +199,7 @@ local key_def_new_cases = {
 
 local test = tap.test('key_def')
 
-test:plan(#key_def_new_cases - 1 + 7)
+test:plan(#key_def_new_cases - 1 + 9)
 for _, case in ipairs(key_def_new_cases) do
     if type(case) == 'function' then
         case()
@@ -520,14 +536,15 @@ test:test('merge()', function(test)
     local key_def_cb = key_def_c:merge(key_def_b)
     local exp_parts = key_def_c:totable()
     exp_parts[#exp_parts + 1] = {type = 'number', fieldno = 3,
-        is_nullable = false}
+        is_nullable = false, exclude_null = false, sort_order = 'asc'}
     test:is_deeply(key_def_cb:totable(), exp_parts,
         'case 3: verify with :totable()')
     test:is_deeply(key_def_cb:extract_key(tuple_a):totable(),
         {1, 1, box.NULL, 22}, 'case 3: verify with :extract_key()')
 
     local parts_unsigned = {
-        {type = 'unsigned', fieldno = 1, is_nullable = false},
+        {type = 'unsigned', fieldno = 1, is_nullable = false,
+         exclude_null = false, sort_order = 'asc'},
     }
     local key_def_unsigned = key_def_lib.new(parts_unsigned)
     local key_def_string = key_def_lib.new({
@@ -550,12 +567,52 @@ test:test('merge()', function(test)
 
     local key_def_array_map = key_def_array:merge(key_def_map)
     local exp_parts = {
-        {type = 'array', fieldno = 1, is_nullable = false},
-        {type = 'unsigned', fieldno = 2, is_nullable = false},
-        {type = 'map', fieldno = 3, is_nullable = true},
+        {type = 'array', fieldno = 1, is_nullable = false,
+         exclude_null = false, sort_order = 'asc'},
+        {type = 'unsigned', fieldno = 2, is_nullable = false,
+         exclude_null = false, sort_order = 'asc'},
+        {type = 'map', fieldno = 3, is_nullable = true,
+         exclude_null = false, sort_order = 'asc'},
     }
     test:is_deeply(key_def_array_map:totable(), exp_parts,
         'composite case')
+end)
+
+-- Check the usage error messages.
+test:test('Usage errors', function(test)
+    test:plan(5)
+    -- key_def_lib.new() is tested above.
+    test:is_deeply({pcall(key_def_lib.extract_key)},
+                   {false, 'Usage: key_def:extract_key(tuple)'},
+                   'extract_key()')
+    test:is_deeply({pcall(key_def_lib.compare)},
+                   {false, 'Usage: key_def:compare(tuple_a, tuple_b)'},
+                   'compare()')
+    test:is_deeply({pcall(key_def_lib.compare_with_key)},
+                   {false, 'Usage: key_def:compare_with_key(tuple, key)'},
+                   'compare_with_key()')
+    test:is_deeply({pcall(key_def_lib.merge)},
+                   {false, 'Usage: key_def:merge(second_key_def)'},
+                   'merge()')
+    test:is_deeply({pcall(key_def_lib.totable)},
+                   {false, 'Usage: key_def:totable()'},
+                   'totable()')
+end)
+
+-- Check key_def:part_count
+test:test('Key_def part_count', function(test)
+    test:plan(4)
+    local kd = key_def_lib.new({
+        {fieldno = 2, type = 'unsigned'}, {fieldno = 4, type = 'string'}
+    })
+    test:ok(kd, 'instance created')
+    test:is(#kd, 2, 'part_count')
+
+    local kd = key_def_lib.new({
+        {fieldno = 22, type = 'string'},
+    })
+    test:ok(kd, 'instance created')
+    test:is(#kd, 1, 'part_count')
 end)
 
 os.exit(test:check() and 0 or 1)

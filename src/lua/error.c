@@ -34,7 +34,7 @@
 #include <fiber.h>
 #include "utils.h"
 
-uint32_t CTID_CONST_STRUCT_ERROR_REF = 0;
+__thread uint32_t CTID_CONST_STRUCT_ERROR_REF = 0;
 
 struct error *
 luaL_iserror(struct lua_State *L, int narg)
@@ -54,12 +54,14 @@ luaL_iserror(struct lua_State *L, int narg)
 }
 
 struct error *
-luaL_checkerror(struct lua_State *L, int narg)
+luaT_checkerror(struct lua_State *L, int narg)
 {
 	struct error *error = luaL_iserror(L, narg);
 	if (error == NULL)  {
-		luaL_error(L, "Invalid argument #%d (error expected, got %s)",
-			   narg, lua_typename(L, lua_type(L, narg)));
+		diag_set(IllegalParams,
+			 "Invalid argument #%d (error expected, got %s)",
+			 narg, lua_typename(L, lua_type(L, narg)));
+		luaT_error(L);
 	}
 	return error;
 }
@@ -67,7 +69,7 @@ luaL_checkerror(struct lua_State *L, int narg)
 static int
 luaL_error_gc(struct lua_State *L)
 {
-	struct error *error = luaL_checkerror(L, 1);
+	struct error *error = luaT_checkerror(L, 1);
 	error_unref(error);
 	return 0;
 }
@@ -93,15 +95,44 @@ luaT_pusherror(struct lua_State *L, struct error *e)
 	luaL_setcdatagc(L, -2);
 }
 
+void
+luaT_error_set_trace(lua_State *L, int level, struct error *error)
+{
+	const char *file = "";
+	unsigned line = 0;
+	lua_Debug info;
+	if (level > 0 &&
+	    lua_getstack(L, level, &info) &&
+	    lua_getinfo(L, "Sl", &info)) {
+		if (*info.short_src) {
+			file = info.short_src;
+		} else if (*info.source) {
+			file = info.source;
+		} else {
+			file = "eval";
+		}
+		line = info.currentline;
+	}
+	error_set_location(error, file, line);
+}
+
 int
-luaT_error(lua_State *L)
+luaT_error_at(lua_State *L, int level)
 {
 	struct error *e = diag_last_error(&fiber()->diag);
 	assert(e != NULL);
+	if (level > 0)
+		luaT_error_set_trace(L, level, e);
 	luaT_pusherror(L, e);
 	lua_error(L);
 	unreachable();
 	return 0;
+}
+
+int
+luaT_error(lua_State *L)
+{
+	return luaT_error_at(L, 1);
 }
 
 int

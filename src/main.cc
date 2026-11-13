@@ -43,16 +43,16 @@
 #include <sys/resource.h>
 #include <pwd.h>
 #include <unistd.h>
-#include <getopt.h>
 #include <locale.h>
 #include <libgen.h>
 #include <sysexits.h>
-#if defined(TARGET_OS_LINUX) && defined(HAVE_PRCTL_H)
+#if TARGET_OS_LINUX && defined(HAVE_PRCTL_H)
 # include <sys/prctl.h>
 #endif
 #include "fiber.h"
 #include "cbus.h"
 #include "coio_task.h"
+#include "cord_buf.h"
 #include <crc32.h>
 #include "memory.h"
 #include <say.h>
@@ -62,7 +62,9 @@
 #include "trivia/util.h"
 #include "backtrace.h"
 #include "tt_pthread.h"
+#include "tt_strerror.h"
 #include "lua/init.h"
+#include "box/flightrec.h"
 #include "box/box.h"
 #include "box/error.h"
 #include "small/small_features.h"
@@ -74,15 +76,22 @@
 #include "title.h"
 #include <libutil.h>
 #include "box/lua/init.h" /* box_lua_init() */
+#include "box/lua/console.h"
 #include "box/session.h"
 #include "box/memtx_tx.h"
 #include "box/module_cache.h"
+#include "box/watcher.h"
 #include "systemd.h"
-#include "crypto/crypto.h"
+#include "core/ssl.h"
 #include "core/popen.h"
 #include "core/crash.h"
 #include "ssl_cert_paths_discover.h"
 #include "core/errinj.h"
+#include "core/clock_lowres.h"
+#include "lua/utils.h"
+#include "core/event.h"
+#include "on_shutdown.h"
+#include "tnt_thread.h"
 
 static pid_t master_pid = getpid();
 static struct pidfh *pid_file_handle;
@@ -91,16 +100,26 @@ static char *pid_file = NULL;
 static char **main_argv;
 static int main_argc;
 /** Signals handled after start as part of the event loop. */
-static ev_signal ev_sigs[5];
+static ev_signal ev_sigs[6];
 static const int ev_sig_count = sizeof(ev_sigs)/sizeof(*ev_sigs);
 
 static double start_time;
 
 /** A preallocated fiber to run on_shutdown triggers. */
 static struct fiber *on_shutdown_fiber = NULL;
-/** A flag restricting repeated execution of tarantool_exit(). */
-static bool is_shutting_down = false;
+/** A flag restricting repeated execution of start_shutdown(). */
+static bool shutdown_started = false;
+static bool shutdown_finished = false;
 static int exit_code = 0;
+
+char tarantool_path[PATH_MAX];
+
+/**
+ * We need to keep clock data locally to report uptime without binding
+ * to libev and etc. Because we're reporting information at the moment
+ * when crash happens and we are to be independent as much as we can.
+ */
+long tarantool_start_time;
 
 double
 tarantool_uptime(void)
@@ -108,45 +127,50 @@ tarantool_uptime(void)
 	return ev_monotonic_now(loop()) - start_time;
 }
 
-/**
- * Create a checkpoint from signal handler (SIGUSR1)
- */
-static int
-sig_checkpoint_f(va_list ap)
-{
-	(void)ap;
-	if (box_checkpoint() != 0)
-		diag_log();
-	return 0;
-}
-
 static void
-sig_checkpoint(ev_loop * /* loop */, struct ev_signal * /* w */,
-	     int /* revents */)
+signal_checkpoint(ev_loop *loop, struct ev_signal *w, int revents)
 {
-	struct fiber *f = fiber_new("checkpoint", sig_checkpoint_f);
-	if (f == NULL) {
-		say_warn("failed to allocate checkpoint fiber");
-		return;
-	}
-	fiber_wakeup(f);
+	(void)loop;
+	(void)revents;
+	say_info("got signal #%d (%s) from PID %ld, triggering checkpoint",
+		 w->signum, strsignal(w->signum), (long)w->sender_pid);
+	box_checkpoint_async();
 }
 
 static int
 on_shutdown_f(va_list ap)
 {
 	(void) ap;
-	trigger_fiber_run(&box_on_shutdown_trigger_list, NULL,
-			  on_shutdown_trigger_timeout);
+	/*
+	 * If event loop is not running, that means that on_shutdown_f was
+	 * called from the end of main. Return control back to main, which
+	 * will start an event loop and reschedule this fiber.
+	 */
+	if (ev_depth(loop()) == 0)
+		fiber_sleep(0.0);
+
+	/* Handle spurious wakeups. */
+	while (!shutdown_started)
+		fiber_yield();
+
+	if (on_shutdown_run_triggers() != 0) {
+		say_error("on_shutdown triggers failed");
+		diag_log();
+		diag_clear(diag_get());
+	}
+	box_shutdown();
+	tnt_thread_shutdown();
+	shutdown_finished = true;
 	ev_break(loop(), EVBREAK_ALL);
 	return 0;
 }
 
-void
-tarantool_exit(int code)
+/** Trigger Tarantool shutdown. */
+static void
+start_shutdown(int code)
 {
 	start_loop = false;
-	if (is_shutting_down) {
+	if (shutdown_started) {
 		/*
 		 * We are already running on_shutdown triggers,
 		 * and will exit as soon as they'll finish.
@@ -154,16 +178,30 @@ tarantool_exit(int code)
 		 */
 		return;
 	}
-	is_shutting_down = true;
+	shutdown_started = true;
 	exit_code = code;
-	fiber_call(on_shutdown_fiber);
+	box_broadcast_fmt("box.shutdown", "%b", true);
+	fiber_wakeup(on_shutdown_fiber);
+}
+
+/** Exit Tarantool. */
+static void
+tarantool_exit(int code)
+{
+	start_shutdown(code);
+	/*
+	 * Make sure we yield even if the code after exit() never yields.
+	 * After on_shutdown fiber completes, we will never wake up again.
+	 */
+	fiber_set_system(fiber(), true);
+	while (true)
+		fiber_sleep(TIMEOUT_INFINITY);
 }
 
 static void
 signal_cb(ev_loop *loop, struct ev_signal *w, int revents)
 {
 	(void) loop;
-	(void) w;
 	(void) revents;
 
 	/**
@@ -174,8 +212,23 @@ signal_cb(ev_loop *loop, struct ev_signal *w, int revents)
 	 * explicit in the log.
 	 */
 	if (pid_file)
-		say_crit("got signal %d - %s", w->signum, strsignal(w->signum));
-	tarantool_exit(0);
+		say_crit("got signal #%d (%s) from PID %ld", w->signum,
+			 strsignal(w->signum), (long)w->sender_pid);
+	start_shutdown(0);
+}
+
+/*
+ * Handle SIGINT like SIGTERM by default, but allow to overwrite the behavior.
+ * Used by console.
+ */
+static sigint_cb_t signal_sigint_cb = signal_cb;
+
+sigint_cb_t
+set_sigint_cb(sigint_cb_t new_sigint_cb)
+{
+	sigint_cb_t old_cb = signal_sigint_cb;
+	ev_set_cb(&ev_sigs[1], new_sigint_cb);
+	return old_cb;
 }
 
 static void
@@ -189,48 +242,34 @@ signal_sigwinch_cb(ev_loop *loop, struct ev_signal *w, int revents)
 }
 
 static void
+broadcast_sigusr2(ev_loop *loop, struct ev_signal *w, int revents)
+{
+	(void)loop;
+	(void)revents;
+	say_info("got signal #%d (%s) from PID %ld",
+		 w->signum, strsignal(w->signum), (long)w->sender_pid);
+	const char *key = "box.internal.SIGUSR2";
+	box_broadcast(key, strlen(key), NULL, 0);
+}
+
+static void
+signal_sighup_cb(ev_loop *loop, struct ev_signal *w, int revents)
+{
+	(void)loop;
+	(void)revents;
+	say_info("got signal #%d (%s) from PID %ld",
+		 w->signum, strsignal(w->signum), (long)w->sender_pid);
+	say_logrotate();
+	const char *key = "box.internal.SIGHUP";
+	box_broadcast(key, strlen(key), NULL, 0);
+}
+
+static void
 signal_free(void)
 {
 	int i;
 	for (i = 0; i < ev_sig_count; i++)
 		ev_signal_stop(loop(), &ev_sigs[i]);
-}
-
-/** Make sure the child has a default signal disposition. */
-static void
-signal_reset(void)
-{
-	for (int i = 0; i < ev_sig_count; i++)
-		ev_signal_stop(loop(), &ev_sigs[i]);
-
-	struct sigaction sa;
-
-	/* Reset all signals to their defaults. */
-	memset(&sa, 0, sizeof(sa));
-	sigemptyset(&sa.sa_mask);
-	sa.sa_handler = SIG_DFL;
-
-	if (sigaction(SIGUSR1, &sa, NULL) == -1 ||
-	    sigaction(SIGINT, &sa, NULL) == -1 ||
-	    sigaction(SIGTERM, &sa, NULL) == -1 ||
-	    sigaction(SIGHUP, &sa, NULL) == -1 ||
-	    sigaction(SIGWINCH, &sa, NULL) == -1)
-		say_syserror("sigaction");
-
-	crash_signal_reset();
-
-	/* Unblock any signals blocked by libev. */
-	sigset_t sigset;
-	sigfillset(&sigset);
-	if (sigprocmask(SIG_UNBLOCK, &sigset, NULL) == -1)
-		say_syserror("sigprocmask");
-}
-
-static void
-tarantool_atfork(void)
-{
-	signal_reset();
-	box_atfork();
 }
 
 /**
@@ -248,17 +287,17 @@ signal_init(void)
 	if (sigaction(SIGPIPE, &sa, 0) == -1)
 		panic_syserror("sigaction");
 
+	fiber_signal_init();
 	crash_signal_init();
 
-	ev_signal_init(&ev_sigs[0], sig_checkpoint, SIGUSR1);
-	ev_signal_init(&ev_sigs[1], signal_cb, SIGINT);
+	ev_signal_init(&ev_sigs[0], signal_checkpoint, SIGUSR1);
+	ev_signal_init(&ev_sigs[1], signal_sigint_cb, SIGINT);
 	ev_signal_init(&ev_sigs[2], signal_cb, SIGTERM);
 	ev_signal_init(&ev_sigs[3], signal_sigwinch_cb, SIGWINCH);
-	ev_signal_init(&ev_sigs[4], say_logrotate, SIGHUP);
+	ev_signal_init(&ev_sigs[4], signal_sighup_cb, SIGHUP);
+	ev_signal_init(&ev_sigs[5], broadcast_sigusr2, SIGUSR2);
 	for (int i = 0; i < ev_sig_count; i++)
 		ev_signal_start(loop(), &ev_sigs[i]);
-
-	(void) tt_pthread_atfork(NULL, NULL, tarantool_atfork);
 }
 
 /** Run in the background. */
@@ -273,6 +312,9 @@ daemonize(void)
 	fflush(stdin);
 	fflush(stdout);
 	fflush(stderr);
+
+	coio_prefork();
+
 	pid = fork();
 	switch (pid) {
 	case -1:
@@ -296,11 +338,7 @@ daemonize(void)
 	 */
 	ev_loop_fork(cord()->loop);
 
-	/*
-	 * reinit signals after fork, because fork() implicitly calls
-	 * signal_reset() via pthread_atfork() hook installed by signal_init().
-	 */
-	signal_init();
+	coio_postfork();
 
 	/* redirect stdin; stdout and stderr handled in say_logger_init */
 	fd = open("/dev/null", O_RDONLY);
@@ -358,7 +396,7 @@ load_cfg(void)
 			say_syserror("setrlimit");
 			exit(EX_OSERR);
 		}
-#if defined(TARGET_OS_LINUX) && defined(HAVE_PRCTL_H)
+#if TARGET_OS_LINUX && defined(HAVE_PRCTL_H)
 		if (prctl(PR_SET_DUMPABLE, 1, 0, 0, 0) < 0) {
 			say_syserror("prctl");
 			exit(EX_OSERR);
@@ -375,7 +413,7 @@ load_cfg(void)
 		if (!small_test_feature(SMALL_FEATURE_DONTDUMP)) {
 			static const char strip_msg[] =
 				"'strip_core' is set but unsupported";
-#ifdef TARGET_OS_LINUX
+#if TARGET_OS_LINUX
 			/*
 			 * Linux is known to support madvise(DONT_DUMP)
 			 * feature, thus warn on this platform only. The
@@ -391,7 +429,6 @@ load_cfg(void)
 
 	int background = cfg_geti("background");
 	const char *log = cfg_gets("log");
-	const char *log_format = cfg_gets("log_format");
 	pid_file = (char *)cfg_gets("pid_file");
 	if (pid_file != NULL) {
 		pid_file = abspath(pid_file);
@@ -439,11 +476,19 @@ load_cfg(void)
 	 * logger init must happen before daemonising in order for the error
 	 * to show and for the process to exit with a failure status
 	 */
-	say_logger_init(log,
-			cfg_geti("log_level"),
-			cfg_getb("log_nonblock"),
-			log_format,
-			background);
+	if (box_init_say() != 0) {
+		diag_log();
+		exit(EXIT_FAILURE);
+	}
+
+	/*
+	 * Initialize flight recorder after say logger as we might use
+	 * say API.
+	 */
+	if (box_set_flightrec() != 0) {
+		diag_log();
+		exit(EXIT_FAILURE);
+	}
 
 	memtx_tx_manager_use_mvcc_engine = cfg_getb("memtx_use_mvcc_engine");
 
@@ -454,8 +499,10 @@ load_cfg(void)
 	 * after (optional) daemonising to avoid confusing messages with
 	 * different pids
 	 */
-	say_crit("%s %s", tarantool_package(), tarantool_version());
-	say_crit("log level %i", cfg_geti("log_level"));
+	say_info("%s %s %s", tarantool_package(), tarantool_version(),
+		 BUILD_INFO);
+	int log_level = say_get_log_level();
+	say_info("log level %d (%s)", log_level, say_log_level_str(log_level));
 
 	if (pid_file_handle != NULL) {
 		if (pidfile_write(pid_file_handle) == -1)
@@ -467,10 +514,10 @@ load_cfg(void)
 	box_cfg();
 }
 
-void
+static void
 free_rl_state(void)
 {
-	/* tarantool_lua_free() was formerly reponsible for terminal reset,
+	/* tarantool_lua_free() was formerly responsible for terminal reset,
 	 * but it is no longer called
 	 */
 	if (isatty(STDIN_FILENO)) {
@@ -482,7 +529,7 @@ free_rl_state(void)
 	}
 }
 
-void
+static void
 tarantool_atexit(void)
 {
 	/* Same checks as in tarantool_free() */
@@ -495,7 +542,7 @@ tarantool_atexit(void)
 	free_rl_state();
 }
 
-void
+static void
 tarantool_free(void)
 {
 	/*
@@ -517,6 +564,9 @@ tarantool_free(void)
 	/* Shutdown worker pool. Waits until threads terminate. */
 	coio_shutdown();
 
+	box_lua_free();
+	/* Lua may have reference to engine tuples. */
+	tarantool_lua_free();
 	box_free();
 
 	title_free(main_argc, main_argv);
@@ -530,26 +580,26 @@ tarantool_free(void)
 	free(pid_file);
 	signal_free();
 #ifdef ENABLE_GCOV
-	__gcov_flush();
+	gcov_flush();
 #endif
+	tnt_thread_free();
 	cbus_free();
 #if 0
 	/*
 	 * This doesn't work reliably since things
 	 * are too interconnected.
 	 */
-	tarantool_lua_free();
 	session_free();
-	user_cache_free();
-	fiber_free();
-	memory_free();
-	random_free();
 #endif
-	crypto_free();
-	memtx_tx_manager_free();
+	event_free();
+	ssl_free();
 	coll_free();
 	systemd_free();
 	say_logger_free();
+	cord_buf_free();
+	fiber_free();
+	memory_free();
+	random_free();
 }
 
 static void
@@ -563,26 +613,132 @@ print_version(void)
 	printf("CXX_FLAGS:%s\n", TARANTOOL_CXX_FLAGS);
 }
 
+/**
+ * Yield Tarantool help message to the given stream.
+ */
 static void
-print_help(const char *program)
+print_help(FILE *stream)
 {
-	puts("Tarantool - a Lua application server");
-	puts("");
-	printf("Usage: %s script.lua [OPTIONS] [SCRIPT [ARGS]]\n", program);
-	puts("");
-	puts("All command line options are passed to the interpreted script.");
-	puts("When no script name is provided, the server responds to:");
-	puts("  -h, --help\t\t\tdisplay this help and exit");
-	puts("  -v, --version\t\t\tprint program version and exit");
-	puts("  -e EXPR\t\t\texecute string 'EXPR'");
-	puts("  -l NAME\t\t\trequire library 'NAME'");
-	puts("  -i\t\t\t\tenter interactive mode after executing 'SCRIPT'");
-	puts("  --\t\t\t\tstop handling options");
-	puts("  -\t\t\t\texecute stdin and stop handling options");
-	puts("");
-	puts("Please visit project home page at http://tarantool.org");
-	puts("to see online documentation, submit bugs or contribute a patch.");
+	static const char help_msg[] = "Tarantool %s\n"
+		"\n"
+		"----------------------------------------------------------\n"
+		"\n"
+		"The recommended way to work with Tarantool is to use tt\n"
+		"tool.\n"
+		"\n"
+		"Run a Tarantool instance:\n"
+		"\n"
+		"$ tt start <app name>:<instance name>\n"
+		"\n"
+		"Connect to an instance:\n"
+		"\n"
+		"$ tt connect <uri>\n"
+		"\n"
+		"Execute a Lua script:\n"
+		"\n"
+		"$ tt run [OPTIONS] script.lua [ARGS]\n"
+		"\n"
+		"Run an interactive Lua interpreter:\n"
+		"\n"
+		"$ tt run -i\n"
+		"\n"
+		"Please visit https://tarantool.io/tt to see online\n"
+		"documentation.\n"
+		"\n"
+		"----------------------------------------------------------\n"
+		"\n"
+		"At the lower level there are the following action options.\n"
+		"\n"
+		"-h\n"
+		"--help\n"
+		"\n"
+		"    Print this help message.\n"
+		"\n"
+		"-v, -V\n"
+		"--version\n"
+		"\n"
+		"    Print version and build information.\n"
+		"\n"
+		"--help-env-list\n"
+		"\n"
+		"    Print environment variables list.\n"
+		"\n"
+		"-n <...> [-c <...>]\n"
+		"--name <...> [--config <...>]\n"
+		"\n"
+		"    Start an instance.\n"
+		"\n"
+		"    The path to the configuration file can be omitted if a\n"
+		"    configuration is stored in etcd and TT_CONFIG_ETCD_*\n"
+		"    environment variables are set.\n"
+		"\n"
+		"<first positional argument> [<..more args..>]\n"
+		"\n"
+		"    Run a Lua script file. All the arguments after the\n"
+		"    script name are stored in the `arg` global value.\n"
+		"\n"
+		"    The file may be pointed as `-` to read the script from\n"
+		"    stdin.\n"
+		"\n"
+		"-e <..code..>\n"
+		"\n"
+		"    Run a Lua code.\n"
+		"\n"
+		"    It can be used on its own (as an action option) or\n"
+		"    together with another action option (as a modifier).\n"
+		"\n"
+		"-i\n"
+		"\n"
+		"    Run the interactive REPL.\n"
+		"\n"
+		"--failover\n"
+		"\n"
+		"    Run a failover coordinator service.\n"
+		"\n"
+		"    It is available in Tarantool Enterprise Edition.\n"
+		"\n"
+		"The following modifier options are applicable to actions.\n"
+		"\n"
+		"--force-recovery\n"
+		"\n"
+		"    Enable force-recovery mode at database loading.\n"
+		"\n"
+		"--integrity-check <path/to/hashes.json>\n"
+		"\n"
+		"    Enable integrity check and load hash sums.\n"
+		"\n"
+		"-l <module>\n"
+		"\n"
+		"    `require` Lua module <module> and set it the same named\n"
+		"    global variable.\n"
+		"\n"
+		"-j <cmd>\n"
+		"\n"
+		"    Perform LuaJIT control command <cmd>.\n"
+		"\n"
+		"-b <...>\n"
+		"\n"
+		"    Save or list bytecode.\n"
+		"\n"
+		"-d\n"
+		"\n"
+		"    Activate debugging session for a given script.\n"
+		"\n"
+		"--\n"
+		"\n"
+		"    End-of-options marker. All the arguments after the\n"
+		"    marker are interpreted as non-option ones.\n"
+		"\n"
+		"Please visit project home page at https://tarantool.io\n"
+		"to see online documentation.\n"
+		"\n"
+		"Visit https://github.com/tarantool/tarantool to submit bugs\n"
+		"or contribute a patch.\n";
+	fprintf(stream, help_msg, tarantool_version());
 }
+
+/* Instance configuration data. */
+static instance_state instance;
 
 int
 main(int argc, char **argv)
@@ -595,57 +751,176 @@ main(int argc, char **argv)
 	fpconv_check();
 
 	/* Enter interactive mode after executing 'script' */
-	bool interactive = false;
-	/* Lua interpeter options, e.g. -e and -l */
+	uint32_t opt_mask = 0;
+	/* Lua interpreter options, e.g. -e and -l */
 	int optc = 0;
 	const char **optv = NULL;
+	/* The maximum possible number of Lua interpreter options */
+	int optc_max = (argc - 1) * 2;
+	bool say_entering_the_event_loop = true;
 	auto guard = make_scoped_guard([&optc, &optv]{ if (optc) free(optv); });
 
 	static struct option longopts[] = {
 		{"help", no_argument, 0, 'h'},
 		{"version", no_argument, 0, 'v'},
+		{"config", required_argument, 0, 'c'},
+		{"name", required_argument, 0, 'n'},
+		/*
+		 * Use 'E' character as an indicator of the
+		 * --help-env-list option.
+		 *
+		 * Note: there is no -E short option, see the
+		 * `opts` variable below.
+		 *
+		 * An arbitrary `int` value that is not used for
+		 * another option may be used here. Feel free to
+		 * change it if -E short option should be added.
+		 */
+		{"help-env-list", no_argument, 0, 'E'},
+		{"force-recovery", no_argument, 0, 'F'},
+		{"integrity-check", required_argument, 0, 'I'},
+		/*
+		 * Use 'O' for --failover. See --help-env-list
+		 * above for details of the approach.
+		 */
+		{"failover", no_argument, 0, 'O'},
 		{NULL, 0, 0, 0},
 	};
-	static const char *opts = "+hVvie:l:";
+	static const char *opts = "+hVvb::ij:e:l:dc:n:";
 
 	int ch;
+	bool lj_arg = false;
 	while ((ch = getopt_long(argc, argv, opts, longopts, NULL)) != -1) {
 		switch (ch) {
+		case 'n':
+			/*
+			 * XXX: The given argument is copied to be
+			 * consistent with <getenv_safe> results.
+			 */
+			free((void *)instance.name);
+			instance.name = (const char *)xstrdup(optarg);
+			break;
+		case 'c':
+			/*
+			 * XXX: The given argument is copied to be
+			 * consistent with <getenv_safe> results.
+			 */
+			free((void *)instance.config);
+			instance.config = (const char *)xstrdup(optarg);
+			break;
 		case 'V':
 		case 'v':
 			print_version();
 			return 0;
 		case 'h':
-			print_help(basename(argv[0]));
+			print_help(stdout);
 			return 0;
+		case 'E':
+			opt_mask |= O_HELP_ENV_LIST;
+			break;
+		case 'F':
+			box_is_force_recovery = true;
+			break;
+		case 'I':
+#if ENABLE_INTEGRITY
+			opt_mask |= O_INTEGRITY;
+
+			/*
+			 * Reset all environment variables.
+			 * XXX: This is the most early spot to
+			 * reset the environment; if the error
+			 * occurs, execution cannot be proceed.
+			 */
+			if (clearenv() != 0) {
+				fprintf(stderr, "Environment is not reset, but "
+					"integrity check is enabled.\n");
+				return 1;
+			}
+
+			instance.hashes = optarg;
+			break;
+#else
+			fprintf(stderr, "--integrity-check CLI option is "
+				"available only in Tarantool "
+				"Enterprise Edition\n");
+			return EX_USAGE;
+#endif
+
 		case 'i':
 			/* Force interactive mode */
-			interactive = true;
+			opt_mask |= O_INTERACTIVE;
 			break;
-		case 'l':
+		case 'd':
+			opt_mask |= O_DEBUGGING;
+			break;
+		case 'b':
+			opt_mask |= O_BYTECODE;
+			/*
+			 * The bytecode option is met --
+			 * all subsequent options are
+			 * treated as its suboptions.
+			 */
+			lj_arg = true;
+			optind--;
+			break;
+		case 'O':
+#if ENABLE_FAILOVER
+			/*
+			 * No much sense to print this message for
+			 * a standalone failover coordinator
+			 * service.
+			 */
+			say_entering_the_event_loop = false;
+			opt_mask |= O_FAILOVER;
+			break;
+#else
+			fprintf(stderr, "--failover CLI option is available "
+				"only in Tarantool Enterprise Edition\n");
+			return EX_USAGE;
+#endif
 		case 'e':
+			opt_mask |= O_EXECUTE;
+			FALLTHROUGH;
+		case 'j':
+		case 'l':
 			/* Save Lua interepter options to optv as is */
-			if (optc == 0) {
-				optv = (const char **) calloc(argc,
-							      sizeof(optv[0]));
-				if (optv == NULL)
-					panic_syserror("No enough memory for arguments");
-			}
-			optv[optc++] = ch == 'l' ? "-l" : "-e";
+			if (optc == 0)
+				optv = (const char **)xcalloc(optc_max,
+							sizeof(optv[0]));
+			if (ch == 'l')
+				optv[optc++] = "-l";
+			else if (ch == 'j')
+				optv[optc++] = "-j";
+			else
+				optv[optc++] = "-e";
 			optv[optc++] = optarg;
 			break;
 		default:
 			/* "invalid option" is printed by getopt */
 			return EX_USAGE;
 		}
+
+		/* See the comment about the bytecode option above. */
+		if (lj_arg)
+			break;
 	}
+
+	if (instance.name == NULL)
+		instance.name = getenv_safe("TT_INSTANCE_NAME", NULL, 0);
+	if (instance.config == NULL)
+		instance.config = getenv_safe("TT_CONFIG", NULL, 0);
 
 	/* Shift arguments */
 	argc = 1 + (argc - optind);
 	for (int i = 1; i < argc; i++)
 		argv[i] = argv[optind + i - 1];
-
-	if (argc > 1 && strcmp(argv[1], "-") && access(argv[1], R_OK) != 0) {
+	/*
+	 * The corresponding check is omitted for `O_BYTECODE`
+	 * since it is present in `bcsave.lua` module, which
+	 * performs the bytecode dump.
+	 */
+	if (!(opt_mask & O_BYTECODE) && argc > 1 &&
+	    strcmp(argv[1], "-") && access(argv[1], R_OK) != 0) {
 		/*
 		 * Somebody made a mistake in the file
 		 * name. Be nice: open the file to set
@@ -655,13 +930,14 @@ main(int argc, char **argv)
 		int save_errno = errno;
 		if (fd >= 0)
 			close(fd);
-		printf("Can't open script %s: %s\n", argv[1], strerror(save_errno));
+		printf("Can't open script %s: %s\n",
+		       argv[1], tt_strerror(save_errno));
 		return save_errno;
 	}
 
 	argv = title_init(argc, argv);
 	/*
-	 * Support only #!/usr/bin/tarantol but not
+	 * Support only #!/usr/bin/tarantool but not
 	 * #!/usr/bin/tarantool -a -b because:
 	 * - not all shells support it,
 	 * - those shells that do support it, do not
@@ -671,7 +947,7 @@ main(int argc, char **argv)
 	 *   such options (in script line) don't work
 	 */
 
-	char *tarantool_bin = find_path(argv[0]);
+	const char *tarantool_bin = find_path(argv[0]);
 	if (!tarantool_bin)
 		tarantool_bin = argv[0];
 	if (argc > 1) {
@@ -680,8 +956,46 @@ main(int argc, char **argv)
 		script = argv[0];
 		title_set_script_name(argv[0]);
 	}
+	strlcpy(tarantool_path, tarantool_bin, sizeof(tarantool_path));
+	if (strlen(tarantool_path) < strlen(tarantool_bin))
+		panic("executable path is trimmed");
 
-	crash_init(tarantool_bin);
+	/*
+	 * The idea of the check below is that we can't run
+	 * tarantool without any action: there should be at least
+	 * one.
+	 *
+	 * There are the following actions.
+	 *
+	 * * Print a help message or a version (--help, --version;
+	 *   these actions are handled above).
+	 * * Print environment variables list (--help-env-list).
+	 * * Start an instance (with a name and a config).
+	 * * Run a script pointed by a positional argument or
+	 *   written using -e option.
+	 * * Start interactive REPL (-i).
+	 * * Start a failover coordinator (--failover).
+	 */
+	uint32_t action_opt_mask = O_INTERACTIVE | O_EXECUTE | O_HELP_ENV_LIST |
+		O_FAILOVER;
+	if (script == NULL && (opt_mask & action_opt_mask) == 0 &&
+	    instance.name == NULL) {
+		static const char misuse_msg[] = "Invalid usage: "
+			"please either provide a Lua script name\n"
+			"or specify an instance name to be started\n"
+			"or set -i CLI flag to spawn Lua REPL or run a\n"
+			"failover coordinator using --failover CLI option.\n\n"
+			;
+		fputs(misuse_msg, stderr);
+		print_help(stderr);
+		return EXIT_FAILURE;
+	}
+
+	struct timespec ts;
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+		tarantool_start_time = ts.tv_sec;
+	else
+		say_syserror("failed to get start time, ignore");
 
 	random_init();
 
@@ -691,18 +1005,17 @@ main(int argc, char **argv)
 	main_argc = argc;
 	main_argv = argv;
 
-	exception_init();
-
 	fiber_init(fiber_cxx_invoke);
 	popen_init();
 	coio_init();
 	coio_enable();
 	signal_init();
 	cbus_init();
+	tnt_thread_init();
 	coll_init();
-	memtx_tx_manager_init();
 	module_init();
-	crypto_init();
+	ssl_init();
+	event_init();
 	systemd_init();
 
 	const int override_cert_paths_env_vars = 0;
@@ -713,27 +1026,27 @@ main(int argc, char **argv)
 #ifndef NDEBUG
 	errinj_set_with_environment_vars();
 #endif
-	tarantool_lua_init(tarantool_bin, main_argc, main_argv);
+	/*
+	 * Pass either a configuration file or a script file to
+	 * configure Lua loaders paths.
+	 */
+	const char *config_or_script = instance.config != NULL ?
+		instance.config : script;
+	tarantool_lua_init(tarantool_bin, config_or_script, main_argc,
+			   main_argv);
+	tarantool_lua_exit_function = tarantool_exit;
 
 	start_time = ev_monotonic_time();
 
 	try {
 		box_init();
 		box_lua_init(tarantool_L);
+		tarantool_lua_postinit(tarantool_L);
 		/*
 		 * Reserve a fiber to run on_shutdown triggers.
-		 * Make sure the fiber is non-cancellable so that
-		 * it doesn't get woken up from Lua unintentionally.
 		 */
-		struct fiber_attr attr;
-		fiber_attr_create(&attr);
-		attr.flags &= ~FIBER_IS_CANCELLABLE;
-		on_shutdown_fiber = fiber_new_ex("on_shutdown",
-						 &attr,
-						 on_shutdown_f);
-		if (on_shutdown_fiber == NULL)
-			diag_raise();
-
+		on_shutdown_fiber = fiber_new_system("on_shutdown",
+						     on_shutdown_f);
 		/*
 		 * The call to tarantool_free() below, thanks to
 		 * on_shutdown triggers, works all the time
@@ -743,9 +1056,6 @@ main(int argc, char **argv)
 		 */
 		atexit(tarantool_atexit);
 
-		if (!loop())
-			panic("%s", "can't init event loop");
-
 		int events = ev_activecnt(loop());
 		/*
 		 * Load user init script.  The script should have access
@@ -753,8 +1063,8 @@ main(int argc, char **argv)
 		 * is why script must run only after the server was fully
 		 * initialized.
 		 */
-		if (tarantool_lua_run_script(script, interactive, optc, optv,
-					     main_argc, main_argv) != 0)
+		if (tarantool_lua_run_script(script, &instance, opt_mask, optc,
+					     optv, main_argc, main_argv) != 0)
 			diag_raise();
 		/*
 		 * Start event loop after executing Lua script if signal_cb()
@@ -762,10 +1072,15 @@ main(int argc, char **argv)
 		 * of start_loop can be set to false by signal_cb().
 		 */
 		start_loop = start_loop && ev_activecnt(loop()) > events;
-		region_free(&fiber()->gc);
 		if (start_loop) {
-			say_crit("entering the event loop");
+			if (say_entering_the_event_loop)
+				say_info("entering the event loop");
 			systemd_snotify("READY=1");
+			if (is_console_exited) {
+				printf("Exited console. Type Ctrl-C to exit "
+				       "Tarantool.\n");
+				fflush(stdout);
+			}
 			ev_now_update(loop());
 			ev_run(loop(), 0);
 		}
@@ -779,15 +1094,21 @@ main(int argc, char **argv)
 		panic("unknown exception");
 	}
 
+	ERROR_INJECT_SIGILL(ERRINJ_SIGILL_MAIN_THREAD);
 	if (start_loop)
-		say_crit("exiting the event loop");
+		say_info("exiting the event loop");
 	/*
-	 * If Tarantool was stopped using Ctrl+D, then we need to
-	 * call on_shutdown triggers, because Ctrl+D  causes not
-	 * any signals.
+	 * If Tarantool was stopped by Ctrl+D or by reaching the end of the
+	 * init script, and there was neither os.exit nor SIGTERM, then call
+	 * start_shutdown and start an event loop to run on_shutdown triggers.
 	 */
-	tarantool_exit(exit_code);
-	/* freeing resources */
+	if (!shutdown_started)
+		start_shutdown(exit_code);
+	if (!shutdown_finished)
+		ev_run(loop(), 0);
 	tarantool_free();
+	ERROR_INJECT(ERRINJ_WRITE_EXIT_CODE_TO_STDERR, {
+		fprintf(stderr, "Tarantool exited with code %d\n", exit_code);
+	});
 	return exit_code;
 }

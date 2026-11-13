@@ -48,7 +48,7 @@
 #include "coio_file.h"
 
 #define lbox_fio_pushsyserror(L) ({				\
-	diag_set(SystemError, "fio: %s", strerror(errno));	\
+	diag_set(SystemError, "fio");				\
 	luaT_push_nil_and_error(L);				\
 })
 
@@ -118,7 +118,7 @@ lbox_fio_pushbool(struct lua_State *L, bool res)
 {
 	lua_pushboolean(L, res);
 	if (!res) {
-		diag_set(SystemError, "fio: %s", strerror(errno));
+		diag_set(SystemError, "fio");
 		struct error *e = diag_last_error(diag_get());
 		assert(e != NULL);
 		luaT_pusherror(L, e);
@@ -212,6 +212,13 @@ lbox_fio_write(struct lua_State *L)
 static int
 lbox_fio_chown(struct lua_State *L)
 {
+	enum {
+#ifdef NDEBUG
+		START_BUF_LEN = 128,
+#else
+		START_BUF_LEN = 2,
+#endif
+	};
 	const char *pathname;
 	if (lua_gettop(L) < 3) {
 usage:
@@ -228,7 +235,15 @@ usage:
 		const char *username = lua_tostring(L, 2);
 		if (username == NULL)
 			username = "";
-		struct passwd *entry = getpwnam(username);
+		struct passwd pwbuf, *entry;
+		size_t buflen = START_BUF_LEN;
+		char *buf = xmalloc(buflen);
+		while (getpwnam_r(username, &pwbuf, buf, buflen,
+				  &entry) == ERANGE) {
+			buflen *= 2;
+			buf = xrealloc(buf, buflen);
+		}
+		free(buf);
 		if (!entry) {
 			errno = EINVAL;
 			lua_pushnil(L);
@@ -244,7 +259,15 @@ usage:
 		const char *groupname = lua_tostring(L, 3);
 		if (groupname == NULL)
 			groupname = "";
-		struct group *entry = getgrnam(groupname);
+		struct group grbuf, *entry;
+		size_t buflen = START_BUF_LEN;
+		char *buf = xmalloc(buflen);
+		while (getgrnam_r(groupname, &grbuf, buf, buflen,
+				  &entry) == ERANGE) {
+			buflen *= 2;
+			buf = xrealloc(buf, buflen);
+		}
+		free(buf);
 		if (!entry) {
 			errno = EINVAL;
 			lua_pushnil(L);
@@ -304,14 +327,6 @@ lbox_fio_lseek(struct lua_State *L)
 	return 1;
 }
 
-#if defined(__APPLE__)
-static int
-lbox_fio_pushtimespec(struct lua_State *L, const time_t *ts)
-{
-	lua_pushnumber(L, *ts);
-	return 1;
-}
-#else
 static int
 lbox_fio_pushtimespec(struct lua_State *L, const struct timespec *ts)
 {
@@ -320,7 +335,6 @@ lbox_fio_pushtimespec(struct lua_State *L, const struct timespec *ts)
 	lua_pushnumber(L, ts->tv_sec + nsec);
 	return 1;
 }
-#endif
 
 #define PUSHTABLE(name, method, value)	{	\
 	lua_pushliteral(L, name);		\
@@ -372,9 +386,9 @@ lbox_fio_pushstat(struct lua_State *L, int res, const struct stat *stat)
 	PUSHTABLE("blksize", lua_pushinteger, stat->st_blksize);
 	PUSHTABLE("blocks", lua_pushinteger, stat->st_blocks);
 	#if defined(__APPLE__)
-		PUSHTABLE("ctime", lbox_fio_pushtimespec, &stat->st_ctime);
-		PUSHTABLE("mtime", lbox_fio_pushtimespec, &stat->st_mtime);
-		PUSHTABLE("atime", lbox_fio_pushtimespec, &stat->st_atime);
+		PUSHTABLE("ctime", lbox_fio_pushtimespec, &stat->st_ctimespec);
+		PUSHTABLE("mtime", lbox_fio_pushtimespec, &stat->st_mtimespec);
+		PUSHTABLE("atime", lbox_fio_pushtimespec, &stat->st_atimespec);
 	#else
 		PUSHTABLE("ctime", lbox_fio_pushtimespec, &stat->st_ctim);
 		PUSHTABLE("mtime", lbox_fio_pushtimespec, &stat->st_mtim);
@@ -402,7 +416,7 @@ lbox_fio_pushstat(struct lua_State *L, int res, const struct stat *stat)
 #endif
 		{ NULL,			NULL				}
 	};
-	luaL_register(L, NULL, stat_methods);
+	luaL_setfuncs(L, stat_methods, 0);
 	lua_settable(L, -3);
 
 	lua_setmetatable(L, top);
@@ -617,21 +631,6 @@ lbox_fio_tempdir(struct lua_State *L)
 }
 
 static int
-lbox_fio_cwd(struct lua_State *L)
-{
-	char *buf = (char *)lua_newuserdata(L, PATH_MAX);
-	if (!buf) {
-		errno = ENOMEM;
-		return lbox_fio_pushsyserror(L);
-	}
-	if (getcwd(buf, PATH_MAX) == NULL)
-		return lbox_fio_pushsyserror(L);
-	lua_pushstring(L, buf);
-	lua_remove(L, -2);
-	return 1;
-}
-
-static int
 lbox_fio_fsync(struct lua_State *L)
 {
 	int fd = lua_tointeger(L, 1);
@@ -694,12 +693,11 @@ tarantool_lua_fio_init(struct lua_State *L)
 		{ "chmod",		lbox_fio_chmod			},
 		{ "truncate",		lbox_fio_truncate		},
 		{ "tempdir",		lbox_fio_tempdir		},
-		{ "cwd",		lbox_fio_cwd			},
 		{ "sync",		lbox_fio_sync			},
 		{ NULL,			NULL				}
 	};
 
-	luaL_register_module(L, "fio", fio_methods);
+	luaT_newmodule(L, "fio", fio_methods);
 
 	/* internal table */
 	lua_pushliteral(L, "internal");
@@ -721,7 +719,7 @@ tarantool_lua_fio_init(struct lua_State *L)
 		{ "utime",		lbox_fio_utime			},
 		{ NULL,			NULL				}
 	};
-	luaL_register(L, NULL, internal_methods);
+	luaL_setfuncs(L, internal_methods, 0);
 	lua_settable(L, -3);
 
 

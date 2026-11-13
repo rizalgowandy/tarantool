@@ -36,14 +36,14 @@
 #include "small/quota.h"
 #include "small/small.h"
 #include "xrow_update.h"
-#include "coll_id_cache.h"
 
-static struct mempool tuple_iterator_pool;
-static struct small_alloc runtime_alloc;
+/** Memory pool used for allocating tuple_iterator objects. */
+static __thread struct mempool tuple_iterator_pool;
 
-enum {
-	/** Lowest allowed slab_alloc_minimal */
-	OBJSIZE_MIN = 16,
+const char *tuple_arena_type_strs[tuple_arena_type_MAX] = {
+	[TUPLE_ARENA_MEMTX] = "memtx",
+	[TUPLE_ARENA_MALLOC] = "malloc",
+	[TUPLE_ARENA_RUNTIME] = "runtime",
 };
 
 /**
@@ -75,17 +75,15 @@ tuple_pointer_hash(const struct tuple *a)
 #define MH_SOURCE 1
 #include "salad/mhash.h"
 
-static struct mh_tuple_uploaded_refs_t *tuple_uploaded_refs;
-
-static const double ALLOC_FACTOR = 1.05;
+static __thread struct mh_tuple_uploaded_refs_t *tuple_uploaded_refs;
 
 /**
  * Last tuple returned by public C API
  * \sa tuple_bless()
  */
-struct tuple *box_tuple_last;
+__thread struct tuple *box_tuple_last;
 
-struct tuple_format *tuple_format_runtime;
+__thread struct tuple_format *tuple_format_runtime;
 
 static void
 runtime_tuple_delete(struct tuple_format *format, struct tuple *tuple);
@@ -93,12 +91,16 @@ runtime_tuple_delete(struct tuple_format *format, struct tuple *tuple);
 static struct tuple *
 runtime_tuple_new(struct tuple_format *format, const char *data, const char *end);
 
+/** Fill `tuple_info'. */
+static void
+runtime_tuple_info(struct tuple_format *format, struct tuple *tuple,
+		   struct tuple_info *tuple_info);
+
 /** A virtual method table for tuple_format_runtime */
 static struct tuple_format_vtab tuple_format_runtime_vtab = {
 	runtime_tuple_delete,
 	runtime_tuple_new,
-	NULL,
-	NULL,
+	runtime_tuple_info,
 };
 
 static struct tuple *
@@ -125,7 +127,7 @@ runtime_tuple_new(struct tuple_format *format, const char *data, const char *end
 		data_offset -= TUPLE_COMPACT_SAVINGS;
 
 	size_t total = data_offset + data_len;
-	tuple = (struct tuple *) smalloc(&runtime_alloc, total);
+	tuple = (struct tuple *)runtime_memory_alloc(total);
 	if (tuple == NULL) {
 		diag_set(OutOfMemory, (unsigned) total,
 			 "malloc", "tuple");
@@ -138,7 +140,6 @@ runtime_tuple_new(struct tuple_format *format, const char *data, const char *end
 	char *raw = (char *) tuple + data_offset;
 	field_map_build(&builder, raw - field_map_size);
 	memcpy(raw, data, data_len);
-	say_debug("%s(%zu) = %p", __func__, data_len, tuple);
 end:
 	region_truncate(region, region_svp);
 	return tuple;
@@ -148,12 +149,29 @@ static void
 runtime_tuple_delete(struct tuple_format *format, struct tuple *tuple)
 {
 	assert(format->vtab.tuple_delete == tuple_format_runtime_vtab.tuple_delete);
-	say_debug("%s(%p)", __func__, tuple);
 	assert(tuple->local_refs == 0);
-	assert(!tuple->has_uploaded_refs);
+	assert(!tuple_has_flag(tuple, TUPLE_HAS_UPLOADED_REFS));
 	size_t total = tuple_size(tuple);
 	tuple_format_unref(format);
-	smfree(&runtime_alloc, tuple, total);
+	runtime_memory_free(tuple, total);
+}
+
+static void
+runtime_tuple_info(struct tuple_format *format, struct tuple *tuple,
+		   struct tuple_info *tuple_info)
+{
+	assert(format->vtab.tuple_delete ==
+	       tuple_format_runtime_vtab.tuple_delete);
+	(void)format;
+
+	uint16_t data_offset = tuple_data_offset(tuple);
+	tuple_info->data_size = tuple_bsize(tuple);
+	tuple_info->header_size = sizeof(struct tuple);
+	if (tuple_is_compact(tuple))
+		tuple_info->header_size -= TUPLE_COMPACT_SAVINGS;
+	tuple_info->field_map_size = data_offset - tuple_info->header_size;
+	tuple_info->waste_size = 0;
+	tuple_info->arena_type = TUPLE_ARENA_RUNTIME;
 }
 
 int
@@ -221,7 +239,7 @@ enum { TUPLE_UPLOAD_REFS = TUPLE_LOCAL_REF_MAX / 2 + 1 };
 static uint32_t
 tuple_ref_get_uploaded_refs(struct tuple *tuple)
 {
-	if (!tuple->has_uploaded_refs)
+	if (!tuple_has_flag(tuple, TUPLE_HAS_UPLOADED_REFS))
 		return 0;
 	mh_int_t pos = mh_tuple_uploaded_refs_find(tuple_uploaded_refs, tuple,
 						   0);
@@ -248,7 +266,7 @@ tuple_ref_set_uploaded_refs(struct tuple *tuple, uint32_t refs)
 static void
 tuple_ref_drop_uploaded_refs(struct tuple *tuple)
 {
-	assert(tuple->has_uploaded_refs);
+	assert(tuple_has_flag(tuple, TUPLE_HAS_UPLOADED_REFS));
 	mh_int_t pos = mh_tuple_uploaded_refs_find(tuple_uploaded_refs, tuple,
 						   0);
 	assert(pos != mh_end(tuple_uploaded_refs));
@@ -261,7 +279,7 @@ tuple_upload_refs(struct tuple *tuple)
 	assert(tuple->local_refs == TUPLE_LOCAL_REF_MAX);
 	uint32_t refs = tuple_ref_get_uploaded_refs(tuple);
 	tuple_ref_set_uploaded_refs(tuple, refs + TUPLE_UPLOAD_REFS);
-	tuple->has_uploaded_refs = true;
+	tuple_set_flag(tuple, TUPLE_HAS_UPLOADED_REFS);
 	tuple->local_refs -= TUPLE_UPLOAD_REFS;
 }
 
@@ -269,11 +287,11 @@ void
 tuple_acquire_refs(struct tuple *tuple)
 {
 	assert(tuple->local_refs == 0);
-	assert(tuple->has_uploaded_refs);
+	assert(tuple_has_flag(tuple, TUPLE_HAS_UPLOADED_REFS));
 	uint32_t refs = tuple_ref_get_uploaded_refs(tuple);
 	if (refs == TUPLE_UPLOAD_REFS) {
 		tuple_ref_drop_uploaded_refs(tuple);
-		tuple->has_uploaded_refs = false;
+		tuple_clear_flag(tuple, TUPLE_HAS_UPLOADED_REFS);
 	} else {
 		tuple_ref_set_uploaded_refs(tuple, refs - TUPLE_UPLOAD_REFS);
 	}
@@ -286,27 +304,65 @@ tuple_bigref_tuple_count()
 	return tuple_uploaded_refs->size;
 }
 
-int
-tuple_init(field_name_hash_f hash)
+struct tuple_format *
+runtime_tuple_format_new(const char *format_data, size_t format_data_len,
+			 bool names_only)
+{
+	struct region *region = &fiber()->gc;
+	size_t region_svp = region_used(region);
+	const char *p = format_data;
+	struct field_def *fields = NULL;
+	uint32_t field_count = 0;
+	if (format_data != NULL &&
+	    field_def_array_decode(&p, &fields, &field_count, region,
+				   /*names_only=*/names_only) != 0)
+		goto error;
+	struct tuple_dictionary *dict =
+		tuple_dictionary_new(fields, field_count);
+	if (dict == NULL)
+		goto error;
+	if (names_only) {
+		fields = NULL;
+		field_count = 0;
+	}
+	struct tuple_format *format =
+		tuple_format_new(/*vtab=*/&tuple_format_runtime_vtab,
+				 /*engine=*/NULL, /*keys=*/NULL,
+				 /*key_count=*/0, /*space_fields=*/fields,
+				 /*space_field_count=*/field_count,
+				 /*exact_field_count=*/0,  /*dict=*/dict,
+				 /*is_temporary=*/false, /*is_reusable=*/true,
+				 /*constraint_def=*/NULL,
+				 /*constraint_count=*/0,
+				 /*format_data=*/format_data,
+				 /*format_data_len=*/format_data_len);
+	region_truncate(region, region_svp);
+	/*
+	 * Since dictionary reference counter is 1 from the
+	 * beginning and after creation of the tuple_format
+	 * increases by one, we must decrease it once.
+	 */
+	tuple_dictionary_unref(dict);
+	return format;
+error:
+	region_truncate(region, region_svp);
+	return NULL;
+}
+
+void
+tuple_init(void)
 {
 	tuple_format_init();
-	field_name_hash = hash;
 	/*
 	 * Create a format for runtime tuples
 	 */
-	tuple_format_runtime = tuple_format_new(&tuple_format_runtime_vtab, NULL,
-						NULL, 0, NULL, 0, 0, NULL, false,
-						false);
+	tuple_format_runtime = runtime_tuple_format_new(NULL, 0,
+							/*names_only=*/false);
 	if (tuple_format_runtime == NULL)
-		return -1;
+		panic("failed to create runtime tuple format");
 
 	/* Make sure this one stays around. */
 	tuple_format_ref(tuple_format_runtime);
-
-	float actual_alloc_factor;
-	small_alloc_create(&runtime_alloc, &cord()->slabc, OBJSIZE_MIN,
-			   sizeof(intptr_t), ALLOC_FACTOR,
-			   &actual_alloc_factor);
 
 	mempool_create(&tuple_iterator_pool, &cord()->slabc,
 		       sizeof(struct tuple_iterator));
@@ -314,9 +370,6 @@ tuple_init(field_name_hash_f hash)
 	box_tuple_last = NULL;
 
 	tuple_uploaded_refs = mh_tuple_uploaded_refs_new();
-
-	coll_id_cache_init();
-	return 0;
 }
 
 void
@@ -350,9 +403,6 @@ tuple_arena_create(struct slab_arena *arena, struct quota *quota,
 				       " tuple arena", prealloc, arena_name);
 		}
 	}
-
-	say_debug("tuple arena %s: addr %p size %zu flags %#x dontdump %d",
-		  arena_name, arena->arena, prealloc, flags, dontdump);
 }
 
 void
@@ -371,11 +421,8 @@ tuple_free(void)
 	}
 
 	mempool_destroy(&tuple_iterator_pool);
-	small_alloc_destroy(&runtime_alloc);
 
 	tuple_format_free();
-
-	coll_id_cache_destroy();
 
 	mh_tuple_uploaded_refs_delete(tuple_uploaded_refs);
 }
@@ -418,7 +465,8 @@ tuple_field_go_to_index(const char **field, uint64_t index)
 }
 
 int
-tuple_field_go_to_key(const char **field, const char *key, int len)
+tuple_field_go_to_key(const char **field, const char *key, int len,
+		      const char **field_key)
 {
 	enum mp_type type = mp_typeof(**field);
 	if (type != MP_MAP)
@@ -428,6 +476,8 @@ tuple_field_go_to_key(const char **field, const char *key, int len)
 		type = mp_typeof(**field);
 		if (type == MP_STR) {
 			uint32_t value_len;
+			if (field_key != NULL)
+				*field_key = *field;
 			const char *value = mp_decode_str(field, &value_len);
 			if (value_len == (uint)len &&
 			    memcmp(value, key, len) == 0)
@@ -444,12 +494,12 @@ tuple_field_go_to_key(const char **field, const char *key, int len)
 
 int
 tuple_go_to_path(const char **data, const char *path, uint32_t path_len,
-		 int multikey_idx)
+		 int index_base, int multikey_idx)
 {
 	int rc;
 	struct json_lexer lexer;
 	struct json_token token;
-	json_lexer_create(&lexer, path, path_len, TUPLE_INDEX_BASE);
+	json_lexer_create(&lexer, path, path_len, index_base);
 	while ((rc = json_lexer_next_token(&lexer, &token)) == 0) {
 		switch (token.type) {
 		case JSON_TOKEN_ANY:
@@ -461,7 +511,8 @@ tuple_go_to_path(const char **data, const char *path, uint32_t path_len,
 			rc = tuple_field_go_to_index(data, token.num);
 			break;
 		case JSON_TOKEN_STR:
-			rc = tuple_field_go_to_key(data, token.str, token.len);
+			rc = tuple_field_go_to_key(data, token.str, token.len,
+						   /*field_key=*/NULL);
 			break;
 		default:
 			assert(token.type == JSON_TOKEN_END);
@@ -478,7 +529,8 @@ tuple_go_to_path(const char **data, const char *path, uint32_t path_len,
 const char *
 tuple_field_raw_by_full_path(struct tuple_format *format, const char *tuple,
 			     const uint32_t *field_map, const char *path,
-			     uint32_t path_len, uint32_t path_hash)
+			     uint32_t path_len, uint32_t path_hash,
+			     int index_base)
 {
 	assert(path_len > 0);
 	uint32_t fieldno;
@@ -493,7 +545,7 @@ tuple_field_raw_by_full_path(struct tuple_format *format, const char *tuple,
 		return tuple_field_raw(format, tuple, field_map, fieldno);
 	struct json_lexer lexer;
 	struct json_token token;
-	json_lexer_create(&lexer, path, path_len, TUPLE_INDEX_BASE);
+	json_lexer_create(&lexer, path, path_len, index_base);
 	if (json_lexer_next_token(&lexer, &token) != 0)
 		return NULL;
 	switch(token.type) {
@@ -528,7 +580,7 @@ tuple_field_raw_by_full_path(struct tuple_format *format, const char *tuple,
 	return tuple_field_raw_by_path(format, tuple, field_map, fieldno,
 				       path + lexer.offset,
 				       path_len - lexer.offset,
-				       NULL, MULTIKEY_NONE);
+				       index_base, NULL, MULTIKEY_NONE);
 }
 
 uint32_t
@@ -542,6 +594,7 @@ tuple_raw_multikey_count(struct tuple_format *format, const char *data,
 					key_def->multikey_fieldno,
 					key_def->multikey_path,
 					key_def->multikey_path_len,
+					TUPLE_INDEX_BASE,
 					NULL, MULTIKEY_NONE);
 	if (array_raw == NULL)
 		return 0;
@@ -566,9 +619,8 @@ box_tuple_format_t *
 box_tuple_format_new(struct key_def **keys, uint16_t key_count)
 {
 	box_tuple_format_t *format =
-		tuple_format_new(&tuple_format_runtime_vtab, NULL,
-				 keys, key_count, NULL, 0, 0, NULL, false,
-				 false);
+		simple_tuple_format_new(&tuple_format_runtime_vtab,
+					NULL, keys, key_count);
 	if (format != NULL)
 		tuple_format_ref(format);
 	return format;
@@ -594,6 +646,15 @@ box_tuple_field_count(box_tuple_t *tuple)
 {
 	assert(tuple != NULL);
 	return tuple_field_count(tuple);
+}
+
+const char *
+box_tuple_data(box_tuple_t *tuple, size_t *bsize)
+{
+	assert(tuple != NULL);
+	if (bsize != NULL)
+		*bsize = tuple_bsize(tuple);
+	return tuple_data(tuple);
 }
 
 size_t
@@ -633,6 +694,24 @@ box_tuple_field(box_tuple_t *tuple, uint32_t fieldno)
 {
 	assert(tuple != NULL);
 	return tuple_field(tuple, fieldno);
+}
+
+const char *
+box_tuple_field_by_path(box_tuple_t *tuple, const char *path,
+			uint32_t path_len, int index_base)
+{
+	assert(tuple != NULL);
+	assert(path != NULL);
+
+	if (path_len == 0)
+		return NULL;
+
+	uint32_t path_hash = field_name_hash(path, path_len);
+	return tuple_field_raw_by_full_path(tuple_format(tuple),
+					    tuple_data(tuple),
+					    tuple_field_map(tuple),
+					    path, path_len, path_hash,
+					    index_base);
 }
 
 typedef struct tuple_iterator box_tuple_iterator_t;
@@ -695,10 +774,8 @@ box_tuple_update(box_tuple_t *tuple, const char *expr, const char *expr_end)
 	const char *new_data =
 		xrow_update_execute(expr, expr_end, old_data, old_data + bsize,
 				    format, &new_size, 1, NULL);
-	if (new_data == NULL) {
-		region_truncate(region, used);
+	if (new_data == NULL)
 		return NULL;
-	}
 	struct tuple *ret = tuple_new(format, new_data, new_data + new_size);
 	region_truncate(region, used);
 	if (ret != NULL)
@@ -717,10 +794,8 @@ box_tuple_upsert(box_tuple_t *tuple, const char *expr, const char *expr_end)
 	const char *new_data =
 		xrow_upsert_execute(expr, expr_end, old_data, old_data + bsize,
 				    format, &new_size, 1, false, NULL);
-	if (new_data == NULL) {
-		region_truncate(region, used);
+	if (new_data == NULL)
 		return NULL;
-	}
 
 	struct tuple *ret = tuple_new(format, new_data, new_data + new_size);
 	region_truncate(region, used);
@@ -749,29 +824,13 @@ box_tuple_validate(box_tuple_t *tuple, box_tuple_format_t *format)
 int
 tuple_snprint(char *buf, int size, struct tuple *tuple)
 {
-	int total = 0;
-	if (tuple == NULL) {
-		SNPRINT(total, snprintf, buf, size, "<NULL>");
-		return total;
-	}
-	SNPRINT(total, mp_snprint, buf, size, tuple_data(tuple));
-	return total;
+	if (tuple == NULL)
+		return snprintf(buf, size, "<NULL>");
+	return mp_snprint(buf, size, tuple_data(tuple));
 }
 
 const char *
 tuple_str(struct tuple *tuple)
 {
-	char *buf = tt_static_buf();
-	if (tuple_snprint(buf, TT_STATIC_BUF_LEN, tuple) < 0)
-		return "<failed to format tuple>";
-	return buf;
-}
-
-const char *
-mp_str(const char *data)
-{
-	char *buf = tt_static_buf();
-	if (mp_snprint(buf, TT_STATIC_BUF_LEN, data) < 0)
-		return "<failed to format message pack>";
-	return buf;
+	return TOSTR(tuple_snprint, tuple);
 }

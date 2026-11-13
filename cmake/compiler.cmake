@@ -1,3 +1,5 @@
+include(cmake/utils.cmake)
+
 #
 # Check if the same compile family is used for both C and CXX
 #
@@ -10,7 +12,8 @@ endif()
 # We support building with Clang and gcc. First check 
 # what we're using for build.
 #
-if (CMAKE_C_COMPILER_ID STREQUAL Clang)
+if (CMAKE_C_COMPILER_ID STREQUAL Clang OR
+    CMAKE_C_COMPILER_ID STREQUAL AppleClang)
     set(CMAKE_COMPILER_IS_CLANG  ON)
     set(CMAKE_COMPILER_IS_GNUCC  OFF)
     set(CMAKE_COMPILER_IS_GNUCXX OFF)
@@ -38,47 +41,28 @@ endif()
 #
 # Check supported standards
 #
-if((NOT HAVE_STD_C11 AND NOT HAVE_STD_GNU99) OR
-   (NOT HAVE_STD_CXX11 AND NOT HAVE_STD_GNUXX0X))
-    set(CMAKE_REQUIRED_FLAGS "-std=c11")
-    check_c_source_compiles("
-    /*
-     * FreeBSD 10 ctype.h header fail to compile on gcc4.8 in c11 mode.
-     * Make sure we aren't affected.
-     */
-    #include <ctype.h>
-    int main(void) { return 0; }
-    " HAVE_STD_C11)
-    set(CMAKE_REQUIRED_FLAGS "-std=gnu99")
-    check_c_source_compiles("int main(void) { return 0; }" HAVE_STD_GNU99)
-    set(CMAKE_REQUIRED_FLAGS "-std=c++11")
-    check_cxx_source_compiles("int main(void) { return 0; }" HAVE_STD_CXX11)
-    set(CMAKE_REQUIRED_FLAGS "-std=gnu++0x")
-    check_cxx_source_compiles("int main(void) { return 0; }" HAVE_STD_GNUXX0X)
-    set(CMAKE_REQUIRED_FLAGS "")
-endif()
-if((NOT HAVE_STD_C11 AND NOT HAVE_STD_GNU99) OR
-   (NOT HAVE_STD_CXX11 AND NOT HAVE_STD_GNUXX0X))
-    message (FATAL_ERROR
-        "${CMAKE_C_COMPILER} should support -std=c11 or -std=gnu99. "
-        "${CMAKE_CXX_COMPILER} should support -std=c++11 or -std=gnu++0x. "
-        "Please consider upgrade to gcc 4.5+ or clang 3.2+.")
-endif()
-
+# C++17 mode is the default since GCC 11; it can be explicitly selected with
+# the -std=c++17 command-line flag, or -std=gnu++17 to enable GNU extensions
+# as well. Some C++17 features are available since GCC 5, but support was
+# experimental and the ABI of C++17 features was not stable until GCC 9 [1].
 #
-# Check for an omp support
+# Clang 5 and later implement all the features of the ISO C++ 2017 standard.
+# By default, Clang 16 or later builds C++ code according to the C++17
+# standard [2].
 #
-set(CMAKE_REQUIRED_FLAGS "-fopenmp -Werror")
-check_cxx_source_compiles("int main(void) {
-#pragma omp parallel
-    {
-    }
-    return 0;
-}" HAVE_OPENMP)
+# 1. https://gcc.gnu.org/projects/cxx-status.html#cxx17
+# 2. https://clang.llvm.org/cxx_status.html#cxx17
+#
+set(CMAKE_REQUIRED_FLAGS "-std=c11")
+check_c_source_compiles("int main(void) { return 0; }" HAVE_STD_C11)
+set(CMAKE_REQUIRED_FLAGS "-std=c++17")
+check_cxx_source_compiles("int main(void) { return 0; }" HAVE_STD_CXX17)
 set(CMAKE_REQUIRED_FLAGS "")
-
-if (NOT HAVE_OPENMP)
-    add_compile_flags("C;CXX" -Wno-unknown-pragmas)
+if(NOT HAVE_STD_C11 OR NOT HAVE_STD_CXX17)
+    message (FATAL_ERROR
+        "${CMAKE_C_COMPILER} should support -std=c11. "
+        "${CMAKE_CXX_COMPILER} should support -std=c++17. "
+        "Please consider upgrade to gcc 9+ or clang 5+.")
 endif()
 
 #
@@ -92,8 +76,6 @@ check_c_compiler_flag("-Wno-parentheses-equality" CC_HAS_WNO_PARENTHESES_EQUALIT
 check_c_compiler_flag("-Wno-tautological-compare" CC_HAS_WNO_TAUTOLOGICAL_COMPARE)
 check_c_compiler_flag("-Wno-misleading-indentation" CC_HAS_WNO_MISLEADING_INDENTATION)
 check_c_compiler_flag("-Wno-varargs" CC_HAS_WNO_VARARGS)
-check_c_compiler_flag("-Wno-char-subscripts" CC_HAS_WNO_CHAR_SUBSCRIPTS)
-check_c_compiler_flag("-Wno-format-truncation" CC_HAS_WNO_FORMAT_TRUNCATION)
 check_c_compiler_flag("-Wno-implicit-fallthrough" CC_HAS_WNO_IMPLICIT_FALLTHROUGH)
 check_c_compiler_flag("-Wno-cast-function-type" CC_HAS_WNO_CAST_FUNCTION_TYPE)
 
@@ -116,117 +98,67 @@ set (CMAKE_CXX_FLAGS_RELWITHDEBINFO
 
 unset(CC_DEBUG_OPT)
 
-message(STATUS "Looking for libunwind.h")
-find_path(UNWIND_INCLUDE_DIR libunwind.h)
-message(STATUS "Looking for libunwind.h - ${UNWIND_INCLUDE_DIR}")
-
-if (UNWIND_INCLUDE_DIR)
-    include_directories(${UNWIND_INCLUDE_DIR})
-endif()
-
-set(CMAKE_REQUIRED_INCLUDES ${UNWIND_INCLUDE_DIR})
-check_include_file(libunwind.h HAVE_LIBUNWIND_H)
-set(CMAKE_REQUIRED_INCLUDES "")
-
-if(BUILD_STATIC AND NOT TARGET_OS_DARWIN)
-    set(UNWIND_LIB_NAME libunwind.a)
-else()
-    # libunwind can't be compiled on macOS.
-    # But there exists libunwind.dylib as a part of MacOSSDK
-    set(UNWIND_LIB_NAME unwind)
-endif()
-find_library(UNWIND_LIBRARY PATH_SUFFIXES system NAMES ${UNWIND_LIB_NAME})
-
-# Disabled backtraces support on FreeBSD by default, because of
-# gh-4278.
-# Disabled backtraces support on arm64 by default, because of
-# gh-6272, gh-6060 and gh-6222.
-set(ENABLE_BACKTRACE_DEFAULT OFF)
-if (NOT TARGET_OS_FREEBSD AND NOT CMAKE_SYSTEM_PROCESSOR MATCHES "arm*" AND
-    NOT CMAKE_SYSTEM_PROCESSOR MATCHES "aarch*" AND
-    NOT CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "arm*" AND
-    NOT CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "aarch*" AND
-    UNWIND_LIBRARY AND HAVE_LIBUNWIND_H)
-    set(ENABLE_BACKTRACE_DEFAULT ON)
-endif()
-
-option(ENABLE_BACKTRACE "Enable output of fiber backtrace information in
-'fiber.info()' command." ${ENABLE_BACKTRACE_DEFAULT})
-
-if (ENABLE_BACKTRACE)
-    # unwind is required
-    if (NOT (UNWIND_LIBRARY AND HAVE_LIBUNWIND_H))
-        message (FATAL_ERROR "ENABLE_BACKTRACE option is set but unwind "
-                             "library is not found")
-    endif()
-    if (TARGET_OS_DARWIN)
-        set (UNWIND_LIBRARIES ${UNWIND_LIBRARY})
-    else()
-        if (CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64" OR
-            CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
-            if(BUILD_STATIC)
-                set(UNWIND_PLATFORM_LIB_NAME "libunwind-${CMAKE_SYSTEM_PROCESSOR}.a")
-            else()
-                set(UNWIND_PLATFORM_LIB_NAME "unwind-${CMAKE_SYSTEM_PROCESSOR}")
-            endif()
-        elseif (CMAKE_SYSTEM_PROCESSOR STREQUAL "i686")
-            if(BUILD_STATIC)
-                set(UNWIND_PLATFORM_LIB_NAME "libunwind-x86.a")
-            else()
-                set(UNWIND_PLATFORM_LIB_NAME "unwind-x86")
-            endif()
-        elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "arm*")
-            if(BUILD_STATIC)
-                set(UNWIND_PLATFORM_LIB_NAME "libunwind-arm.a")
-            else()
-                set(UNWIND_PLATFORM_LIB_NAME "unwind-arm")
-            endif()
-        endif()
-        find_library(UNWIND_PLATFORM_LIBRARY PATH_SUFFIXES system
-            NAMES ${UNWIND_PLATFORM_LIB_NAME})
-        set(UNWIND_LIBRARIES ${UNWIND_PLATFORM_LIBRARY} ${UNWIND_LIBRARY})
-    endif()
-    if (BUILD_STATIC)
-        # some versions of libunwind need liblzma, and we don't use pkg-config
-        # so we just look whether liblzma is installed, and add it if it is.
-        # It might not be actually needed, but doesn't hurt if it is not.
-        # We don't need any headers, just the lib, as it's privately needed.
-        find_library(LZMA_LIBRARY PATH_SUFFIXES system NAMES liblzma.a)
-        if (NOT LZMA_LIBRARY STREQUAL "LZMA_LIBRARY-NOTFOUND")
-            message(STATUS "liblzma found")
-            set(UNWIND_LIBRARIES ${UNWIND_LIBRARIES} ${LZMA_LIBRARY})
-        endif()
-    endif()
-    find_package_message(UNWIND_LIBRARIES "Found unwind" "${UNWIND_LIBRARIES}")
-endif()
-
-# On macOS there is no '-static-libstdc++' flag and it's use will
-# raise following error:
-# error: argument unused during compilation: '-static-libstdc++'
-if(BUILD_STATIC AND NOT TARGET_OS_DARWIN)
-    # Static linking for c++ routines
-    add_compile_flags("C;CXX" "-static-libstdc++")
-endif()
-
-#
 # Set flags for all include files: those maintained by us and
 # coming from third parties.
 # Since we began using luajit, which uses gcc stack unwind
 # internally, we also need to make sure all code is compiled
 # with unwind info.
-#
-
 add_compile_flags("C;CXX" "-fexceptions" "-funwind-tables")
 
-# We must set -fno-omit-frame-pointer here, since we rely
-# on frame pointer when getting a backtrace, and it must
-# be used consistently across all object files.
-# The same reasoning applies to -fno-stack-protector switch.
+# Enable emission of the DWARF CFI (Call Frame Information) directives to the
+# assembler. This option is enabled by default on most compilers, but on GCC 7
+# for AArch64 and older it wasn't, so turn it on explicitly. When enabled, the
+# compiler emits .cfi_* directives that are required for the stack unwinding,
+# and defines __GCC_HAVE_DWARF2_CFI_ASM, which is checked below.
+add_compile_flags("C;CXX" "-fasynchronous-unwind-tables")
 
-if (ENABLE_BACKTRACE)
-    add_compile_flags("C;CXX"
-        "-fno-omit-frame-pointer"
-        "-fno-stack-protector")
+check_c_source_compiles(
+    "
+    #if defined(__x86_64__) && !__has_attribute(force_align_arg_pointer)
+    #error
+    #endif /* defined(__x86_64__) &&
+            !__has_attribute(force_align_arg_pointer) */
+
+    int main(){}
+    " HAVE_FORCE_ALIGN_ARG_POINTER_ATTR)
+check_c_source_compiles(
+    "
+    #if !defined(__clang__) /* clang supports CFI assembly by default */ && \
+        (!defined(__GNUC__) || !defined(__GCC_HAVE_DWARF2_CFI_ASM))
+    #error
+    #endif  /* !defined(__clang__) && (!defined(__GNUC__) ||
+               !defined(__GCC_HAVE_DWARF2_CFI_ASM)) */
+
+    int main(){}
+    " HAVE_CFI_ASM)
+set(ENABLE_BACKTRACE_DEFAULT OFF)
+# Disabled backtraces support on FreeBSD by default, because of
+# gh-4278.
+# Disabled backtraces support on AArch64 Linux by default, because of gh-8791.
+if(NOT TARGET_OS_FREEBSD AND HAVE_FORCE_ALIGN_ARG_POINTER_ATTR AND HAVE_CFI_ASM
+        AND NOT (TARGET_OS_LINUX AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64"))
+    set(ENABLE_BACKTRACE_DEFAULT ON)
+endif()
+
+option(ENABLE_BACKTRACE "Enable output of fiber backtrace information in \
+                         'fiber.info()' command."
+       ${ENABLE_BACKTRACE_DEFAULT})
+
+check_include_file(stdatomic.h HAVE_STDATOMIC_H)
+set(ENABLE_BUNDLED_LIBUNWIND_DEFAULT ON)
+if(TARGET_OS_DARWIN OR NOT HAVE_STDATOMIC_H OR
+    NOT HAVE_FORCE_ALIGN_ARG_POINTER_ATTR)
+    set(ENABLE_BUNDLED_LIBUNWIND_DEFAULT OFF)
+endif()
+option(ENABLE_BUNDLED_LIBUNWIND "Bundled libunwind will be built"
+       ${ENABLE_BUNDLED_LIBUNWIND_DEFAULT})
+
+# In Clang there is no '-static-libstdc++' flag and its use will raise
+# the following error:
+#     clang: error: argument unused during compilation: '-static-libstdc++'
+if(BUILD_STATIC AND NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    # Static linking for c++ routines
+    add_compile_flags("C;CXX" "-static-libstdc++")
 endif()
 
 # In C a global variable without a storage specifier (static/extern) and
@@ -249,8 +181,10 @@ endif()
 
 add_compile_flags("C;CXX" "-fno-common")
 
-if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
-# Remove VALGRIND code and assertions in *any* type of release build.
+if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_definitions("-Wp,-U_FORTIFY_SOURCE")
+else()
+    # Remove VALGRIND code and assertions in *any* type of release build.
     add_definitions("-DNDEBUG" "-DNVALGRIND")
 endif()
 
@@ -264,84 +198,68 @@ macro(enable_tnt_compile_flags)
     # of the code.
 
     # Set standard
-    if (HAVE_STD_C11)
-        add_compile_flags("C" "-std=c11")
-    else()
-        add_compile_flags("C" "-std=gnu99")
-    endif()
-
-    if (HAVE_STD_CXX11)
-        add_compile_flags("CXX" "-std=c++11")
-    else()
-        add_compile_flags("CXX" "-std=gnu++0x")
-        add_definitions("-Doverride=")
-    endif()
+    add_compile_flags("C" "-std=c11")
+    add_compile_flags("CXX" "-std=c++17")
 
     add_compile_flags("C;CXX"
         "-Wall"
         "-Wextra"
-        "-Wno-strict-aliasing"
     )
+    if (CMAKE_COMPILER_IS_GNUCC AND CMAKE_C_COMPILER_VERSION VERSION_LESS "8")
+        # Strict aliasing violation warnings cannot be disabled for libev with
+        # `system_header` pragma.
+        add_compile_flags("C" "-Wno-strict-aliasing")
+    endif()
 
     if (ENABLE_UB_SANITIZER)
-        if (NOT CMAKE_COMPILER_IS_CLANG)
-            message(FATAL_ERROR "Undefined behaviour sanitizer only available for clang")
-        else()
-            string(JOIN "," SANITIZE_FLAGS
-                alignment bool bounds builtin enum float-cast-overflow
-                float-divide-by-zero function integer-divide-by-zero return
-                shift unreachable vla-bound
-            )
-
-            # Exclude "object-size".
+        # UndefinedBehaviourSanitizer has been added to GCC since
+        # version 4.9.0, see https://gcc.gnu.org/gcc-4.9/changes.html.
+        if(CMAKE_COMPILER_IS_GNUCC AND
+            CMAKE_C_COMPILER_VERSION VERSION_LESS 4.9.0)
+            message(FATAL_ERROR "UndefinedBehaviourSanitizer is unsupported in GCC ${CMAKE_C_COMPILER_VERSION}")
+        endif()
+        # Use all needed checks from the UndefinedBehaviorSanitizer
+        # documentation:
+        # https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html.
+        string(JOIN "," UBSAN_IGNORE_OPTIONS
             # Gives compilation warnings when -O0 is used, which is always,
             # because some tests build with -O0.
-
-            # Exclude "pointer-overflow".
-            # Stailq data structure subtracts a positive value from NULL.
-
-            # Exclude "vptr".
-            # Intrusive data structures may abuse '&obj->member' on pointer
-            # 'obj' which is not really a pointer at an object of its type.
-            # For example, rlist uses '&item->member' expression in macro cycles
-            # to check end of cycle, but on the last iteration 'item' points at
-            # the list metadata head, not at an object of type stored in this
-            # list.
-
-            # Exclude "implicit-signed-integer-truncation",
-            # "implicit-integer-sign-change", "signed-integer-overflow".
-            # Integer overflow and truncation are disabled due to extensive
-            # usage of this UB in SQL code to 'implement' some kind of int65_t.
-
-            # Exclude "null", "nonnull-attribute", "nullability-arg",
-            # "returns-nonnull-attribute", "nullability-assign",
-            # "nullability-return".
+            object-size
+            # See https://github.com/tarantool/tarantool/issues/10742.
+            pointer-overflow
             # NULL checking is disabled, because this is not a UB and raises
             # lots of false-positive fails such as typeof(*obj) with
-            # obj == NULL, or memcpy() with NULL argument and 0 size. All
-            # nullability sanitations are disabled, because from the tests it
-            # seems they implicitly turn each other on, when one is used. For
-            # example, having "returns-nonnull-attribute" may lead to fail in
-            # the typeof(*obj) when obj is NULL, even though there is nothing
-            # related to return.
-
-            set(SANITIZE_FLAGS "-fsanitize=${SANITIZE_FLAGS} -fno-sanitize-recover=${SANITIZE_FLAGS}")
-
-            add_compile_flags("C;CXX" "${SANITIZE_FLAGS}")
+            # obj == NULL, or memcpy() with NULL argument and 0 size.
+            # "UBSan: check null is globally suppressed",
+            # https://github.com/tarantool/tarantool/issues/10741
+            null
+            # "UBSan: check nonnull-attribute is globally suppressed",
+            # https://github.com/tarantool/tarantool/issues/10740
+            nonnull-attribute
+        )
+        # GCC has no "function" UB check. See details here:
+        # https://gcc.gnu.org/onlinedocs/gcc/Instrumentation-Options.html#index-fsanitize_003dundefined
+        if(NOT CMAKE_C_COMPILER_ID STREQUAL "GNU")
+            string(JOIN "," UBSAN_IGNORE_OPTIONS
+                ${UBSAN_IGNORE_OPTIONS}
+                # Not interested in function type mismatch errors.
+                function
+            )
         endif()
-    endif()
-
-    if (CMAKE_COMPILER_IS_CLANG AND CC_HAS_WNO_UNUSED_VALUE)
-        # False-positive warnings for ({ xx = ...; x; }) macroses
-        add_compile_flags("C;CXX" "-Wno-unused-value")
-    endif()
-
-    if (CC_HAS_WNO_CHAR_SUBSCRIPTS)
-        add_compile_flags("C;CXX" "-Wno-char-subscripts")
-    endif()
-
-    if (CC_HAS_WNO_FORMAT_TRUNCATION)
-        add_compile_flags("C;CXX" "-Wno-format-truncation")
+        # XXX: To get nicer stack traces in error messages.
+        set(SANITIZE_FLAGS "${SANITIZE_FLAGS} -fno-omit-frame-pointer")
+        # Enable UndefinedBehaviorSanitizer support.
+        # This flag enables all supported options (the documentation
+        # on site is not correct about that moment, unfortunately)
+        # except float-divide-by-zero. Floating point division by zero
+        # behaviour is defined without -ffast-math and uses the
+        # IEEE 754 standard on which all NaN tagging is based.
+        set(SANITIZE_FLAGS "${SANITIZE_FLAGS} -fsanitize=undefined")
+        set(SANITIZE_FLAGS "${SANITIZE_FLAGS} -fno-sanitize=${UBSAN_IGNORE_OPTIONS}")
+        # Print a verbose error report and exit the program.
+        set(SANITIZE_FLAGS "${SANITIZE_FLAGS} -fno-sanitize-recover=undefined")
+        set(SANITIZE_FLAGS "${SANITIZE_FLAGS} -fsanitize-blacklist=${PROJECT_SOURCE_DIR}/asan/ubsan.supp")
+        add_compile_flags("C;CXX" "${SANITIZE_FLAGS}")
     endif()
 
     if (CMAKE_COMPILER_IS_CLANG OR CMAKE_COMPILER_IS_GNUCXX)
@@ -377,8 +295,7 @@ macro(enable_tnt_compile_flags)
 
     # Only add -Werror if it's a debug build, done by developers.
     # Release builds should not cause extra trouble.
-    if ((${CMAKE_BUILD_TYPE} STREQUAL "Debug")
-        AND HAVE_STD_C11 AND HAVE_STD_CXX11)
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
         add_compile_flags("C;CXX" "-Werror")
     endif()
 
@@ -387,10 +304,6 @@ macro(enable_tnt_compile_flags)
         add_compile_flags("C;CXX" "-Werror")
     endif()
 endmacro(enable_tnt_compile_flags)
-
-if (HAVE_OPENMP)
-    add_compile_flags("C;CXX" "-fopenmp")
-endif()
 
 if (CMAKE_COMPILER_IS_CLANG OR CMAKE_COMPILER_IS_GNUCC)
     set(HAVE_BUILTIN_CTZ 1)

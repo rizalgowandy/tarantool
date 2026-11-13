@@ -1,5 +1,7 @@
 #include "memory.h"
 #include "fiber.h"
+
+#define UNIT_TAP_COMPATIBLE 1
 #include "unit.h"
 
 static struct fiber_attr default_attr;
@@ -7,37 +9,39 @@ static struct fiber_attr default_attr;
 static void
 sigsegf_handler(int signo)
 {
-	note("signal handler called");
-	exit(0);
+	ok(true);
+	footer();
+	exit(check_plan());
 }
 
-static int __attribute__((noinline))
-stack_break_f(char *ptr)
+/*
+ * ASAN is disabled for this function, because for the stack-use-after-return
+ * detection it could allocate the `block' on a fake stack, rather than placing
+ * it on a fiber stack. In that case, a lot more recursive calls will be
+ * required to overflow the stack.
+ */
+static NOINLINE NO_SANITIZE_ADDRESS int
+stack_break_f(char *frame_zero)
 {
-	char block[2048];
+	char *frame_curr = (char *)__builtin_frame_address(0);
+	volatile char block[2048];
 	/*
 	 * Make sum volatile to prevent a compiler from
 	 * optimizing away call to this function.
 	 */
 	volatile char sum = 0;
-	memset(block, 0xff, 2048);
+	memset((void *)block, 0xff, sizeof(block));
 	sum += block[(unsigned char) block[4]];
-	ptrdiff_t stack_diff = ptr > block ? ptr - block : block - ptr;
-	if (stack_diff < (ptrdiff_t)default_attr.stack_size)
-		sum += stack_break_f(ptr);
+
+	ptrdiff_t stack_diff = frame_curr - frame_zero;
+	if ((size_t)abs(stack_diff) < default_attr.stack_size)
+		sum += stack_break_f(frame_zero);
 	return sum;
 }
-
-static char stack_buf[SIGSTKSZ];
 
 static int
 main_f(va_list ap)
 {
-	stack_t stack;
-	stack.ss_sp = stack_buf;
-	stack.ss_size = SIGSTKSZ;
-	stack.ss_flags = 0;
-	sigaltstack(&stack, NULL);
 	struct sigaction sa;
 	sa.sa_handler = sigsegf_handler;
 	sigemptyset(&sa.sa_mask);
@@ -45,7 +49,7 @@ main_f(va_list ap)
 	sigaction(SIGSEGV, &sa, NULL);
 	sigaction(SIGBUS, &sa, NULL);
 
-	int res = stack_break_f((char *)&stack);
+	int res = stack_break_f((char *)__builtin_frame_address(0));
 
 	ev_break(loop(), EVBREAK_ALL);
 	return res;
@@ -53,14 +57,22 @@ main_f(va_list ap)
 
 int main()
 {
+	plan(1);
+	header();
+
+#ifndef ENABLE_ASAN
 	memory_init();
 	fiber_init(fiber_cxx_invoke);
 	fiber_attr_create(&default_attr);
-	struct fiber *fmain = fiber_new_xc("main", main_f);
+	struct fiber *fmain = fiber_new("main", main_f);
 	fiber_wakeup(fmain);
 	ev_run(loop(), 0);
 	fiber_free();
 	memory_free();
-	fail("signal handler was not executed", "");
-	return 0;
+#else
+	ok(true);
+#endif
+
+	footer();
+	return check_plan();
 }

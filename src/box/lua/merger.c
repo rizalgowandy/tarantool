@@ -50,7 +50,7 @@
 #include "lua/utils.h"       /* luaL_pushcdata(),
 				luaL_iterator_*() */
 
-#include "box/lua/key_def.h" /* luaT_check_key_def() */
+#include "box/lua/key_def.h" /* luaT_is_key_def() */
 #include "box/lua/tuple.h"   /* luaT_tuple_new() */
 
 #include "small/ibuf.h"      /* struct ibuf */
@@ -58,7 +58,7 @@
 
 #include "box/merger.h"      /* merge_source_*, merger_*() */
 
-static uint32_t CTID_STRUCT_MERGE_SOURCE_REF = 0;
+static __thread uint32_t CTID_STRUCT_MERGE_SOURCE_REF = 0;
 
 /**
  * A type of a function to create a source from a Lua iterator on
@@ -115,8 +115,8 @@ decode_header(struct ibuf *buf, size_t *len_p)
 static void
 encode_header(struct ibuf *output_buffer, uint32_t result_len)
 {
-	ibuf_reserve(output_buffer, mp_sizeof_array(result_len));
-	output_buffer->wpos = mp_encode_array(output_buffer->wpos, result_len);
+	void *wpos = xibuf_alloc(output_buffer, mp_sizeof_array(result_len));
+	mp_encode_array(wpos, result_len);
 }
 
 /**
@@ -317,6 +317,7 @@ luaT_merger_new_parse_sources(struct lua_State *L, int idx,
 	}
 
 	/* Save all sources. */
+	int top = lua_gettop(L);
 	for (uint32_t i = 0; i < source_count; ++i) {
 		lua_pushinteger(L, i + 1);
 		lua_gettable(L, idx);
@@ -331,7 +332,7 @@ luaT_merger_new_parse_sources(struct lua_State *L, int idx,
 		}
 		sources[i] = source;
 	}
-	lua_pop(L, source_count);
+	lua_settop(L, top);
 
 	*source_count_ptr = source_count;
 	return sources;
@@ -351,7 +352,7 @@ lbox_merger_new(struct lua_State *L)
 	int top = lua_gettop(L);
 	bool ok = (top == 2 || top == 3) &&
 		/* key_def. */
-		(key_def = luaT_check_key_def(L, 1)) != NULL &&
+		(key_def = luaT_is_key_def(L, 1)) != NULL &&
 		/* Sources. */
 		lua_istable(L, 2) == 1 &&
 		/* Opts. */
@@ -595,10 +596,26 @@ luaL_merge_source_buffer_next(struct merge_source *base,
 		return -1;
 	}
 	--source->remaining_tuple_count;
-	source->buf->rpos = (char *) tuple_end;
 	if (format == NULL)
 		format = tuple_format_runtime;
+	/*
+	 * If we encounter an MP_TUPLE, skip the extension header and the tuple
+	 * format identifier.
+	 */
+	if (mp_typeof(*tuple_beg) == MP_EXT) {
+		int8_t type;
+		mp_decode_extl(&tuple_beg, &type);
+		if (type != MP_TUPLE) {
+			diag_set(IllegalParams,
+				 "Unexpected MsgPack extension type "
+				 "(should be MP_TUPLE)");
+			return -1;
+		}
+		/* Skip the tuple format identifier. */
+		mp_decode_uint(&tuple_beg);
+	}
 	struct tuple *tuple = tuple_new(format, tuple_beg, tuple_end);
+	ibuf_consume_before(source->buf, tuple_end);
 	if (tuple == NULL)
 		return -1;
 
@@ -1025,6 +1042,10 @@ lbox_merge_source_gen(struct lua_State *L)
 		return luaL_error(L, "Bad params, use: lbox_merge_source_gen("
 				  "nil, merge_source)");
 
+#ifndef NDEBUG
+	int top = lua_gettop(L);
+#endif
+
 	struct tuple *tuple;
 	if (merge_source_next(source, NULL, &tuple) != 0)
 		return luaT_error(L);
@@ -1034,17 +1055,36 @@ lbox_merge_source_gen(struct lua_State *L)
 		return 2;
 	}
 
-	/* Push merge_source, tuple. */
-	*(struct merge_source **)
-		luaL_pushcdata(L, CTID_STRUCT_MERGE_SOURCE_REF) = source;
-	luaT_pushtuple(L, tuple);
+	/*
+	 * It is crucial to have the merge_source at the topmost
+	 * slot to actually return merge_source and tuple as the
+	 * result.
+	 *
+	 * Despite that merge_source_next() does not accept a Lua
+	 * state as an argument, it may use a temporary Lua state
+	 * internally. This state may be the same as L.
+	 *
+	 * merge_source_next() must return the Lua stack to the
+	 * original state if it uses the stack.
+	 */
+	assert(lua_gettop(L) == top);
+	/*
+	 * We want the consistent function behaviour in Debug and
+	 * Release builds. If the top value is not cdata
+	 * luaT_check_merge_source() will raise the error in Debug
+	 * build. So add the assert with luaL_iscdata() check.
+	 */
+	assert(luaL_iscdata(L, -1));
+	assert(luaT_check_merge_source(L, -1) == source);
 
 	/*
 	 * luaT_pushtuple() references the tuple, so we
 	 * unreference it on merger's side.
 	 */
+	luaT_pushtuple(L, tuple);
 	tuple_unref(tuple);
 
+	/* Return merge_source and tuple. */
 	return 2;
 }
 
@@ -1116,9 +1156,8 @@ encode_result_buffer(struct lua_State *L, struct merge_source *source,
 	       merge_source_next(source, NULL, &tuple)) == 0 &&
 	       tuple != NULL) {
 		uint32_t bsize = tuple_bsize(tuple);
-		ibuf_reserve(output_buffer, bsize);
-		memcpy(output_buffer->wpos, tuple_data(tuple), bsize);
-		output_buffer->wpos += bsize;
+		void *wpos = xibuf_alloc(output_buffer, bsize);
+		memcpy(wpos, tuple_data(tuple), bsize);
 		result_len_offset += bsize;
 		++result_len;
 
@@ -1265,7 +1304,7 @@ luaopen_merger(struct lua_State *L)
 		{"new", lbox_merger_new},
 		{NULL, NULL}
 	};
-	luaL_register_module(L, "merger", meta);
+	luaT_newmodule(L, "merger", meta);
 
 	/* Add internal.{select,ipairs}(). */
 	lua_newtable(L); /* merger.internal */

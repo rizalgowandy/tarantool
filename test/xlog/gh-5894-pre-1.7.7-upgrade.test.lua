@@ -6,7 +6,8 @@ test_run:cmd('create server upgrade with script="xlog/upgrade.lua", \
 test_run:cmd('start server upgrade')
 test_run:switch('upgrade')
 
-assert(not box.internal.schema_needs_upgrade())
+box.schema.upgrade()
+assert(not box.schema.needs_upgrade())
 box.space.distro:select{}
 box.space._index:select{box.space.distro.id}
 box.space._space:format()
@@ -19,13 +20,30 @@ test_run:switch('default')
 test_run:cmd('stop server upgrade')
 test_run:cmd('delete server upgrade')
 
+-- Check that various combinations of box.cfg.work_dir and box.cfg.memtx_dir are
+-- handled correctly.
+-- work_dir - empty, memtx_dir - absolute tested above.
+-- work_dir - relative, memtx_dir - absolute (set by test-run).
+test_run:cmd('create server upgrade with script="xlog/upgrade.lua", \
+             workdir="xlog/upgrade/1.6.8/gh-5894-pre-1.7.7-upgrade"')
+test_run:cmd('start server upgrade with args="upgrade"')
+test_run:cmd('stop server upgrade')
+test_run:cmd('delete server upgrade')
+-- work_dir - relative, memtx_dir - relative.
+test_run:cmd('create server upgrade with script="xlog/upgrade.lua", \
+             workdir="xlog/upgrade/1.6.8/gh-5894-pre-1.7.7-upgrade"')
+test_run:cmd('start server upgrade with args="upgrade ."')
+test_run:cmd('stop server upgrade')
+test_run:cmd('delete server upgrade')
+
 -- Upgrade from 1.7.1.
 test_run:cmd('create server upgrade with script="xlog/upgrade.lua", \
              workdir="xlog/upgrade/1.7.1/gh-5894-pre-1.7.7-upgrade"')
 test_run:cmd('start server upgrade')
 test_run:switch('upgrade')
 
-assert(not box.internal.schema_needs_upgrade())
+box.schema.upgrade()
+assert(not box.schema.needs_upgrade())
 box.space.distro:select{}
 box.space._index:select{box.space.distro.id}
 box.space._space:format()
@@ -44,7 +62,8 @@ test_run:cmd('create server upgrade with script="xlog/upgrade.lua", \
 test_run:cmd('start server upgrade')
 test_run:switch('upgrade')
 
-assert(not box.internal.schema_needs_upgrade())
+box.schema.upgrade()
+assert(not box.schema.needs_upgrade())
 box.space.distro:select{}
 box.space._index:select{box.space.distro.id}
 box.space._space:format()
@@ -63,7 +82,8 @@ test_run:cmd('create server upgrade with script="xlog/upgrade.lua", \
 test_run:cmd('start server upgrade')
 test_run:switch('upgrade')
 
-assert(not box.internal.schema_needs_upgrade())
+box.schema.upgrade()
+assert(not box.schema.needs_upgrade())
 box.space.distro:select{}
 box.space._index:select{box.space.distro.id}
 box.space._space:format()

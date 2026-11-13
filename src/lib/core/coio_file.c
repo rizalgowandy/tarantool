@@ -49,6 +49,9 @@ struct coio_file_task {
 	bool done;
 
 	union {
+		/** File descriptor to synchronize. */
+		int sync_fd;
+
 		struct {
 			int fd;
 			struct stat *buf;
@@ -502,17 +505,19 @@ coio_do_tempdir(eio_req *req)
 }
 
 int
-coio_tempdir(char *path, size_t path_len)
+coio_tempdir(char *path, size_t path_size)
 {
 	INIT_COEIO_FILE(eio);
 
-	const char *tmpdir = getenv("TMPDIR");
-	if (tmpdir == NULL)
-		tmpdir = "/tmp";
-	int rc = snprintf(path, path_len, "%s/XXXXXX", tmpdir);
+	char *tmpdir = getenv_safe("TMPDIR", NULL, 0);
+	const char *append_dir = tmpdir;
+	if (append_dir == NULL)
+		append_dir = "/tmp";
+	int rc = snprintf(path, path_size, "%s/XXXXXX", append_dir);
+	free(tmpdir);
 	if (rc < 0)
 		return -1;
-	if ((size_t) rc >= path_len) {
+	if ((size_t)rc >= path_size) {
 		errno = ENOMEM;
 		return -1;
 	}
@@ -530,19 +535,35 @@ coio_sync(void)
 	return coio_wait_done(req, &eio);
 }
 
+static void
+coio_do_fsync(eio_req *req)
+{
+	struct coio_file_task *eio = (struct coio_file_task *)req->data;
+	req->result = fio_fsync(eio->sync_fd);
+}
+
 int
 coio_fsync(int fd)
 {
 	INIT_COEIO_FILE(eio);
-	eio_req *req = eio_fsync(fd, 0, coio_complete, &eio);
+	eio.sync_fd = fd;
+	eio_req *req = eio_custom(coio_do_fsync, 0, coio_complete, &eio);
 	return coio_wait_done(req, &eio);
+}
+
+static void
+coio_do_fdatasync(eio_req *req)
+{
+	struct coio_file_task *eio = (struct coio_file_task *)req->data;
+	req->result = fio_fdatasync(eio->sync_fd);
 }
 
 int
 coio_fdatasync(int fd)
 {
 	INIT_COEIO_FILE(eio);
-	eio_req *req = eio_fdatasync(fd, 0, coio_complete, &eio);
+	eio.sync_fd = fd;
+	eio_req *req = eio_custom(coio_do_fdatasync, 0, coio_complete, &eio);
 	return coio_wait_done(req, &eio);
 }
 

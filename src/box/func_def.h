@@ -34,7 +34,9 @@
 #include "trivia/util.h"
 #include "field_def.h"
 #include "opt_def.h"
+
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -48,6 +50,7 @@ enum func_language {
 	FUNC_LANGUAGE_C,
 	FUNC_LANGUAGE_SQL,
 	FUNC_LANGUAGE_SQL_BUILTIN,
+	FUNC_LANGUAGE_SQL_EXPR,
 	func_language_MAX,
 };
 
@@ -68,6 +71,10 @@ struct func_opts {
 	 * packed in array.
 	 */
 	bool is_multikey;
+	/**
+	 * True if the function expects a msgpack object for args.
+	 */
+	bool takes_raw_args;
 };
 
 extern const struct func_opts func_opts_default;
@@ -89,10 +96,19 @@ struct func_def {
 	uint32_t fid;
 	/** Owner of the function. */
 	uint32_t uid;
+	/** Function name. */
+	const char *name;
+	/** The length of the function name. */
+	uint32_t name_len;
 	/** Definition of the persistent function. */
 	char *body;
 	/** User-defined comment for a function. */
 	char *comment;
+	/**
+	 * MsgPack array of strings - names of events in trigger registry.
+	 * If it is set, underlying array is not empty.
+	 */
+	char *triggers;
 	/**
 	 * True if the function requires change of user id before
 	 * invocation.
@@ -119,8 +135,6 @@ struct func_def {
 	 * The language of the stored function.
 	 */
 	enum func_language language;
-	/** The length of the function name. */
-	uint32_t name_len;
 	/** Frontends where function must be available. */
 	union {
 		struct {
@@ -131,42 +145,37 @@ struct func_def {
 	} exports;
 	/** The function options. */
 	struct func_opts opts;
-	/** Function name. */
-	char name[0];
 };
 
 /**
- * @param name_len length of func_def->name
- * @returns size in bytes needed to allocate for struct func_def
- * for a function of length @a a name_len, body @a body_len and
- * with comment @a comment_len.
+ * Allocates and initializes a function definition.
+ * Fields unspecified in the arguments are set to their default values.
+ * Argument triggers must be a MsgPack array.
+ * This function never fails (never returns NULL).
  */
-static inline size_t
-func_def_sizeof(uint32_t name_len, uint32_t body_len, uint32_t comment_len,
-		uint32_t *body_offset, uint32_t *comment_offset)
-{
-	/* +1 for '\0' name terminating. */
-	size_t sz = sizeof(struct func_def) + name_len + 1;
-	*body_offset = sz;
-	if (body_len > 0)
-		sz += body_len + 1;
-	*comment_offset = sz;
-	if (comment_len > 0)
-		sz += comment_len + 1;
-	return sz;
-}
+struct func_def *
+func_def_new(uint32_t fid, uint32_t uid, const char *name, uint32_t name_len,
+	     enum func_language language, const char *body, uint32_t body_len,
+	     const char *comment, uint32_t comment_len, const char *triggers);
+
+/** Frees a function definition object. */
+void
+func_def_delete(struct func_def *def);
 
 /** Compare two given function definitions. */
 int
-func_def_cmp(struct func_def *def1, struct func_def *def2);
+func_def_cmp(const struct func_def *def1, const struct func_def *def2);
 
-/** Duplicate a given function defintion object. */
+/**
+ * Duplicates a given function definition object.
+ * This function never fails (never returns NULL).
+ */
 struct func_def *
-func_def_dup(struct func_def *def);
+func_def_dup(const struct func_def *def);
 
 /** Check if a non-empty function body is correct. */
 int
-func_def_check(struct func_def *def);
+func_def_check(const struct func_def *def);
 
 #ifdef __cplusplus
 }

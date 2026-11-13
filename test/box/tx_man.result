@@ -165,6 +165,74 @@ s:select{}
  | - - [1, 2]
  | ...
 
+-- Insert read/write conflicts.
+s:delete{1}
+ | ---
+ | - [1, 2]
+ | ...
+tx1:begin()
+ | ---
+ | - 
+ | ...
+tx2:begin()
+ | ---
+ | - 
+ | ...
+tx1('s:insert{1, 1}')
+ | ---
+ | - - [1, 1]
+ | ...
+tx2('s:insert{1, 2}')
+ | ---
+ | - - [1, 2]
+ | ...
+tx1:commit()
+ | ---
+ | - 
+ | ...
+tx2:commit()
+ | ---
+ | - - {'error': 'Transaction has been aborted by conflict'}
+ | ...
+s:select{}
+ | ---
+ | - - [1, 1]
+ | ...
+
+-- Insert read/write conflicts, different order.
+s:delete{1}
+ | ---
+ | - [1, 1]
+ | ...
+tx1:begin()
+ | ---
+ | - 
+ | ...
+tx2:begin()
+ | ---
+ | - 
+ | ...
+tx1('s:insert{1, 1}')
+ | ---
+ | - - [1, 1]
+ | ...
+tx2('s:insert{1, 2}')
+ | ---
+ | - - [1, 2]
+ | ...
+tx2:commit() -- note that tx2 commits first.
+ | ---
+ | - 
+ | ...
+tx1:commit()
+ | ---
+ | - - {'error': 'Transaction has been aborted by conflict'}
+ | ...
+s:select{}
+ | ---
+ | - - [1, 2]
+ | ...
+
 -- Implicit read/write conflicts.
 s:replace{1, 0}
  | ---
@@ -409,11 +477,11 @@ tx1("s:select{}")
  | ...
 tx1("s:replace{3, 13}")
  | ---
- | - - [3, 13]
+ | - - {'error': 'Transaction has been aborted by conflict'}
  | ...
 tx1("s:select{}")
  | ---
- | - - [[1, 1], [2, 2], [3, 13]]
+ | - - {'error': 'Transaction has been aborted by conflict'}
  | ...
 tx1:commit()
  | ---
@@ -1914,6 +1982,60 @@ tx2:commit()
  | - - {'error': 'Transaction has been aborted by conflict'}
  | ...
 
+-- Check that rolled back story is accounted correctly.
+s:truncate()
+ | ---
+ | ...
+tx1:begin()
+ | ---
+ | - 
+ | ...
+tx1('s:replace{0, 0}')
+ | ---
+ | - - [0, 0]
+ | ...
+tx1:rollback()
+ | ---
+ | - 
+ | ...
+s:count()
+ | ---
+ | - 0
+ | ...
+
+-- Check that invisible read-view story is accounted correctly.
+s:truncate()
+ | ---
+ | ...
+s:insert{0, 0}
+ | ---
+ | - [0, 0]
+ | ...
+tx1:begin()
+ | ---
+ | - 
+ | ...
+tx1('s:select{0}')
+ | ---
+ | - - [[0, 0]]
+ | ...
+s:replace{0, 1}
+ | ---
+ | - [0, 1]
+ | ...
+tx1:commit()
+ | ---
+ | - 
+ | ...
+s:delete{0}
+ | ---
+ | - [0, 1]
+ | ...
+s:count()
+ | ---
+ | - 0
+ | ...
+
 -- Check different orders
 s:truncate()
  | ---
@@ -2089,7 +2211,7 @@ tx2:commit()
  | ...
 tx1("s:update({1}, {{'=', 2, 3}})")
  | ---
- | - - [1, 3]
+ | - - {'error': 'Transaction has been aborted by conflict'}
  | ...
 tx1:commit()
  | ---
@@ -2332,9 +2454,12 @@ box.space.t:drop()
  | ...
 
 -- https://github.com/tarantool/tarantool/issues/5892
-box.execute([[CREATE TABLE u (column1 INT PRIMARY KEY, column2 INT);]])
+box.execute([[CREATE TABLE U (COLUMN1 INT PRIMARY KEY, COLUMN2 INT);]])
  | ---
  | - row_count: 1
+ | ...
+box.schema.user.grant('guest', 'execute', 'sql')
+ | ---
  | ...
 box.schema.user.grant('guest', 'read,write', 'space', 'U')
  | ---
@@ -2343,7 +2468,7 @@ conn = require('net.box').connect(box.cfg.listen)
  | ---
  | ...
 
-box.execute([[INSERT INTO u VALUES (1, 20);]])
+box.execute([[INSERT INTO U VALUES (1, 20);]])
  | ---
  | - row_count: 1
  | ...
@@ -2351,7 +2476,7 @@ box.execute([[START TRANSACTION;]])
  | ---
  | - row_count: 0
  | ...
-box.execute([[SELECT * FROM u;]])
+box.execute([[SELECT * FROM SEQSCAN U;]])
  | ---
  | - metadata:
  |   - name: COLUMN1
@@ -2362,21 +2487,22 @@ box.execute([[SELECT * FROM u;]])
  |   - [1, 20]
  | ...
 
-conn:execute([[UPDATE u SET column2 = 21;]])
+conn:execute([[UPDATE U SET COLUMN2 = 21;]])
  | ---
  | - row_count: 1
  | ...
 
-box.execute([[UPDATE u SET column2 = 22;]])
+box.execute([[UPDATE U SET COLUMN2 = 22;]])
  | ---
- | - row_count: 1
+ | - null
+ | - Transaction has been aborted by conflict
  | ...
 box.execute([[COMMIT;]])
  | ---
  | - null
  | - Transaction has been aborted by conflict
  | ...
-box.execute([[SELECT * FROM u;]])
+box.execute([[SELECT * FROM SEQSCAN U;]])
  | ---
  | - metadata:
  |   - name: COLUMN1
@@ -2387,7 +2513,7 @@ box.execute([[SELECT * FROM u;]])
  |   - [1, 21]
  | ...
 
-box.execute([[DROP TABLE u ;]])
+box.execute([[DROP TABLE U ;]])
  | ---
  | - row_count: 1
  | ...
@@ -3495,7 +3621,7 @@ s:delete{1}
  | ...
 tx1('s:replace{10, 10}') -- make an op to become RW
  | ---
- | - - [10, 10]
+ | - - {'error': 'Transaction has been aborted by conflict'}
  | ...
 tx1:commit() -- must fail since it actually saw {1, 1, "original"}
  | ---
@@ -3503,7 +3629,7 @@ tx1:commit() -- must fail since it actually saw {1, 1, "original"}
  | ...
 tx2('s:replace{11, 11}') -- make an op to become RW
  | ---
- | - - [11, 11]
+ | - - {'error': 'Transaction has been aborted by conflict'}
  | ...
 tx2:commit() -- must fail since it actually saw {1, 1, "original"}
  | ---
@@ -3573,19 +3699,23 @@ s:drop()
 
 -- https://github.com/tarantool/tarantool/issues/5801
 -- flaw #1
-box.execute([[CREATE TABLE k1 (s1 INT PRIMARY KEY);]])
+box.execute([[CREATE TABLE K1 (S1 INT PRIMARY KEY);]])
  | ---
  | - row_count: 1
  | ...
-box.execute([[CREATE TABLE k2 (s1 INT PRIMARY KEY, s2 INT REFERENCES k1);]])
+box.execute([[CREATE TABLE K2 (S1 INT PRIMARY KEY, S2 INT REFERENCES K1);]])
  | ---
  | - row_count: 1
  | ...
-box.execute([[CREATE TABLE k3 (c INTEGER PRIMARY KEY AUTOINCREMENT);]])
+box.execute([[CREATE INDEX I1 ON K2(S2);]])
  | ---
  | - row_count: 1
  | ...
-box.execute([[CREATE TABLE k4 (s1 INT PRIMARY KEY);]])
+box.execute([[CREATE TABLE K3 (C INTEGER PRIMARY KEY AUTOINCREMENT);]])
+ | ---
+ | - row_count: 1
+ | ...
+box.execute([[CREATE TABLE K4 (S1 INT PRIMARY KEY);]])
  | ---
  | - row_count: 1
  | ...
@@ -3603,7 +3733,7 @@ conn = net_box.connect(box.cfg.listen)
  | ---
  | ...
 
-box.execute([[INSERT INTO k1 VALUES (1);]])
+box.execute([[INSERT INTO K1 VALUES (1);]])
  | ---
  | - row_count: 1
  | ...
@@ -3611,7 +3741,7 @@ box.execute([[START TRANSACTION;]])
  | ---
  | - row_count: 0
  | ...
-box.execute([[INSERT INTO k2 VALUES (99,1);]])
+box.execute([[INSERT INTO K2 VALUES (99,1);]])
  | ---
  | - row_count: 1
  | ...
@@ -3627,11 +3757,11 @@ box.execute([[COMMIT;]])
  | ...
 
 -- flaw #2
-box.execute([[DELETE FROM k2;]])
+box.execute([[DELETE FROM K2;]])
  | ---
  | - row_count: 0
  | ...
-box.execute([[DELETE FROM k1;]])
+box.execute([[DELETE FROM K1;]])
  | ---
  | - row_count: 0
  | ...
@@ -3639,15 +3769,15 @@ tx1:begin()
  | ---
  | - 
  | ...
-tx1('box.execute([[SELECT COUNT() from k1]])')
+tx1('box.execute([[SELECT COUNT() FROM SEQSCAN K1]])')
  | ---
  | - - {'rows': [[0]], 'metadata': [{'type': 'integer', 'name': 'COLUMN_1'}]}
  | ...
-box.execute([[INSERT INTO k1 VALUES (1);]])
+box.execute([[INSERT INTO K1 VALUES (1);]])
  | ---
  | - row_count: 1
  | ...
-tx1('box.execute([[SELECT COUNT() from k1]])')
+tx1('box.execute([[SELECT COUNT() FROM SEQSCAN K1]])')
  | ---
  | - - {'rows': [[0]], 'metadata': [{'type': 'integer', 'name': 'COLUMN_1'}]}
  | ...
@@ -3656,19 +3786,19 @@ tx1:commit()
  | - 
  | ...
 
-box.execute([[DROP TABLE k4;]])
+box.execute([[DROP TABLE K4;]])
  | ---
  | - row_count: 1
  | ...
-box.execute([[DROP TABLE k3;]])
+box.execute([[DROP TABLE K3;]])
  | ---
  | - row_count: 1
  | ...
-box.execute([[DROP TABLE k2;]])
+box.execute([[DROP TABLE K2;]])
  | ---
  | - row_count: 1
  | ...
-box.execute([[DROP TABLE k1;]])
+box.execute([[DROP TABLE K1;]])
  | ---
  | - row_count: 1
  | ...
@@ -3752,13 +3882,15 @@ s:create_index('sk', {parts = {{2, 'unsigned'}}})
  | ---
  | - unique: true
  |   parts:
- |   - type: unsigned
+ |   - fieldno: 2
+ |     sort_order: asc
+ |     type: unsigned
+ |     exclude_null: false
  |     is_nullable: false
- |     fieldno: 2
  |   hint: true
  |   id: 1
  |   type: TREE
- |   space_id: 668
+ |   space_id: 512
  |   name: sk
  | ...
 
@@ -3831,4 +3963,3 @@ test_run:cmd("cleanup server tx_man")
  | ---
  | - true
  | ...
-

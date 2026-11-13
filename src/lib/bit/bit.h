@@ -40,8 +40,8 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
-#if defined(HAVE_FFSL) || defined(HAVE_FFSLL)
 #include <string.h>
+#if defined(HAVE_FFSL) || defined(HAVE_FFSLL)
 #include <strings.h>
 #endif /* defined(HAVE_FFSL) || defined(HAVE_FFSLL) */
 #include <limits.h>
@@ -49,25 +49,6 @@
 #if defined(__cplusplus)
 extern "C" {
 #endif /* defined(__cplusplus) */
-
-/** @cond false **/
-#define bit_likely(x)    __builtin_expect((x),1)
-#define bit_unlikely(x)  __builtin_expect((x),0)
-
-struct PACKED unaligned_mem
-{
-	union
-	{
-		uint8_t  u8;
-		uint16_t u16;
-		uint32_t u32;
-		uint64_t u64;
-		float	 f;
-		double	 lf;
-		bool     b;
-	};
-};
-/** @endcond **/
 
 /**
  * @brief Unaligned load from memory.
@@ -77,49 +58,63 @@ struct PACKED unaligned_mem
 inline uint8_t
 load_u8(const void *p)
 {
-	return ((const struct unaligned_mem *)p)->u8;
+	uint8_t res;
+	memcpy(&res, p, sizeof(res));
+	return res;
 }
 
 /** @copydoc load_u8 */
 inline uint16_t
 load_u16(const void *p)
 {
-	return ((const struct unaligned_mem *)p)->u16;
+	uint16_t res;
+	memcpy(&res, p, sizeof(res));
+	return res;
 }
 
 /** @copydoc load_u8 */
 inline uint32_t
 load_u32(const void *p)
 {
-	return ((const struct unaligned_mem *)p)->u32;
+	uint32_t res;
+	memcpy(&res, p, sizeof(res));
+	return res;
 }
 
 /** @copydoc load_u8 */
 inline uint64_t
 load_u64(const void *p)
 {
-	return ((const struct unaligned_mem *)p)->u64;
+	uint64_t res;
+	memcpy(&res, p, sizeof(res));
+	return res;
 }
 
 /** @copydoc load_u8 */
 inline float
 load_float(const void *p)
 {
-	return ((const struct unaligned_mem *)p)->f;
+	float res;
+	memcpy(&res, p, sizeof(res));
+	return res;
 }
 
 /** @copydoc load_u8 */
 inline double
 load_double(const void *p)
 {
-	return ((const struct unaligned_mem *)p)->lf;
+	double res;
+	memcpy(&res, p, sizeof(res));
+	return res;
 }
 
 /** @copydoc load_u8 */
 inline bool
 load_bool(const void *p)
 {
-	return ((const struct unaligned_mem *)p)->b;
+	bool res;
+	memcpy(&res, p, sizeof(res));
+	return res;
 }
 
 /**
@@ -130,49 +125,49 @@ load_bool(const void *p)
 inline void
 store_u8(void *p, uint8_t v)
 {
-	((struct unaligned_mem *)p)->u8 = v;
+	memcpy(p, &v, sizeof(v));
 }
 
 /** @copydoc store_u8 */
 inline void
 store_u16(void *p, uint16_t v)
 {
-	((struct unaligned_mem *)p)->u16 = v;
+	memcpy(p, &v, sizeof(v));
 }
 
 /** @copydoc store_u8 */
 inline void
 store_u32(void *p, uint32_t v)
 {
-	((struct unaligned_mem *)p)->u32 = v;
+	memcpy(p, &v, sizeof(v));
 }
 
 /** @copydoc store_u8 */
 inline void
 store_u64(void *p, uint64_t v)
 {
-	((struct unaligned_mem *)p)->u64 = v;
+	memcpy(p, &v, sizeof(v));
 }
 
 /** @copydoc store_u8 */
 inline void
 store_float(void *p, float v)
 {
-	((struct unaligned_mem *)p)->f = v;
+	memcpy(p, &v, sizeof(v));
 }
 
 /** @copydoc store_u8 */
 inline void
 store_double(void *p, double v)
 {
-	((struct unaligned_mem *)p)->lf = v;
+	memcpy(p, &v, sizeof(v));
 }
 
 /** @copydoc store_bool */
 inline void
-store_bool(void *p, bool b)
+store_bool(void *p, bool v)
 {
-	((struct unaligned_mem *)p)->b = b;
+	memcpy(p, &v, sizeof(v));
 }
 
 /**
@@ -188,8 +183,6 @@ store_bool(void *p, bool b)
 
 /**
  * @brief Test bit \a pos in memory chunk \a data
- * data is considered as a sequence of chars,
- *  although data size must be sizeof(long) aligned
  * @param data memory chunk
  * @param pos bit number (zero-based)
  * @retval true bit \a pos is set in \a data
@@ -207,8 +200,6 @@ bit_test(const void *data, size_t pos)
 
 /**
  * @brief Set bit \a pos in a memory chunk \a data
- * data is considered as a sequence of chars,
- *  although data size must be sizeof(long) aligned
  * @param data memory chunk
  * @param pos bit number (zero-based)
  * @return previous value
@@ -229,8 +220,6 @@ bit_set(void *data, size_t pos)
 
 /**
  * @brief Clear bit \a pos in memory chunk \a data
- * data is considered as a sequence of chars,
- *  although data size must be sizeof(long) aligned
  * @param data memory chunk
  * @param pos bit number (zero-based)
  * @return previous value
@@ -248,6 +237,101 @@ bit_clear(void *data, size_t pos)
 	ldata[chunk] &= ~(1UL << offset);
 	return prev;
 }
+
+/**
+ * @brief Set \a count bits in a memory chunk \a data starting from bit \a pos
+ *  to the value \a val.
+ * @param data - memory chunk
+ * @param pos - the first bit number (zero-based)
+ * @param count - the amount of bits to set
+ * @param val - the new value of bits
+ */
+inline void
+bit_set_range(void *data, size_t pos, size_t count, bool val)
+{
+	if (count == 0)
+		return;
+	/*
+	 * We can have:
+	 *  - a head of bits in the start;
+	 *  - a bunch of whole bytes in the middle;
+	 *  - a tail of bits in the end.
+	 */
+	size_t pos_byte = pos / CHAR_BIT;
+	size_t pos_bit = pos % CHAR_BIT;
+	/*
+	 * The head may be the only byte to copy to.
+	 */
+	size_t head_size = pos_bit + count < CHAR_BIT ?
+			   count : CHAR_BIT - pos_bit;
+	size_t rest_size = count - head_size;    /* Can be 0. */
+	size_t body_size = rest_size / CHAR_BIT; /* In bytes. */
+	size_t tail_size = rest_size % CHAR_BIT; /* In bits. */
+
+	size_t head_mask = ((1ULL << head_size) - 1) << pos_bit;
+	size_t tail_mask = ((1ULL << tail_size) - 1);
+
+	uint8_t value = val ? 0xFF : 0x00;
+	uint8_t *head = (uint8_t *)data + pos_byte;
+	uint8_t *body = head + 1;
+	uint8_t *tail = body + body_size;
+	/*
+	 * Set the head bits.
+	 */
+	*head = (*head & ~head_mask) | (value & head_mask);
+	/*
+	 * Set the body bytes.
+	 */
+	memset(body, value, body_size);
+	/*
+	 * Set the tail bits. The if-statement is required to avoid overwriting
+	 * a byte beyond the buffer even if `tail_mask' is empty.
+	 */
+	if (tail_size > 0)
+		*tail = (*tail & ~tail_mask) | (value & tail_mask);
+	/*
+	 * Once you are done trying to "optimize" this routine, and have
+	 * realized what a terrible mistake that was, please increment
+	 * the following counter as a warning to the next guy:
+	 *
+	 * total_hours_wasted_here = 8
+	 */
+}
+
+/**
+ * @brief Copy \a count bits from memory chunk \a src starting from bit \a src_i
+ *  into \a dst starting from bit \a dst_i.
+ * @param dst - the memory chunk to copy bits into.
+ * @param dst_i - the position to copy bits into.
+ * @param count - the amount of bits to copy.
+ * @param src - the memory chunk to copy bits from.
+ * @param src_i - the position to copy bits from.
+ * @pre the bit buffers do not overlap.
+ */
+void
+bit_copy_range(uint8_t *restrict dst, size_t dst_i, const uint8_t *restrict src,
+	       size_t src_i, size_t count);
+
+/**
+ * @brief Copy \a count bits from memory chunk \a src starting from bit \a src_i
+ *  in backward order into \a dst starting from bit \a dst_i in forward order.
+ * @param dst - the memory chunk to copy bits into.
+ * @param dst_i - the position to copy bits into.
+ * @param count - the amount of bits to copy.
+ * @param src - the memory chunk to copy bits from.
+ * @param src_i - the position to copy bits from.
+ * @pre the bit buffers do not overlap.
+ */
+void
+bit_copy_range_reverse(uint8_t *restrict dst, size_t dst_i,
+		       const uint8_t *restrict src, size_t src_i, size_t count);
+
+/**
+ * Whether two bitmasks of `count` bits overlap - have at least one position
+ * where bit is set in both masks.
+ */
+bool
+bit_overlap(const void *a, const void *b, size_t count);
 
 /**
  * @cond false
@@ -401,6 +485,21 @@ bit_count_u64(uint64_t x)
 #undef POPCOUNT_NAIVE
 
 /**
+ * @brief Returns the number of 1-bits in @a data vector starting from
+ *	  @a bit_offset.
+ * @param data byte vector of length @a length bits.
+ * @param bit_offset offset within the byte vector from where to start
+ *		     counting 1-bits.
+ * @param length length in bits of byte vector @a data.
+ * @return the number of 1-bits in @a data.
+ *
+ * Implementation adopted from the internals of the Apache
+ * Arrow C++ library.
+ */
+size_t
+bit_count(const uint8_t *data, size_t bit_offset, size_t length);
+
+/**
  * @brief Rotate @a x left by @a r bits
  * @param x integer
  * @param r number for bits to rotate
@@ -517,6 +616,20 @@ bswap_u64(uint64_t x)
 }
 
 /**
+ * @brief Reverse bits in \a x.
+ * @param x value
+ * @return value with bits reversed
+ */
+static inline uint8_t
+bit_reverse_u8(uint8_t x)
+{
+	x = ((x & 0x55) << 1) | ((x >> 1) & 0x55);
+	x = ((x & 0x33) << 2) | ((x >> 2) & 0x33);
+	x = (x << 4) | (x >> 4);
+	return x;
+}
+
+/**
  * @brief Index bits in the @a x, i.e. find all positions where bits are set.
  * This method fills @a indexes array with found positions in increasing order.
  * @a offset is added to each index before putting it into @a indexes.
@@ -581,7 +694,7 @@ bit_iterator_init(struct bit_iterator *it, const void *data, size_t size,
 	it->start = (const char *) data;
 	it->next = it->start;
 	it->end = it->next + size;
-	if (bit_unlikely(size == 0)) {
+	if (unlikely(size == 0)) {
 		it->word = 0;
 		return;
 	}
@@ -590,11 +703,11 @@ bit_iterator_init(struct bit_iterator *it, const void *data, size_t size,
 	it->word_base = 0;
 
 	/* Check if size is a multiple of sizeof(ITER_UINT) */
-	const char *e = it->next + size % sizeof(ITER_UINT);
-	if (bit_likely(it->next == e)) {
+	if (likely(size % sizeof(ITER_UINT) == 0)) {
 		it->word = ITER_LOAD(it->next);
 		it->next += sizeof(ITER_UINT);
 	} else {
+		const char *e = it->next + size % sizeof(ITER_UINT);
 		it->word = it->word_xor;
 		char *w = (char *) &it->word;
 		while (it->next < e)
@@ -613,8 +726,8 @@ bit_iterator_init(struct bit_iterator *it, const void *data, size_t size,
 inline size_t
 bit_iterator_next(struct bit_iterator *it)
 {
-	while (bit_unlikely(it->word == 0)) {
-		if (bit_unlikely(it->next >= it->end))
+	while (unlikely(it->word == 0)) {
+		if (unlikely(it->next >= it->end))
 			return SIZE_MAX;
 
 		/* Extract the next word from memory */

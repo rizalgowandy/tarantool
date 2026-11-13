@@ -12,18 +12,23 @@ test_run = require('test_run').new()
 fiber = require('fiber')
 errinj = box.error.injection
 
-s = box.schema.create_space('test', {engine = 'vinyl'})
+-- Defer DELETEs to make sure REPLACE doesn't read disk.
+s = box.schema.create_space('test', {engine = 'vinyl', defer_deletes = true})
 pk = s:create_index('pk')
 sk = s:create_index('sk', {parts = {{2, 'unsigned'}}, unique = false})
 s:replace{3, 2}
 s:replace{2, 2}
 box.snapshot()
 
-c = fiber.channel(1)
-
 function do_write() s:replace{1, 2} end
-function init_read() end
-function do_read() local ret = sk:select{2} c:put(ret) end
+
+test_run:cmd("setopt delimiter ';'")
+function do_read()
+    box.begin({txn_isolation = 'read-committed'})
+    local ret = sk:select{2}
+    box.commit()
+    return ret
+end;
 
 -- Since we have tuples stored on disk, read procedure may
 -- yield, opening window for WAL thread to commit or rollback
@@ -38,30 +43,32 @@ function do_read() local ret = sk:select{2} c:put(ret) end
 -- mem doesn't change and the statement is returned in the result set
 -- (i.e. dirty read takes place).
 --
-test_run:cmd("setopt delimiter ';'");
 -- is_tx_faster_than_wal determines whether wal thread has time
 -- to finish its routine or not. In the first case we add extra
 -- time gap to make sure that  WAL thread finished work and
 -- statement is rolled back.
 --
 function read_prepared_with_delay(is_tx_faster_than_wal)
-    errinj.set("ERRINJ_WAL_DELAY", true)
-    fiber.create(do_write, s)
-    init_read()
-    errinj.set("ERRINJ_VY_READ_PAGE_DELAY", true)
-    fiber.create(do_read, sk, c)
     errinj.set("ERRINJ_WAL_WRITE", true)
-    if is_tx_faster_than_wal then
-        errinj.set("ERRINJ_RELAY_FASTER_THAN_TX", true)
+    errinj.set("ERRINJ_WAL_DELAY", true)
+    errinj.set("ERRINJ_VY_READ_PAGE_DELAY", true)
+    local writer = fiber.new(do_write)
+    writer:set_joinable(true)
+    fiber.yield()
+    local reader = fiber.new(do_read)
+    reader:set_joinable(true)
+    fiber.yield()
+    if not is_tx_faster_than_wal then
+        errinj.set("ERRINJ_WAL_DELAY", false)
+        writer:join()
     end
-    errinj.set("ERRINJ_WAL_DELAY", false)
-    fiber.sleep(0.1)
     errinj.set("ERRINJ_VY_READ_PAGE_DELAY", false)
-    local res = c:get()
-    errinj.set("ERRINJ_WAL_WRITE", false)
+    local _, res = reader:join()
     if is_tx_faster_than_wal then
-        errinj.set("ERRINJ_RELAY_FASTER_THAN_TX", false)
+        errinj.set("ERRINJ_WAL_DELAY", false)
+        writer:join()
     end
+    errinj.set("ERRINJ_WAL_WRITE", false)
     return res
 end;
 
@@ -104,8 +111,17 @@ gen = nil
 param = nil
 state = nil
 function do_write() s:replace{3, 20} end
-function init_read() gen, param, state = sk:pairs({20}, {iterator = box.index.EQ}) gen(param, state) end
-function do_read() local _, ret = gen(param, state) c:put(ret) end
+
+test_run:cmd("setopt delimiter ';'")
+function do_read()
+    box.begin({txn_isolation = 'read-committed'})
+    gen, param, state = sk:pairs({20}, {iterator = box.index.EQ})
+    gen(param, state)
+    local _, ret = gen(param, state)
+    box.commit()
+    return ret
+end;
+test_run:cmd("setopt delimiter ''");
 
 read_prepared_with_delay(false)
 -- All the same but test second scenario (WAL thread is not finished

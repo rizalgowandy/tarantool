@@ -48,12 +48,12 @@ local function test_misc(test, s)
     test:is_deeply(result, {1}, "ibuf_decode result")
     test:ok(not st and e:match("null"), "null ibuf")
     st, e = pcall(s.decode, "\xd4\x0f\x00")
-    test:is(e, "Unsupported MsgPack extension type: 15",
-               "decode result for \\xd4\\x0f\\x00: " .. e)
+    test:is(tostring(e), "Unsupported MsgPack extension type: 15",
+            "decode result for \\xd4\\x0f\\x00: " .. e)
     test:ok(not st, "unsupported extension decode")
     st, e = pcall(s.decode, "\xd4\xfe\x00")
-    test:is(e, "Unsupported MsgPack extension type: -2",
-               "decode result for \\xd4\\xfe\\x00: " .. e)
+    test:is(tostring(e), "Unsupported MsgPack extension type: -2",
+            "decode result for \\xd4\\xfe\\x00: " .. e)
     test:ok(not st, "unsupported extension decode")
 end
 
@@ -263,15 +263,20 @@ local function test_decode_array_map_header(test, s)
     end
 end
 
-tap.test("msgpack", function(test)
+local test = tap.test("msgpack")
+
+test:plan(1)
+
+test:test("msgpack", function(test)
     local serializer = require('msgpack')
-    test:plan(14)
+    test:plan(15)
     test:test("unsigned", common.test_unsigned, serializer)
     test:test("signed", common.test_signed, serializer)
     test:test("double", common.test_double, serializer)
     test:test("boolean", common.test_boolean, serializer)
     test:test("string", common.test_string, serializer)
     test:test("nil", common.test_nil, serializer)
+    test:test("datetime", common.test_datetime, serializer)
     test:test("table", common.test_table, serializer, is_array, is_map)
     test:test("ucdata", common.test_ucdata, serializer)
     test:test("depth", common.test_depth, serializer)
@@ -281,3 +286,5 @@ tap.test("msgpack", function(test)
     test:test("decode_buffer", common.test_decode_buffer, serializer)
     test:test("error", common.test_error, serializer)
 end)
+
+os.exit(test:check() and 0 or 1)

@@ -315,6 +315,11 @@ struct vy_recovery {
 	 * seen matching VY_LOG_ABORT_REBOOTSTRAP.
 	 */
 	bool in_rebootstrap;
+	/**
+	 * Set there were errors encountered and skipped during recovery.
+	 * May be set only if the VY_RECOVERY_IGNORE_ERRORS flag was used.
+	 */
+	bool has_errors;
 };
 
 /** LSM tree info stored in a recovery context. */
@@ -442,6 +447,10 @@ struct vy_slice_recovery_info {
 void
 vy_log_init(const char *dir);
 
+/** Shutdown metadata log. Shutdown stops the subsystem fibers. It may yield. */
+void
+vy_log_shutdown(void);
+
 /**
  * Destroy the metadata log.
  */
@@ -527,6 +536,17 @@ void
 vy_log_tx_try_commit(void);
 
 /**
+ * Similar vy_log_tx_try_commit() but additionally updates recovery
+ * context during recovery (see vy_log_begin_recovery()), fixing
+ * it with records we fail to save on previous starts.
+ *
+ * It is expected to be called when missing vy_log changes can be recovered
+ * from xlog.
+ */
+void
+vy_log_tx_try_commit_recoverable(void);
+
+/**
  * Write a record to the metadata log.
  *
  * This function simply appends the record to the internal buffer.
@@ -583,11 +603,24 @@ enum vy_recovery_flag {
 	 * there's no VY_LOG_ABORT_REBOOTSTRAP record.
 	 */
 	VY_RECOVERY_ABORT_REBOOTSTRAP	= 1 << 1,
+	/**
+	 * Log and skip invalid rows (force recovery mode).
+	 */
+	VY_RECOVERY_IGNORE_ERRORS	= 1 << 2,
 };
 
 /**
  * Create a recovery context from the metadata log created
  * by checkpoint with the given signature.
+ *
+ * If the signature is -1, the function loads the metadata log corresponding
+ * to the last created checkpoint. Note, it isn't quite the same as passing
+ * vy_log_signature(). The latter opens a time window for a log rotation so
+ * it may load a stale metadata log while using -1 locks out concurrent log
+ * rotation and thus guarantees that the function loads the latest log.
+ * This is important if the caller writes new log records asynchronously
+ * (with vy_log_tx_try_commit()) basing on the recovered state and expects
+ * them to be recovered on the next execution.
  *
  * For valid values of @flags, see vy_recovery_flag.
  *

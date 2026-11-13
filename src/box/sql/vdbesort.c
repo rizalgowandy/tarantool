@@ -310,19 +310,14 @@ struct VdbeSorter {
 	int pgsz;		/* Main database page size */
 	PmaReader *pReader;	/* Readr data from here after Rewind() */
 	MergeEngine *pMerger;	/* Or here, if bUseThreads==0 */
-	sql *db;		/* Database connection */
 	struct key_def *key_def;
 	UnpackedRecord *pUnpacked;	/* Used by VdbeSorterCompare() */
 	SorterList list;	/* List of in-memory records */
 	int iMemory;		/* Offset of free space in list.aMemory */
 	int nMemory;		/* Size of list.aMemory allocation in bytes */
 	u8 bUsePMA;		/* True if one or more PMAs created */
-	u8 typeMask;
 	SortSubtask aTask;	/* A single subtask */
 };
-
-#define SORTER_TYPE_INTEGER 0x01
-#define SORTER_TYPE_TEXT    0x02
 
 /*
  * An instance of the following object is used to read records out of a
@@ -419,7 +414,7 @@ struct PmaWriter {
  * Or, if using the single large allocation method (VdbeSorter.list.aMemory!=0),
  * then while records are being accumulated the list is linked using the
  * SorterRecord.u.iNext offset. This is because the aMemory[] array may
- * be sqlRealloc()ed while records are being accumulated. Once the VM
+ * be xrealloc()ed while records are being accumulated. Once the VM
  * has finished passing records to the sorter, or when the in-memory buffer
  * is full, the list is sorted. As part of the sorting process, it is
  * converted to use the SorterRecord.u.pNext pointers. See function
@@ -454,8 +449,8 @@ static void vdbeIncrFree(IncrMerger *);
 static void
 vdbePmaReaderClear(PmaReader * pReadr)
 {
-	sql_free(pReadr->aAlloc);
-	sql_free(pReadr->aBuffer);
+	free(pReadr->aAlloc);
+	free(pReadr->aBuffer);
 	if (pReadr->aMap)
 		sqlOsUnfetch(pReadr->pFd, 0, pReadr->aMap);
 	vdbeIncrFree(pReadr->pIncr);
@@ -532,9 +527,8 @@ vdbePmaReadBlob(PmaReader * p,	/* PmaReader from which to take the blob */
 			int nNew = MAX(128, p->nAlloc * 2);
 			while (nByte > nNew)
 				nNew = nNew * 2;
-			aNew = sqlRealloc(p->aAlloc, nNew);
-			if (!aNew)
-				return -1;
+			assert(nNew > 0);
+			aNew = xrealloc(p->aAlloc, nNew);
 			p->nAlloc = nNew;
 			p->aAlloc = aNew;
 		}
@@ -613,15 +607,14 @@ vdbePmaReadVarint(PmaReader * p, u64 * pnOut)
  * *pp is undefined in this case.
  */
 static int
-vdbeSorterMapFile(SortSubtask * pTask, SorterFile * pFile, u8 ** pp)
+vdbeSorterMapFile(struct SorterFile *pFile, u8 **pp)
 {
 	int rc = 0;
-	if (pFile->iEof <= (i64) (pTask->pSorter->db->nMaxSorterMmap)) {
+	if (pFile->iEof <= (i64)(sql_get()->nMaxSorterMmap)) {
 		sql_file *pFd = pFile->pFd;
 		if (pFd->pMethods->iVersion >= 3) {
 			rc = sqlOsFetch(pFd, 0, (int)pFile->iEof,
 					    (void **)pp);
-			testcase(rc != 0);
 		}
 	}
 	return rc;
@@ -651,14 +644,12 @@ vdbePmaReaderSeek(SortSubtask * pTask,	/* Task context */
 	pReadr->iEof = pFile->iEof;
 	pReadr->pFd = pFile->pFd;
 
-	rc = vdbeSorterMapFile(pTask, pFile, &pReadr->aMap);
+	rc = vdbeSorterMapFile(pFile, &pReadr->aMap);
 	if (rc == 0 && pReadr->aMap == NULL) {
 		int pgsz = pTask->pSorter->pgsz;
 		int iBuf = pReadr->iReadOff % pgsz;
 		if (pReadr->aBuffer == 0) {
-			pReadr->aBuffer = (u8 *) sqlMalloc(pgsz);
-			if (pReadr->aBuffer == 0)
-				rc = -1;
+			pReadr->aBuffer = xmalloc(pgsz);
 			pReadr->nBuffer = pgsz;
 		}
 		if (rc == 0 && iBuf != 0) {
@@ -668,7 +659,6 @@ vdbePmaReaderSeek(SortSubtask * pTask,	/* Task context */
 			}
 			rc = sqlOsRead(pReadr->pFd, &pReadr->aBuffer[iBuf],
 					   nRead, pReadr->iReadOff);
-			testcase(rc != 0);
 		}
 	}
 
@@ -701,7 +691,6 @@ vdbePmaReaderNext(PmaReader * pReadr)
 		if (bEof) {
 			/* This is an EOF condition */
 			vdbePmaReaderClear(pReadr);
-			testcase(rc != 0);
 			return rc;
 		}
 	}
@@ -711,7 +700,6 @@ vdbePmaReaderNext(PmaReader * pReadr)
 	if (rc == 0) {
 		pReadr->nKey = (int)nRec;
 		rc = vdbePmaReadBlob(pReadr, (int)nRec, &pReadr->aKey);
-		testcase(rc != 0);
 	}
 
 	return rc;
@@ -787,29 +775,8 @@ vdbeSorterCompare(struct SortSubtask *task, bool *key2_cached,
 	return sqlVdbeRecordCompareMsgpack(key1, r2);
 }
 
-/*
- * Initialize the temporary index cursor just opened as a sorter cursor.
- *
- * Usually, the sorter module uses the value of (pCsr->key_def->part_count)
- * to determine the number of fields that should be compared from the
- * records being sorted. However, if the value passed as argument nField
- * is non-zero and the sorter is able to guarantee a stable sort, nField
- * is used instead. This is used when sorting records for a CREATE INDEX
- * statement. In this case, keys are always delivered to the sorter in
- * order of the primary key, which happens to be make up the final part
- * of the records being sorted. So if the sort is stable, there is never
- * any reason to compare PK fields and they can be ignored for a small
- * performance boost.
- *
- * The sorter can guarantee a stable sort when running in single-threaded
- * mode, but not in multi-threaded mode.
- *
- * 0 is returned if successful, or an sql error code otherwise.
- */
 int
-sqlVdbeSorterInit(sql * db,	/* Database connection (for malloc()) */
-		      VdbeCursor * pCsr	/* Cursor that holds the new sorter */
-    )
+sqlVdbeSorterInit(struct VdbeCursor *pCsr)
 {
 	int pgsz;		/* Page size of main database */
 	VdbeSorter *pSorter;	/* The new sorter */
@@ -818,14 +785,11 @@ sqlVdbeSorterInit(sql * db,	/* Database connection (for malloc()) */
 	assert(pCsr->key_def != NULL);
 	assert(pCsr->eCurType == CURTYPE_SORTER);
 
-	pSorter = (VdbeSorter *) sqlDbMallocZero(db, sizeof(VdbeSorter));
+	pSorter = sql_xmalloc0(sizeof(VdbeSorter));
 	pCsr->uc.pSorter = pSorter;
-	if (pSorter == 0)
-		return -1;
 
 	pSorter->key_def = pCsr->key_def;
 	pSorter->pgsz = pgsz = 1024;
-	pSorter->db = db;
 	pSorter->aTask.pSorter = pSorter;
 
 	/* Cache size in bytes */
@@ -839,13 +803,7 @@ sqlVdbeSorterInit(sql * db,	/* Database connection (for malloc()) */
 	pSorter->mxPmaSize = MAX(pSorter->mnPmaSize, (int)mxCache);
 	assert(pSorter->iMemory == 0);
 	pSorter->nMemory = pgsz;
-	pSorter->list.aMemory = (u8 *) sqlMalloc(pgsz);
-	if (!pSorter->list.aMemory)
-		rc = -1;
-
-	if (pCsr->key_def->part_count < 13 &&
-	    pCsr->key_def->parts[0].coll == NULL)
-		pSorter->typeMask = SORTER_TYPE_INTEGER | SORTER_TYPE_TEXT;
+	pSorter->list.aMemory = xmalloc(pgsz);
 
 	return rc;
 }
@@ -854,13 +812,13 @@ sqlVdbeSorterInit(sql * db,	/* Database connection (for malloc()) */
  * Free the list of sorted records starting at pRecord.
  */
 static void
-vdbeSorterRecordFree(sql * db, SorterRecord * pRecord)
+vdbeSorterRecordFree(struct SorterRecord *pRecord)
 {
 	SorterRecord *p;
 	SorterRecord *pNext;
 	for (p = pRecord; p; p = pNext) {
 		pNext = p->u.pNext;
-		sqlDbFree(db, p);
+		sql_xfree(p);
 	}
 }
 
@@ -869,12 +827,12 @@ vdbeSorterRecordFree(sql * db, SorterRecord * pRecord)
  * fields of *pTask are zeroed before returning.
  */
 static void
-vdbeSortSubtaskCleanup(sql * db, SortSubtask * pTask)
+vdbeSortSubtaskCleanup(struct SortSubtask *pTask)
 {
-	sqlDbFree(db, pTask->pUnpacked);
+	sql_xfree(pTask->pUnpacked);
 
 	assert(pTask->list.aMemory == 0);
-	vdbeSorterRecordFree(0, pTask->list.pList);
+	vdbeSorterRecordFree(pTask->list.pList);
 
 	if (pTask->file.pFd) {
 		sqlOsCloseFree(pTask->file.pFd);
@@ -907,13 +865,11 @@ vdbeMergeEngineNew(int nReader)
 		N += N;
 	nByte = sizeof(MergeEngine) + N * (sizeof(int) + sizeof(PmaReader));
 
-	pNew = (MergeEngine *) sqlMallocZero(nByte);
-	if (pNew) {
-		pNew->nTree = N;
-		pNew->pTask = 0;
-		pNew->aReadr = (PmaReader *) & pNew[1];
-		pNew->aTree = (int *)&pNew->aReadr[N];
-	}
+	pNew = xcalloc(1, nByte);
+	pNew->nTree = N;
+	pNew->pTask = 0;
+	pNew->aReadr = (PmaReader *)&pNew[1];
+	pNew->aTree = (int *)&pNew->aReadr[N];
 	return pNew;
 }
 
@@ -929,7 +885,7 @@ vdbeMergeEngineFree(MergeEngine * pMerger)
 			vdbePmaReaderClear(&pMerger->aReadr[i]);
 		}
 	}
-	sql_free(pMerger);
+	free(pMerger);
 }
 
 /*
@@ -941,47 +897,40 @@ vdbeIncrFree(IncrMerger * pIncr)
 {
 	if (pIncr) {
 		vdbeMergeEngineFree(pIncr->pMerger);
-		sql_free(pIncr);
+		free(pIncr);
 	}
 }
 
-/*
- * Reset a sorting cursor back to its original empty state.
- */
 void
-sqlVdbeSorterReset(sql * db, VdbeSorter * pSorter)
+sqlVdbeSorterReset(struct VdbeSorter *pSorter)
 {
 	(void)vdbeSorterJoinAll(pSorter, 0);
 	assert(pSorter->pReader == 0);
 	vdbeMergeEngineFree(pSorter->pMerger);
 	pSorter->pMerger = 0;
-	vdbeSortSubtaskCleanup(db, &pSorter->aTask);
+	vdbeSortSubtaskCleanup(&pSorter->aTask);
 	pSorter->aTask.pSorter = pSorter;
-	if (pSorter->list.aMemory == 0) {
-		vdbeSorterRecordFree(0, pSorter->list.pList);
-	}
+	if (pSorter->list.aMemory == 0)
+		vdbeSorterRecordFree(pSorter->list.pList);
 	pSorter->list.pList = 0;
 	pSorter->list.szPMA = 0;
 	pSorter->bUsePMA = 0;
 	pSorter->iMemory = 0;
 	pSorter->mxKeysize = 0;
-	sqlDbFree(db, pSorter->pUnpacked);
+	sql_xfree(pSorter->pUnpacked);
 	pSorter->pUnpacked = 0;
 }
 
-/*
- * Free any cursor components allocated by sqlVdbeSorterXXX routines.
- */
 void
-sqlVdbeSorterClose(sql * db, VdbeCursor * pCsr)
+sqlVdbeSorterClose(struct VdbeCursor *pCsr)
 {
 	VdbeSorter *pSorter;
 	assert(pCsr->eCurType == CURTYPE_SORTER);
 	pSorter = pCsr->uc.pSorter;
 	if (pSorter) {
-		sqlVdbeSorterReset(db, pSorter);
-		sql_free(pSorter->list.aMemory);
-		sqlDbFree(db, pSorter);
+		sqlVdbeSorterReset(pSorter);
+		free(pSorter->list.aMemory);
+		sql_xfree(pSorter);
 		pCsr->uc.pSorter = 0;
 	}
 }
@@ -997,9 +946,10 @@ sqlVdbeSorterClose(sql * db, VdbeCursor * pCsr)
  * the specific VFS implementation.
  */
 static void
-vdbeSorterExtendFile(sql * db, sql_file * pFd, i64 nByte)
+vdbeSorterExtendFile(struct sql_file *pFd, i64 nByte)
 {
-	if (nByte <= (i64) (db->nMaxSorterMmap) && pFd->pMethods->iVersion >= 3) {
+	struct sql *db = sql_get();
+	if (nByte <= db->nMaxSorterMmap && pFd->pMethods->iVersion >= 3) {
 		void *p = 0;
 		int chunksize = 4 * 1024;
 		sqlOsFileControlHint(pFd, SQL_FCNTL_CHUNK_SIZE,
@@ -1010,7 +960,7 @@ vdbeSorterExtendFile(sql * db, sql_file * pFd, i64 nByte)
 	}
 }
 #else
-#define vdbeSorterExtendFile(x,y,z)
+#define vdbeSorterExtendFile(y, z)
 #endif
 
 /*
@@ -1019,21 +969,18 @@ vdbeSorterExtendFile(sql * db, sql_file * pFd, i64 nByte)
  * Otherwise, set *ppFd to 0 and return an sql error code.
  */
 static int
-vdbeSorterOpenTempFile(sql * db,	/* Database handle doing sort */
-		       i64 nExtend,	/* Attempt to extend file to this size */
-		       sql_file ** ppFd)
+vdbeSorterOpenTempFile(int64_t nExtend, struct sql_file **ppFd)
 {
 	int rc;
-	rc = sqlOsOpenMalloc(db->pVfs, 0, ppFd,
-				 SQL_OPEN_READWRITE | SQL_OPEN_CREATE |
-				 SQL_OPEN_EXCLUSIVE |
-				 SQL_OPEN_DELETEONCLOSE, &rc);
+	rc = sqlOsOpenMalloc(sql_get()->pVfs, 0, ppFd,
+			     SQL_OPEN_READWRITE | SQL_OPEN_CREATE |
+			     SQL_OPEN_EXCLUSIVE | SQL_OPEN_DELETEONCLOSE, &rc);
 	if (rc == 0) {
 		i64 max = SQL_MAX_MMAP_SIZE;
 		sqlOsFileControlHint(*ppFd, SQL_FCNTL_MMAP_SIZE,
 					 (void *)&max);
 		if (nExtend > 0) {
-			vdbeSorterExtendFile(db, *ppFd, nExtend);
+			vdbeSorterExtendFile(*ppFd, nExtend);
 		}
 	}
 	return rc;
@@ -1049,10 +996,7 @@ vdbeSortAllocUnpacked(SortSubtask * pTask)
 {
 	if (pTask->pUnpacked == 0) {
 		pTask->pUnpacked =
-			sqlVdbeAllocUnpackedRecord(pTask->pSorter->db,
-						       pTask->pSorter->key_def);
-		if (pTask->pUnpacked == 0)
-			return -1;
+			sqlVdbeAllocUnpackedRecord(pTask->pSorter->key_def);
 		pTask->pUnpacked->nField = pTask->pSorter->key_def->part_count;
 	}
 	return 0;
@@ -1131,11 +1075,7 @@ vdbeSorterSort(SortSubtask * pTask, SorterList * pList)
 	p = pList->pList;
 	pTask->xCompare = vdbeSorterGetCompare(pTask->pSorter);
 
-	aSlot =
-	    (SorterRecord **) sqlMallocZero(64 * sizeof(SorterRecord *));
-	if (!aSlot) {
-		return -1;
-	}
+	aSlot = xcalloc(64, sizeof(SorterRecord *));
 
 	while (p) {
 		SorterRecord *pNext;
@@ -1143,8 +1083,6 @@ vdbeSorterSort(SortSubtask * pTask, SorterList * pList)
 			if ((u8 *) p == pList->aMemory) {
 				pNext = 0;
 			} else {
-				assert(p->u.iNext <
-				       sqlMallocSize(pList->aMemory));
 				pNext =
 				    (SorterRecord *) & pList->aMemory[p->u.
 								      iNext];
@@ -1170,7 +1108,7 @@ vdbeSorterSort(SortSubtask * pTask, SorterList * pList)
 	}
 	pList->pList = p;
 
-	sql_free(aSlot);
+	free(aSlot);
 	return 0;
 }
 
@@ -1185,15 +1123,12 @@ vdbePmaWriterInit(sql_file * pFd,	/* File handle to write to */
     )
 {
 	memset(p, 0, sizeof(PmaWriter));
-	p->aBuffer = (u8 *) sqlMalloc(nBuf);
-	if (!p->aBuffer) {
-		p->eFWErr = -1;
-	} else {
-		p->iBufEnd = p->iBufStart = (iStart % nBuf);
-		p->iWriteOff = iStart - p->iBufStart;
-		p->nBuffer = nBuf;
-		p->pFd = pFd;
-	}
+	p->aBuffer = xmalloc(nBuf);
+	p->iBufEnd = iStart % nBuf;
+	p->iBufStart = p->iBufEnd;
+	p->iWriteOff = iStart - p->iBufStart;
+	p->nBuffer = nBuf;
+	p->pFd = pFd;
 }
 
 /*
@@ -1246,7 +1181,7 @@ vdbePmaWriterFinish(PmaWriter * p, i64 * piEof)
 					   p->iWriteOff + p->iBufStart);
 	}
 	*piEof = (p->iWriteOff + p->iBufEnd);
-	sql_free(p->aBuffer);
+	free(p->aBuffer);
 	rc = p->eFWErr;
 	memset(p, 0, sizeof(PmaWriter));
 	return rc;
@@ -1282,7 +1217,6 @@ vdbePmaWriteVarint(PmaWriter * p, u64 iVal)
 static int
 vdbeSorterListToPMA(SortSubtask * pTask, SorterList * pList)
 {
-	sql *db = pTask->pSorter->db;
 	int rc = 0;	/* Return code */
 	PmaWriter writer;	/* Object used to write to the file */
 
@@ -1299,7 +1233,7 @@ vdbeSorterListToPMA(SortSubtask * pTask, SorterList * pList)
 
 	/* If the first temporary PMA file has not been opened, open it now. */
 	if (pTask->file.pFd == 0) {
-		rc = vdbeSorterOpenTempFile(db, 0, &pTask->file.pFd);
+		rc = vdbeSorterOpenTempFile(0, &pTask->file.pFd);
 		assert(rc != 0 || pTask->file.pFd);
 		assert(pTask->file.iEof == 0);
 		assert(pTask->nPMA == 0);
@@ -1307,7 +1241,7 @@ vdbeSorterListToPMA(SortSubtask * pTask, SorterList * pList)
 
 	/* Try to get the file to memory map */
 	if (rc == 0) {
-		vdbeSorterExtendFile(db, pTask->file.pFd,
+		vdbeSorterExtendFile(pTask->file.pFd,
 				     pTask->file.iEof + pList->szPMA + 9);
 	}
 
@@ -1328,7 +1262,7 @@ vdbeSorterListToPMA(SortSubtask * pTask, SorterList * pList)
 			vdbePmaWriteVarint(&writer, p->nVal);
 			vdbePmaWriteBlob(&writer, SRVAL(p), p->nVal);
 			if (pList->aMemory == 0)
-				sql_free(p);
+				free(p);
 		}
 		pList->pList = p;
 		rc = vdbePmaWriterFinish(&writer, &pTask->file.iEof);
@@ -1448,19 +1382,9 @@ sqlVdbeSorterWrite(const VdbeCursor * pCsr,	/* Sorter cursor */
 	int bFlush;		/* True to flush contents of memory to PMA */
 	int nReq;		/* Bytes of memory required */
 	int nPMA;		/* Bytes of PMA space required */
-	int t;			/* serial type of first record field */
 
 	assert(pCsr->eCurType == CURTYPE_SORTER);
 	pSorter = pCsr->uc.pSorter;
-	getVarint32((const u8 *)&pVal->z[1], t);
-	if (t > 0 && t < 10 && t != 7) {
-		pSorter->typeMask &= SORTER_TYPE_INTEGER;
-	} else if (t > 10 && (t & 0x01)) {
-		pSorter->typeMask &= SORTER_TYPE_TEXT;
-	} else {
-		pSorter->typeMask = 0;
-	}
-
 	assert(pSorter);
 
 	/* Figure out whether or not the current contents of memory should be
@@ -1513,9 +1437,8 @@ sqlVdbeSorterWrite(const VdbeCursor * pCsr,	/* Sorter cursor */
 			if (nNew < nMin)
 				nNew = nMin;
 
-			aNew = sqlRealloc(pSorter->list.aMemory, nNew);
-			if (!aNew)
-				return -1;
+			assert(nNew > 0);
+			aNew = xrealloc(pSorter->list.aMemory, nNew);
 			pSorter->list.pList = (SorterRecord *) & aNew[iListOff];
 			pSorter->list.aMemory = aNew;
 			pSorter->nMemory = nNew;
@@ -1530,10 +1453,7 @@ sqlVdbeSorterWrite(const VdbeCursor * pCsr,	/* Sorter cursor */
 				  pSorter->list.aMemory);
 		}
 	} else {
-		pNew = (SorterRecord *) sqlMalloc(nReq);
-		if (pNew == 0) {
-			return -1;
-		}
+		pNew = xmalloc(nReq);
 		pNew->u.pNext = pSorter->list.pList;
 	}
 
@@ -1632,19 +1552,13 @@ vdbeIncrMergerNew(SortSubtask * pTask,	/* The thread that will be using the new 
     )
 {
 	int rc = 0;
-	IncrMerger *pIncr = *ppOut =
-		(IncrMerger *) sqlMallocZero(sizeof(*pIncr));
-	if (pIncr) {
-		pIncr->pMerger = pMerger;
-		pIncr->pTask = pTask;
-		pIncr->mxSz =
-		    MAX(pTask->pSorter->mxKeysize + 9,
-			pTask->pSorter->mxPmaSize / 2);
-		pTask->file2.iEof += pIncr->mxSz;
-	} else {
-		vdbeMergeEngineFree(pMerger);
-		rc = -1;
-	}
+	IncrMerger *pIncr = xcalloc(1, sizeof(*pIncr));
+	*ppOut = pIncr;
+	pIncr->pMerger = pMerger;
+	pIncr->pTask = pTask;
+	pIncr->mxSz = MAX(pTask->pSorter->mxKeysize + 9,
+			  pTask->pSorter->mxPmaSize / 2);
+	pTask->file2.iEof += pIncr->mxSz;
 	return rc;
 }
 
@@ -1761,7 +1675,6 @@ vdbePmaReaderIncrMergeInit(PmaReader * pReadr)
 	int rc = 0;
 	IncrMerger *pIncr = pReadr->pIncr;
 	SortSubtask *pTask = pIncr->pTask;
-	sql *db = pTask->pSorter->db;
 
 	rc = vdbeMergeEngineInit(pTask, pIncr->pMerger);
 
@@ -1773,8 +1686,7 @@ vdbePmaReaderIncrMergeInit(PmaReader * pReadr)
 		int mxSz = pIncr->mxSz;
 		if (pTask->file2.pFd == 0) {
 			assert(pTask->file2.iEof > 0);
-			rc = vdbeSorterOpenTempFile(db,
-						    pTask->file2.iEof,
+			rc = vdbeSorterOpenTempFile(pTask->file2.iEof,
 						    &pTask->file2.pFd);
 			pTask->file2.iEof = 0;
 		}
@@ -2089,11 +2001,9 @@ sqlVdbeSorterRewind(const VdbeCursor * pCsr, int *pbEof)
 	return rc;
 }
 
-/*
- * Advance to the next element in the sorter.
- */
+/** Advance to the next element in the sorter. */
 int
-sqlVdbeSorterNext(sql * db, const VdbeCursor * pCsr, int *pbEof)
+sqlVdbeSorterNext(const struct VdbeCursor *pCsr, int *pbEof)
 {
 	VdbeSorter *pSorter;
 	int rc;			/* Return code */
@@ -2112,7 +2022,7 @@ sqlVdbeSorterNext(sql * db, const VdbeCursor * pCsr, int *pbEof)
 		pSorter->list.pList = pFree->u.pNext;
 		pFree->u.pNext = 0;
 		if (pSorter->list.aMemory == 0)
-			vdbeSorterRecordFree(db, pFree);
+			vdbeSorterRecordFree(pFree);
 		*pbEof = !pSorter->list.pList;
 		rc = 0;
 	}
@@ -2158,8 +2068,7 @@ sqlVdbeSorterRowkey(const VdbeCursor * pCsr, Mem * pOut)
 	assert(pCsr->eCurType == CURTYPE_SORTER);
 	pSorter = pCsr->uc.pSorter;
 	pKey = vdbeSorterRowkey(pSorter, &nKey);
-	if (mem_copy_bin(pOut, pKey, nKey) != 0)
-		return -1;
+	mem_copy_bin(pOut, pKey, nKey);
 
 	return 0;
 }
@@ -2197,10 +2106,8 @@ sqlVdbeSorterCompare(const VdbeCursor * pCsr,	/* Sorter cursor */
 	pSorter = pCsr->uc.pSorter;
 	r2 = pSorter->pUnpacked;
 	if (r2 == 0) {
-		r2 = pSorter->pUnpacked =
-			sqlVdbeAllocUnpackedRecord(pSorter->db,  pCsr->key_def);
-		if (r2 == 0)
-			return -1;
+		r2 = sqlVdbeAllocUnpackedRecord(pCsr->key_def);
+		pSorter->pUnpacked = r2;
 		r2->nField = nKeyCol;
 	}
 	assert(r2->nField == nKeyCol);

@@ -31,7 +31,10 @@
  * SUCH DAMAGE.
  */
 #include "coio.h"
+#include "diag.h"
 #include <small/ibuf.h>
+
+struct iostream;
 
 /** Buffered cooperative IO */
 
@@ -41,11 +44,13 @@
  * of EOF).
  */
 static inline ssize_t
-coio_bread(struct ev_io *coio, struct ibuf *buf, size_t sz)
+coio_bread(struct iostream *io, struct ibuf *buf, size_t sz)
 {
-	ibuf_reserve_xc(buf, sz);
-	ssize_t n = coio_read_ahead(coio, buf->wpos, sz, ibuf_unused(buf));
-	buf->wpos += n;
+	xibuf_reserve(buf, sz);
+	ssize_t n = coio_read_ahead(io, buf->wpos, sz, ibuf_unused(buf));
+	if (n < 0)
+		diag_raise();
+	VERIFY(ibuf_alloc(buf, n) != NULL);
 	return n;
 }
 
@@ -55,39 +60,46 @@ coio_bread(struct ev_io *coio, struct ibuf *buf, size_t sz)
  * in case of EOF or timeout).
  */
 static inline ssize_t
-coio_bread_timeout(struct ev_io *coio, struct ibuf *buf, size_t sz,
+coio_bread_timeout(struct iostream *io, struct ibuf *buf, size_t sz,
 		   ev_tstamp timeout)
 {
-	ibuf_reserve_xc(buf, sz);
-	ssize_t n = coio_read_ahead_timeout(coio, buf->wpos, sz, ibuf_unused(buf),
+	xibuf_reserve(buf, sz);
+	ssize_t n = coio_read_ahead_timeout(io, buf->wpos, sz, ibuf_unused(buf),
 			                    timeout);
-	buf->wpos += n;
+	if (n < 0)
+		diag_raise();
+	VERIFY(ibuf_alloc(buf, n) != NULL);
 	return n;
 }
 
 /** Read at least sz bytes, buffered. Throw an exception in case of EOF. */
 static inline ssize_t
-coio_breadn(struct ev_io *coio, struct ibuf *buf, size_t sz)
+coio_breadn(struct iostream *io, struct ibuf *buf, size_t sz)
 {
-	ibuf_reserve_xc(buf, sz);
-	ssize_t n = coio_readn_ahead(coio, buf->wpos, sz, ibuf_unused(buf));
-	buf->wpos += n;
+	xibuf_reserve(buf, sz);
+	ssize_t n = coio_readn_ahead(io, buf->wpos, sz, ibuf_unused(buf));
+	if (n < 0)
+		diag_raise();
+	VERIFY(ibuf_alloc(buf, n) != NULL);
 	return n;
 }
 
-/** Reat at least sz bytes, buffered. Throw an exception in case
+/**
+ * Read at least sz bytes, buffered. Throw an exception in case
  * of EOF.
  * @return the number of bytes read. Can be less than sz in
  * case of timeout.
  */
 static inline ssize_t
-coio_breadn_timeout(struct ev_io *coio, struct ibuf *buf, size_t sz,
+coio_breadn_timeout(struct iostream *io, struct ibuf *buf, size_t sz,
 		    ev_tstamp timeout)
 {
-	ibuf_reserve_xc(buf, sz);
-	ssize_t n = coio_readn_ahead_timeout(coio, buf->wpos, sz, ibuf_unused(buf),
+	xibuf_reserve(buf, sz);
+	ssize_t n = coio_readn_ahead_timeout(io, buf->wpos, sz, ibuf_unused(buf),
 			                     timeout);
-	buf->wpos += n;
+	if (n < 0)
+		diag_raise();
+	VERIFY(ibuf_alloc(buf, n) != NULL);
 	return n;
 }
 

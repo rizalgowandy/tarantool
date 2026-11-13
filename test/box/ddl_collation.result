@@ -13,23 +13,23 @@ function setmap(table) return setmetatable(table, { __serialize = 'map' }) end
 
 box.internal.collation.create('test')
  | ---
- | - error: Illegal parameters, type (second arg) must be a string
+ | - error: type (second arg) must be a string
  | ...
 box.internal.collation.create('test', 'ICU')
  | ---
- | - error: Illegal parameters, locale (third arg) must be a string
+ | - error: locale (third arg) must be a string
  | ...
 box.internal.collation.create(42, 'ICU', 'ru_RU')
  | ---
- | - error: Illegal parameters, name (first arg) must be a string
+ | - error: name (first arg) must be a string
  | ...
 box.internal.collation.create('test', 42, 'ru_RU')
  | ---
- | - error: Illegal parameters, type (second arg) must be a string
+ | - error: type (second arg) must be a string
  | ...
 box.internal.collation.create('test', 'ICU', 42)
  | ---
- | - error: Illegal parameters, locale (third arg) must be a string
+ | - error: locale (third arg) must be a string
  | ...
 box.internal.collation.create('test', 'nothing', 'ru_RU')
  | ---
@@ -53,15 +53,15 @@ box.internal.collation.drop('nothing') -- allowed
  | ...
 box.internal.collation.create('test', 'ICU', 'ru_RU', 42)
  | ---
- | - error: Illegal parameters, options (fourth arg) must be a table or nil
+ | - error: options (fourth arg) must be a table or nil
  | ...
 box.internal.collation.create('test', 'ICU', 'ru_RU', 'options')
  | ---
- | - error: Illegal parameters, options (fourth arg) must be a table or nil
+ | - error: options (fourth arg) must be a table or nil
  | ...
 box.internal.collation.create('test', 'ICU', 'ru_RU', {ping='pong'})
  | ---
- | - error: 'Wrong collation options (field 5): unexpected option ''ping'''
+ | - error: 'Wrong collation options: unexpected option ''ping'''
  | ...
 box.internal.collation.create('test', 'ICU', 'ru_RU', {french_collation='german'})
  | ---
@@ -81,11 +81,11 @@ box.internal.collation.create('test', 'ICU', 'ru_RU', {strength='supervillian'})
  | ...
 box.internal.collation.create('test', 'ICU', 'ru_RU', {strength=42})
  | ---
- | - error: 'Wrong collation options (field 5): ''strength'' must be enum'
+ | - error: 'Wrong collation options: ''strength'' must be enum'
  | ...
 box.internal.collation.create('test', 'ICU', 'ru_RU', {strength=2}) --ok
  | ---
- | - error: 'Wrong collation options (field 5): ''strength'' must be enum'
+ | - error: 'Wrong collation options: ''strength'' must be enum'
  | ...
 box.internal.collation.drop('test') --ok
  | ---
@@ -141,22 +141,22 @@ box.space._collation:auto_increment{'test', 0, 'ICU'}
  | ---
  | - error: Tuple field 5 (locale) required by space format is missing
  | ...
-box.space._collation:auto_increment{'test', 'ADMIN', 'ICU', 'ru_RU'}
+box.space._collation:auto_increment{'test', 'ADMIN', 'ICU', 'ru_RU', setmap{}}
  | ---
  | - error: 'Tuple field 3 (owner) type does not match one required by operation: expected
  |     unsigned, got string'
  | ...
-box.space._collation:auto_increment{42, 0, 'ICU', 'ru_RU'}
+box.space._collation:auto_increment{42, 0, 'ICU', 'ru_RU', setmap{}}
  | ---
  | - error: 'Tuple field 2 (name) type does not match one required by operation: expected
  |     string, got unsigned'
  | ...
-box.space._collation:auto_increment{'test', 0, 42, 'ru_RU'}
+box.space._collation:auto_increment{'test', 0, 42, 'ru_RU', setmap{}}
  | ---
  | - error: 'Tuple field 4 (type) type does not match one required by operation: expected
  |     string, got unsigned'
  | ...
-box.space._collation:auto_increment{'test', 0, 'ICU', 42}
+box.space._collation:auto_increment{'test', 0, 'ICU', 42, setmap{}}
  | ---
  | - error: 'Tuple field 5 (locale) type does not match one required by operation: expected
  |     string, got unsigned'
@@ -191,7 +191,7 @@ box.space._collation:auto_increment{'test', 0, 'ICU', 'ru_RU', 'options'}
  | ...
 box.space._collation:auto_increment{'test', 0, 'ICU', 'ru_RU', {ping='pong'}}
  | ---
- | - error: 'Wrong collation options (field 5): unexpected option ''ping'''
+ | - error: 'Wrong collation options: unexpected option ''ping'''
  | ...
 opts = {normalization_mode='NORMAL'}
  | ---
@@ -232,7 +232,7 @@ opts.alternate_handling1 = 'ON'
  | ...
 box.space._collation:auto_increment{'test', 0, 'ICU', 'ru_RU', opts}
  | ---
- | - error: 'Wrong collation options (field 5): unexpected option ''alternate_handling1'''
+ | - error: 'Wrong collation options: unexpected option ''alternate_handling1'''
  | ...
 opts.alternate_handling1 = nil
  | ---

@@ -5,12 +5,13 @@ macro(ares_build)
     set(ARES_INSTALL_DIR ${PROJECT_BINARY_DIR}/build/ares/dest)
 
     # See BuildLibCURL.cmake for details.
-    set(ARES_CFLAGS "")
+    set(ARES_CFLAGS ${DEPENDENCY_CFLAGS})
     if (TARGET_OS_DARWIN AND NOT "${CMAKE_OSX_SYSROOT}" STREQUAL "")
         set(ARES_CFLAGS "${ARES_CFLAGS} ${CMAKE_C_SYSROOT_FLAG} ${CMAKE_OSX_SYSROOT}")
     endif()
 
     set(ARES_CMAKE_FLAGS "-DCARES_STATIC=ON")
+    list(APPEND ARES_CMAKE_FLAGS "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}")
     list(APPEND ARES_CMAKE_FLAGS "-DCARES_SHARED=OFF")
     list(APPEND ARES_CMAKE_FLAGS "-DCARES_BUILD_TOOLS=OFF")
     # We build both static and shared versions of curl, so ares
@@ -47,7 +48,8 @@ macro(ares_build)
         TMP_DIR ${ARES_BINARY_DIR}/tmp
         STAMP_DIR ${ARES_BINARY_DIR}/stamp
         BINARY_DIR ${ARES_BINARY_DIR}
-        CMAKE_ARGS ${ARES_CMAKE_FLAGS})
+        CMAKE_ARGS ${ARES_CMAKE_FLAGS}
+        BUILD_BYPRODUCTS ${ARES_INSTALL_DIR}/lib/libcares.a)
 
     add_library(bundled-ares STATIC IMPORTED GLOBAL)
     set_target_properties(bundled-ares PROPERTIES IMPORTED_LOCATION

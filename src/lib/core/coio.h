@@ -39,57 +39,21 @@
 extern "C" {
 #endif /* defined(__cplusplus) */
 
+struct iostream;
 struct sockaddr;
-struct uri;
-
-/**
- * Co-operative I/O
- * Yield the current fiber until IO is ready.
- */
-struct coio_service
-{
-	struct evio_service evio_service;
-	/* Fiber function. */
-	fiber_func handler;
-	/** Passed to the created fiber. */
-	void *handler_param;
-};
 
 int
-coio_connect_timeout(struct ev_io *coio, struct uri *uri, struct sockaddr *addr,
-		     socklen_t *addr_len, ev_tstamp timeout);
-
-static inline int
-coio_connect(struct ev_io *coio, struct uri *uri, struct sockaddr *addr,
-		socklen_t *addr_len)
-{
-	return coio_connect_timeout(coio, uri, addr, addr_len, TIMEOUT_INFINITY);
-}
-
-void
-coio_bind(struct ev_io *coio, struct sockaddr *addr,
-	  socklen_t addrlen);
+coio_connect(const char *host, const char *service, int host_hint,
+	     struct sockaddr *addr, socklen_t *addr_len,
+	     ev_tstamp timeout, const char *iface);
 
 int
-coio_accept(struct ev_io *coio, struct sockaddr *addr, socklen_t addrlen,
+coio_accept(int sfd, struct sockaddr *addr, socklen_t addrlen,
 	    ev_tstamp timeout);
 
-void
-coio_create(struct ev_io *coio, int fd);
-
-/*
- * Due to name conflict with coio_close in API_EXPORT
- * we have to use coio_close_io() instead of plain coio_close().
- */
-static inline void
-coio_close_io(ev_loop *loop, struct ev_io *coio)
-{
-	return evio_close(loop, coio);
-}
-
 ssize_t
-coio_read_ahead_timeout(struct ev_io *coio, void *buf, size_t sz, size_t bufsiz,
-		        ev_tstamp timeout);
+coio_read_ahead_timeout(struct iostream *io, void *buf, size_t sz,
+			size_t bufsiz, ev_tstamp timeout);
 
 static inline void
 coio_timeout_init(ev_tstamp *start, ev_tstamp *delay,
@@ -107,135 +71,83 @@ coio_timeout_update(ev_tstamp *start, ev_tstamp *delay)
 /**
  * Reat at least sz bytes, with readahead.
  *
- * Returns 0 in case of EOF.
+ * Returns 0 in case of EOF, -1 in case of error.
  */
 static inline ssize_t
-coio_read_ahead(struct ev_io *coio, void *buf, size_t sz, size_t bufsiz)
+coio_read_ahead(struct iostream *io, void *buf, size_t sz, size_t bufsiz)
 {
-	return coio_read_ahead_timeout(coio, buf, sz, bufsiz, TIMEOUT_INFINITY);
+	return coio_read_ahead_timeout(io, buf, sz, bufsiz, TIMEOUT_INFINITY);
 }
 
 ssize_t
-coio_readn_ahead(struct ev_io *coio, void *buf, size_t sz, size_t bufsiz);
+coio_readn_ahead(struct iostream *io, void *buf, size_t sz, size_t bufsiz);
 
 static inline ssize_t
-coio_read(struct ev_io *coio, void *buf, size_t sz)
+coio_read(struct iostream *io, void *buf, size_t sz)
 {
-	return coio_read_ahead(coio, buf, sz, sz);
+	return coio_read_ahead(io, buf, sz, sz);
 }
 
 static inline ssize_t
-coio_read_timeout(struct ev_io *coio, void *buf, size_t sz, ev_tstamp timeout)
+coio_read_timeout(struct iostream *io, void *buf, size_t sz, ev_tstamp timeout)
 {
-	return coio_read_ahead_timeout(coio, buf, sz, sz, timeout);
+	return coio_read_ahead_timeout(io, buf, sz, sz, timeout);
 }
-
-/**
- * Read data with timeout.
- *
- * Yield until some data will be available for read.
- *
- * Returns amount of read bytes at success, otherwise returns -1
- * and set a diag.
- *
- * Zero return value means EOF.
- *
- * Note: Less then @a count bytes may be available for read at a
- * moment, so a return value less then @a count does not mean EOF.
- *
- * Possible errors:
- *
- * - SocketError: an IO error occurs at read().
- * - TimedOut: @a timeout quota is exceeded.
- * - FiberIsCancelled: cancelled by an outside code.
- */
-ssize_t
-coio_read_ahead_timeout_noxc(struct ev_io *coio, void *buf, size_t sz,
-			     size_t bufsiz, ev_tstamp timeout);
 
 static inline ssize_t
-coio_readn(struct ev_io *coio, void *buf, size_t sz)
+coio_readn(struct iostream *io, void *buf, size_t sz)
 {
-	return coio_readn_ahead(coio, buf, sz, sz);
+	return coio_readn_ahead(io, buf, sz, sz);
 }
 
 ssize_t
-coio_readn_ahead_timeout(struct ev_io *coio, void *buf, size_t sz, size_t bufsiz,
-		         ev_tstamp timeout);
+coio_readn_ahead_timeout(struct iostream *io, void *buf, size_t sz,
+			 size_t bufsiz, ev_tstamp timeout);
+
+static inline ssize_t
+coio_readn_timeout(struct iostream *io, void *buf, size_t sz, ev_tstamp timeout)
+{
+	return coio_readn_ahead_timeout(io, buf, sz, sz, timeout);
+}
 
 ssize_t
-coio_write_timeout(struct ev_io *coio, const void *buf, size_t sz,
+coio_write_timeout(struct iostream *io, const void *buf, size_t sz,
 		   ev_tstamp timeout);
 
-/**
- * Write @a count bytes with timeout.
- *
- * Yield until all @a count bytes will be written.
- *
- * Returns @a count at success, otherwise returns -1 and set a
- * diag.
- *
- * Possible errors:
- *
- * - SocketError: an IO error occurs at write().
- * - TimedOut: @a timeout quota is exceeded.
- * - FiberIsCancelled: cancelled by an outside code.
- */
-ssize_t
-coio_write_timeout_noxc(struct ev_io *coio, const void *buf, size_t sz,
-			ev_tstamp timeout);
-
 static inline void
-coio_write(struct ev_io *coio, const void *buf, size_t sz)
+coio_write(struct iostream *io, const void *buf, size_t sz)
 {
-	coio_write_timeout(coio, buf, sz, TIMEOUT_INFINITY);
+	coio_write_timeout(io, buf, sz, TIMEOUT_INFINITY);
 }
 
 ssize_t
-coio_writev_timeout(struct ev_io *coio, struct iovec *iov, int iovcnt,
+coio_writev_timeout(struct iostream *io, struct iovec *iov, int iovcnt,
 		    size_t size, ev_tstamp timeout);
 
 static inline ssize_t
-coio_writev(struct ev_io *coio, struct iovec *iov, int iovcnt, size_t size)
+coio_writev(struct iostream *io, struct iovec *iov, int iovcnt, size_t size)
 {
-	return coio_writev_timeout(coio, iov, iovcnt, size, TIMEOUT_INFINITY);
+	return coio_writev_timeout(io, iov, iovcnt, size, TIMEOUT_INFINITY);
 }
-
-ssize_t
-coio_sendto_timeout(struct ev_io *coio, const void *buf, size_t sz, int flags,
-		    const struct sockaddr *dest_addr, socklen_t addrlen,
-		    ev_tstamp timeout);
-
-ssize_t
-coio_recvfrom_timeout(struct ev_io *coio, void *buf, size_t sz, int flags,
-		      struct sockaddr *src_addr, socklen_t addrlen,
-		      ev_tstamp timeout);
-
-void
-coio_service_init(struct coio_service *service, const char *name,
-		  fiber_func handler, void *handler_param);
-
-/** Wait until the service binds to the port. */
-void
-coio_service_start(struct evio_service *service, const char *uri);
 
 void
 coio_stat_init(ev_stat *stat, const char *path);
 
-void
+/**
+ * Wait for the stat data changes.
+ * Returns 0 on event or timeout, -1 if the fiber was cancelled.
+ */
+int
 coio_stat_stat_timeout(ev_stat *stat, ev_tstamp delay);
 
 /**
  * Wait for a child to end.
- * @note this is a cancellation point (can throw
- * FiberIsCancelled).
- *
- * @retval exit status of the child.
- *
+ * The exit status is written to @a status.
+ * Returns 0 on success, -1 if the fiber was cancelled.
  * This call only works in the main thread.
  */
 int
-coio_waitpid(pid_t pid);
+coio_waitpid(pid_t pid, int *status);
 
 /** \cond public */
 
@@ -248,12 +160,12 @@ enum {
 
 /**
  * Wait until READ or WRITE event on socket (\a fd). Yields.
- * \param fd - non-blocking socket file description
- * \param events - requested events to wait.
+ * \param fd non-blocking socket file description
+ * \param event requested events to wait.
  * Combination of TNT_IO_READ | TNT_IO_WRITE bit flags.
- * \param timeoout - timeout in seconds.
- * \retval 0 - timeout
- * \retval >0 - returned events. Combination of TNT_IO_READ | TNT_IO_WRITE
+ * \param timeout timeout in seconds.
+ * \retval 0 timeout
+ * \retval >0 returned events. Combination of TNT_IO_READ | TNT_IO_WRITE
  * bit flags.
  */
 API_EXPORT int
@@ -267,19 +179,6 @@ API_EXPORT int
 coio_close(int fd);
 
 /** \endcond public */
-
-/**
- * Write to a socket in at most @a timeout seconds.
- * @param fd Socket descriptor.
- * @param data Data to write.
- * @param size Size of @a data.
- * @param timeout Timeout on the operation.
- *
- * @retval 0 Success.
- * @retval -1 Timeout or socket error.
- */
-int
-coio_write_fd_timeout(int fd, const void *data, size_t size, ev_tstamp timeout);
 
 #if defined(__cplusplus)
 } /* extern "C" */

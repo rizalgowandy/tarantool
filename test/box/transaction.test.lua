@@ -99,9 +99,9 @@ box.begin();
 -- back a transction with no statements.
 box.commit();
 box.begin() s:insert{1, 'Must be rolled back'};
--- nothing - the transaction was rolled back
-while s:get{1} ~= nil do fiber.sleep(0) end
--- nothing to commit because of yield
+fiber.yield();
+-- error - the transaction was rolled back by yield
+s:get{1};
 box.commit();
 -- Test background fiber
 --
@@ -217,7 +217,7 @@ box.atomic(tx);
 function tx_error(space)
     space:auto_increment{'third'}
     space:auto_increment{'fourth'}
-    error("some error")
+    box.error(box.error.ILLEGAL_PARAMS, "some error")
 end;
 box.atomic(tx_error, space);
 
@@ -301,30 +301,28 @@ box.commit();
 -- is not allowed.
 box.begin()
 box.space.test:truncate()
-box.space.vinyl:select{}
+box.space.vinyl:select{};
 
 -- A transaction is left open due to an exception in the Lua fragment
 box.rollback();
 
--- DDL as a second statement - doesn't work
+-- DDL as a second statement - works if the egine is the same
 box.begin()
 box.space.memtx:insert{2, 'truncate'}
-box.space.test:truncate();
-
--- A transaction is left open due to an exception in the Lua fragment
-box.rollback();
+box.space.test:truncate()
+box.commit();
 
 box.space.memtx:select{};
 
 -- DML as a second statement - works if the engine is the same
 box.begin()
 box.space.test:truncate()
-box.space.memtx:insert{2, 'truncate'}
+box.space.memtx:insert{3, 'truncate'}
 box.commit();
 
 box.space.memtx:select{};
 
--- DML as a second statement - works if the engine is the same
+-- DML as a second statement. Multi-engine transaction is not allowed.
 box.begin()
 box.space.test:truncate()
 box.space.vinyl:insert{2, 'truncate'};

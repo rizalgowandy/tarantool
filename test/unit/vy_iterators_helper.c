@@ -1,14 +1,23 @@
 #include "vy_iterators_helper.h"
 #include "memory.h"
 #include "fiber.h"
-#include "uuid/tt_uuid.h"
 #include "say.h"
+#include "small/mempool.h"
+#include "tt_uuid.h"
 
 struct tt_uuid INSTANCE_UUID;
 
 struct vy_stmt_env stmt_env;
+struct tuple_format *key_format;
 struct vy_mem_env mem_env;
 struct vy_cache_env cache_env;
+struct mempool history_node_pool;
+struct vy_stmt_counter dummy_count;
+
+struct tuple_format *
+space_tuple_format_new(struct tuple_format_vtab *vtab, void *engine,
+		       struct key_def *const *keys, uint16_t key_count,
+		       const struct space_def *def) { return NULL; }
 
 void
 vy_iterator_C_test_init(size_t cache_size)
@@ -18,20 +27,26 @@ vy_iterator_C_test_init(size_t cache_size)
 
 	memory_init();
 	fiber_init(fiber_c_invoke);
-	tuple_init(NULL);
+	tuple_init();
 	vy_stmt_env_create(&stmt_env);
+	key_format = vy_simple_stmt_format_new(&stmt_env, NULL, 0);
+	fail_if(key_format == NULL);
+	tuple_format_ref(key_format);
 	vy_cache_env_create(&cache_env, cord_slab_cache());
 	vy_cache_env_set_quota(&cache_env, cache_size);
 	size_t mem_size = 64 * 1024 * 1024;
 	vy_mem_env_create(&mem_env, mem_size);
+	mempool_create(&history_node_pool, cord_slab_cache(),
+		       sizeof(struct vy_history_node));
 }
 
 void
 vy_iterator_C_test_finish()
 {
+	mempool_destroy(&history_node_pool);
+	tuple_format_unref(key_format);
 	vy_mem_env_destroy(&mem_env);
 	vy_cache_env_destroy(&cache_env);
-	vy_stmt_env_destroy(&stmt_env);
 	tuple_free();
 	fiber_free();
 	memory_free();
@@ -117,7 +132,7 @@ vy_new_simple_stmt(struct tuple_format *format, struct key_def *key_def,
 		break;
 	}
 	case IPROTO_SELECT: {
-		ret = vy_key_from_msgpack(stmt_env.key_format, buf);
+		ret = vy_key_from_msgpack(key_format, buf);
 		fail_if(ret == NULL);
 		break;
 	}
@@ -126,7 +141,7 @@ vy_new_simple_stmt(struct tuple_format *format, struct key_def *key_def,
 	}
 	free(buf);
 	vy_stmt_set_lsn(ret, templ->lsn);
-	vy_stmt_set_flags(ret, templ->flags);
+	vy_stmt_set_flags(ret, vy_stmt_flags(ret) | templ->flags);
 	struct vy_entry entry;
 	entry.stmt = ret;
 	entry.hint = vy_stmt_hint(ret, key_def);
@@ -144,9 +159,9 @@ vy_mem_insert_template(struct vy_mem *mem, const struct vy_stmt_template *templ)
 	tuple_unref(entry.stmt);
 	entry.stmt = region_stmt;
 	if (templ->type == IPROTO_UPSERT)
-		vy_mem_insert_upsert(mem, entry);
+		vy_mem_insert_upsert(mem, entry, &dummy_count);
 	else
-		vy_mem_insert(mem, entry);
+		vy_mem_insert(mem, entry, &dummy_count);
 	return entry;
 }
 
@@ -162,14 +177,16 @@ vy_cache_insert_templates_chain(struct vy_cache *cache,
 						 key_templ);
 	struct vy_entry prev_entry = vy_entry_none();
 	struct vy_entry entry = vy_entry_none();
+	bool is_first = true;
 
 	for (uint i = 0; i < length; ++i) {
 		entry = vy_new_simple_stmt(format, cache->cmp_def, &chain[i]);
-		vy_cache_add(cache, entry, prev_entry, key, order);
+		vy_cache_add(cache, entry, prev_entry, is_first, 0, key, order);
 		if (i != 0)
 			tuple_unref(prev_entry.stmt);
 		prev_entry = entry;
 		entry = vy_entry_none();
+		is_first = false;
 	}
 	tuple_unref(key.stmt);
 	if (prev_entry.stmt != NULL)
@@ -186,23 +203,12 @@ vy_cache_on_write_template(struct vy_cache *cache, struct tuple_format *format,
 	tuple_unref(written.stmt);
 }
 
-void
-init_read_views_list(struct rlist *rlist, struct vy_read_view *rvs,
-		     const int *vlsns, int count)
-{
-	rlist_create(rlist);
-	for (int i = 0; i < count; ++i) {
-		rvs[i].vlsn = vlsns[i];
-		rlist_add_tail_entry(rlist, &rvs[i], in_read_views);
-	}
-}
-
 struct vy_mem *
 create_test_mem(struct key_def *def)
 {
 	/* Create format */
 	struct tuple_format *format;
-	format = vy_stmt_format_new(&stmt_env, &def, 1, NULL, 0, 0, NULL);
+	format = vy_simple_stmt_format_new(&stmt_env, &def, 1);
 	fail_if(format == NULL);
 
 	/* Create mem */
@@ -219,7 +225,7 @@ create_test_cache(uint32_t *fields, uint32_t *types,
 	*def = box_key_def_new(fields, types, key_cnt);
 	assert(*def != NULL);
 	vy_cache_create(cache, &cache_env, *def, true);
-	*format = vy_stmt_format_new(&stmt_env, def, 1, NULL, 0, 0, NULL);
+	*format = vy_simple_stmt_format_new(&stmt_env, def, 1);
 	tuple_format_ref(*format);
 }
 

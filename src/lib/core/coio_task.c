@@ -111,9 +111,7 @@ static int
 coio_on_start(void *data)
 {
 	(void) data;
-	struct cord *cord = (struct cord *)calloc(sizeof(struct cord), 1);
-	if (!cord)
-		return -1;
+	struct cord *cord = xcalloc(1, sizeof(struct cord));
 	cord_create(cord, "coio");
 	return 0;
 }
@@ -122,6 +120,7 @@ static int
 coio_on_stop(void *data)
 {
 	(void) data;
+	cord_exit(cord());
 	cord_destroy(cord());
 	free(cord());
 	return 0;
@@ -130,6 +129,7 @@ coio_on_stop(void *data)
 void
 coio_init(void)
 {
+	eio_init();
 	eio_set_thread_on_start(coio_on_start, NULL);
 	eio_set_thread_on_stop(coio_on_stop, NULL);
 }
@@ -142,7 +142,7 @@ coio_init(void)
 void
 coio_enable(void)
 {
-	eio_init(&coio_manager, coio_want_poll_cb, coio_done_poll_cb);
+	eio_enable(&coio_manager, coio_want_poll_cb, coio_done_poll_cb);
 	coio_manager.loop = loop();
 
 	ev_idle_init(&coio_manager.coio_idle, coio_idle_cb);
@@ -157,6 +157,29 @@ coio_shutdown(void)
 	eio_set_max_parallel(0);
 }
 
+/**
+ * We store the number of configured coio threads in this variable in
+ * coio_prefork() so as to restore it in coio_postfork().
+ */
+static int coio_prefork_threads;
+
+void
+coio_prefork(void)
+{
+	assert(cord_is_main());
+	assert(coio_prefork_threads == 0);
+	coio_prefork_threads = eio_set_max_parallel(0);
+}
+
+void
+coio_postfork(void)
+{
+	assert(cord_is_main());
+	assert(coio_prefork_threads > 0);
+	eio_set_min_parallel(coio_prefork_threads);
+	coio_prefork_threads = 0;
+}
+
 static void
 coio_on_feed(eio_req *req)
 {
@@ -164,6 +187,7 @@ coio_on_feed(eio_req *req)
 	req->result = task->task_cb(task);
 	if (req->result)
 		diag_move(diag_get(), &task->diag);
+	fiber_check_gc();
 }
 
 /**

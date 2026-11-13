@@ -29,11 +29,14 @@
  * SUCH DAMAGE.
  */
 #include "crypto/crypto.h"
+#include "core/ssl.h"
 #include "core/random.h"
-#include "unit.h"
 #include "trivia/util.h"
 #include "memory.h"
 #include "fiber.h"
+
+#define UNIT_TAP_COMPATIBLE 1
+#include "unit.h"
 
 static void
 test_aes128_codec(void)
@@ -102,7 +105,7 @@ test_aes128_codec(void)
 	rc = crypto_codec_encrypt(c, iv2, plain, plain_size,
 				  buffer2, buffer_size);
 	is(rc, 16, "encrypt with different IV and the same number of written "\
-	   "bytes returned")
+	   "bytes returned");
 	isnt(memcmp(buffer2, buffer1, rc), 0,
 	     "the encrypted data looks different");
 	rc = crypto_codec_decrypt(c, iv2, buffer2, 16, buffer1, buffer_size);
@@ -286,7 +289,7 @@ main(void)
 	header();
 	plan(5);
 	random_init();
-	crypto_init();
+	ssl_init();
 	memory_init();
 	fiber_init(fiber_c_invoke);
 
@@ -300,7 +303,7 @@ main(void)
 
 	fiber_free();
 	memory_free();
-	crypto_free();
+	ssl_free();
 	random_free();
 	int rc = check_plan();
 	footer();

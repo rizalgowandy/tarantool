@@ -13,7 +13,7 @@
 	ignore = dirty
 [submodule "third_party/luafun"]
 	path = third_party/luafun
-	url = https://github.com/rtsisyk/luafun.git
+	url = https://github.com/luafun/luafun.git
 	ignore = dirty
 [submodule "test-run"]
 	path = test-run
@@ -27,10 +27,6 @@
 	path = third_party/zstd
 	url = https://github.com/tarantool/zstd.git
 	ignore = dirty
-[submodule "third_party/luarocks"]
-	path = third_party/luarocks
-	url = https://github.com/tarantool/luarocks.git
-	branch = luarocks-3.1.1-tarantool
 [submodule "third_party/decNumber"]
 	path = third_party/decNumber
 	url = https://github.com/tarantool/decNumber.git
@@ -46,3 +42,24 @@
 [submodule "third_party/c-dt"]
 	path = third_party/c-dt
 	url = https://github.com/tarantool/c-dt.git
+[submodule "third_party/lua-zlib"]
+	path = third_party/lua-zlib
+	url = https://github.com/tarantool/lua-zlib.git
+[submodule "third_party/luazip"]
+	path = third_party/luazip
+	url = https://github.com/tarantool/luazip.git
+[submodule "third_party/nghttp2"]
+	path = third_party/nghttp2
+	url = https://github.com/tarantool/nghttp2.git
+[submodule "third_party/tz"]
+	path = third_party/tz
+	url = https://github.com/tarantool/tz.git
+[submodule "third_party/checks"]
+	path = third_party/checks
+	url = https://github.com/tarantool/checks.git
+[submodule "third_party/metrics"]
+	path = third_party/metrics
+	url = https://github.com/tarantool/metrics.git
+[submodule "luatest"]
+	path = luatest
+	url = https://github.com/tarantool/luatest.git

@@ -8,6 +8,7 @@
 #include <assert.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 #include "small/rlist.h"
 
@@ -153,6 +154,8 @@ struct watchable {
 	struct rlist pending_watchers;
 	/** Background fiber that runs watcher callbacks. */
 	struct fiber *worker;
+	/** Set if watchable shutdown is started. */
+	bool is_shutdown;
 };
 
 /**
@@ -251,8 +254,42 @@ void
 box_broadcast(const char *key, size_t key_len,
 	      const char *data, const char *data_end);
 
+/**
+ * A convenience wrapper around box_broadcast(), which takes a zero-terminated
+ * string for key and generates msgpack with mp_vformat() from the given
+ * format.
+ */
+void
+box_broadcast_fmt(const char *key, const char *format, ...);
+
+/**
+ * Returns the data attached to a notification key.
+ *
+ * @param key Name of the notification key
+ * @param key_len Length of the key name
+ * @param[out] end End of the key data
+ * @retval Key data
+ *
+ * The function never fails.
+ *
+ * If there's no data attached to the given notification key (box_broadcast()
+ * has never been called for this key), the function returns NULL.
+ *
+ * Note that the data returned by this function may be updated by a concurrent
+ * call to box_broadcast() so the caller must copy it if it intends to yield.
+ */
+const char *
+box_watch_once(const char *key, size_t key_len, const char **end);
+
 void
 box_watcher_init(void);
+
+/**
+ * Shutdown watcher. After shutdown API still can be used but notifications
+ * are stopped.
+ */
+void
+box_watcher_shutdown(void);
 
 void
 box_watcher_free(void);

@@ -50,16 +50,6 @@
 #include <qsort_arg.h>
 #include <stdint.h>
 
-enum {
-	/*
-	 * The size of an array from which it is reasonable to start
-	 * multithread sort.
-	 * If the array size is less than the size below, a single-threaded
-	 * version of qsort will be started.S
-	 */
-	MULTITHREAD_SIZE_THRESHOLD = 128 * 1024,
-};
-
 #define min(a, b)   (a) < (b) ? a : b
 
 static char *med3(char *a, char *b, char *c,
@@ -118,8 +108,8 @@ med3(char *a, char *b, char *c, int (*cmp)(const void *a, const void *b, void *a
 /**
  * Single-thread version of qsort.
  */
-static void
-qsort_arg_st(void *a, size_t n, size_t es, int (*cmp)(const void *a, const void *b, void *arg), void *arg)
+void
+qsort_arg(void *a, size_t n, size_t es, int (*cmp)(const void *a, const void *b, void *arg), void *arg)
 {
 	char	   *pa,
 			   *pb,
@@ -128,8 +118,9 @@ qsort_arg_st(void *a, size_t n, size_t es, int (*cmp)(const void *a, const void 
 			   *pl,
 			   *pm,
 			   *pn;
-	intptr_t		d,
-				r,
+	size_t			d1,
+				d2;
+	intptr_t		r,
 				swaptype,
 				presorted;
 
@@ -160,7 +151,7 @@ loop:SWAPINIT(a, es);
 		pn = (char *) a + (n - 1) * es;
 		if (n > 40)
 		{
-			d = (n / 8) * es;
+			size_t d = (n / 8) * es;
 			pl = med3(pl, pl + d, pl + 2 * d, cmp, arg);
 			pm = med3(pm - d, pm, pm + d, cmp, arg);
 			pn = med3(pn - 2 * d, pn - d, pn, cmp, arg);
@@ -197,46 +188,37 @@ loop:SWAPINIT(a, es);
 		pc -= es;
 	}
 	pn = (char *) a + n * es;
-	r = min(pa - (char *) a, pb - pa);
-	vecswap(a, pb - r, r);
-	r = min(pd - pc, pn - pd - (intptr_t)es);
-	vecswap(pb, pn - r, r);
-	if ((r = pb - pa) > (intptr_t)es)
-		qsort_arg(a, r / es, es, cmp, arg);
-	if ((r = pd - pc) > (intptr_t)es)
+	d1 = min(pa - (char *) a, pb - pa);
+	vecswap(a, pb - d1, d1);
+	d1 = min(pd - pc, pn - pd - es);
+	vecswap(pb, pn - d1, d1);
+	d1 = pb - pa;
+	d2 = pd - pc;
+	if (d1 <= d2)
 	{
-		/* Iterate rather than recurse to save stack space */
-		a = pn - r;
-		n = r / es;
-		goto loop;
+		/* Recurse on left partition, then iterate on right partition */
+		if (d1 > es)
+			qsort_arg(a, d1 / es, es, cmp, arg);
+		if (d2 > es)
+		{
+			/* Iterate rather than recurse to save stack space */
+			/* qsort(pn - d2, d2 / es, es, cmp); */
+			a = pn - d2;
+			n = d2 / es;
+			goto loop;
+		}
 	}
-/*		qsort_arg(pn - r, r / es, es, cmp, arg);*/
-}
-
-#ifdef HAVE_OPENMP
-/**
- * Multi-thread version of qsort. Only present when target machine supports
- * open MP.
- */
-void qsort_arg_mt(void *a, size_t n, size_t es,
-		  int (*cmp)(const void *, const void *, void *), void *arg);
-#endif
-
-/**
- * General version of qsort that calls single-threaded of multi-threaded
- * qsort depending on open MP availability and given array size.
- */
-void
-qsort_arg(void *a, size_t n, size_t es,
-	  int (*cmp)(const void *a, const void *b, void *arg), void *arg)
-{
-#ifdef HAVE_OPENMP
-	if (n >= MULTITHREAD_SIZE_THRESHOLD)
-		qsort_arg_mt(a, n, es, cmp, arg);
 	else
-		qsort_arg_st(a, n, es, cmp, arg);
-#else
-	qsort_arg_st(a, n, es, cmp, arg);
-#endif
+	{
+		/* Recurse on right partition, then iterate on left partition */
+		if (d2 > es)
+			qsort_arg(pn - d2, d2 / es, es, cmp, arg);
+		if (d1 > es)
+		{
+			/* Iterate rather than recurse to save stack space */
+			/* qsort(a, d1 / es, es, cmp); */
+			n = d1 / es;
+			goto loop;
+		}
+	}
 }
-

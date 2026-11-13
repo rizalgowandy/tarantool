@@ -33,6 +33,7 @@
 #include <stdbool.h>
 #include <assert.h>
 #include "tarantool_ev.h"
+#include "raft_ev.h"
 #include "trigger.h"
 #include "vclock/vclock.h"
 
@@ -107,6 +108,13 @@ struct raft_msg {
 	 */
 	uint32_t vote;
 	/**
+	 * Instance id of the current term leader. Can be 0 when leader is
+	 * unknown.
+	 */
+	uint32_t leader_id;
+	/** Whether the node has a direct connection to the leader. */
+	bool is_leader_seen;
+	/**
 	 * State of the instance. Can be 0 if the state does not matter for the
 	 * message. For instance, when the message is sent to disk.
 	 */
@@ -121,6 +129,8 @@ struct raft_msg {
 typedef void (*raft_broadcast_f)(struct raft *raft, const struct raft_msg *req);
 typedef void (*raft_write_f)(struct raft *raft, const struct raft_msg *req);
 typedef void (*raft_schedule_async_f)(struct raft *raft);
+typedef const char*
+(*raft_node_info_f)(uint32_t node_id);
 
 /**
  * Raft connection to the environment, via which it talks to other nodes, to
@@ -136,6 +146,16 @@ struct raft_vtab {
 	 * right now.
 	 */
 	raft_schedule_async_f schedule_async;
+	/** Get an extended information about raft node: name/uuid, id, uri. */
+	raft_node_info_f node_to_string;
+};
+
+/** Vote descriptor of a single node. */
+struct raft_vote {
+	/** Whether the node voted for anybody. */
+	bool did_vote;
+	/** How many votes the node got in the current term. */
+	int count;
 };
 
 struct raft {
@@ -189,13 +209,14 @@ struct raft {
 	 */
 	uint64_t term;
 	uint32_t vote;
-	/**
-	 * Bit 1 on position N means that a vote from instance with ID = N was
-	 * obtained.
-	 */
-	vclock_map_t vote_mask;
-	/** Number of votes for this instance. Valid only in candidate state. */
-	int vote_count;
+	/** Statistics which node voted for who. */
+	struct raft_vote votes[VCLOCK_MAX];
+	/** How many nodes voted in the current term. */
+	int voted_count;
+	/** Max vote count given to any node in the current term. */
+	int max_vote;
+	/** A bitmap of sources which see the leader of the current term. */
+	vclock_map_t leader_witness_map;
 	/** Number of votes necessary for successful election. */
 	int election_quorum;
 	/**
@@ -207,8 +228,16 @@ struct raft {
 	 * subsystems, such as Raft.
 	 */
 	const struct vclock *vclock;
+	/**
+	 * Vclock of the candidate which the current instance is trying to vote
+	 * for right now. It is used to double-check if the instance still can
+	 * vote for the given candidate after own WAL queue was flushed.
+	 */
+	struct vclock candidate_vclock;
 	/** State machine timed event trigger. */
 	struct ev_timer timer;
+	/** The moment of the last communication with the leader. */
+	double leader_last_seen;
 	/** Configured election timeout in seconds. */
 	double election_timeout;
 	/**
@@ -216,6 +245,10 @@ struct raft {
 	 * elections can be started.
 	 */
 	double death_timeout;
+	/** Maximal deviation from the election timeout. */
+	double max_shift;
+	/** Number of instances registered in the cluster. */
+	int cluster_size;
 	/** Virtual table to perform application-specific actions. */
 	const struct raft_vtab *vtab;
 	/**
@@ -241,6 +274,25 @@ static inline bool
 raft_is_enabled(const struct raft *raft)
 {
 	return raft->is_enabled;
+}
+
+/** Number of votes for self. */
+static inline int
+raft_vote_count(const struct raft *raft)
+{
+	return raft->votes[raft->self].count;
+}
+
+/** Time since the latest communication with the leader. */
+static inline double
+raft_leader_idle(const struct raft *raft)
+{
+	assert(raft->is_enabled);
+	if (raft->state != RAFT_STATE_LEADER) {
+		return raft_ev_monotonic_now(raft_loop()) -
+		       raft->leader_last_seen;
+	}
+	return 0;
 }
 
 /** Process a raft entry stored in WAL/snapshot. */
@@ -274,6 +326,20 @@ raft_cfg_is_enabled(struct raft *raft, bool is_enabled);
 void
 raft_cfg_is_candidate(struct raft *raft, bool is_candidate);
 
+/** Notify this instance whether its peer sees the current leader. */
+void
+raft_notify_is_leader_seen(struct raft *raft, bool is_leader_seen,
+			   uint32_t source);
+
+/**
+ * Configure whether the node may be a candidate, e.g. start new elections and
+ * become a Raft leader. The configurations takes effect in the next term, so
+ * that it doesn't take effect on current leader or candidate until someone else
+ * starts new term.
+ */
+void
+raft_cfg_is_candidate_later(struct raft *raft, bool is_candidate);
+
 /**
  * Bump the term and become a candidate for it regardless of the config. In case
  * of another term bump the node's role is restored according to its config
@@ -281,6 +347,13 @@ raft_cfg_is_candidate(struct raft *raft, bool is_candidate);
  */
 void
 raft_promote(struct raft *raft);
+
+/**
+ * Resign from RAFT leadership. Become follower in current term.
+ * Don't start new term until quorum is reobtained.
+ */
+void
+raft_resign(struct raft *raft);
 
 /**
  * Restore the instance role according to its config. In particular, if it was
@@ -307,7 +380,14 @@ raft_cfg_election_quorum(struct raft *raft, int election_quorum);
  * heartbeats from the leader to consider it dead.
  */
 void
-raft_cfg_death_timeout(struct raft *raft, double death_timeout);
+raft_cfg_death_timeout(struct raft *raft, double timeout);
+
+/**
+ * Configure maximal random shift from the election timeout. The timeout during
+ * election is randomized as cfg_timeout * (1 + shift).
+ */
+void
+raft_cfg_max_shift(struct raft *raft, double shift);
 
 /**
  * Configure ID of the given Raft instance. The ID can't be changed after it is
@@ -323,6 +403,10 @@ raft_cfg_instance_id(struct raft *raft, uint32_t instance_id);
 void
 raft_cfg_vclock(struct raft *raft, const struct vclock *vclock);
 
+/** Configure number of registered instances in the cluster. */
+void
+raft_cfg_cluster_size(struct raft *raft, int size);
+
 /**
  * Bump the term. When it is persisted, the node checks if there is a leader,
  * and if there is not, a new election is started. That said, this function can
@@ -330,6 +414,13 @@ raft_cfg_vclock(struct raft *raft, const struct vclock *vclock);
  */
 void
 raft_new_term(struct raft *raft);
+
+/**
+ * Handle a term reported by the instance with the given ID. Might cause local
+ * term bump.
+ */
+void
+raft_process_term(struct raft *raft, uint64_t term, uint32_t source);
 
 /**
  * Save complete Raft state into a request to be sent to other instances of the

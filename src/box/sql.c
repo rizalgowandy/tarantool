@@ -52,24 +52,32 @@
 #include "session.h"
 #include "xrow.h"
 #include "iproto_constants.h"
-#include "fk_constraint.h"
 #include "mpstream/mpstream.h"
 #include "sql_stmt_cache.h"
+#include "box/tuple_constraint_def.h"
+#include "mp_util.h"
+#include "tweaks.h"
+#include "coll_id_cache.h"
 
 static sql *db = NULL;
 
 static const char nil_key[] = { 0x90 }; /* Empty MsgPack array. */
 
-static const uint32_t default_sql_flags = SQL_EnableTrigger
-					  | SQL_AutoIndex
-					  | SQL_RecTriggers;
+static bool sql_seq_scan_default = false;
+TWEAK_BOOL(sql_seq_scan_default);
+
+uint32_t
+sql_default_session_flags(void)
+{
+	if (sql_seq_scan_default)
+		return SQL_DEFAULT_FLAGS | SQL_SeqScan;
+	return SQL_DEFAULT_FLAGS & ~SQL_SeqScan;
+}
 
 void
 sql_init(void)
 {
-	default_flags |= default_sql_flags;
-
-	current_session()->sql_flags |= default_sql_flags;
+	current_session()->sql_flags = sql_default_session_flags();
 
 	if (sql_init_db(&db) != 0)
 		panic("failed to initialize SQL subsystem");
@@ -211,7 +219,7 @@ sql_cursor_seek(struct BtCursor *cur, struct Mem *mems, uint32_t len, int *res)
 	struct region *region = &fiber()->gc;
 	size_t used = region_used(region);
 	uint32_t size;
-	const char *tuple = sql_vdbe_mem_encode_tuple(mems, len, &size, region);
+	const char *tuple = mem_encode_array(mems, len, &size, region);
 	if (tuple == NULL)
 		return -1;
 	if (key_alloc(cur, size) != 0)
@@ -233,6 +241,11 @@ tarantoolsqlEphemeralCount(struct BtCursor *pCur)
 {
 	assert(pCur->curFlags & BTCF_TEphemCursor);
 	struct index *primary_index = space_index(pCur->space, 0 /* PK */);
+	/*
+	 * Cannot use `box_index_count` since the ephemeral space has no id.
+	 * Anyway, ephemeral spaces are internal and actually bypass
+	 * the transactional engine so it's safe to use raw index here.
+	 */
 	return index_count(primary_index, pCur->iter_type, NULL, 0);
 }
 
@@ -240,7 +253,11 @@ int64_t
 tarantoolsqlCount(struct BtCursor *pCur)
 {
 	assert(pCur->curFlags & BTCF_TaCursor);
-	return index_count(pCur->index, pCur->iter_type, NULL, 0);
+	/* Empty key encoded in MsgPack. */
+	const char empty_key[] = {0x90};
+	return box_index_count(pCur->space->def->id, pCur->index->def->iid,
+			       pCur->iter_type, empty_key,
+			       empty_key + sizeof(empty_key));
 }
 
 struct sql_space_info *
@@ -255,11 +272,7 @@ sql_space_info_new(uint32_t field_count, uint32_t part_count)
 	uint32_t size = info_size + field_size + colls_size + parts_size +
 			sort_orders_size;
 
-	struct sql_space_info *info = sqlDbMallocRawNN(sql_get(), size);
-	if (info == NULL) {
-		diag_set(OutOfMemory, size, "sqlDbMallocRawNN", "info");
-		return NULL;
-	}
+	struct sql_space_info *info = sql_xmalloc(size);
 	info->types = (enum field_type *)((char *)info + info_size);
 	info->coll_ids = (uint32_t *)((char *)info->types + field_size);
 	info->parts = part_count == 0 ? NULL :
@@ -286,8 +299,6 @@ sql_space_info_new_from_space_def(const struct space_def *def)
 {
 	uint32_t field_count = def->field_count + 1;
 	struct sql_space_info *info = sql_space_info_new(field_count, 0);
-	if (info == NULL)
-		return NULL;
 	for (uint32_t i = 0; i < def->field_count; ++i) {
 		info->types[i] = def->fields[i].type;
 		info->coll_ids[i] = def->fields[i].coll_id;
@@ -304,8 +315,6 @@ sql_space_info_new_from_index_def(const struct index_def *def, bool has_rowid)
 	if (has_rowid)
 		++field_count;
 	struct sql_space_info *info = sql_space_info_new(field_count, 0);
-	if (info == NULL)
-		return NULL;
 	for (uint32_t i = 0; i < def->key_def->part_count; ++i) {
 		info->types[i] = def->key_def->parts[i].type;
 		info->coll_ids[i] = def->key_def->parts[i].coll_id;
@@ -330,16 +339,13 @@ sql_ephemeral_space_new(const struct sql_space_info *info)
 	 * plus length of UINT32_MAX turned to string, which is 10 and plus 1
 	 * for '\0'.
 	 */
-	uint32_t size = names_indent + field_count * 19;
+	uint32_t max_len = 19;
+	uint32_t size = names_indent + field_count * max_len;
 
 	struct region *region = &fiber()->gc;
 	size_t svp = region_used(region);
-	struct field_def *fields = region_aligned_alloc(region, size,
-							alignof(fields[0]));
-	if (fields == NULL) {
-		diag_set(OutOfMemory, size, "region_aligned_alloc", "fields");
-		return NULL;
-	}
+	struct field_def *fields = xregion_aligned_alloc(region, size,
+							 alignof(fields[0]));
 	struct key_part_def *parts = (struct key_part_def *)((char *)fields +
 							     parts_indent);
 	static_assert(alignof(*fields) == alignof(*parts), "allocated in one "
@@ -347,15 +353,18 @@ sql_ephemeral_space_new(const struct sql_space_info *info)
 	char *names = (char *)fields + names_indent;
 
 	for (uint32_t i = 0; i < info->field_count; ++i) {
+		fields[i] = field_def_default;
 		fields[i].name = names;
-		sprintf(names, "_COLUMN_%d", i);
+		snprintf(names, max_len, "_COLUMN_%d", i);
 		names += strlen(fields[i].name) + 1;
 		fields[i].is_nullable = true;
 		fields[i].nullable_action = ON_CONFLICT_ACTION_NONE;
 		fields[i].default_value = NULL;
-		fields[i].default_value_expr = NULL;
+		fields[i].default_value_size = 0;
+		fields[i].default_func_id = 0;
 		fields[i].type = info->types[i];
 		fields[i].coll_id = info->coll_ids[i];
+		fields[i].compression_opts.type = COMPRESSION_TYPE_NONE;
 	}
 	for (uint32_t i = 0; i < part_count; ++i) {
 		uint32_t j = info->parts == NULL ? i : info->parts[i];
@@ -365,32 +374,40 @@ sql_ephemeral_space_new(const struct sql_space_info *info)
 		parts[i].exclude_null = false;
 		parts[i].sort_order = SORT_ORDER_ASC;
 		parts[i].path = NULL;
-		parts[i].type = info->types[j];
+		enum field_type type = info->types[j];
+		parts[i].type = type;
+		if (!field_type1_contains_type2(FIELD_TYPE_SCALAR, NULL,
+						type, NULL)) {
+			const char *err =
+				tt_sprintf("field type '%s' is not comparable",
+					   field_type_strs[type]);
+			diag_set(ClientError, ER_SQL_EXECUTE, err);
+			return NULL;
+		}
+
 		parts[i].coll_id = info->coll_ids[j];
 	}
 
-	struct key_def *key_def = key_def_new(parts, part_count, false);
-	if (key_def == NULL)
+	struct space_def *space_def = space_def_new_ephemeral(field_count,
+							      fields);
+
+	struct key_def *key_def = key_def_new(parts, part_count, 0);
+	if (key_def == NULL) {
+		space_def_delete(space_def);
 		return NULL;
+	}
 
 	const char *name = "ephemer_idx";
 	struct index_def *index_def = index_def_new(0, 0, name, strlen(name),
+						    space_def->name,
+						    space_def->engine_name,
 						    TREE, &index_opts_default,
 						    key_def, NULL);
 	key_def_delete(key_def);
-	if (index_def == NULL)
-		return NULL;
 
 	struct rlist key_list;
 	rlist_create(&key_list);
 	rlist_add_entry(&key_list, index_def, link);
-
-	struct space_def *space_def = space_def_new_ephemeral(field_count,
-							      fields);
-	if (space_def == NULL) {
-		index_def_delete(index_def);
-		return NULL;
-	}
 
 	struct space *space = space_new_ephemeral(space_def, &key_list);
 	index_def_delete(index_def);
@@ -461,13 +478,14 @@ int tarantoolsqlEphemeralDelete(BtCursor *pCur)
 
 	char *key;
 	uint32_t key_size;
-	key = tuple_extract_key(pCur->last_tuple,
-				pCur->iter->index->def->key_def,
+	size_t region_svp = region_used(&fiber()->gc);
+	key = tuple_extract_key(pCur->last_tuple, pCur->index->def->key_def,
 				MULTIKEY_NONE, &key_size);
 	if (key == NULL)
 		return -1;
 
 	int rc = space_ephemeral_delete(pCur->space, key);
+	region_truncate(&fiber()->gc, region_svp);
 	if (rc != 0) {
 		diag_log();
 		return -1;
@@ -475,10 +493,9 @@ int tarantoolsqlEphemeralDelete(BtCursor *pCur)
 	return 0;
 }
 
-int tarantoolsqlDelete(BtCursor *pCur, u8 flags)
+int
+tarantoolsqlDelete(struct BtCursor *pCur)
 {
-	(void)flags;
-
 	assert(pCur->curFlags & BTCF_TaCursor);
 	assert(pCur->iter != NULL);
 	assert(pCur->last_tuple != NULL);
@@ -486,13 +503,16 @@ int tarantoolsqlDelete(BtCursor *pCur, u8 flags)
 	char *key;
 	uint32_t key_size;
 
+	size_t region_svp = region_used(&fiber()->gc);
 	key = tuple_extract_key(pCur->last_tuple,
-				pCur->iter->index->def->key_def,
+				pCur->index->def->key_def,
 				MULTIKEY_NONE, &key_size);
 	if (key == NULL)
 		return -1;
-	return sql_delete_by_key(pCur->space, pCur->index->def->iid, key,
-				 key_size);
+	int rc = sql_delete_by_key(pCur->space, pCur->index->def->iid, key,
+				   key_size);
+	region_truncate(&fiber()->gc, region_svp);
+	return rc;
 }
 
 int
@@ -538,9 +558,13 @@ int tarantoolsqlEphemeralClearTable(BtCursor *pCur)
 	uint32_t  key_size;
 
 	while (iterator_next(it, &tuple) == 0 && tuple != NULL) {
-		key = tuple_extract_key(tuple, it->index->def->key_def,
+		size_t region_svp = region_used(&fiber()->gc);
+		key = tuple_extract_key(tuple, pCur->index->def->key_def,
 					MULTIKEY_NONE, &key_size);
-		if (space_ephemeral_delete(pCur->space, key) != 0) {
+		int rc = space_ephemeral_delete(pCur->space, key);
+		region_truncate(&fiber()->gc, region_svp);
+
+		if (rc != 0) {
 			iterator_delete(it);
 			return -1;
 		}
@@ -571,10 +595,12 @@ int tarantoolsqlClearTable(struct space *space, uint32_t *tuple_count)
 	if (iter == NULL)
 		return -1;
 	while (iterator_next(iter, &tuple) == 0 && tuple != NULL) {
+		size_t region_svp = region_used(&fiber()->gc);
 		request.key = tuple_extract_key(tuple, pk->def->key_def,
 						MULTIKEY_NONE, &key_size);
 		request.key_end = request.key + key_size;
 		rc = box_process1(&request, &unused);
+		region_truncate(&fiber()->gc, region_svp);
 		if (rc != 0) {
 			iterator_delete(iter);
 			return -1;
@@ -604,11 +630,7 @@ int tarantoolsqlRenameTrigger(const char *trig_name,
 	uint32_t old_table_name_len = strlen(old_table_name);
 	uint32_t new_table_name_len = strlen(new_table_name);
 	uint32_t key_len = mp_sizeof_str(trig_name_len) + mp_sizeof_array(1);
-	char *key_begin = (char*) region_alloc(&fiber()->gc, key_len);
-	if (key_begin == NULL) {
-		diag_set(OutOfMemory, key_len, "region_alloc", "key_begin");
-		return -1;
-	}
+	char *key_begin = xregion_alloc(&fiber()->gc, key_len);
 	char *key = mp_encode_array(key_begin, 1);
 	key = mp_encode_str(key, trig_name, trig_name_len);
 	if (box_index_get(BOX_TRIGGER_ID, 0, key_begin, key, &tuple) != 0)
@@ -629,17 +651,11 @@ int tarantoolsqlRenameTrigger(const char *trig_name,
 	}
 	uint32_t trigger_stmt_len;
 	const char *trigger_stmt_old = mp_decode_str(&field, &trigger_stmt_len);
-	char *trigger_stmt = (char*)region_alloc(&fiber()->gc,
-						 trigger_stmt_len + 1);
-	if (trigger_stmt == NULL) {
-		diag_set(OutOfMemory, trigger_stmt_len + 1, "region_alloc",
-			 "trigger_stmt");
-		return -1;
-	}
+	char *trigger_stmt = xregion_alloc(&fiber()->gc, trigger_stmt_len + 1);
 	memcpy(trigger_stmt, trigger_stmt_old, trigger_stmt_len);
 	trigger_stmt[trigger_stmt_len] = '\0';
 	bool is_quoted = false;
-	trigger_stmt = rename_trigger(db, trigger_stmt, new_table_name, &is_quoted);
+	trigger_stmt = rename_trigger(trigger_stmt, new_table_name, &is_quoted);
 
 	uint32_t trigger_stmt_new_len = trigger_stmt_len + new_table_name_len -
 					old_table_name_len + 2 * (!is_quoted);
@@ -648,11 +664,7 @@ int tarantoolsqlRenameTrigger(const char *trig_name,
 		  mp_sizeof_map(1) + mp_sizeof_str(3) +
 		  mp_sizeof_str(trigger_stmt_new_len) +
 		  mp_sizeof_uint(space_id);
-	char *new_tuple = (char*)region_alloc(&fiber()->gc, key_len);
-	if (new_tuple == NULL) {
-		diag_set(OutOfMemory, key_len, "region_alloc", "new_tuple");
-		return -1;
-	}
+	char *new_tuple = xregion_alloc(&fiber()->gc, key_len);
 	char *new_tuple_end = mp_encode_array(new_tuple, 3);
 	new_tuple_end = mp_encode_str(new_tuple_end, trig_name, trig_name_len);
 	new_tuple_end = mp_encode_uint(new_tuple_end, space_id);
@@ -673,11 +685,8 @@ sql_rename_table(uint32_t space_id, const char *new_name)
 	struct region *region = &fiber()->gc;
 	/* 32 + name_len is enough to encode one update op. */
 	size_t size = 32 + name_len;
-	char *raw = (char *) region_alloc(region, size);
-	if (raw == NULL) {
-		diag_set(OutOfMemory, size, "region_alloc", "raw");
-		return -1;
-	}
+	size_t region_svp = region_used(&fiber()->gc);
+	char *raw = xregion_alloc(region, size);
 	/* Encode key. */
 	char *pos = mp_encode_array(raw, 1);
 	pos = mp_encode_uint(pos, space_id);
@@ -689,7 +698,9 @@ sql_rename_table(uint32_t space_id, const char *new_name)
 	pos = mp_encode_str(pos, "=", 1);
 	pos = mp_encode_uint(pos, BOX_SPACE_FIELD_NAME);
 	pos = mp_encode_str(pos, new_name, name_len);
-	return box_update(BOX_SPACE_ID, 0, raw, ops, ops, pos, 0, NULL);
+	int rc = box_update(BOX_SPACE_ID, 0, raw, ops, ops, pos, 0, NULL);
+	region_truncate(&fiber()->gc, region_svp);
+	return rc;
 }
 
 int
@@ -715,14 +726,16 @@ tarantoolsqlIdxKeyCompare(struct BtCursor *cursor,
 	uint32_t key_size;
 #endif
 
-	key_def = cursor->iter->index->def->key_def;
+	key_def = cursor->index->def->key_def;
 	n = MIN(unpacked->nField, key_def->part_count);
 	tuple = cursor->last_tuple;
 	base = tuple_data(tuple);
 	format = tuple_format(tuple);
 	field_map = tuple_field_map(tuple);
 	field_count = tuple_format_field_count(format);
-	field0 = base; mp_decode_array(&field0); p = field0;
+	field0 = base;
+	uint32_t base_len = mp_decode_array(&field0);
+	p = field0;
 	for (i = 0; i < n; i++) {
 		/*
 		 * Tuple contains offset map to make it possible to
@@ -735,13 +748,26 @@ tarantoolsqlIdxKeyCompare(struct BtCursor *cursor,
 		 *  (3) field maps are rebuilt lazily when a new index
 		 *      is added, i.e. it is possible to encounter a
 		 *      tuple with an incomplete offset map.
+		 *  (4) it is possible that the length of the tuple data will be
+		 *      less than the given fieldno of the part, in which case
+		 *      we should just compare the mem from unpacked with NULL.
 		 */
 		uint32_t fieldno = key_def->parts[i].fieldno;
+		struct Mem *mem = &unpacked->aMem[i];
+		struct key_part *part = &unpacked->key_def->parts[i];
+		if (fieldno >= base_len) {
+			if (mem_is_null(mem))
+				continue;
+			rc = part->sort_order == SORT_ORDER_ASC ? -1 : 1;
+			goto out;
+		}
 
 		if (fieldno != next_fieldno) {
-			struct tuple_field *field =
-				tuple_format_field(format, fieldno);
-			if (fieldno >= field_count ||
+			struct tuple_field *field = NULL;
+			if (fieldno < field_count)
+				field = tuple_format_field(format, fieldno);
+
+			if (field == NULL ||
 			    field->offset_slot == TUPLE_OFFSET_SLOT_NIL) {
 				/* Outdated field_map. */
 				uint32_t j = 0;
@@ -758,8 +784,6 @@ tarantoolsqlIdxKeyCompare(struct BtCursor *cursor,
 			}
 		}
 		next_fieldno = fieldno + 1;
-		struct key_part *part = &unpacked->key_def->parts[i];
-		struct Mem *mem = unpacked->aMem + i;
 		struct coll *coll = part->coll;
 		if (mem_cmp_msgpack(mem, &p, &rc, coll) != 0)
 			rc = 0;
@@ -778,46 +802,28 @@ out:
 	if (key != NULL) {
 		int new_rc = sqlVdbeRecordCompareMsgpack(key, unpacked);
 		region_truncate(&fiber()->gc, original_size);
-		assert(rc == new_rc);
+		/*
+		 * Here we compare two results from memcmp() alike
+		 * calls. A particular implementation depends on
+		 * a type of msgpack values to compare. For some
+		 * of them we actually call memcmp().
+		 *
+		 * memcmp() only guarantees that a result will be
+		 * less than zero, zero or more than zero. It
+		 * DOES NOT guarantee that the result will be
+		 * subtraction of the first non-equal bytes or
+		 * something else about the result aside of its
+		 * sign.
+		 *
+		 * So we don't compare `rc` and `new_rc` for
+		 * equivalence.
+		 */
+		assert((rc == 0 && new_rc == 0) ||
+		       (rc < 0 && new_rc < 0) ||
+		       (rc > 0 && new_rc > 0));
 	}
 #endif
 	return rc;
-}
-
-int
-tarantoolsqlIncrementMaxid(uint64_t *space_max_id)
-{
-	/* ["max_id"] */
-	static const char key[] = {
-		(char)0x91, /* MsgPack array(1) */
-		(char)0xa6, /* MsgPack string(6) */
-		'm', 'a', 'x', '_', 'i', 'd'
-	};
-	/* [["+", 1, 1]]*/
-	static const char ops[] = {
-		(char)0x91, /* MsgPack array(1) */
-		(char)0x93, /* MsgPack array(3) */
-		(char)0xa1, /* MsgPack string(1) */
-		'+',
-		1,          /* MsgPack int(1) */
-		1           /* MsgPack int(1) */
-	};
-
-	struct tuple *res = NULL;
-	struct space *space_schema = space_by_id(BOX_SCHEMA_ID);
-	assert(space_schema != NULL);
-	struct request request;
-	memset(&request, 0, sizeof(request));
-	request.tuple = ops;
-	request.tuple_end = ops + sizeof(ops);
-	request.key = key;
-	request.key_end = key + sizeof(key);
-	request.type = IPROTO_UPDATE;
-	request.space_id = space_schema->def->id;
-	if (box_process1(&request, &res) != 0 || res == NULL ||
-	    tuple_field_u64(res, 1, space_max_id) != 0)
-		return -1;
-	return 0;
 }
 
 /*
@@ -852,7 +858,7 @@ key_alloc(BtCursor *cur, size_t key_size)
 	return 0;
 }
 
-/*
+/*sql_stmt_compile
  * Create new Tarantool iterator and set it to the first entry found by
  * given key. If cursor already contains iterator, it will be freed.
  *
@@ -874,7 +880,8 @@ cursor_seek(BtCursor *pCur, int *pRes)
 	}
 	const char *key = (const char *)pCur->key;
 	uint32_t part_count = mp_decode_array(&key);
-	if (key_validate(pCur->index->def, pCur->iter_type, key, part_count)) {
+	if (iterator_validate(pCur->index->def, pCur->iter_type, key,
+			      part_count)) {
 		diag_log();
 		return -1;
 	}
@@ -887,14 +894,12 @@ cursor_seek(BtCursor *pCur, int *pRes)
 	struct iterator *it =
 		index_create_iterator(pCur->index, pCur->iter_type, key,
 				      part_count);
+	if (txn != NULL)
+		txn_end_ro_stmt(txn, &svp);
 	if (it == NULL) {
-		if (txn != NULL)
-			txn_rollback_stmt(txn);
 		pCur->eState = CURSOR_INVALID;
 		return -1;
 	}
-	if (txn != NULL)
-		txn_commit_ro_stmt(txn, &svp);
 	pCur->iter = it;
 	pCur->eState = CURSOR_VALID;
 
@@ -942,6 +947,50 @@ cursor_advance(BtCursor *pCur, int *pRes)
  * format data for certain fields in _space and _index.
  */
 
+/** Encode space constraints. */
+static void
+sql_mpstream_encode_constraints(struct mpstream *stream,
+				const struct tuple_constraint_def *cdefs,
+				uint32_t ck_count, uint32_t fk_count)
+{
+	if (fk_count > 0) {
+		mpstream_encode_str(stream, "foreign_key");
+		mpstream_encode_map(stream, fk_count);
+		uint32_t count = ck_count + fk_count;
+		for (uint32_t i = 0; i < count; ++i) {
+			if (cdefs[i].type != CONSTR_FKEY)
+				continue;
+			mpstream_encode_str(stream, cdefs[i].name);
+			const struct tuple_constraint_fkey_def *fkey =
+				&cdefs[i].fkey;
+			uint32_t space_id = fkey->space_id;
+			if (space_id != 0) {
+				mpstream_encode_map(stream, 2);
+				mpstream_encode_str(stream, "space");
+				mpstream_encode_uint(stream, space_id);
+			} else {
+				mpstream_encode_map(stream, 1);
+			}
+			mpstream_encode_str(stream, "field");
+			if (fkey->field.name_len > 0)
+				mpstream_encode_str(stream, fkey->field.name);
+			else
+				mpstream_encode_uint(stream, fkey->field.id);
+		}
+	}
+	if (ck_count > 0) {
+		mpstream_encode_str(stream, "constraint");
+		mpstream_encode_map(stream, ck_count);
+		uint32_t count = ck_count + fk_count;
+		for (uint32_t i = 0; i < count; ++i) {
+			if (cdefs[i].type != CONSTR_FUNC)
+				continue;
+			mpstream_encode_str(stream, cdefs[i].name);
+			mpstream_encode_uint(stream, cdefs[i].func.id);
+		}
+	}
+}
+
 char *
 sql_encode_table(struct region *region, struct space_def *def, uint32_t *size)
 {
@@ -957,12 +1006,28 @@ sql_encode_table(struct region *region, struct space_def *def, uint32_t *size)
 	for (uint32_t i = 0; i < field_count && !is_error; i++) {
 		uint32_t cid = def->fields[i].coll_id;
 		struct field_def *field = &def->fields[i];
-		const char *default_str = field->default_value;
 		int base_len = 4;
 		if (cid != COLL_NONE)
 			base_len += 1;
-		if (default_str != NULL)
+		if (field->default_value != NULL)
 			base_len += 1;
+		if (field->default_func_id != 0)
+			base_len += 1;
+		uint32_t ck_count = 0;
+		uint32_t fk_count = 0;
+		struct tuple_constraint_def *cdefs = field->constraint_def;
+		for (uint32_t i = 0; i < field->constraint_count; ++i) {
+			assert(cdefs[i].type == CONSTR_FUNC ||
+			       cdefs[i].type == CONSTR_FKEY);
+			if (cdefs[i].type == CONSTR_FUNC)
+				++ck_count;
+			else
+				++fk_count;
+		}
+		if (ck_count > 0)
+			++base_len;
+		if (fk_count > 0)
+			++base_len;
 		mpstream_encode_map(&stream, base_len);
 		mpstream_encode_str(&stream, "name");
 		mpstream_encode_str(&stream, field->name);
@@ -982,10 +1047,17 @@ sql_encode_table(struct region *region, struct space_def *def, uint32_t *size)
 			mpstream_encode_str(&stream, "collation");
 			mpstream_encode_uint(&stream, cid);
 		}
-		if (default_str != NULL) {
+		if (field->default_value != NULL) {
 			mpstream_encode_str(&stream, "default");
-			mpstream_encode_str(&stream, default_str);
+			mpstream_memcpy(&stream, field->default_value,
+					field->default_value_size);
 		}
+		if (field->default_func_id != 0) {
+			mpstream_encode_str(&stream, "default_func");
+			mpstream_encode_uint(&stream, field->default_func_id);
+		}
+		sql_mpstream_encode_constraints(&stream, cdefs, ck_count,
+						fk_count);
 	}
 	mpstream_flush(&stream);
 	if (is_error) {
@@ -994,10 +1066,7 @@ sql_encode_table(struct region *region, struct space_def *def, uint32_t *size)
 		return NULL;
 	}
 	*size = region_used(region) - used;
-	char *raw = region_join(region, *size);
-	if (raw == NULL)
-		diag_set(OutOfMemory, *size, "region_join", "raw");
-	return raw;
+	return xregion_join(region, *size);
 }
 
 char *
@@ -1026,36 +1095,24 @@ sql_encode_table_opts(struct region *region, struct space_def *def,
 		return NULL;
 	}
 	*size = region_used(region) - used;
-	char *raw = region_join(region, *size);
-	if (raw == NULL)
-		diag_set(OutOfMemory, *size, "region_join", "raw");
-	return raw;
+	return xregion_join(region, *size);
 }
 
 char *
-fk_constraint_encode_links(struct region *region, const struct fk_constraint_def *def,
-			   int type, uint32_t *size)
+fk_constraint_encode_links(const struct fk_constraint_def *fk, uint32_t *size)
 {
-	size_t used = region_used(region);
-	struct mpstream stream;
-	bool is_error = false;
-	mpstream_init(&stream, region, region_reserve_cb, region_alloc_cb,
-		      set_encode_error, &is_error);
-	uint32_t field_count = def->field_count;
-	mpstream_encode_array(&stream, field_count);
-	for (uint32_t i = 0; i < field_count && !is_error; ++i)
-		mpstream_encode_uint(&stream, def->links[i].fields[type]);
-	mpstream_flush(&stream);
-	if (is_error) {
-		diag_set(OutOfMemory, stream.pos - stream.buf,
-			 "mpstream_flush", "stream");
-		return NULL;
+	*size = mp_sizeof_map(fk->field_count);
+	for (uint32_t i = 0; i < fk->field_count; ++i) {
+		*size += mp_sizeof_uint(fk->links[i].child_field);
+		*size += mp_sizeof_uint(fk->links[i].parent_field);
 	}
-	*size = region_used(region) - used;
-	char *raw = region_join(region, *size);
-	if (raw == NULL)
-		diag_set(OutOfMemory, *size, "region_join", "raw");
-	return raw;
+	char *buf = sql_xmalloc(*size);
+	char *buf_end = mp_encode_map(buf, fk->field_count);
+	for (uint32_t i = 0; i < fk->field_count; ++i) {
+		buf_end = mp_encode_uint(buf_end, fk->links[i].child_field);
+		buf_end = mp_encode_uint(buf_end, fk->links[i].parent_field);
+	}
+	return buf;
 }
 
 char *
@@ -1108,10 +1165,7 @@ sql_encode_index_parts(struct region *region, const struct field_def *fields,
 		return NULL;
 	}
 	*size = region_used(region) - used;
-	char *raw = region_join(region, *size);
-	if (raw == NULL)
-		diag_set(OutOfMemory, *size, "region_join", "raw");
-	return raw;
+	return xregion_join(region, *size);
 }
 
 char *
@@ -1152,10 +1206,7 @@ sql_encode_index_opts(struct region *region, const struct index_opts *opts,
 		return NULL;
 	}
 	*size = region_used(region) - used;
-	char *raw = region_join(region, *size);
-	if (raw == NULL)
-		diag_set(OutOfMemory, *size, "region_join", "raw");
-	return raw;
+	return xregion_join(region, *size);
 }
 
 void
@@ -1173,63 +1224,18 @@ sql_debug_info(struct info_handler *h)
 	info_end(h);
 }
 
-int
-tarantoolSqlNextSeqId(uint64_t *max_id)
-{
-	char key[1];
-	struct tuple *tuple;
-	char *key_end = mp_encode_array(key, 0);
-	assert(key_end - key == 1);
-	if (box_index_max(BOX_SEQUENCE_ID, 0 /* PK */, key,
-			  key_end, &tuple) != 0)
-		return -1;
-
-	/* Index is empty  */
-	if (tuple == NULL) {
-		*max_id = 0;
-		return 0;
-	}
-
-	return tuple_field_u64(tuple, BOX_SEQUENCE_FIELD_ID, max_id);
-}
-
-struct Expr*
-space_column_default_expr(uint32_t space_id, uint32_t fieldno)
-{
-	struct space *space;
-	space = space_cache_find(space_id);
-	assert(space != NULL);
-	assert(space->def != NULL);
-	if (space->def->opts.is_view)
-		return NULL;
-	assert(space->def->field_count > fieldno);
-
-	return space->def->fields[fieldno].default_value_expr;
-}
-
 /**
  * Create and initialize a new template space_def object.
  * @param parser SQL Parser object.
  * @param name Name of space to be created.
- * @retval NULL on memory allocation error, Parser state changed.
- * @retval not NULL on success.
  */
 static struct space_def *
 sql_template_space_def_new(struct Parse *parser, const char *name)
 {
 	struct space_def *def = NULL;
 	size_t name_len = name != NULL ? strlen(name) : 0;
-	uint32_t dummy;
-	size_t size = space_def_sizeof(name_len, NULL, 0, &dummy, &dummy,
-				       &dummy);
-	def = (struct space_def *)region_aligned_alloc(&parser->region, size,
-						       alignof(*def));
-	if (def == NULL) {
-		diag_set(OutOfMemory, size, "region_aligned_alloc", "def");
-		parser->is_aborted = true;
-		return NULL;
-	}
-
+	size_t size = sizeof(*def) + name_len + 1;
+	def = xregion_aligned_alloc(&parser->region, size, alignof(*def));
 	memset(def, 0, size);
 	memcpy(def->name, name, name_len);
 	def->name[name_len] = '\0';
@@ -1240,42 +1246,32 @@ sql_template_space_def_new(struct Parse *parser, const char *name)
 struct space *
 sql_template_space_new(Parse *parser, const char *name)
 {
-	size_t sz;
-	struct space *space = region_alloc_object(&parser->region,
-						  typeof(*space), &sz);
-	if (space == NULL) {
-		diag_set(OutOfMemory, sz, "region_alloc_object", "space");
-		parser->is_aborted = true;
-		return NULL;
-	}
-
-	memset(space, 0, sz);
+	struct space *space = xregion_alloc_object(&parser->region,
+						   typeof(*space));
+	memset(space, 0, sizeof(*space));
 	space->def = sql_template_space_def_new(parser, name);
-	if (space->def == NULL)
-		return NULL;
-
 	return space;
 }
 
 /**
- * Initialize a new vdbe_field_ref instance with given tuple
- * data.
+ * Fill vdbe_field_ref instance with given tuple data.
+ *
  * @param field_ref The vdbe_field_ref instance to initialize.
  * @param tuple The tuple object pointer or NULL when undefined.
  * @param data The tuple data (is always defined).
  * @param data_sz The size of tuple data (is always defined).
  */
 static void
-vdbe_field_ref_create(struct vdbe_field_ref *field_ref, struct tuple *tuple,
-		      const char *data, uint32_t data_sz)
+vdbe_field_ref_fill(struct vdbe_field_ref *field_ref, struct tuple *tuple,
+		    uint32_t mp_count, const char *data, uint32_t data_sz)
 {
 	field_ref->tuple = tuple;
 	field_ref->data = data;
 	field_ref->data_sz = data_sz;
 
-	const char *field0 = data;
-	field_ref->field_count = mp_decode_array((const char **) &field0);
-	field_ref->slots[0] = (uint32_t)(field0 - data);
+	field_ref->format = NULL;
+	field_ref->field_count = MIN(field_ref->field_capacity, mp_count);
+	field_ref->slots[0] = 0;
 	memset(&field_ref->slots[1], 0,
 	       field_ref->field_count * sizeof(field_ref->slots[0]));
 	field_ref->slot_bitmask = 0;
@@ -1286,15 +1282,36 @@ void
 vdbe_field_ref_prepare_data(struct vdbe_field_ref *field_ref, const char *data,
 			    uint32_t data_sz)
 {
-	vdbe_field_ref_create(field_ref, NULL, data, data_sz);
+	const char *field0 = data;
+	uint32_t mp_count = mp_decode_array(&field0);
+	vdbe_field_ref_fill(field_ref, NULL, mp_count, field0,
+			    (uint32_t)(field0 - data) + data_sz);
 }
 
 void
 vdbe_field_ref_prepare_tuple(struct vdbe_field_ref *field_ref,
 			     struct tuple *tuple)
 {
-	vdbe_field_ref_create(field_ref, tuple, tuple_data(tuple),
-			      tuple_bsize(tuple));
+	const char *data = tuple_data(tuple);
+	uint32_t data_sz = tuple_bsize(tuple);
+	const char *field0 = data;
+	uint32_t mp_count = mp_decode_array(&field0);
+	vdbe_field_ref_fill(field_ref, NULL, mp_count, field0,
+			    (uint32_t)(field0 - data) + data_sz);
+}
+
+void
+vdbe_field_ref_prepare_array(struct vdbe_field_ref *ref, uint32_t field_count,
+			     const char *data, uint32_t data_sz)
+{
+	return vdbe_field_ref_fill(ref, NULL, field_count, data, data_sz);
+}
+
+void
+vdbe_field_ref_create(struct vdbe_field_ref *ref, uint32_t capacity)
+{
+	memset(ref, 0, sizeof(*ref) + capacity * sizeof(ref->slots[0]));
+	ref->field_capacity = capacity;
 }
 
 ssize_t
@@ -1331,9 +1348,8 @@ sql_index_tuple_size(struct space *space, struct index *idx)
  * generated here are based on typical values found in actual
  * indices.
  */
-const log_est_t default_tuple_est[] = {DEFAULT_TUPLE_LOG_COUNT,
-/**                  [10*log_{2}(x)]:  10, 9,  8,  7,  6,  5 */
-				       33, 32, 30, 28, 26, 23};
+const int16_t default_tuple_est[] = {DEFAULT_TUPLE_LOG_COUNT, 33, 32, 30, 28,
+				     26, 23};
 
 LogEst
 sql_space_tuple_log_count(struct space *space)
@@ -1349,27 +1365,440 @@ sql_space_tuple_log_count(struct space *space)
 	return sqlLogEst(pk->vtab->size(pk));
 }
 
-log_est_t
+int16_t
 index_field_tuple_est(const struct index_def *idx_def, uint32_t field)
 {
 	assert(idx_def != NULL);
 	struct space *space = space_by_id(idx_def->space_id);
-	if (space == NULL || strcmp(idx_def->name, "fake_autoindex") == 0)
-		return idx_def->opts.stat->tuple_log_est[field];
+	if (space == NULL)
+		return 0;
+	if (strcmp(idx_def->name, "fake_autoindex") == 0)
+		return DEFAULT_TUPLE_LOG_COUNT;
 	assert(field <= idx_def->key_def->part_count);
-	/* Statistics is held only in real indexes. */
-	struct index *tnt_idx = space_index(space, idx_def->iid);
-	assert(tnt_idx != NULL);
-	if (tnt_idx->def->opts.stat == NULL) {
-		/*
-		 * Last number for unique index is always 0:
-		 * only one tuple exists with given full key
-		 * in unique index and log(1) == 0.
-		 */
-		if (field == idx_def->key_def->part_count &&
-		    idx_def->opts.is_unique)
-			return 0;
-		return default_tuple_est[field + 1 >= 6 ? 6 : field];
-	}
-	return tnt_idx->def->opts.stat->tuple_log_est[field];
+	/*
+	 * Last number for unique index is always 0: only one tuple exists with
+	 * given full key in unique index and log(1) == 0.
+	 */
+	if (field == idx_def->key_def->part_count &&
+	    idx_def->opts.is_unique)
+		return 0;
+	return default_tuple_est[field + 1 >= 6 ? 6 : field];
 }
+
+/** Drop tuple or field constraint. */
+static int
+sql_constraint_drop(uint32_t space_id, const char *name, const char *prefix)
+{
+	size_t name_len = strlen(name);
+	size_t prefix_len = strlen(prefix);
+
+	struct region *region = &fiber()->gc;
+	uint32_t used = region_used(region);
+	char *path = xregion_alloc(region, name_len + prefix_len + 1);
+	memcpy(path, prefix, prefix_len);
+	memcpy(path + prefix_len, name, name_len);
+	path[name_len + prefix_len] = '\0';
+
+	char key[16];
+	char *key_end = key + mp_format(key, 16, "[%u]", space_id);
+	size_t size;
+	const char *ops = mp_format_on_region(region, &size, "[[%s%s%u]]", "#",
+					      path, 1);
+	const char *end = ops + size;
+	int rc = box_update(BOX_SPACE_ID, 0, key, key_end, ops, end, 0, NULL);
+	region_truncate(region, used);
+	return rc;
+}
+
+int
+sql_tuple_foreign_key_drop(uint32_t space_id, const char *name)
+{
+	return sql_constraint_drop(space_id, name, "flags.foreign_key.");
+}
+
+int
+sql_tuple_check_drop(uint32_t space_id, const char *name)
+{
+	return sql_constraint_drop(space_id, name, "flags.constraint.");
+}
+
+int
+sql_field_foreign_key_drop(uint32_t space_id, uint32_t fieldno,
+			   const char *name)
+{
+	const char *prefix = tt_sprintf("format[%u].foreign_key.", fieldno + 1);
+	return sql_constraint_drop(space_id, name, prefix);
+}
+
+int
+sql_field_check_drop(uint32_t space_id, uint32_t fieldno, const char *name)
+{
+	const char *prefix = tt_sprintf("format[%u].constraint.", fieldno + 1);
+	return sql_constraint_drop(space_id, name, prefix);
+}
+
+/**
+ * Create new constraint in space.
+ *
+ * @param name Name of the constraint.
+ * @param space_id ID of the space.
+ * @param path JSON-path of the new constraint.
+ * @param value Encoded value of the new constraint.
+ */
+static int
+sql_constraint_create(const char *name, uint32_t space_id, const char *path,
+		      const char *value)
+{
+	struct region *region = &fiber()->gc;
+	uint32_t used = region_used(region);
+	const int key_size = 16;
+	char key[key_size];
+	char *key_end = key + mp_format(key, key_size, "[%u]", space_id);
+	/*
+	 * Even if there were no constraints of this type, it is possible that
+	 * _space contains a non-empty field of this type with an empty map as
+	 * its value, which affects the update operation.
+	 */
+	struct tuple *tuple;
+	if (box_index_get(BOX_SPACE_ID, 0, key, key_end, &tuple) != 0)
+		goto error;
+	assert(tuple != NULL);
+	uint32_t path_len = strlen(path);
+	uint32_t path_hash = field_name_hash(path, path_len);
+	const char *field = tuple_field_raw_by_full_path(
+		tuple_format(tuple), tuple_data(tuple), tuple_field_map(tuple),
+		path, path_len, path_hash, TUPLE_INDEX_BASE);
+	bool is_empty = field == NULL;
+
+	const char *ops;
+	size_t ops_size;
+	if (is_empty) {
+		ops = mp_format_on_region(region, &ops_size, "[[%s%s{%s%p}]]",
+					  "!", path, name, value);
+	} else {
+		uint32_t size = strlen(path) + strlen(name) + 2;
+		char *buf = xregion_alloc(region, size);
+		int len = snprintf(buf, size, "%s.%s", path, name);
+		assert(len >= 0 && (uint32_t)len < size);
+		(void)len;
+		ops = mp_format_on_region(region, &ops_size, "[[%s%s%p]]", "!",
+					  buf, value);
+	}
+	const char *end = ops + ops_size;
+	if (box_update(BOX_SPACE_ID, 0, key, key_end, ops, end, 0, NULL) != 0)
+		goto error;
+	region_truncate(region, used);
+	return 0;
+error:
+	region_truncate(region, used);
+	return -1;
+}
+
+int
+sql_foreign_key_create(const char *name, uint32_t child_id, uint32_t parent_id,
+		       uint32_t child_fieldno, uint32_t parent_fieldno,
+		       const char *mapping)
+{
+	const struct space *child = space_by_id(child_id);
+	if (child == NULL) {
+		diag_set(ClientError, ER_NO_SUCH_SPACE, space_name);
+		return -1;
+	}
+	struct tuple_constraint_def *cdefs;
+	uint32_t count;
+	const int buf_size = 64;
+	char buf[buf_size];
+	const char *path;
+	const char *value = NULL;
+
+	struct region *region = &fiber()->gc;
+	uint32_t used = region_used(region);
+	if (mapping == NULL) {
+		count = child->def->fields[child_fieldno].constraint_count;
+		cdefs = child->def->fields[child_fieldno].constraint_def;
+		int len = snprintf(buf, buf_size, "format[%u].foreign_key",
+				   child_fieldno + 1);
+		assert(len > 0 && len < buf_size);
+		(void)len;
+		path = buf;
+		size_t unused;
+		value = mp_format_on_region(region, &unused, "{%s%u%s%u}",
+					    "space", parent_id, "field",
+					    parent_fieldno);
+	} else {
+		count = child->def->opts.constraint_count;
+		cdefs = child->def->opts.constraint_def;
+		path = "flags.foreign_key";
+		size_t unused;
+		value = mp_format_on_region(region, &unused, "{%s%u%s%p}",
+					    "space", parent_id, "field",
+					    mapping);
+	}
+	assert(mp_typeof(*value) == MP_MAP);
+	for (uint32_t i = 0; i < count; ++i) {
+		if (cdefs[i].type != CONSTR_FKEY)
+			continue;
+		if (strcmp(name, cdefs[i].name) == 0) {
+			region_truncate(region, used);
+			diag_set(ClientError, ER_CONSTRAINT_EXISTS,
+				 "FOREIGN KEY", name, space_name(child));
+			return -1;
+		}
+	}
+	int rc = sql_constraint_create(name, child_id, path, value);
+	region_truncate(region, used);
+	return rc;
+}
+
+int
+sql_check_create(const char *name, uint32_t space_id, uint32_t func_id,
+		 uint32_t fieldno, bool is_field_ck)
+{
+	const struct space *space = space_by_id(space_id);
+	assert(space != NULL);
+	struct tuple_constraint_def *cdefs;
+	uint32_t count;
+	const char *path;
+	const int buf_size = 64;
+	char buf[buf_size];
+	const uint32_t value_size = 16;
+	char value[value_size];
+	assert(mp_sizeof_uint(func_id) < value_size);
+	mp_encode_uint(value, func_id);
+
+	if (is_field_ck) {
+		struct func *func = func_by_id(func_id);
+		assert(func != NULL);
+		const char *field_name = space->def->fields[fieldno].name;
+		if (!func_sql_expr_has_single_arg(func, field_name)) {
+			diag_set(ClientError, ER_CREATE_CK_CONSTRAINT, name,
+				 "wrong field name specified in the field "
+				 "check constraint");
+			return -1;
+		}
+		count = space->def->fields[fieldno].constraint_count;
+		cdefs = space->def->fields[fieldno].constraint_def;
+		int len = snprintf(buf, buf_size, "format[%u].constraint",
+				   fieldno + 1);
+		assert(len > 0 && len < buf_size);
+		(void)len;
+		path = buf;
+	} else {
+		count = space->def->opts.constraint_count;
+		cdefs = space->def->opts.constraint_def;
+		path = "flags.constraint";
+	}
+	for (uint32_t i = 0; i < count; ++i) {
+		if (cdefs[i].type != CONSTR_FUNC)
+			continue;
+		if (strcmp(name, cdefs[i].name) == 0) {
+			diag_set(ClientError, ER_CONSTRAINT_EXISTS, "CHECK",
+				 name, space_name(space));
+			return -1;
+		}
+	}
+	return sql_constraint_create(name, space_id, path, value);
+}
+
+int
+sql_add_default(uint32_t space_id, uint32_t fieldno, uint32_t func_id)
+{
+	const char *path = tt_sprintf("format[%u].default_func", fieldno + 1);
+	const int ops_size = 128;
+	char ops[ops_size];
+	const char *ops_end = ops + mp_format(ops, ops_size, "[[%s%s%u]]", "!",
+					      path, func_id);
+	const int key_size = 16;
+	char key[key_size];
+	const char *key_end = key + mp_format(key, key_size, "[%u]", space_id);
+	return box_update(BOX_SPACE_ID, 0, key, key_end, ops, ops_end, 0, NULL);
+}
+
+const struct space *
+sql_space_by_token(const struct Token *name)
+{
+	char *name_str = sql_name_from_token(name);
+	struct space *res = space_by_name0(name_str);
+	sql_xfree(name_str);
+	if (res != NULL || name->z[0] == '"')
+		return res;
+	char *old_name_str = sql_legacy_name_new(name->z, name->n);
+	res = space_by_name0(old_name_str);
+	sql_xfree(old_name_str);
+	return res;
+}
+
+const struct space *
+sql_space_by_src(const struct SrcList_item *src)
+{
+	struct space *res = space_by_name0(src->zName);
+	if (res != NULL || src->legacy_name == NULL)
+		return res;
+	return space_by_name0(src->legacy_name);
+}
+
+/**
+ * Return id of index with the given name. Return UINT32_MAX if the index was
+ * not found.
+ */
+static uint32_t
+sql_space_index_id(const struct space *space, const char *name)
+{
+	for (uint32_t i = 0; i < space->index_count; ++i) {
+		if (strcmp(space->index[i]->def->name, name) == 0)
+			return space->index[i]->def->iid;
+	}
+	return UINT32_MAX;
+}
+
+uint32_t
+sql_index_id_by_token(const struct space *space, const struct Token *name)
+{
+	char *name_str = sql_name_from_token(name);
+	uint32_t res = sql_space_index_id(space, name_str);
+	sql_xfree(name_str);
+	if (res != UINT32_MAX || name->z[0] == '"')
+		return res;
+	char *old_name_str = sql_legacy_name_new(name->z, name->n);
+	res = sql_space_index_id(space, old_name_str);
+	sql_xfree(old_name_str);
+	return res;
+}
+
+uint32_t
+sql_index_id_by_src(const struct SrcList_item *src)
+{
+	assert(src->space != NULL && src->fg.isIndexedBy != 0);
+	uint32_t res = sql_space_index_id(src->space, src->indexed_by);
+	if (res != UINT32_MAX || src->legacy_index_name == NULL)
+		return res;
+	return sql_space_index_id(src->space, src->legacy_index_name);
+}
+
+uint32_t
+sql_space_fieldno(const struct space *space, const char *name)
+{
+	for (uint32_t i = 0; i < space->def->field_count; ++i) {
+		if (strcmp(space->def->fields[i].name, name) == 0)
+			return i;
+	}
+	return UINT32_MAX;
+}
+
+uint32_t
+sql_fieldno_by_token(const struct space *space, const struct Token *name)
+{
+	char *name_str = sql_name_from_token(name);
+	uint32_t res = sql_space_fieldno(space, name_str);
+	sql_xfree(name_str);
+	return res;
+}
+
+uint32_t
+sql_fieldno_by_id(const struct space *space, const struct IdList_item *id)
+{
+	uint32_t res = sql_space_fieldno(space, id->zName);
+	if (res != UINT32_MAX || id->legacy_name == NULL)
+		return res;
+	return sql_space_fieldno(space, id->legacy_name);
+}
+
+uint32_t
+sql_coll_id_by_token(const struct Token *name)
+{
+	char *name_str = sql_name_from_token(name);
+	struct coll_id *coll_id = coll_by_name(name_str, strlen(name_str));
+	sql_xfree(name_str);
+	if (coll_id != NULL)
+		return coll_id->id;
+	if (name->z[0] == '"')
+		return UINT32_MAX;
+
+	char *old_name_str = sql_legacy_name_new(name->z, name->n);
+	coll_id = coll_by_name(old_name_str, strlen(old_name_str));
+	sql_xfree(old_name_str);
+	if (coll_id != NULL)
+		return coll_id->id;
+	return UINT32_MAX;
+}
+
+/**
+ * Return a constraint with the name specified by the token and the
+ * specified type. A second lookup will be performed if the constraint is not
+ * found on the first try and token is not start with double quote. Return NULL
+ * if the constraint was not found.
+ */
+static const struct tuple_constraint_def *
+sql_constraint_by_token(const struct tuple_constraint_def *cdefs,
+			uint32_t count, enum tuple_constraint_type type,
+			const struct Token *name)
+{
+	char *name_str = sql_name_from_token(name);
+	for (uint32_t i = 0; i < count; ++i) {
+		if (strcmp(cdefs[i].name, name_str) == 0 &&
+		    cdefs[i].type == type) {
+			sql_xfree(name_str);
+			return &cdefs[i];
+		}
+	}
+	sql_xfree(name_str);
+	if (name->z[0] == '"')
+		return NULL;
+	char *old_name_str = sql_legacy_name_new(name->z, name->n);
+	for (uint32_t i = 0; i < count; ++i) {
+		if (strcmp(cdefs[i].name, old_name_str) == 0 &&
+		    cdefs[i].type == type) {
+			sql_xfree(old_name_str);
+			return &cdefs[i];
+		}
+	}
+	sql_xfree(old_name_str);
+	return NULL;
+}
+
+const struct tuple_constraint_def *
+sql_tuple_fk_by_token(const struct space *space, const struct Token *name)
+{
+	struct tuple_constraint_def *cdefs = space->def->opts.constraint_def;
+	uint32_t count = space->def->opts.constraint_count;
+	return sql_constraint_by_token(cdefs, count, CONSTR_FKEY, name);
+}
+
+const struct tuple_constraint_def *
+sql_tuple_ck_by_token(const struct space *space, const struct Token *name)
+{
+	struct tuple_constraint_def *cdefs = space->def->opts.constraint_def;
+	uint32_t count = space->def->opts.constraint_count;
+	return sql_constraint_by_token(cdefs, count, CONSTR_FUNC, name);
+}
+
+const struct tuple_constraint_def *
+sql_field_fk_by_token(const struct space *space, uint32_t fieldno,
+		      const struct Token *name)
+{
+	struct field_def *field = &space->def->fields[fieldno];
+	struct tuple_constraint_def *cdefs = field->constraint_def;
+	uint32_t count = field->constraint_count;
+	return sql_constraint_by_token(cdefs, count, CONSTR_FKEY, name);
+}
+
+const struct tuple_constraint_def *
+sql_field_ck_by_token(const struct space *space, uint32_t fieldno,
+		      const struct Token *name)
+{
+	struct field_def *field = &space->def->fields[fieldno];
+	struct tuple_constraint_def *cdefs = field->constraint_def;
+	uint32_t count = field->constraint_count;
+	return sql_constraint_by_token(cdefs, count, CONSTR_FUNC, name);
+}
+
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+int
+sql_fuzz(const char *sql)
+{
+	struct Vdbe *stmt = sql_stmt_compile(sql);
+	if (stmt == NULL)
+		return -1;
+	return sqlVdbeFinalize(stmt);
+}
+#endif /* FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION */

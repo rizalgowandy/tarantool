@@ -67,20 +67,6 @@ enum {
 	VCLOCK_STR_LEN_MAX = 1 + VCLOCK_MAX * (2 + 2 + 20 + 2) + 1
 };
 
-/** Predefined replication group identifiers. */
-enum {
-	/**
-	 * Default replication group: changes made to the space
-	 * are replicated throughout the entire cluster.
-	 */
-	GROUP_DEFAULT = 0,
-	/**
-	 * Replica local space: changes made to the space are
-	 * not replicated.
-	 */
-	GROUP_LOCAL = 1,
-};
-
 /** Cluster vector clock */
 struct vclock {
 	/** Map of used components in lsn array */
@@ -173,7 +159,7 @@ vclock_inc(struct vclock *vclock, uint32_t replica_id)
 	/* Easier add each time than check. */
 	if (((vclock->map >> replica_id) & 0x01) == 0) {
 		vclock->lsn[replica_id] = 0;
-		vclock->map |= 1 << replica_id;
+		vclock->map |= 1U << replica_id;
 	}
 	vclock->signature++;
 	return ++vclock->lsn[replica_id];
@@ -196,11 +182,11 @@ vclock_reset(struct vclock *vclock, uint32_t replica_id, int64_t lsn)
 	assert(replica_id < VCLOCK_MAX);
 	vclock->signature -= vclock_get(vclock, replica_id);
 	if (lsn == 0) {
-		vclock->map &= ~(1 << replica_id);
+		vclock->map &= ~(1U << replica_id);
 		return;
 	}
 	vclock->lsn[replica_id] = lsn;
-	vclock->map |= 1 << replica_id;
+	vclock->map |= 1U << replica_id;
 	vclock->signature += lsn;
 }
 
@@ -214,6 +200,13 @@ vclock_copy(struct vclock *dst, const struct vclock *src)
 	unsigned int max_pos = VCLOCK_MAX - bit_clz_u32(src->map | 0x01);
 	memcpy(dst, src, offsetof(struct vclock, lsn) +
 			 sizeof(*dst->lsn) * max_pos);
+}
+
+static inline void
+vclock_copy_ignore0(struct vclock *dst, const struct vclock *src)
+{
+	vclock_copy(dst, src);
+	vclock_reset(dst, 0, 0);
 }
 
 static inline uint32_t
@@ -289,6 +282,13 @@ vclock_to_string(const struct vclock *vclock);
  */
 size_t
 vclock_from_string(struct vclock *vclock, const char *str);
+
+/**
+ * Stringify the vclock into the given buffer. Same semantics as
+ * snprintf().
+ */
+int
+vclock_snprint(char *buf, int size, const struct vclock *vclock);
 
 enum { VCLOCK_ORDER_UNDEFINED = INT_MAX };
 
@@ -387,29 +387,64 @@ vclock_lex_compare(const struct vclock *a, const struct vclock *b)
 }
 
 /**
- * Return a vclock, which is a componentwise minimum between
- * vclocks @a a and @a b. Do not take vclock[0] into account.
+ * Return a vclock, which is a componentwise minimum (when @sign is -1) or
+ * maximum (when @sign is +1) between vclocks @a a and @a b.
  *
  * @param[in,out] a Vclock containing the minimum components.
  * @param b Vclock to compare with.
+ * @param sign Which extremum to find:
+ *             -1 for minimum,
+ *             +1 for maximum.
+ * @param ignore_zero Whether to order by 0-th component or not.
+ *        The 0-th component is ignored in replication, as it's used for
+ *        local writes.
  */
 static inline void
-vclock_min_ignore0(struct vclock *a, const struct vclock *b)
+vclock_minmax(struct vclock *a, const struct vclock *b, int sign,
+	      bool ignore_zero)
 {
 	vclock_map_t map = a->map | b->map;
 	struct bit_iterator it;
 	bit_iterator_init(&it, &map, sizeof(map), true);
 	size_t replica_id = bit_iterator_next(&it);
-	if (replica_id == 0)
+	if (replica_id == 0 && ignore_zero)
 		replica_id = bit_iterator_next(&it);
 
 	for( ; replica_id < VCLOCK_MAX; replica_id = bit_iterator_next(&it)) {
 		int64_t lsn_a = vclock_get(a, replica_id);
 		int64_t lsn_b = vclock_get(b, replica_id);
-		if (lsn_a <= lsn_b)
+		if (sign * lsn_a >= sign * lsn_b)
 			continue;
 		vclock_reset(a, replica_id, lsn_b);
 	}
+}
+
+/** @sa vclock_minmax_ignore0. */
+static inline void
+vclock_min_ignore0(struct vclock *a, const struct vclock *b)
+{
+	return vclock_minmax(a, b, -1, true);
+}
+
+/** @sa vclock_minmax_ignore0. */
+static inline void
+vclock_max_ignore0(struct vclock *a, const struct vclock *b)
+{
+	return vclock_minmax(a, b, 1, true);
+}
+
+/** @sa vclock_minmax_ignore0. */
+static inline void
+vclock_min(struct vclock *a, const struct vclock *b)
+{
+	return vclock_minmax(a, b, -1, false);
+}
+
+/** @sa vclock_minmax_ignore0. */
+static inline void
+vclock_max(struct vclock *a, const struct vclock *b)
+{
+	return vclock_minmax(a, b, 1, false);
 }
 
 /**
@@ -428,7 +463,7 @@ rb_proto(, vclockset_, vclockset_t, struct vclock);
  * @return a vclock that <= than \a key
  */
 static inline struct vclock *
-vclockset_match(vclockset_t *set, struct vclock *key)
+vclockset_match(vclockset_t *set, const struct vclock *key)
 {
 	struct vclock *match = vclockset_psearch(set, key);
 	/**
@@ -452,6 +487,23 @@ vclockset_match(vclockset_t *set, struct vclock *key)
 	 */
 	return vclockset_first(set);
 }
+
+/**
+ * Calculates the kth order statistic.
+ */
+int64_t
+vclock_nth_element(const struct vclock *vclock, uint32_t n);
+
+/**
+ * Count the number of components that are more than or equal to a given value.
+ */
+int
+vclock_count_ge(const struct vclock *vclock, int64_t lsn);
+
+#define vclockset_foreach(set, vclock) \
+	for ((vclock) = vclockset_first(set); \
+	     (vclock) != NULL; \
+	     (vclock) = vclockset_next((set), (vclock)))
 
 #if defined(__cplusplus)
 } /* extern "C" */

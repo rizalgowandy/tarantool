@@ -1,17 +1,14 @@
 -- fio.lua (internal file)
 
+local minifio = require('internal.minifio')
 local fio = require('fio')
 local ffi = require('ffi')
 local buffer = require('buffer')
 local fiber = require('fiber')
 local errno = require('errno')
 local schedule_task = fiber._internal.schedule_task
-local cord_ibuf_take = buffer.internal.cord_ibuf_take
-local cord_ibuf_put = buffer.internal.cord_ibuf_put
-
 ffi.cdef[[
     int umask(int mask);
-    char *dirname(char *path);
     int chdir(const char *path);
 
     struct fio_handle {
@@ -100,9 +97,15 @@ end
 -- pread(buf, size, offset) -> len
 fio_methods.pread = function(self, buf, size, offset)
     local tmpbuf
-    if not ffi.istype(const_char_ptr_t, buf) then
+    local has_buf = ffi.istype(const_char_ptr_t, buf)
+    if not has_buf then
         offset = size
         size = buf
+    end
+    if type(size) ~= 'number' or (type(offset) ~= 'number' and offset ~= nil) then
+        error('Usage: fh:pread(buf, size[, offset]) or fh:pread(size[, offset])')
+    end
+    if not has_buf then
         tmpbuf = buffer.ibuf()
         buf = tmpbuf:reserve(size)
     end
@@ -193,7 +196,7 @@ fio.open = function(path, flags, mode)
         flags = { flags }
     end
     if type(mode) ~= 'table' then
-        mode = { mode or (bit.band(0x1FF, fio.umask())) }
+        mode = { mode or tonumber('666', 8) }
     end
 
 
@@ -232,51 +235,20 @@ fio.open = function(path, flags, mode)
     return res
 end
 
-fio.pathjoin = function(...)
-    local i, path = 1, nil
-
-    local len = select('#', ...)
-    while i <= len do
-        local sp = select(i, ...)
-        if sp == nil then
-            error("fio.pathjoin(): undefined path part "..i)
-        end
-
-        sp = tostring(sp)
-        if sp ~= '' then
-            path = sp
-            break
-        else
-            i = i + 1
-        end
-    end
-
-    if path == nil then
-        return '.'
-    end
-
-    i = i + 1
-    while i <= len do
-        local sp = select(i, ...)
-        if sp == nil then
-            error("fio.pathjoin(): undefined path part "..i)
-        end
-
-        sp = tostring(sp)
-        if sp ~= '' then
-            path = path .. '/' .. sp
-        end
-
-        i = i + 1
-    end
-
-    path = path:gsub('/+', '/')
-    if path ~= '/' then
-        path = path:gsub('/$', '')
-    end
-
-    return path
+-- Expose several functions implemented as part of the minifio
+-- module.
+for name, func in pairs(minifio.expose_from_fio) do
+    fio[name] = func
 end
+
+-- List of functions exposed from fio, but defined in minifio.
+--
+-- Without the list a reader should be aware of the fio/minifio
+-- splitting in order to find an implementation of a function by
+-- its name. Let's make a reader's life a bit easier.
+assert(type(fio.cwd) == 'function')
+assert(type(fio.pathjoin) == 'function')
+assert(type(fio.abspath) == 'function')
 
 fio.basename = function(path, suffix)
     if type(path) ~= 'string' then
@@ -301,15 +273,7 @@ fio.dirname = function(path)
     if type(path) ~= 'string' then
         error("Usage: fio.dirname(path)")
     end
-    -- Can't just cast path to char * - on Linux dirname modifies
-    -- its argument.
-    local bsize = #path + 1
-    local ibuf = cord_ibuf_take()
-    local cpath = ibuf:alloc(bsize)
-    ffi.copy(cpath, ffi.cast('const char *', path), bsize)
-    path = ffi.string(ffi.C.dirname(cpath))
-    cord_ibuf_put(ibuf)
-    return path
+    return minifio.dirname(path)
 end
 
 fio.umask = function(umask)
@@ -324,30 +288,6 @@ fio.umask = function(umask)
 
     return ffi.C.umask(tonumber(umask))
 
-end
-
-fio.abspath = function(path)
-    -- following established conventions of fio module:
-    -- letting nil through and converting path to string
-    if path == nil then
-        error("Usage: fio.abspath(path)")
-    end
-    path = path
-    local joined_path
-    local path_tab = {}
-    if string.sub(path, 1, 1) == '/' then
-        joined_path = path
-    else
-        joined_path = fio.pathjoin(fio.cwd(), path)
-    end
-    for sp in string.gmatch(joined_path, '[^/]+') do
-        if sp == '..' then
-            table.remove(path_tab)
-        elseif sp ~= '.' then
-            table.insert(path_tab, sp)
-        end
-    end
-    return '/' .. table.concat(path_tab, '/')
 end
 
 fio.chdir = function(path)

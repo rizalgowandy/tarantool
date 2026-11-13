@@ -240,11 +240,11 @@ pong = s:sysread()
 ...
 string.len(pong)
 ---
-- 29
+- 33
 ...
 msgpack.decode(pong)
 ---
-- 24
+- 28
 - 6
 ...
 function remove_schema_id(t, x) if t[5] then t[5] = 'XXX' end return t, x end
@@ -253,7 +253,7 @@ function remove_schema_id(t, x) if t[5] then t[5] = 'XXX' end return t, x end
 remove_schema_id(msgpack.decode(pong, 6))
 ---
 - {0: 0, 1: 0, 5: 'XXX'}
-- 29
+- 33
 ...
 s:close()
 ---
@@ -433,6 +433,22 @@ s = socket('PF_INET', 'SOCK_STREAM', 'tcp')
 ---
 ...
 s:setsockopt('SOL_SOCKET', 'SO_REUSEADDR', true)
+---
+- true
+...
+s:setsockopt('SOL_SOCKET', 'SO_REUSEPORT', true)
+---
+- true
+...
+s:getsockopt('SOL_SOCKET', 'SO_REUSEPORT') > 0
+---
+- true
+...
+s:setsockopt('SOL_SOCKET', 'SO_REUSEPORT', false)
+---
+- true
+...
+s:getsockopt('SOL_SOCKET', 'SO_REUSEPORT') == 0
 ---
 - true
 ...
@@ -2094,9 +2110,8 @@ sc:close()
 ...
 c:receive("*a", "Message: ")
 ---
-- 'Message: Pong
-
-  '
+- |
+  Message: Pong
 ...
 c:receive("*a", "Message: ")
 ---

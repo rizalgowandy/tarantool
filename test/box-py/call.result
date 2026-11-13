@@ -48,7 +48,7 @@ call  f1 ()
         "reason": "unsupported Lua type 'function'"
     }
 }
-call  box.error (33333, 'Hey!')
+call  box.error (33333,)
 {
     "error": {
         "code": "U", 
@@ -256,8 +256,7 @@ call  myinsert (3, 'old', 2)
 }
 space:update({3}, {{'=', 1, 4}, {'=', 2, 'new'}})
 ---
-- error: Attempt to modify a tuple field which is part of index 'primary' in space
-    'tweedledum'
+- error: Attempt to modify a tuple field which is part of primary index in space 'tweedledum'
 ...
 space:insert(space:get{3}:update{{'=', 1, 4}, {'=', 2, 'new'}}) space:delete{3}
 ---
@@ -421,7 +420,7 @@ call f()
 ---
 - {"c": {"106": [1, 1428578535], "2": [1, 1428578535]}, "pc": {"106": [1, 1428578535, 9243], "2": [1, 1428578535, 9243]}, "s": [1, 1428578535], "u": 1428578535, "v": []}
 - true
-t = box.tuple.new('tuple', {1, 2, 3}, { k1 = 'v', k2 = 'v2'})
+t = box.tuple.new{'tuple', {1, 2, 3}, { k1 = 'v', k2 = 'v2'}}
 ---
 ...
 eval (return t)()

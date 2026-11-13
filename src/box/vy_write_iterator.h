@@ -32,7 +32,6 @@
  */
 #include "trivia/util.h"
 #include "vy_stmt_stream.h"
-#include "vy_read_view.h"
 #include <stdbool.h>
 #include <pthread.h>
 
@@ -241,7 +240,8 @@ struct vy_deferred_delete_handler {
  * @param cmp_def - key definition for tuple compare.
  * @param LSM tree is_primary - set if this iterator is for a primary index.
  * @param is_last_level - there is no older level than the one we're writing to.
- * @param read_views - Opened read views.
+ * @param vlsns - Array of read view LSNs sorted in the ascending order.
+ * @param vlsn_count - Number of entries in the vlsns array.
  * @param handler - Deferred DELETE handler or NULL if no deferred DELETEs is
  * expected. Only relevant to primary index compaction. For secondary indexes
  * this argument must be set to NULL.
@@ -249,7 +249,7 @@ struct vy_deferred_delete_handler {
  */
 struct vy_stmt_stream *
 vy_write_iterator_new(struct key_def *cmp_def, bool is_primary,
-		      bool is_last_level, struct rlist *read_views,
+		      bool is_last_level, const int64_t *vlsns, int vlsn_count,
 		      struct vy_deferred_delete_handler *handler);
 
 /**
@@ -257,7 +257,8 @@ vy_write_iterator_new(struct key_def *cmp_def, bool is_primary,
  * @return 0 on success, -1 on error (diag is set).
  */
 NODISCARD int
-vy_write_iterator_new_mem(struct vy_stmt_stream *stream, struct vy_mem *mem);
+vy_write_iterator_new_mem(struct vy_stmt_stream *stream, struct vy_mem *mem,
+			  struct tuple_format *format);
 
 /**
  * Add a run slice as a source to the iterator.
@@ -266,7 +267,8 @@ vy_write_iterator_new_mem(struct vy_stmt_stream *stream, struct vy_mem *mem);
 NODISCARD int
 vy_write_iterator_new_slice(struct vy_stmt_stream *stream,
 			    struct vy_slice *slice,
-			    struct tuple_format *disk_format);
+			    struct tuple_format *format,
+			    struct tuple_format *key_format);
 
 #endif /* INCLUDES_TARANTOOL_BOX_VY_WRITE_STREAM_H */
 

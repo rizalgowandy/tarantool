@@ -59,7 +59,11 @@ string.match(box.info.uptime, '^[1-9][0-9]*$') ~= nil
 ---
 - true
 ...
-box.info.cluster.uuid == box.space._schema:get{'cluster'}[2]
+box.info.replicaset.uuid == box.space._schema:get{'replicaset_uuid'}[2]
+---
+- true
+...
+type(box.info.hostname) == 'string'
 ---
 - true
 ...
@@ -75,17 +79,23 @@ table.sort(t)
 t
 ---
 - - cluster
+  - config
   - election
   - gc
+  - health
+  - hostname
   - id
   - listen
   - lsn
   - memory
+  - name
   - package
   - pid
+  - replicaset
   - replication
   - replication_anon
   - ro
+  - schema_version
   - signature
   - sql
   - status
@@ -134,11 +144,11 @@ box.info().ro == box.info.server.ro
 --
 box.ctl.wait_ro("abc") -- invalid argument
 ---
-- error: 'bad argument #1 to ''?'' (number expected, got string)'
+- error: expected number as 1 argument
 ...
 box.ctl.wait_rw("def") -- invalid argument
 ---
-- error: 'bad argument #1 to ''?'' (number expected, got string)'
+- error: expected number as 1 argument
 ...
 box.info.ro -- false
 ---
@@ -232,4 +242,39 @@ box.cfg{read_only = false}
 ch:get() -- false
 ---
 - false
+...
+--
+-- box.info.cluster compat. Before 3.0.0 it meant the current replicaset. Now it
+-- means the whole cluster.
+--
+compat = require('compat')
+---
+...
+info = compat.box_info_cluster_meaning
+---
+...
+assert(info.current == 'default')
+---
+- true
+...
+assert(info.default == 'new')
+---
+- true
+...
+rs_uuid = box.info.replicaset.uuid
+---
+...
+assert(box.info.cluster.uuid ~= rs_uuid)
+---
+- true
+...
+compat.box_info_cluster_meaning = 'old'
+---
+...
+assert(box.info.cluster.uuid == rs_uuid)
+---
+- true
+...
+compat.box_info_cluster_meaning = 'default'
+---
 ...

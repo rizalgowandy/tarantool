@@ -108,9 +108,9 @@ stream_2:commit()
 conn = net_box.connect(server_addr)
 assert(conn:ping())
 -- Begin, commit and rollback supported only for streams
-conn:_request(net_box._method.begin, nil, nil, nil)
-conn:_request(net_box._method.commit, nil, nil, nil)
-conn:_request(net_box._method.rollback, nil, nil, nil)
+conn:_request('BEGIN')
+conn:_request('COMMIT')
+conn:_request('ROLLBACK')
 -- Not all requests supported by stream.
 stream = conn:new_stream()
 -- Start transaction to allocate stream object on the
@@ -120,18 +120,15 @@ IPROTO_REQUEST_TYPE       = 0x00
 IPROTO_SYNC               = 0x01
 IPROTO_AUTH               = 7
 IPROTO_STREAM_ID          = 0x0a
-next_request_id           = 10
 test_run:cmd("setopt delimiter ';'")
 header = msgpack.encode({
     [IPROTO_REQUEST_TYPE] = IPROTO_AUTH,
-    [IPROTO_SYNC] = next_request_id,
+    [IPROTO_SYNC] = conn:_next_sync(),
     [IPROTO_STREAM_ID] = 1,
 });
 body = msgpack.encode({nil});
 size = msgpack.encode(header:len() + body:len());
-conn._transport.perform_request(nil, nil, false, net_box._method.inject,
-                                nil, nil, nil, nil,
-                                size .. header .. body);
+conn:_request('INJECT', nil, nil, nil, size .. header .. body);
 test_run:cmd("setopt delimiter ''");
 conn:close()
 test_run:cmd("stop server test")
@@ -146,11 +143,7 @@ conn, stream, space = start_server_and_init(false)
 stream:begin()
 test_run:wait_cond(function () return get_current_stream_count() == 1 end)
 space:replace({1})
--- Empty select, transaction was not commited and
--- is not visible from requests not belonging to the
--- transaction.
-space:select{}
--- Select is empty, because memtx_use_mvcc_engine is false
+-- Select fails, because memtx_use_mvcc_engine is false
 space:select({})
 test_run:switch("test")
 -- Select is empty, transaction was not commited
@@ -169,7 +162,7 @@ stream:commit()
 -- Same checks for `call` end `eval` functions.
 stream:call('box.begin')
 stream:call('s:replace', {{1}})
--- Select is empty, because memtx_use_mvcc_engine is false
+-- Select fails, because memtx_use_mvcc_engine is false
 space:select({})
 stream:call('s:select', {})
 test_run:switch("test")
@@ -185,7 +178,7 @@ space:select{}
 -- begin and commit transaction.
 stream:execute('START TRANSACTION')
 stream:call('s:replace', {{1}})
--- Select is empty, because memtx_use_mvcc_engine is false
+-- Select fails, because memtx_use_mvcc_engine is false
 space:select({})
 stream:call('s:select', {})
 test_run:switch("test")
@@ -614,86 +607,76 @@ function execute_sql_string_and_return_result(stream, sql_string)
     end
 end$
 function monster_ddl(stream)
-    local _, err1, err2, err3, err4, err5, err6
+    local _, err1, err2, err3, err4, err5
     local stream_or_box = stream or box
-    execute_sql_string(stream, [[CREATE TABLE t1(id INTEGER PRIMARY KEY,
-                                                 a INTEGER,
-                                                 b INTEGER);]])
-    execute_sql_string(stream, [[CREATE TABLE t2(id INTEGER PRIMARY KEY,
-                                                 a INTEGER,
-                                                 b INTEGER UNIQUE,
-                                                 CONSTRAINT ck1
-                                                 CHECK(b < 100));]])
+    execute_sql_string(stream, [[CREATE TABLE T1(ID INTEGER PRIMARY KEY,
+                                                 A INTEGER,
+                                                 B INTEGER);]])
+    execute_sql_string(stream, [[CREATE TABLE T2(ID INTEGER PRIMARY KEY,
+                                                 A INTEGER,
+                                                 B INTEGER UNIQUE,
+                                                 CONSTRAINT CK1
+                                                 CHECK(B < 100));]])
 
-    execute_sql_string(stream, 'CREATE INDEX t1a ON t1(a);')
-    execute_sql_string(stream, 'CREATE INDEX t2a ON t2(a);')
+    execute_sql_string(stream, 'CREATE INDEX T1A ON T1(A);')
+    execute_sql_string(stream, 'CREATE INDEX T2A ON T2(A);')
 
-    execute_sql_string(stream, [[CREATE TABLE t_to_rename(id INTEGER PRIMARY
-                                                          KEY, a INTEGER);]])
+    execute_sql_string(stream, [[CREATE TABLE T_TO_RENAME(ID INTEGER PRIMARY
+                                                          KEY, A INTEGER);]])
 
-    execute_sql_string(stream, 'DROP INDEX t2a ON t2;')
+    execute_sql_string(stream, 'DROP INDEX T2A ON T2;')
 
-    execute_sql_string(stream, 'CREATE INDEX t_to_rename_a ON t_to_rename(a);')
+    execute_sql_string(stream, 'CREATE INDEX T_TO_RENAME_A ON T_TO_RENAME(A);')
 
-    execute_sql_string(stream, [[ALTER TABLE t1 ADD CONSTRAINT ck1
-                                 CHECK(b > 0);]])
+    execute_sql_string(stream, [[ALTER TABLE T1 ADD CONSTRAINT CK1
+                                 CHECK(B > 0);]])
 
     _, err1 =
-        execute_sql_string_and_return_result(stream, [[ALTER TABLE t_to_rename
-                                                       RENAME TO t1;]])
+        execute_sql_string_and_return_result(stream, [[ALTER TABLE T_TO_RENAME
+                                                       RENAME TO T1;]])
 
-    execute_sql_string(stream, [[ALTER TABLE t1 ADD CONSTRAINT
-                                 ck2 CHECK(a > 0);]])
-    execute_sql_string(stream, 'ALTER TABLE t1 DROP CONSTRAINT ck1;')
-
-    execute_sql_string(stream, [[ALTER TABLE t1 ADD CONSTRAINT fk1 FOREIGN KEY
-                                 (a) REFERENCES t2(b);]])
-    execute_sql_string(stream, 'ALTER TABLE t1 DROP CONSTRAINT fk1;')
+    execute_sql_string(stream, [[ALTER TABLE T1 ADD CONSTRAINT
+                                 CK2 CHECK(A > 0);]])
+    execute_sql_string(stream, 'ALTER TABLE T1 DROP CONSTRAINT CK1;')
 
     _, err2 =
-        execute_sql_string_and_return_result(stream, [[CREATE TABLE t1(id
+        execute_sql_string_and_return_result(stream, [[CREATE TABLE T1(ID
                                                        INTEGER PRIMARY KEY);]])
 
-    execute_sql_string(stream, [[ALTER TABLE t1 ADD CONSTRAINT fk1 FOREIGN KEY
-                                 (a) REFERENCES t2(b);]])
-
     execute_sql_string(stream, [[CREATE TABLE
-                                 trigger_catcher(id INTEGER PRIMARY
+                                 TRIGGER_CATCHER(ID INTEGER PRIMARY
                                                  KEY AUTOINCREMENT);]])
 
-    execute_sql_string(stream, 'ALTER TABLE t_to_rename RENAME TO t_renamed;')
+    execute_sql_string(stream, 'ALTER TABLE T_TO_RENAME RENAME TO T_RENAMED;')
 
-    execute_sql_string(stream, 'DROP INDEX t_to_rename_a ON t_renamed;')
+    execute_sql_string(stream, 'DROP INDEX T_TO_RENAME_A ON T_RENAMED;')
 
-    execute_sql_string(stream, [[CREATE TRIGGER t1t AFTER INSERT ON
-                                 t1 FOR EACH ROW
+    execute_sql_string(stream, [[CREATE TRIGGER T1T AFTER INSERT ON
+                                 T1 FOR EACH ROW
                                  BEGIN
-                                     INSERT INTO trigger_catcher VALUES(1);
+                                     INSERT INTO TRIGGER_CATCHER VALUES(1);
                                  END; ]])
 
-    _, err3 = execute_sql_string_and_return_result(stream, 'DROP TABLE t3;')
+    _, err3 = execute_sql_string_and_return_result(stream, 'DROP TABLE T3;')
 
-    execute_sql_string(stream, [[CREATE TRIGGER t2t AFTER INSERT ON
-                                 t2 FOR EACH ROW
+    execute_sql_string(stream, [[CREATE TRIGGER T2T AFTER INSERT ON
+                                 T2 FOR EACH ROW
                                  BEGIN
-                                     INSERT INTO trigger_catcher VALUES(1);
+                                     INSERT INTO TRIGGER_CATCHER VALUES(1);
                                  END; ]])
 
     _, err4 =
-        execute_sql_string_and_return_result(stream, [[CREATE INDEX t1a
-                                                       ON t1(a, b);]])
+        execute_sql_string_and_return_result(stream, [[CREATE INDEX T1A
+                                                       ON T1(A, B);]])
 
-    execute_sql_string(stream, 'TRUNCATE TABLE t1;')
+    execute_sql_string(stream, 'TRUNCATE TABLE T1;')
     _, err5 =
-        execute_sql_string_and_return_result(stream, 'TRUNCATE TABLE t2;')
-    _, err6 =
         execute_sql_string_and_return_result(stream, [[TRUNCATE TABLE
-                                                       t_does_not_exist;]])
+                                                       T_DOES_NOT_EXIST;]])
 
-    execute_sql_string(stream, 'DROP TRIGGER t2t;')
+    execute_sql_string(stream, 'DROP TRIGGER T2T;')
 
-    return {'Finished ok, errors in the middle: ', err1, err2, err3, err4,
-            err5, err6}
+    return {'Finished ok, errors in the middle: ', err1, err2, err3, err4, err5}
 end$
 function monster_ddl_cmp_res(res1, res2)
     if json.encode(res1) == json.encode(res2) then
@@ -712,7 +695,7 @@ function monster_ddl_is_clean(stream)
     assert(stream_or_box.space.T_TO_RENAME == nil)
 end$
 function monster_ddl_check(stream)
-    local _, err1, err2, err3, err4, res
+    local _, err1, err2, err3, res
     local stream_or_box = stream or box
     _, err1 =
        execute_sql_string_and_return_result(stream, [[INSERT INTO t2
@@ -723,9 +706,6 @@ function monster_ddl_check(stream)
                                                        VALUES(2, 2, 1)]])
     _, err3 =
         execute_sql_string_and_return_result(stream, [[INSERT INTO t1
-                                                       VALUES(1, 20, 1)]])
-    _, err4 =
-        execute_sql_string_and_return_result(stream, [[INSERT INTO t1
                                                        VALUES(1, -1, 1)]])
     execute_sql_string(stream, 'INSERT INTO t1 VALUES (1, 1, 1)')
     if not stream then
@@ -733,19 +713,19 @@ function monster_ddl_check(stream)
         assert(stream_or_box.space.T_RENAMED.index.T_TO_RENAME_A == nil)
         assert(stream_or_box.space.T_TO_RENAME == nil)
         res = execute_sql_string_and_return_result(stream, [[SELECT * FROM
+                                                             SEQSCAN
                                                              trigger_catcher]])
     else
         _, res =
-            execute_sql_string_and_return_result(stream, [[SELECT * FROM
+            execute_sql_string_and_return_result(stream, [[SELECT * FROM SEQSCAN
                                                            trigger_catcher]])
     end
     return {'Finished ok, errors and trigger catcher content: ', err1, err2,
-            err3, err4, res}
+            err3, res}
 end$
 function monster_ddl_clear(stream)
     execute_sql_string(stream, 'DROP TRIGGER IF EXISTS t1t;')
     execute_sql_string(stream, 'DROP TABLE IF EXISTS trigger_catcher;')
-    execute_sql_string(stream, 'ALTER TABLE t1 DROP CONSTRAINT fk1;')
     execute_sql_string(stream, 'DROP TABLE IF EXISTS t2')
     execute_sql_string(stream, 'DROP TABLE IF EXISTS t1')
     execute_sql_string(stream, 'DROP TABLE IF EXISTS t_renamed')
@@ -808,7 +788,7 @@ conn = net_box.connect(server_addr)
 assert(conn:ping())
 stream = conn:new_stream()
 
-stream:execute('CREATE TABLE test (id INT PRIMARY KEY, a NUMBER, b TEXT)')
+stream:execute('CREATE TABLE TEST (ID INT PRIMARY KEY, A NUMBER, B TEXT)')
 -- reload schema
 stream:ping()
 space = stream.space.TEST
@@ -818,8 +798,8 @@ space:replace{1, 2, '3'}
 space:select()
 -- select is empty, because transaction was not commited
 conn.space.TEST:select()
-stream_pr = stream:prepare("SELECT * FROM test WHERE id = ? AND a = ?;")
-conn_pr = conn:prepare("SELECT * FROM test WHERE id = ? AND a = ?;")
+stream_pr = stream:prepare("SELECT * FROM TEST WHERE ID = ? AND A = ?;")
+conn_pr = conn:prepare("SELECT * FROM TEST WHERE ID = ? AND A = ?;")
 assert(stream_pr.stmt_id == conn_pr.stmt_id)
 -- [ 1, 2, '3' ]
 stream:execute(stream_pr.stmt_id, {1, 2})

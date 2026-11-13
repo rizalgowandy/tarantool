@@ -10,19 +10,30 @@ from tarantool import Connection
 from tarantool.request import Request, RequestInsert, RequestSelect, RequestUpdate, RequestUpsert
 from tarantool.response import Response
 from lib.tarantool_connection import TarantoolConnection
+from tarantool.error import DatabaseError
 
 # FIXME: Remove after the new constants are added to the Python connector.
 if not 'REQUEST_TYPE_ID' in locals():
     REQUEST_TYPE_ID = 73
+    IPROTO_SCHEMA_VERSION = 0x05
+    IPROTO_STREAM_ID = 0x0a
     IPROTO_VERSION = 0x54
     IPROTO_FEATURES = 0x55
+    IPROTO_AUTH_TYPE = 0x5b
 
 if not 'REQUEST_TYPE_WATCH' in locals():
     REQUEST_TYPE_WATCH = 74
     REQUEST_TYPE_UNWATCH = 75
     REQUEST_TYPE_EVENT = 76
+    REQUEST_TYPE_WATCH_ONCE = 77
     IPROTO_EVENT_KEY = 0x57
     IPROTO_EVENT_DATA = 0x58
+
+if not 'IPROTO_AFTER_POSITION' in locals():
+    IPROTO_FETCH_POSITION = 0x1f
+    IPROTO_AFTER_POSITION = 0x2e
+    IPROTO_AFTER_TUPLE = 0x2f
+    IPROTO_POSITION = 0x35
 
 admin("box.schema.user.grant('guest', 'read,write,execute', 'universe')")
 
@@ -68,7 +79,7 @@ def repr_dict(todump):
 
 def test(header, body):
     # Connect and authenticate
-    c = Connection("localhost", server.iproto.port)
+    c = Connection(None, server.iproto.port)
     c.connect()
     print("query", repr_dict(header), repr_dict(body))
     header = msgpack.dumps(header)
@@ -114,9 +125,9 @@ print("\n")
 admin("box.cfg.wal_mode")
 admin("space = box.schema.space.create('test', { id = 567 })")
 admin("index = space:create_index('primary', { type = 'hash' })")
-admin("box.schema.user.grant('guest', 'read,write,execute', 'space', 'test')")
+admin("box.schema.user.grant('guest', 'read,write', 'space', 'test')")
 
-c = Connection("localhost", server.iproto.port)
+c = Connection(None, server.iproto.port)
 c.connect()
 request1 = RequestInsert(c, 567, [1, "baobab"])
 request2 = RequestInsert(c, 567, [2, "obbaba"])
@@ -236,7 +247,7 @@ for test in TESTS:
 
 
 print("Test of schema_id in iproto.")
-c = Connection("localhost", server.iproto.port)
+c = Connection(None, server.iproto.port)
 c.connect()
 s = c._socket
 
@@ -293,30 +304,34 @@ body = { IPROTO_SPACE_ID: space_id,
     IPROTO_LIMIT: 1 }
 resp = test_request(header, body)
 print("Normal connect done w/o errors:", resp["header"][0] == 0)
-print("Got schema_id:", resp["header"][5] > 0)
-schema_id = resp["header"][5]
+print("Got schema_id:", resp["header"][IPROTO_SCHEMA_VERSION] > 0)
+schema_id = resp["header"][IPROTO_SCHEMA_VERSION]
 
-header = { IPROTO_CODE : REQUEST_TYPE_SELECT, 5 : 0 }
+header = { IPROTO_CODE : REQUEST_TYPE_SELECT, IPROTO_SCHEMA_VERSION : 0 }
 resp = test_request(header, body)
 print("Zero-schema_id connect done w/o errors:", resp["header"][0] == 0)
-print("Same schema_id:", resp["header"][5] == schema_id)
+print("Same schema_id:", resp["header"][IPROTO_SCHEMA_VERSION] == schema_id)
 
-header = { IPROTO_CODE : REQUEST_TYPE_SELECT, 5 : schema_id }
+header = { IPROTO_CODE : REQUEST_TYPE_SELECT,
+           IPROTO_SCHEMA_VERSION : schema_id }
 resp = test_request(header, body)
 print("Normal connect done w/o errors:", resp["header"][0] == 0)
-print("Same schema_id:", resp["header"][5] == schema_id)
+print("Same schema_id:", resp["header"][IPROTO_SCHEMA_VERSION] == schema_id)
 
-header = { IPROTO_CODE : REQUEST_TYPE_SELECT, 5 : schema_id + 1 }
+header = { IPROTO_CODE : REQUEST_TYPE_SELECT,
+           IPROTO_SCHEMA_VERSION : schema_id + 1 }
 resp = test_request(header, body)
 print("Wrong schema_id leads to error:", resp["header"][0] != 0)
-print("Same schema_id:", resp["header"][5] == schema_id)
+print("Same schema_id:", resp["header"][IPROTO_SCHEMA_VERSION] == schema_id)
 
 admin("space2 = box.schema.create_space('test2')")
 
-header = { IPROTO_CODE : REQUEST_TYPE_SELECT, 5 : schema_id }
+header = { IPROTO_CODE : REQUEST_TYPE_SELECT,
+           IPROTO_SCHEMA_VERSION : schema_id }
 resp = test_request(header, body)
 print("Schema changed -> error:", resp["header"][0] != 0)
-print("Got another schema_id:", resp["header"][5] != schema_id)
+print("Got another schema_id:",
+      resp["header"][IPROTO_SCHEMA_VERSION] != schema_id)
 
 #
 # gh-2334 Lost SYNC in JOIN response.
@@ -381,7 +396,7 @@ print("""
 # an error code and do not close connection
 """)
 
-c = Connection("localhost", server.iproto.port)
+c = Connection(None, server.iproto.port)
 c.connect()
 s = c._socket
 header = { "hello": "world"}
@@ -404,9 +419,9 @@ c.close()
 
 admin("space = box.schema.space.create('test_index_base', { id = 568 })")
 admin("index = space:create_index('primary', { type = 'hash' })")
-admin("box.schema.user.grant('guest', 'read,write,execute', 'space', 'test_index_base')")
+admin("box.schema.user.grant('guest', 'read,write', 'space', 'test_index_base')")
 
-c = Connection("localhost", server.iproto.port)
+c = Connection(None, server.iproto.port)
 c.connect()
 s = c._socket
 
@@ -449,7 +464,7 @@ c.close()
 admin("function kek() return 'kek' end")
 admin("box.schema.user.grant('guest', 'read,write,execute', 'universe')")
 
-c = Connection("localhost", server.iproto.port)
+c = Connection(None, server.iproto.port)
 c.connect()
 s = c._socket
 
@@ -473,25 +488,43 @@ print("""
 # gh-6253 IPROTO_ID
 #
 """)
-c = Connection("localhost", server.iproto.port)
+def print_id_response(resp):
+    if resp["header"][IPROTO_CODE] == REQUEST_TYPE_OK:
+        features = resp["body"][IPROTO_FEATURES]
+        # Some features are available only in EE, so remove them
+        # from the list of features so that diff test passes.
+        # IPROTO_FEATURES_FETCH_SNAPSHOT_CURSOR - 10.
+        if 10 in features:
+            features.remove(10)
+        print("version={}, features={}, auth_type={}".format(
+            resp["body"][IPROTO_VERSION], features,
+            resp["body"].get(IPROTO_AUTH_TYPE, "").decode("utf-8")))
+    else:
+        print(str(resp["body"][IPROTO_ERROR].decode("utf-8")))
+
+c = Connection(None, server.iproto.port)
 c.connect()
 s = c._socket
 header = { IPROTO_CODE: REQUEST_TYPE_ID }
 print("# Invalid version")
 resp = test_request(header, { IPROTO_VERSION: "abc" })
-print(str(resp["body"][IPROTO_ERROR].decode("utf-8")))
+print_id_response(resp)
 print("# Invalid features")
 resp = test_request(header, { IPROTO_FEATURES: ["abc"] })
-print(str(resp["body"][IPROTO_ERROR].decode("utf-8")))
+print_id_response(resp)
+print("# Invalid auth_type")
+resp = test_request(header, { IPROTO_AUTH_TYPE: 123 })
+print_id_response(resp)
 print("# Empty request body")
 resp = test_request(header, {})
-print("version={}, features={}".format(
-    resp["body"][IPROTO_VERSION], resp["body"][IPROTO_FEATURES]))
+print_id_response(resp)
 print("# Unknown version and features")
 resp = test_request(header, { IPROTO_VERSION: 99999999,
                               IPROTO_FEATURES: [99999999] })
-print("version={}, features={}".format(
-    resp["body"][IPROTO_VERSION], resp["body"][IPROTO_FEATURES]))
+print_id_response(resp)
+print("# Unknown request key")
+resp = test_request(header, { 0xdead: 'foobar' })
+print_id_response(resp)
 c.close()
 
 print("""
@@ -499,25 +532,27 @@ print("""
 # gh-6257 Watchers
 #
 """)
-def watch(key):
-    print("# Watch key '{}'".format(key))
-    send_request({IPROTO_CODE: REQUEST_TYPE_WATCH}, {IPROTO_EVENT_KEY: key})
+def watch(key, sync):
+    print("# Watch key '{}', sync={}".format(key, sync))
+    send_request({IPROTO_CODE: REQUEST_TYPE_WATCH, IPROTO_SYNC: sync},
+                 {IPROTO_EVENT_KEY: key})
 
 def unwatch(key):
     print("# Unwatch key '{}'".format(key))
     send_request({IPROTO_CODE: REQUEST_TYPE_UNWATCH}, {IPROTO_EVENT_KEY: key})
 
 def receive_event():
-    print("# Recieve event")
+    print("# Receive event")
     resp = receive_response()
     code = resp["header"].get(IPROTO_CODE)
     if code is None:
         print("<no event received>")
         return
     if code == REQUEST_TYPE_EVENT:
-        print("key='{}', value={}".format(
+        print("key='{}', value={}, sync={}".format(
             resp["body"].get(IPROTO_EVENT_KEY, '').decode('utf-8'),
-            resp["body"].get(IPROTO_EVENT_DATA)))
+            resp["body"].get(IPROTO_EVENT_DATA),
+            resp["header"].get(IPROTO_SYNC)))
     else:
         print("Unexpected packet: {}".format(resp))
 
@@ -526,7 +561,7 @@ def check_no_event():
     receive_event()
     s.settimeout(None)
 
-c = Connection("localhost", server.iproto.port)
+c = Connection(None, server.iproto.port)
 c.connect()
 s = c._socket
 
@@ -540,16 +575,16 @@ resp = test_request({IPROTO_CODE: REQUEST_TYPE_WATCH},
 print(resp_status(resp))
 
 # Register a watcher
-watch("foo")
+watch("foo", 1)
 receive_event()
 
 # Register a watcher for another key
-watch("bar")
+watch("bar", 2)
 receive_event()
 
 # Unregister and register watcher
 unwatch("bar")
-watch("bar")
+watch("bar", 3)
 receive_event()
 
 # No notification without ack
@@ -557,9 +592,9 @@ admin("box.broadcast('foo', {1, 2, 3})")
 check_no_event()
 
 # Notification after ack
-watch("foo")
+watch("foo", 4)
 receive_event()
-watch("bar")
+watch("bar", 5)
 admin("box.broadcast('bar', 123)")
 receive_event()
 
@@ -572,3 +607,141 @@ check_no_event()
 c.close()
 admin("box.broadcast('foo', nil)")
 admin("box.broadcast('bar', nil)")
+
+print("""
+#
+# gh-6493 IPROTO_WATCH_ONCE
+#
+""")
+c = Connection(None, server.iproto.port)
+c.connect()
+s = c._socket
+sync = 1000
+
+print("# Schema version")
+sync += 1
+header = { IPROTO_CODE: REQUEST_TYPE_WATCH_ONCE, IPROTO_SYNC: sync,
+           IPROTO_SCHEMA_VERSION: 9999 }
+body = { IPROTO_EVENT_KEY: 'foo' }
+resp = test_request(header, body)
+print("sync={}".format(resp["header"][IPROTO_SYNC]))
+print("Error on invalid schema_id:", resp["header"][IPROTO_CODE] != 0)
+schema_id = resp["header"][IPROTO_SCHEMA_VERSION]
+print("Got schema_id:", schema_id > 0)
+sync += 1
+header[IPROTO_SYNC] = sync
+header[IPROTO_SCHEMA_VERSION] = schema_id
+resp = test_request(header, body)
+print("sync={}".format(resp["header"][IPROTO_SYNC]))
+print("Success on valid schema_id:", resp["header"][IPROTO_CODE] == 0)
+print("Same schema_id:", resp["header"][IPROTO_SCHEMA_VERSION] == schema_id)
+
+print("# Streaming unsupported")
+sync += 1
+header = { IPROTO_CODE: REQUEST_TYPE_WATCH_ONCE, IPROTO_SYNC: sync,
+           IPROTO_STREAM_ID: 555 }
+body = { IPROTO_EVENT_KEY: 'foo' }
+resp = test_request(header, body)
+print("sync={}, {}".format(resp["header"][IPROTO_SYNC], resp_status(resp)))
+
+print("# Invalid key")
+sync += 1
+header = { IPROTO_CODE: REQUEST_TYPE_WATCH_ONCE, IPROTO_SYNC: sync }
+body = {}
+resp = test_request(header, body)
+print("sync={}, {}".format(resp["header"][IPROTO_SYNC], resp_status(resp)))
+sync += 1
+header[IPROTO_SYNC] = sync
+body[IPROTO_EVENT_KEY] = 123
+resp = test_request(header, body)
+print("sync={}, {}".format(resp["header"][IPROTO_SYNC], resp_status(resp)))
+
+print("# Missing key")
+sync += 1
+header = { IPROTO_CODE: REQUEST_TYPE_WATCH_ONCE, IPROTO_SYNC: sync }
+body = { IPROTO_EVENT_KEY: 'foo' }
+resp = test_request(header, body)
+print("sync={}, {}".format(resp["header"][IPROTO_SYNC], resp_status(resp)))
+print("Data:", resp["body"][IPROTO_DATA])
+
+print(" Existing key")
+admin("box.broadcast('foo', {1, 2, 3})")
+sync += 1
+header = { IPROTO_CODE: REQUEST_TYPE_WATCH_ONCE, IPROTO_SYNC: sync }
+body = { IPROTO_EVENT_KEY: 'foo' }
+resp = test_request(header, body)
+print("sync={}, {}".format(resp["header"][IPROTO_SYNC], resp_status(resp)))
+print("Data:", resp["body"][IPROTO_DATA])
+admin("box.broadcast('foo', nil)")
+
+# Cleanup
+c.close()
+
+print("""
+#
+# gh-7639 Pagination
+#
+""")
+admin("space = box.schema.space.create('test', { id = 567 })")
+admin("index = space:create_index('primary', { type = 'tree' })")
+admin("box.schema.user.grant('guest', 'read,write', 'space', 'test')")
+
+c = Connection(None, server.iproto.port)
+c.connect()
+request = bytes()
+for i in range(1, 11):
+    request += bytes(RequestInsert(c, 567, [i, 1]))
+s = c._socket
+try:
+    s.send(request)
+except OSError as e:
+    print("   => ", "Failed to send request")
+c.close()
+
+class RequestSelectAfter(Request):
+    request_type = REQUEST_TYPE_SELECT
+
+    def __init__(self, conn, space_id, key, fetch_pos, after_tuple, after_pos):
+        super(RequestSelectAfter, self).__init__(conn)
+        body = {IPROTO_SPACE_ID: space_id, IPROTO_KEY: key, IPROTO_LIMIT: 2,
+                IPROTO_ITERATOR: 5, IPROTO_FETCH_POSITION: fetch_pos}
+        if after_tuple:
+            body[IPROTO_AFTER_TUPLE] = after_tuple
+        if after_pos:
+            body[IPROTO_AFTER_POSITION] = after_pos
+        self._body = msgpack.dumps(body)
+
+c = Connection(None, server.iproto.port)
+c.connect()
+s = c._socket
+pos = ""
+last_tuple = None
+fetch_pos = True
+space_id = 567
+key = [1]
+print("Simple pagination with after_pos")
+for i in range(1, 7):
+    request = bytes(RequestSelectAfter(c, space_id, key, fetch_pos, last_tuple, pos))
+    try:
+        s.send(request)
+    except OSError as e:
+        print("   => ", "Failed to send request")
+    response = Response(c, c._read_response())
+    print("Page", i)
+    print(response.__str__())
+    pos = response._body.get(IPROTO_POSITION, None)
+print("Position after last iteration must does not present in response:", pos is None)
+print("Simple pagination with after_tuple")
+pos = None
+fetch_pos = False
+for i in range(1, 6):
+    request = bytes(RequestSelectAfter(c, space_id, key, fetch_pos, last_tuple, pos))
+    try:
+        s.send(request)
+    except OSError as e:
+        print("   => ", "Failed to send request")
+    response = Response(c, c._read_response())
+    print("Page", i)
+    print(response.__str__())
+    last_tuple = response._body.get(IPROTO_DATA, None)[1]
+c.close()

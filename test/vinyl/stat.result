@@ -110,6 +110,7 @@ function gstat()
     st.regulator = nil
     st.scheduler.dump_time = nil
     st.scheduler.compaction_time = nil
+    st.memory.level0 = nil
     return st
 end;
 ---
@@ -255,9 +256,9 @@ gstat()
   memory:
     tuple_cache: 0
     tx: 0
-    level0: 0
-    page_index: 0
     bloom_filter: 0
+    page_index: 0
+    tuple: 0
   disk:
     data_compacted: 0
     data: 0
@@ -272,6 +273,10 @@ gstat()
     tasks_completed: 0
     dump_input: 0
     compaction_input: 0
+...
+box.stat.vinyl().memory.level0 == 0
+---
+- true
 ...
 --
 -- Index statistics.
@@ -407,7 +412,6 @@ stat_diff(istat(), st)
     put:
       rows: 1
       bytes: 1053
-  lookup: 1
   disk:
     iterator:
       read:
@@ -419,9 +423,13 @@ stat_diff(istat(), st)
       get:
         rows: 1
         bytes: 1053
+  txw:
+    iterator:
+      lookup: 1
   memory:
     iterator:
       lookup: 1
+  lookup: 1
   get:
     rows: 1
     bytes: 1053
@@ -444,6 +452,9 @@ stat_diff(istat(), st)
     get:
       rows: 1
       bytes: 1053
+  txw:
+    iterator:
+      lookup: 1
   lookup: 1
   get:
     rows: 1
@@ -491,13 +502,16 @@ stat_diff(istat(), st)
     put:
       rows: 1
       bytes: 1053
+  txw:
+    iterator:
+      lookup: 1
+  lookup: 1
   memory:
     iterator:
       lookup: 1
       get:
         rows: 1
         bytes: 1053
-  lookup: 1
   get:
     rows: 1
     bytes: 1053
@@ -661,7 +675,7 @@ stat_diff(istat(), st)
   disk:
     iterator:
       read:
-        bytes: 104300
+        bytes: 104299
         pages: 25
         bytes_compressed: <bytes_compressed>
         rows: 100
@@ -753,15 +767,18 @@ gstat().scheduler.compaction_output == istat().disk.compaction.output.bytes
 - true
 ...
 -- use memory
-st = gstat()
+st = box.stat.vinyl().memory.level0
 ---
 ...
 put(1)
 ---
 ...
-stat_diff(gstat(), st, 'memory.level0')
+diff = box.stat.vinyl().memory.level0 - st
 ---
-- 1056
+...
+diff > 1000 and diff < 1100
+---
+- true
 ...
 -- use cache
 st = gstat()
@@ -772,7 +789,7 @@ _ = s:get(1)
 ...
 stat_diff(gstat(), st, 'memory.tuple_cache')
 ---
-- 1101
+- 1117
 ...
 s:delete(1)
 ---
@@ -998,6 +1015,13 @@ stat_diff(gstat(), st, 'tx')
 ---
 - commit: 1
 ...
+-- free tuples pinned by Lua
+_ = nil
+---
+...
+_ = collectgarbage()
+---
+...
 -- box.stat.reset
 box.stat.reset()
 ---
@@ -1029,7 +1053,7 @@ istat()
       bytes_compressed: <bytes_compressed>
       pages: 25
       rows: 100
-      bytes: 104300
+      bytes: 104299
     rows: 100
     statement:
       inserts: 0
@@ -1080,7 +1104,7 @@ istat()
       count: 0
     pages: 25
     bytes_compressed: <bytes_compressed>
-    bytes: 104300
+    bytes: 104299
   range_size: 16384
   rows: 306
   run_avg: 1
@@ -1088,7 +1112,7 @@ istat()
   upsert:
     squashed: 0
     applied: 0
-  bytes: 316083
+  bytes: 316082
   put:
     rows: 0
     bytes: 0
@@ -1128,14 +1152,14 @@ gstat()
     gap_locks: 0
     read_views: 0
   memory:
-    tuple_cache: 14313
+    tuple_cache: 14521
     tx: 0
-    level0: 261562
-    page_index: 1250
     bloom_filter: 140
+    page_index: 1250
+    tuple: 13715
   disk:
-    data_compacted: 104300
-    data: 104300
+    data_compacted: 104299
+    data: 104299
     index: 1390
   scheduler:
     tasks_inprogress: 0

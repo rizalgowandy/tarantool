@@ -35,6 +35,7 @@
 #include "trivia/util.h"
 
 #include <stdio.h>
+#include <stdint.h>
 #include <errno.h>
 #include <pthread.h>
 #if HAVE_PTHREAD_NP_H || (__OpenBSD__)
@@ -259,17 +260,18 @@
 	tt_pthread_error(e__);			\
 })
 
-#define tt_pthread_atfork(prepare, parent, child)\
-({	int e__ = pthread_atfork(prepare, parent, child);\
-	tt_pthread_error(e__);			\
-})
-
-/** Make sure the created thread blocks all signals,
- * they are handled in the main thread.
+/**
+ * Make sure the created thread blocks all signals, they are handled in the main
+ * thread. Except SIGILL, SIGBUS, SIGFPE and SIGSEGV, that cannot be blocked and
+ * are handled by the thread that triggered them (see crash_signal_init).
  */
 #define tt_pthread_create(thread, attr, run, arg)	\
 ({	sigset_t set, oldset;				\
 	sigfillset(&set);				\
+	sigdelset(&set, SIGILL);			\
+	sigdelset(&set, SIGBUS);			\
+	sigdelset(&set, SIGFPE);			\
+	sigdelset(&set, SIGSEGV);			\
 	pthread_sigmask(SIG_BLOCK, &set, &oldset);	\
 	int e__ = pthread_create(thread, attr, run, arg);\
 	pthread_sigmask(SIG_SETMASK, &oldset, NULL);	\
@@ -279,12 +281,6 @@
 #define tt_pthread_join(thread, ret)			\
 ({	int e__ = pthread_join(thread, ret);		\
 	tt_pthread_error(e__);				\
-})
-
-#define tt_pthread_cancel(thread)			\
-({	int e__ = pthread_cancel(thread);		\
-	assert(e__ == 0 || e__ == ESRCH);		\
-	e__;						\
 })
 
 #define tt_pthread_key_create(key, dtor)		\
@@ -303,11 +299,6 @@
 })
 
 #define tt_pthread_getspecific(key) pthread_getspecific(key)
-
-#define tt_pthread_setcancelstate(state, oldstate)	\
-({	int e__ = pthread_setcancelstate(state, oldstate);\
-	tt_pthread_error(e__);				\
-})
 
 /** Set the current thread's name
  */
@@ -361,7 +352,9 @@ tt_pthread_attr_getstack(pthread_t thread, void **stackaddr, size_t *stacksize)
 #elif (HAVE_PTHREAD_GET_STACKSIZE_NP && HAVE_PTHREAD_GET_STACKADDR_NP)
 	/* Old macOS */
 	*stacksize = pthread_get_stacksize_np(thread);
-	*stackaddr = pthread_get_stackaddr_np(thread);
+	/* Darwin returns the upper boundary of the downward-growing stack. */
+	*stackaddr = (void *)((uintptr_t)pthread_get_stackaddr_np(thread) -
+			     *stacksize);
 #elif (__OpenBSD__)
 	stack_t *sinfo = (stack_t*)malloc(sizeof(stack_t));
 	pthread_stackseg_np(thread, sinfo);

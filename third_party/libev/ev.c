@@ -550,8 +550,12 @@ EV_CPP (extern "C") int (signalfd) (int fd, const sigset_t *mask, int flags);
 struct signalfd_siginfo
 {
   uint32_t ssi_signo;
-  char pad[128 - sizeof (uint32_t)];
+  char unused[8];
+  uint32_t ssi_pid;
+  char pad[112];
 };
+
+static_assert(sizeof(struct signalfd_siginfo) == 128, "signalfd_siginfo size");
 #endif
 
 /* for timerfd, libev core requires TFD_TIMER_CANCEL_ON_SET &c */
@@ -2022,7 +2026,7 @@ ev_syserr (const char *msg)
 }
 
 static void *
-ev_realloc_emul (void *ptr, long size) EV_NOEXCEPT
+ev_realloc_emul (void *ptr, size_t size) EV_NOEXCEPT
 {
   /* some systems, notably openbsd and darwin, fail to properly
    * implement realloc (x, 0) (as required by both ansi c-89 and
@@ -2038,17 +2042,17 @@ ev_realloc_emul (void *ptr, long size) EV_NOEXCEPT
   return 0;
 }
 
-static void *(*alloc)(void *ptr, long size) EV_NOEXCEPT = ev_realloc_emul;
+static void *(*alloc)(void *ptr, size_t size) EV_NOEXCEPT = ev_realloc_emul;
 
 ecb_cold
 void
-ev_set_allocator (void *(*cb)(void *ptr, long size) EV_NOEXCEPT) EV_NOEXCEPT
+ev_set_allocator (void *(*cb)(void *ptr, size_t size) EV_NOEXCEPT) EV_NOEXCEPT
 {
   alloc = cb;
 }
 
 inline_speed void *
-ev_realloc (void *ptr, long size)
+ev_realloc (void *ptr, size_t size)
 {
   ptr = alloc (ptr, size);
 
@@ -2258,14 +2262,14 @@ ev_sleep (ev_tstamp delay) EV_NOEXCEPT
 inline_size int
 array_nextsize (int elem, int cur, int cnt)
 {
-  int ncur = cur + 1;
+  size_t ncur = cur + 1;
 
   do
     ncur <<= 1;
   while (cnt > ncur);
 
   /* if size is large, round to MALLOC_ROUND - 4 * longs to accommodate malloc overhead */
-  if (elem * ncur > MALLOC_ROUND - sizeof (void *) * 4)
+  if (ncur * elem > MALLOC_ROUND - sizeof (void *) * 4)
     {
       ncur *= elem;
       ncur = (ncur + elem + (MALLOC_ROUND - 1) + sizeof (void *) * 4) & ~(MALLOC_ROUND - 1);
@@ -2273,6 +2277,15 @@ array_nextsize (int elem, int cur, int cnt)
       ncur /= elem;
     }
 
+  if (ncur > INT_MAX)
+    {
+#if EV_AVOID_STDIO
+      ev_printerr ("(libev) too many objects to be allocated, aborting.\n");
+#else
+      fprintf (stderr, "(libev) cannot allocate %ld objects, aborting.", ncur);
+#endif
+      abort ();
+    }
   return ncur;
 }
 
@@ -2281,7 +2294,7 @@ static void *
 array_realloc (int elem, void *base, int *cur, int cnt)
 {
   *cur = array_nextsize (elem, *cur, cnt);
-  return ev_realloc (base, elem * *cur);
+  return ev_realloc (base, (size_t)*cur * elem);
 }
 
 #define array_needsize_noinit(base,offset,count)
@@ -2728,6 +2741,7 @@ reheap (ANHE *heap, int N)
 typedef struct
 {
   EV_ATOMIC_T pending;
+  EV_ATOMIC_T sender_pid;
 #if EV_MULTIPLICITY
   EV_P;
 #endif
@@ -2884,7 +2898,7 @@ pipecb (EV_P_ ev_io *iow, int revents)
 
       for (i = EV_NSIG - 1; i--; )
         if (ecb_expect_false (signals [i].pending))
-          ev_feed_signal_event (EV_A_ i + 1);
+          ev_feed_signal_event (EV_A_ i + 1, signals [i].sender_pid);
     }
 #endif
 
@@ -2909,7 +2923,7 @@ pipecb (EV_P_ ev_io *iow, int revents)
 /*****************************************************************************/
 
 void
-ev_feed_signal (int signum) EV_NOEXCEPT
+ev_feed_signal (int signum, pid_t sender_pid) EV_NOEXCEPT
 {
 #if EV_MULTIPLICITY
   EV_P;
@@ -2921,22 +2935,25 @@ ev_feed_signal (int signum) EV_NOEXCEPT
 #endif
 
   signals [signum - 1].pending = 1;
+  signals [signum - 1].sender_pid = sender_pid;
   evpipe_write (EV_A_ &sig_pending);
 }
 
 static void
-ev_sighandler (int signum)
+ev_sighandler (int signum, siginfo_t *info, void *unused)
 {
+  (void)unused;
+
 #ifdef _WIN32
   signal (signum, ev_sighandler);
 #endif
 
-  ev_feed_signal (signum);
+  ev_feed_signal (signum, info->si_pid);
 }
 
 ecb_noinline
 void
-ev_feed_signal_event (EV_P_ int signum) EV_NOEXCEPT
+ev_feed_signal_event (EV_P_ int signum, pid_t sender_pid) EV_NOEXCEPT
 {
   WL w;
 
@@ -2956,8 +2973,10 @@ ev_feed_signal_event (EV_P_ int signum) EV_NOEXCEPT
   signals [signum].pending = 0;
   ECB_MEMORY_FENCE_RELEASE;
 
-  for (w = signals [signum].head; w; w = w->next)
+  for (w = signals [signum].head; w; w = w->next) {
+    ((ev_signal *)w)->sender_pid = sender_pid;
     ev_feed_event (EV_A_ (W)w, EV_SIGNAL);
+  }
 }
 
 #if EV_USE_SIGNALFD
@@ -2972,7 +2991,7 @@ sigfdcb (EV_P_ ev_io *iow, int revents)
 
       /* not ISO-C, as res might be -1, but works with SuS */
       for (sip = si; (char *)sip < (char *)si + res; ++sip)
-        ev_feed_signal_event (EV_A_ sip->ssi_signo);
+        ev_feed_signal_event (EV_A_ sip->ssi_signo, sip->ssi_pid);
 
       if (res < (ssize_t)sizeof (si))
         break;
@@ -4649,7 +4668,7 @@ ev_signal_start (EV_P_ ev_signal *w) EV_NOEXCEPT
     {
       /* TODO: check .head */
       sigaddset (&sigfd_set, w->signum);
-      sigprocmask (SIG_BLOCK, &sigfd_set, 0);
+      pthread_sigmask (SIG_BLOCK, &sigfd_set, 0);
 
       signalfd (sigfd, &sigfd_set, 0);
     }
@@ -4672,16 +4691,16 @@ ev_signal_start (EV_P_ ev_signal *w) EV_NOEXCEPT
 
         evpipe_init (EV_A);
 
-        sa.sa_handler = ev_sighandler;
+        sa.sa_sigaction = ev_sighandler;
         sigfillset (&sa.sa_mask);
-        sa.sa_flags = SA_RESTART; /* if restarting works we save one iteration */
+        sa.sa_flags = SA_SIGINFO | SA_RESTART; /* if restarting works we save one iteration */
         sigaction (w->signum, &sa, 0);
 
         if (origflags & EVFLAG_NOSIGMASK)
           {
             sigemptyset (&sa.sa_mask);
             sigaddset (&sa.sa_mask, w->signum);
-            sigprocmask (SIG_UNBLOCK, &sa.sa_mask, 0);
+            pthread_sigmask (SIG_UNBLOCK, &sa.sa_mask, 0);
           }
 #endif
       }
@@ -4717,7 +4736,7 @@ ev_signal_stop (EV_P_ ev_signal *w) EV_NOEXCEPT
           sigdelset (&sigfd_set, w->signum);
 
           signalfd (sigfd, &sigfd_set, 0);
-          sigprocmask (SIG_UNBLOCK, &ss, 0);
+          pthread_sigmask (SIG_UNBLOCK, &ss, 0);
         }
       else
 #endif

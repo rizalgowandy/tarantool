@@ -223,10 +223,10 @@ struct sql_column_metadata {
  * is really a pointer to an instance of this structure.
  */
 struct Vdbe {
-	sql *db;		/* The database connection that owns this statement */
 	Vdbe *pPrev, *pNext;	/* Linked list of VDBEs with the same Vdbe.db */
 	Parse *pParse;		/* Parsing context used to create this Vdbe */
-	ynVar nVar;		/* Number of entries in aVar[] */
+	/** Number of parameters reported in the statement's bind metadata. */
+	ynVar nVar;
 	u32 magic;		/* Magic number for sanity checking */
 	int nMem;		/* Number of memory locations currently allocated */
 	int nCursor;		/* Number of slots in apCsr[] */
@@ -238,7 +238,7 @@ struct Vdbe {
 	int iStatement;		/* Statement number (or 0 if has not opened stmt) */
 	i64 iCurrentTime;	/* Value of julianday('now') for this statement */
 	i64 nFkConstraint;	/* Number of imm. FK constraints this VM */
-	uint32_t schema_ver;	/* Schema version at the moment of VDBE creation. */
+	uint64_t schema_ver;	/* Schema version at the moment of VDBE creation. */
 
 	/*
 	 * In recursive triggers we can execute INSERT/UPDATE OR IGNORE
@@ -262,12 +262,10 @@ struct Vdbe {
 
 	Op *aOp;		/* Space to hold the virtual machine's program */
 	Mem *aMem;		/* The memory locations */
-	Mem **apArg;		/* Arguments to currently executing user function */
 	/** SQL metadata for DML/DQL queries. */
 	struct sql_column_metadata *metadata;
 	Mem *pResultSet;	/* Pointer to an array of results */
 	VdbeCursor **apCsr;	/* One element of this array for each open cursor */
-	Mem *aVar;		/* Values for the OP_Variable opcode. */
 	/**
 	 * Array which contains positions of variables to be
 	 * bound in resulting set of SELECT.
@@ -282,16 +280,18 @@ struct Vdbe {
 	 */
 	uint32_t res_var_count;
 	VList *pVList;		/* Name of variables */
-	i64 startTime;		/* Time when query started - used for profiling */
 	int nOp;		/* Number of instructions in the program */
 	u16 nResColumn;		/* Number of columns in one row of the result set */
 	u8 errorAction;		/* Recovery action to do in case of an error */
 	bft expired:1;		/* True if the VM needs to be recompiled */
-	bft doingRerun:1;	/* True if rerunning after an auto-reprepare */
 	bft explain:2;		/* True if EXPLAIN present on SQL command */
 	bft changeCntOn:1;	/* True to update the change-counter */
 	bft runOnlyOnce:1;	/* Automatically expire on reset */
-	u32 aCounter[5];	/* Counters used by sql_stmt_status() */
+	/**
+	 * Do not expire this statement if true, because it is an expression and
+	 * does not use external resources other than bind variables.
+	 */
+	bft is_sandboxed : 1;
 	char *zSql;		/* Text of the SQL statement that generated this */
 	void *pFree;		/* Free this when deleting the vdbe */
 	VdbeFrame *pFrame;	/* Parent frame */
@@ -302,6 +302,16 @@ struct Vdbe {
 	uint32_t sql_flags;
 	/* Anonymous savepoint for aborts only */
 	struct txn_savepoint *anonymous_savepoint;
+	/* The statement ID in the prepared statement cache. */
+	uint32_t id;
+	/* Field for storing a function variable. */
+	struct vdbe_field_ref *func_arg;
+	uint32_t bind_count; /** Number of elements in bind. */
+	/**
+	 * Array of all parameters of the current execution.
+	 * Each element of array consists of a name and a value.
+	 */
+	const struct sql_bind *bind;
 };
 
 /*
@@ -313,13 +323,16 @@ struct Vdbe {
 #define VDBE_MAGIC_RESET    0x48fa9f76	/* Reset and ready to run again */
 #define VDBE_MAGIC_DEAD     0x5606c3c8	/* The VDBE has been deallocated */
 
-/*
- * Function prototypes
+/**
+ * Close a VDBE cursor and release all the resources that cursor happens to
+ * hold.
  */
-void sqlVdbeFreeCursor(Vdbe *, VdbeCursor *);
+void
+sqlVdbeFreeCursor(struct VdbeCursor *pCx);
+
 void sqlVdbePopStack(Vdbe *, int);
 int sqlVdbeCursorRestore(VdbeCursor *);
-#if defined(SQL_DEBUG) || defined(VDBE_PROFILE)
+#if defined(SQL_DEBUG)
 void sqlVdbePrintOp(FILE *, int, Op *);
 #endif
 
@@ -333,17 +346,45 @@ int sqlVdbeCloseStatement(Vdbe *, int);
 void sqlVdbeFrameDelete(VdbeFrame *);
 int sqlVdbeFrameRestore(VdbeFrame *);
 
-int sqlVdbeSorterInit(struct sql *db, struct VdbeCursor *cursor);
-void sqlVdbeSorterReset(sql *, VdbeSorter *);
+/**
+ * Initialize the temporary index cursor just opened as a sorter cursor.
+ *
+ * Usually, the sorter module uses the value of (pCsr->key_def->part_count)
+ * to determine the number of fields that should be compared from the
+ * records being sorted. However, if the value passed as argument nField
+ * is non-zero and the sorter is able to guarantee a stable sort, nField
+ * is used instead. This is used when sorting records for a CREATE INDEX
+ * statement. In this case, keys are always delivered to the sorter in
+ * order of the primary key, which happens to be make up the final part
+ * of the records being sorted. So if the sort is stable, there is never
+ * any reason to compare PK fields and they can be ignored for a small
+ * performance boost.
+ *
+ * The sorter can guarantee a stable sort when running in single-threaded
+ * mode, but not in multi-threaded mode.
+ *
+ * 0 is returned if successful, or an sql error code otherwise.
+ */
+int
+sqlVdbeSorterInit(struct VdbeCursor *pCsr);
 
-void sqlVdbeSorterClose(sql *, VdbeCursor *);
+/** Reset a sorting cursor back to its original empty state. */
+void
+sqlVdbeSorterReset(struct VdbeSorter *pSorter);
+
+/** Free any cursor components allocated by sqlVdbeSorterXXX routines. */
+void
+sqlVdbeSorterClose(struct VdbeCursor *pCsr);
+
 int sqlVdbeSorterRowkey(const VdbeCursor *, Mem *);
-int sqlVdbeSorterNext(sql *, const VdbeCursor *, int *);
+
+/** Advance to the next element in the sorter. */
+int
+sqlVdbeSorterNext(const struct VdbeCursor *pCsr, int *pbEof);
+
 int sqlVdbeSorterRewind(const VdbeCursor *, int *);
 int sqlVdbeSorterWrite(const VdbeCursor *, Mem *);
 int sqlVdbeSorterCompare(const VdbeCursor *, Mem *, int, int *);
-
-int sqlVdbeCheckFk(Vdbe *, int);
 
 int sqlVdbeMemTranslate(Mem *, u8);
 #ifdef SQL_DEBUG

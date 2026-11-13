@@ -60,7 +60,7 @@ elseif (${CMAKE_SYSTEM_NAME} STREQUAL "FreeBSD")
     # convenient to set the CMake option explicitly due to some
     # external reason.
     get_filename_component(REAL_OPENSSL_ROOT_DIR "${OPENSSL_ROOT_DIR}"
-                           REALPATH BASE_DIR "${CMAKE_BINARY_DIR}")
+                           REALPATH BASE_DIR "${PROJECT_BINARY_DIR}")
     if ("${REAL_OPENSSL_ROOT_DIR}" STREQUAL "/usr")
         message(WARNING "Using OPENSSL_ROOT_DIR on FreeBSD to choose base "
                         "system libraries is not supported")
@@ -132,7 +132,7 @@ elseif (${CMAKE_SYSTEM_NAME} STREQUAL "Darwin")
         endif()
 
         # Detecting OpenSSL
-        execute_process(COMMAND ${HOMEBREW_EXECUTABLE} --prefix openssl@1.1
+        execute_process(COMMAND ${HOMEBREW_EXECUTABLE} --prefix openssl
                         OUTPUT_VARIABLE HOMEBREW_OPENSSL
                         OUTPUT_STRIP_TRAILING_WHITESPACE)
         if (DEFINED HOMEBREW_OPENSSL)

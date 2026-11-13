@@ -41,7 +41,7 @@ box.schema.INDEX_MAX
 ...
 box.schema.SPACE_MAX
 ---
-- 2147483647
+- 2147483646
 ...
 box.schema.SYSTEM_ID_MAX
 ---
@@ -102,7 +102,7 @@ assert(res.code == box.error.TUPLE_FOUND)
 -- stupid space id
 box.schema.space.create('tweedledee', { id = 'tweedledee' })
 ---
-- error: Illegal parameters, options parameter 'id' should be of type number
+- error: options parameter 'id' should be of type number
 ...
 s:drop()
 ---
@@ -424,13 +424,12 @@ index = s:create_index('test', { type = 'bitset', parts = {1, 'unsigned', 2, 'un
 -- part count must be positive
 index = s:create_index('test', { type = 'hash', parts = {}})
 ---
-- error: Illegal parameters, options.parts must have at least one part
+- error: options.parts must have at least one part
 ...
 -- unknown field type
 index = s:create_index('test', { type = 'hash', parts = { 2, 'nosuchtype' }})
 ---
-- error: 'Wrong index parts: unknown field type; expected field1 id (number), field1
-    type (string), ...'
+- error: 'Wrong index part 1: unknown field type'
 ...
 index = s:create_index('test', { type = 'hash', parts = { 2, 'any' }})
 ---
@@ -449,8 +448,7 @@ index = s:create_index('test', { type = 'hash', parts = { 2, 'map' }})
 ...
 index = s:create_index('test', { type = 'rtree', parts = { 2, 'nosuchtype' }})
 ---
-- error: 'Wrong index parts: unknown field type; expected field1 id (number), field1
-    type (string), ...'
+- error: 'Wrong index part 1: unknown field type'
 ...
 index = s:create_index('test', { type = 'rtree', parts = { 2, 'any' }})
 ---
@@ -465,7 +463,7 @@ index = s:create_index('test', { type = 'rtree', parts = { 2, 'map' }})
 -- bad field no
 index = s:create_index('test', { type = 'hash', parts = { 'qq', 'nosuchtype' }})
 ---
-- error: 'Illegal parameters, options.parts[1]: field was not found by name ''qq'''
+- error: 'options.parts[1]: field was not found by name ''qq'''
 ...
 -- big field no
 index = s:create_index('test', { type = 'hash', parts = { box.schema.FIELD_MAX, 'unsigned' }})
@@ -691,7 +689,7 @@ index = s:create_index('primary', { type = 'hash' })
 -- correct error on misuse of alter
 s.index.primary.alter({unique=false})
 ---
-- error: 'builtin/box/schema.lua..."]:<line>: Use index:alter(...) instead of index.alter(...)'
+- error: Use index:alter(...) instead of index.alter(...)
 ...
 s.index.primary:alter({unique=false})
 ---
@@ -905,7 +903,7 @@ s:insert{2, 1}
 s.index.secondary:alter{ unique = true }
 ---
 - error: Duplicate key exists in unique index "secondary" in space "test" with old
-    tuple - [1, 1] and new tuple - [2, 1]
+    tuple - [2, 1] and new tuple - [1, 1]
 ...
 s:delete{2}
 ---
@@ -933,8 +931,7 @@ s:insert{3, 2}
 -- changing index id is not allowed
 s.index.secondary:alter{ id = 10}
 ---
-- error: Attempt to modify a tuple field which is part of index 'primary' in space
-    '_index'
+- error: Attempt to modify a tuple field which is part of primary index in space '_index'
 ...
 s:drop()
 ---

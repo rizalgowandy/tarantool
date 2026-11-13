@@ -9,20 +9,36 @@ errinj = box.error.injection
  | ---
  | ...
 
+function print_features(conn)                                               \
+    local f = c.peer_protocol_features                                      \
+    f.fetch_snapshot_cursor = nil                                           \
+    return f                                                                \
+end
+ | ---
+ | ...
+
 -- actual version and feautures
 c = net.connect(box.cfg.listen)
  | ---
  | ...
 c.peer_protocol_version
  | ---
- | - 3
+ | - 10
  | ...
-c.peer_protocol_features
+print_features(c)
  | ---
  | - transactions: true
  |   watchers: true
  |   error_extension: true
+ |   call_arg_tuple_extension: true
+ |   pagination: true
+ |   insert_arrow: true
+ |   space_and_index_names: true
+ |   dml_tuple_extension: true
  |   streams: true
+ |   watch_once: true
+ |   call_ret_tuple_extension: true
+ |   is_sync: true
  | ...
 c:close()
  | ---
@@ -44,12 +60,20 @@ c.peer_protocol_version
  | ---
  | - 0
  | ...
-c.peer_protocol_features
+print_features(c)
  | ---
  | - transactions: false
  |   watchers: false
  |   error_extension: false
+ |   call_arg_tuple_extension: false
+ |   pagination: false
+ |   insert_arrow: false
+ |   space_and_index_names: false
+ |   dml_tuple_extension: false
  |   streams: false
+ |   watch_once: false
+ |   call_ret_tuple_extension: false
+ |   is_sync: false
  | ...
 errinj.set('ERRINJ_IPROTO_DISABLE_ID', false)
  | ---
@@ -92,12 +116,20 @@ c.peer_protocol_version
  | ---
  | - 9000
  | ...
-c.peer_protocol_features
+print_features(c)
  | ---
  | - transactions: true
  |   watchers: true
  |   error_extension: true
+ |   call_arg_tuple_extension: true
+ |   pagination: true
+ |   insert_arrow: true
+ |   space_and_index_names: true
+ |   dml_tuple_extension: true
  |   streams: true
+ |   watch_once: true
+ |   call_ret_tuple_extension: true
+ |   is_sync: true
  | ...
 c:close()
  | ---
@@ -143,14 +175,22 @@ c.error -- error
  | ...
 c.peer_protocol_version
  | ---
- | - 3
+ | - 10
  | ...
-c.peer_protocol_features
+print_features(c)
  | ---
  | - transactions: false
  |   watchers: true
  |   error_extension: true
+ |   call_arg_tuple_extension: true
+ |   pagination: true
+ |   insert_arrow: true
+ |   space_and_index_names: true
+ |   dml_tuple_extension: true
  |   streams: true
+ |   watch_once: true
+ |   call_ret_tuple_extension: true
+ |   is_sync: true
  | ...
 c:close()
  | ---
@@ -169,14 +209,22 @@ c.error -- error
  | ...
 c.peer_protocol_version
  | ---
- | - 3
+ | - 10
  | ...
-c.peer_protocol_features
+print_features(c)
  | ---
  | - transactions: true
  |   watchers: true
  |   error_extension: true
+ |   call_arg_tuple_extension: true
+ |   pagination: true
+ |   insert_arrow: true
+ |   space_and_index_names: true
+ |   dml_tuple_extension: true
  |   streams: true
+ |   watch_once: true
+ |   call_ret_tuple_extension: true
+ |   is_sync: true
  | ...
 c:close()
  | ---

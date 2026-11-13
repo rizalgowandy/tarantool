@@ -48,13 +48,63 @@ lua_swim_member_event_push(struct lua_State *L, void *event)
 	return 2;
 }
 
+/**
+ * Normalize arguments for swim_object:on_member_event.
+ * Is implemented in C because is_callable function is not exported to Lua.
+ *
+ * Input format:
+ * 1. new_trigger,
+ * 2. old_trigger or ctx - is considered as old_trigger if object is callable.
+ * 3. trigger_name or ctx - is considered as trigger_name if object is string.
+ * 4. ctx or nil
+ * Also, ctx can be passed with key-value trigger API using key "ctx".
+ *
+ * Output format: new_trigger, old_trigger, trigger_name, ctx.
+ */
+static int
+lua_swim_on_member_event_normalize_arguments(struct lua_State *L)
+{
+	if (!luaL_iscallable(L, 1) && lua_istable(L, 1)) {
+		/* Key-value API is used. */
+		lua_getfield(L, 1, "func");
+		lua_pushnil(L);
+		lua_getfield(L, 1, "name");
+		lua_getfield(L, 1, "ctx");
+		return 4;
+	}
+	/* Fill the stack with nils. */
+	lua_settop(L, 4);
+	const int default_ctx_idx = 4;
+	int ctx_idx = default_ctx_idx;
+	/* New trigger. */
+	lua_pushvalue(L, 1);
+	/* Old trigger or ctx. */
+	if (luaL_iscallable(L, 2) || lua_isnil(L, 2) || luaL_isnull(L, 2)) {
+		lua_pushvalue(L, 2);
+	} else {
+		lua_pushnil(L);
+		ctx_idx = 2;
+	}
+	/* Name or ctx, if it wasn't met earlier. */
+	if (lua_type(L, 3) == LUA_TSTRING || lua_isnil(L, 3) ||
+	    luaL_isnull(L, 3) || ctx_idx != default_ctx_idx) {
+		lua_pushvalue(L, 3);
+	} else {
+		lua_pushnil(L);
+		ctx_idx = 3;
+	}
+	/* Context. */
+	lua_pushvalue(L, ctx_idx);
+	return 4;
+}
+
 /** Set or/and delete a trigger on a SWIM member event. */
 static int
 lua_swim_on_member_event(struct lua_State *L)
 {
 	uint32_t ctypeid;
 	struct swim *s = *(struct swim **) luaL_checkcdata(L, 1, &ctypeid);
-	return lbox_trigger_reset(L, 3, swim_trigger_list_on_member_event(s),
+	return lbox_trigger_reset(L, 2, swim_trigger_list_on_member_event(s),
 				  lua_swim_member_event_push, NULL);
 }
 
@@ -69,8 +119,6 @@ lua_swim_new(struct lua_State *L)
 {
 	uint64_t generation = luaL_checkuint64(L, 1);
 	struct swim *s = swim_new(generation);
-	if (s == NULL)
-		return luaT_push_nil_and_error(L);
 	*(struct swim **) luaL_pushcdata(L, ctid_swim_ptr) = s;
 	return 1;
 }
@@ -103,6 +151,20 @@ lua_swim_quit(struct lua_State *L)
 	return 0;
 }
 
+/**
+ * Delete asynchronously. Does not yield. Object is invalid after return
+ * from this function and should not be used.
+ */
+static int
+lua_swim_gc(struct lua_State *L)
+{
+	uint32_t ctypeid;
+	struct swim *s = *(struct swim **)luaL_checkcdata(L, 1, &ctypeid);
+	assert(ctypeid == ctid_swim_ptr);
+	swim_gc(s);
+	return 0;
+}
+
 void
 tarantool_lua_swim_init(struct lua_State *L)
 {
@@ -113,10 +175,13 @@ tarantool_lua_swim_init(struct lua_State *L)
 	static const struct luaL_Reg lua_swim_internal_methods [] = {
 		{"swim_new", lua_swim_new},
 		{"swim_delete", lua_swim_delete},
+		{"swim_gc", lua_swim_gc},
 		{"swim_quit", lua_swim_quit},
 		{"swim_on_member_event", lua_swim_on_member_event},
+		{"swim_on_member_event_normalize_arguments",
+			lua_swim_on_member_event_normalize_arguments},
 		{NULL, NULL}
 	};
-	luaL_register_module(L, "swim", lua_swim_internal_methods);
+	luaT_newmodule(L, "swim.lib", lua_swim_internal_methods);
 	lua_pop(L, 1);
 }

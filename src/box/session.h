@@ -32,6 +32,7 @@
  */
 #include <inttypes.h>
 #include <stdbool.h>
+#include <sys/socket.h>
 #include "trigger.h"
 #include "fiber.h"
 #include "user.h"
@@ -69,13 +70,6 @@ enum output_format {
 extern const char *session_type_strs[];
 
 /**
- * default_flags accumulates flags value from SQL submodules.
- * It is assigned during sql_init(). Lately it is used in each session
- * initialization.
- */
-extern uint32_t default_flags;
-
-/**
  * Session meta is used in different ways by sessions of different
  * types, and allows to do not store attributes in struct session,
  * that are used only by a session of particular type.
@@ -87,6 +81,16 @@ struct session_meta {
 		/** Console file/socket descriptor. */
 		int fd;
 	};
+	struct {
+		union {
+			/** Peer address. */
+			struct sockaddr addr;
+			/** Peer address storage. */
+			struct sockaddr_storage addrstorage;
+		};
+		/** Peer address size or 0 if the session is local. */
+		socklen_t addrlen;
+	} peer;
 	/** Console output format. */
 	enum output_format output_format;
 	/** IPROTO client features. */
@@ -128,6 +132,12 @@ struct session {
 	struct credentials credentials;
 	/** Trigger for fiber on_stop to cleanup created on-demand session */
 	struct trigger fiber_on_stop;
+	/** Link in shutdown_list. */
+	struct rlist in_shutdown_list;
+	/** Timestamp (ev_now) when the connection was established. */
+	double connect_time;
+	/** Set when the session was closed by the idle timeout. */
+	bool disconnected_by_timeout;
 };
 
 struct session_vtab {
@@ -182,8 +192,11 @@ session_find(uint64_t sid);
 
 /** Global on-connect triggers. */
 extern struct rlist session_on_connect;
+extern struct event *session_on_connect_event;
 
+/** Global on-auth triggers. */
 extern struct rlist session_on_auth;
+extern struct event *session_on_auth_event;
 
 /**
  * Get the current session from @a fiber
@@ -203,15 +216,32 @@ fiber_get_session(struct fiber *fiber)
  * @param session a value to set
  */
 static inline void
-fiber_set_user(struct fiber *fiber, struct credentials *cr)
-{
-	fiber->storage.credentials = cr;
-}
-
-static inline void
 fiber_set_session(struct fiber *fiber, struct session *session)
 {
 	fiber->storage.session = session;
+}
+
+/**
+ * Get the current user from @a fiber
+ * @param fiber fiber
+ * @return user if any
+ * @retval NULL if there is no active user
+ */
+static inline struct credentials *
+fiber_get_user(struct fiber *fiber)
+{
+	return fiber->storage.credentials;
+}
+
+/**
+ * Set the current user in @a fiber
+ * @param fiber fiber
+ * @param cr a value to set
+ */
+static inline void
+fiber_set_user(struct fiber *fiber, struct credentials *cr)
+{
+	fiber->storage.credentials = cr;
 }
 
 /*
@@ -226,7 +256,7 @@ extern struct credentials admin_credentials;
  * trigger to destroy it when this fiber ends.
  */
 struct session *
-session_create_on_demand(void);
+session_new_on_demand(void);
 
 /*
  * When creating a new fiber, the database (box)
@@ -243,9 +273,8 @@ current_session(void)
 {
 	struct session *session = fiber_get_session(fiber());
 	if (session == NULL) {
-		session = session_create_on_demand();
-		if (session == NULL)
-			diag_raise();
+		session = session_new_on_demand();
+		assert(session != NULL);
 	}
 	return session;
 }
@@ -262,7 +291,7 @@ effective_user(void)
 	struct fiber *f = fiber();
 	struct credentials *u = f->storage.credentials;
 	if (u == NULL) {
-		session_create_on_demand();
+		session_new_on_demand();
 		u = f->storage.credentials;
 	}
 	return u;
@@ -270,23 +299,17 @@ effective_user(void)
 
 /** Global on-disconnect triggers. */
 extern struct rlist session_on_disconnect;
+extern struct event *session_on_disconnect_event;
 
 void
 session_storage_cleanup(int sid);
 
 /**
  * Create a session.
- * Invokes a Lua trigger box.session.on_connect if it is
- * defined. Issues a new session identifier.
- * Must called by the networking layer
- * when a new connection is established.
- *
  * @return handle for a created session
- * @exception tnt_Exception or lua error if session
- * trigger fails or runs out of resources.
  */
 struct session *
-session_create(enum session_type type);
+session_new(enum session_type type);
 
 /** Return true if given statement id belongs to the session. */
 bool
@@ -303,14 +326,29 @@ session_remove_stmt_id(struct session *session, uint32_t stmt_id);
 /**
  * Destroy a session.
  * Must be called by the networking layer on disconnect.
- * Invokes a Lua trigger box.session.on_disconnect if it
- * is defined.
- * @param session   session to destroy. may be NULL.
- *
- * @exception none
+ * @param session session to destroy.
  */
 void
-session_destroy(struct session *);
+session_delete(struct session *session);
+
+/**
+ * Set session peer address.
+ */
+static inline void
+session_set_peer_addr(struct session *session,
+		      const struct sockaddr *addr, socklen_t addrlen)
+{
+	assert(addrlen <= sizeof(session->meta.peer.addrstorage));
+	memcpy(&session->meta.peer.addrstorage, addr, addrlen);
+	session->meta.peer.addrlen = addrlen;
+}
+
+/**
+ * Return session peer name or NULL if the session is local.
+ * The string is allocated in the static buffer.
+ */
+const char *
+session_peer(const struct session *session);
 
 /** Run on-connect triggers */
 int
@@ -325,7 +363,8 @@ int
 session_run_on_auth_triggers(const struct on_auth_trigger_ctx *result);
 
 typedef void
-(*session_notify_f)(struct session *session, const char *key, size_t key_len,
+(*session_notify_f)(struct session *session, uint64_t sync,
+		    const char *key, size_t key_len,
 		    const char *data, const char *data_end);
 
 /**
@@ -335,10 +374,12 @@ typedef void
  * The callback will be called unconditionally right after registration and
  * then every time the key is updated provided the last notification was
  * acknowledged.
+ *
+ * The given sync number will be passed to the callback on each invocation.
  */
 void
-session_watch(struct session *session, const char *key, size_t key_len,
-	      session_notify_f cb);
+session_watch(struct session *session, uint64_t sync,
+	      const char *key, size_t key_len, session_notify_f cb);
 
 /**
  * Unregisters a watcher registered for the given session and notification key.
@@ -361,14 +402,12 @@ int
 access_check_universe(user_access_t access);
 
 /**
- * Same as access_check_universe(), but in case the current user
- * doesn't have universal access, set AccessDeniedError for the
- * given object type and name.
+ * This function is called by public API wrappers around session push.
+ * It logs a deprecation warning. If session push is disabled, it also
+ * sets diag and returns -1.
  */
 int
-access_check_universe_object(user_access_t access,
-			     enum schema_object_type object_type,
-			     const char *object_name);
+session_push_check_deprecation(void);
 
 static inline int
 session_push(struct session *session, struct port *port)
@@ -403,17 +442,30 @@ generic_session_fd(struct session *session);
 int64_t
 generic_session_sync(struct session *session);
 
+/** Drops the whole per-user session idle timeout configuration. */
+void
+session_idle_timeout_reset(void);
+
+/**
+ * Sets the idle timeout (in seconds) for the given user name. A timeout of
+ * zero removes the entry (no timeout). The user need not exist yet: the
+ * timeout is resolved by name at authentication time.
+ */
+void
+session_idle_timeout_set(const char *name, uint32_t name_len,
+			 double timeout);
+
+/**
+ * Return the idle timeout (in seconds) configured for the user the given
+ * authentication token belongs to. Zero means no timeout.
+ */
+double
+session_idle_timeout(uint8_t auth_token);
+
 #if defined(__cplusplus)
 } /* extern "C" */
 
 #include "diag.h"
-
-static inline void
-access_check_session_xc(struct user *user)
-{
-	if (access_check_session(user) != 0)
-		diag_raise();
-}
 
 static inline void
 access_check_universe_xc(user_access_t access)

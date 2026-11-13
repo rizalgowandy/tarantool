@@ -80,8 +80,8 @@ sqlStrlen30(const char *z)
  * input does not begin with a quote character, then this routine
  * is a no-op.
  *
- * The input string must be zero-terminated.  A new zero-terminator
- * is added to the dequoted string.
+ * The input string must be zero-terminated. The resulting dequoted
+ * string will also be zero-terminated.
  *
  * The return value is -1 if no dequoting occurs or the length of the
  * dequoted string, exclusive of the zero terminator, if dequoting does
@@ -102,92 +102,42 @@ sqlDequote(char *z)
 	if (!sqlIsquote(quote))
 		return;
 	for (i = 1, j = 0;; i++) {
-		assert(z[i]);
 		if (z[i] == quote) {
 			if (z[i + 1] == quote) {
 				z[j++] = quote;
 				i++;
-			} else {
-				break;
 			}
+		} else if (z[i] == 0) {
+			z[j] = 0;
+			return;
 		} else {
 			z[j++] = z[i];
 		}
+		assert(z[i] != 0);
 	}
-	z[j] = 0;
-}
-
-int
-sql_normalize_name(char *dst, int dst_size, const char *src, int src_len)
-{
-	assert(src != NULL);
-	assert(dst != NULL && dst_size > 0);
-	if (sqlIsquote(src[0])){
-		memcpy(dst, src, src_len);
-		dst[src_len] = '\0';
-		sqlDequote(dst);
-		return src_len + 1;
-	}
-	UErrorCode status = U_ZERO_ERROR;
-	assert(icu_ucase_default_map != NULL);
-	int len = ucasemap_utf8ToUpper(icu_ucase_default_map, dst, dst_size,
-				       src, src_len, &status);
-	assert(U_SUCCESS(status) || status == U_BUFFER_OVERFLOW_ERROR);
-	return len + 1;
 }
 
 char *
-sql_normalized_name_db_new(struct sql *db, const char *name, int len)
+sql_name_new(const char *name, int len)
 {
 	int size = len + 1;
-	ERROR_INJECT(ERRINJ_SQL_NAME_NORMALIZATION, {
-		diag_set(OutOfMemory, size, "sqlDbMallocRawNN", "res");
-		return NULL;
-	});
-	char *res = sqlDbMallocRawNN(db, size);
-	if (res == NULL)
-		return NULL;
-	int rc = sql_normalize_name(res, size, name, len);
-	if (rc <= size)
-		return res;
-
-	size = rc;
-	res = sqlDbReallocOrFree(db, res, size);
-	if (res == NULL)
-		return NULL;
-	if (sql_normalize_name(res, size, name, len) > size)
-		unreachable();
+	char *res = sql_xmalloc(size);
+	memcpy(res, name, len);
+	res[len] = '\0';
+	sqlDequote(res);
 	return res;
 }
 
 char *
-sql_normalized_name_region_new(struct region *r, const char *name, int len)
+sql_name_temp(struct Parse *parser, const char *name, int len)
 {
+	struct region *r = &parser->region;
 	int size = len + 1;
-	ERROR_INJECT(ERRINJ_SQL_NAME_NORMALIZATION, {
-		diag_set(OutOfMemory, size, "region_alloc", "res");
-		return NULL;
-	});
-	size_t region_svp = region_used(r);
-	char *res = region_alloc(r, size);
-	if (res == NULL)
-		goto oom_error;
-	int rc = sql_normalize_name(res, size, name, len);
-	if (rc <= size)
-		return res;
-
-	size = rc;
-	region_truncate(r, region_svp);
-	res = region_alloc(r, size);
-	if (res == NULL)
-		goto oom_error;
-	if (sql_normalize_name(res, size, name, len) > size)
-		unreachable();
+	char *res = xregion_alloc(r, size);
+	memcpy(res, name, len);
+	res[len] = '\0';
+	sqlDequote(res);
 	return res;
-
-oom_error:
-	diag_set(OutOfMemory, size, "region_alloc", "res");
-	return NULL;
 }
 
 /* Convenient short-hand */
@@ -543,11 +493,9 @@ sqlGetInt32(const char *zNum, int *pValue)
 	 *             1234567890
 	 *     2^31 -> 2147483648
 	 */
-	testcase(i == 10);
 	if (i > 10) {
 		return 0;
 	}
-	testcase(v - neg == 2147483647);
 	if (v - neg > 2147483647) {
 		return 0;
 	}
@@ -801,86 +749,6 @@ sqlGetVarint(const unsigned char *p, u64 * v)
 }
 
 /*
- * Read a 32-bit variable-length integer from memory starting at p[0].
- * Return the number of bytes read.  The value is stored in *v.
- *
- * If the varint stored in p[0] is larger than can fit in a 32-bit unsigned
- * integer, then set *v to 0xffffffff.
- *
- * A MACRO version, getVarint32, is provided which inlines the
- * single-byte case.  All code should use the MACRO version as
- * this function assumes the single-byte case has already been handled.
- */
-u8
-sqlGetVarint32(const unsigned char *p, u32 * v)
-{
-	u32 a, b;
-
-	/* The 1-byte case.  Overwhelmingly the most common.  Handled inline
-	 * by the getVarin32() macro
-	 */
-	a = *p;
-	/* a: p0 (unmasked) */
-#ifndef getVarint32
-	if (!(a & 0x80)) {
-		/* Values between 0 and 127 */
-		*v = a;
-		return 1;
-	}
-#endif
-
-	/* The 2-byte case */
-	p++;
-	b = *p;
-	/* b: p1 (unmasked) */
-	if (!(b & 0x80)) {
-		/* Values between 128 and 16383 */
-		a &= 0x7f;
-		a = a << 7;
-		*v = a | b;
-		return 2;
-	}
-
-	/* The 3-byte case */
-	p++;
-	a = a << 14;
-	a |= *p;
-	/* a: p0<<14 | p2 (unmasked) */
-	if (!(a & 0x80)) {
-		/* Values between 16384 and 2097151 */
-		a &= (0x7f << 14) | (0x7f);
-		b &= 0x7f;
-		b = b << 7;
-		*v = a | b;
-		return 3;
-	}
-
-	/* A 32-bit varint is used to store size information in btrees.
-	 * Objects are rarely larger than 2MiB limit of a 3-byte varint.
-	 * A 3-byte varint is sufficient, for example, to record the size
-	 * of a 1048569-byte BLOB or string.
-	 *
-	 * We only unroll the first 1-, 2-, and 3- byte cases.  The very
-	 * rare larger cases can be handled by the slower 64-bit varint
-	 * routine.
-	 */
-	{
-		u64 v64;
-		u8 n;
-
-		p -= 2;
-		n = sqlGetVarint(p, &v64);
-		assert(n > 3 && n <= 9);
-		if ((v64 & SQL_MAX_U32) != v64) {
-			*v = 0xffffffff;
-		} else {
-			*v = (u32) v64;
-		}
-		return n;
-	}
-}
-
-/*
  * Return the number of bytes that will be needed to store the given
  * 64-bit integer.
  */
@@ -908,33 +776,27 @@ sqlHexToInt(int h)
 	return (u8) (h & 0xf);
 }
 
-#if !defined(SQL_OMIT_BLOB_LITERAL) || defined(SQL_HAS_CODEC)
-/*
- * Convert a BLOB literal of the form "x'hhhhhh'" into its binary
- * value.  Return a pointer to its binary value.  Space to hold the
- * binary value has been obtained from malloc and must be freed by
- * the calling routine.
- */
 void *
-sqlHexToBlob(sql * db, const char *z, int n)
+sqlHexToBlob(const char *z, int n)
 {
 	char *zBlob;
 	int i;
 
-	zBlob = (char *)sqlDbMallocRawNN(db, n / 2 + 1);
+	zBlob = sql_xmalloc(n / 2 + 1);
 	n--;
-	if (zBlob) {
-		for (i = 0; i < n; i += 2) {
-			zBlob[i / 2] =
-			    (sqlHexToInt(z[i]) << 4) |
-			    sqlHexToInt(z[i + 1]);
-		}
-		zBlob[i / 2] = 0;
-	}
+	for (i = 0; i < n; i += 2)
+		zBlob[i / 2] = (sqlHexToInt(z[i]) << 4) | sqlHexToInt(z[i + 1]);
+	zBlob[i / 2] = 0;
 	return zBlob;
 }
-#endif				/* !SQL_OMIT_BLOB_LITERAL || SQL_HAS_CODEC */
 
+#if ENABLE_UB_SANITIZER
+/* See https://github.com/tarantool/tarantool/issues/10703. */
+int
+sql_add_int(int64_t lhs, bool is_lhs_neg, int64_t rhs, bool is_rhs_neg,
+	    int64_t *res, bool *is_res_neg)
+  __attribute__((no_sanitize("signed-integer-overflow")));
+#endif
 int
 sql_add_int(int64_t lhs, bool is_lhs_neg, int64_t rhs, bool is_rhs_neg,
 	    int64_t *res, bool *is_res_neg)
@@ -964,6 +826,13 @@ sql_add_int(int64_t lhs, bool is_lhs_neg, int64_t rhs, bool is_rhs_neg,
 	return 0;
 }
 
+#if ENABLE_UB_SANITIZER
+/* See https://github.com/tarantool/tarantool/issues/10703. */
+int
+sql_sub_int(int64_t lhs, bool is_lhs_neg, int64_t rhs, bool is_rhs_neg,
+	    int64_t *res, bool *is_res_neg)
+  __attribute__((no_sanitize("signed-integer-overflow")));
+#endif
 int
 sql_sub_int(int64_t lhs, bool is_lhs_neg, int64_t rhs, bool is_rhs_neg,
 	    int64_t *res, bool *is_res_neg)
@@ -1049,6 +918,13 @@ sql_mul_int(int64_t lhs, bool is_lhs_neg, int64_t rhs, bool is_rhs_neg,
 	return 0;
 }
 
+#if ENABLE_UB_SANITIZER
+/* See https://github.com/tarantool/tarantool/issues/10703. */
+int
+sql_div_int(int64_t lhs, bool is_lhs_neg, int64_t rhs, bool is_rhs_neg,
+	    int64_t *res, bool *is_res_neg)
+  __attribute__((no_sanitize("signed-integer-overflow")));
+#endif
 int
 sql_div_int(int64_t lhs, bool is_lhs_neg, int64_t rhs, bool is_rhs_neg,
 	    int64_t *res, bool *is_res_neg)
@@ -1097,7 +973,7 @@ sql_rem_int(int64_t lhs, bool is_lhs_neg, int64_t rhs, bool is_rhs_neg,
 		uint64_t u_lhs = (uint64_t) (-lhs);
 		uint64_t u_res = u_lhs % u_rhs;
 		*res = -u_res;
-		*is_res_neg = true;
+		*is_res_neg = u_res != 0;
 		return 0;
 	}
 	/*
@@ -1197,49 +1073,8 @@ sqlLogEstToInt(LogEst x)
 	return x >= 3 ? (n + 8) << (x - 3) : (n + 8) >> (3 - x);
 }
 
-/*
- * Add a new name/number pair to a VList.  This might require that the
- * VList object be reallocated, so return the new VList.  If an OOM
- * error occurs, the original VList returned and the
- * db->mallocFailed flag is set.
- *
- * A VList is really just an array of integers.  To destroy a VList,
- * simply pass it to sqlDbFree().
- *
- * The first integer is the number of integers allocated for the whole
- * VList.  The second integer is the number of integers actually used.
- * Each name/number pair is encoded by subsequent groups of 3 or more
- * integers.
- *
- * Each name/number pair starts with two integers which are the numeric
- * value for the pair and the size of the name/number pair, respectively.
- * The text name overlays one or more following integers.  The text name
- * is always zero-terminated.
- *
- * Conceptually:
- *
- *    struct VList {
- *      int nAlloc;   // Number of allocated slots
- *      int nUsed;    // Number of used slots
- *      struct VListEntry {
- *        int iValue;    // Value for this entry
- *        int nSlot;     // Slots used by this entry
- *        // ... variable name goes here
- *      } a[0];
- *    }
- *
- * During code generation, pointers to the variable names within the
- * VList are taken.  When that happens, nAlloc is set to zero as an
- * indication that the VList may never again be enlarged, since the
- * accompanying realloc() would invalidate the pointers.
- */
-VList *
-sqlVListAdd(sql * db,	/* The database connection used for malloc() */
-		VList * pIn,	/* The input VList.  Might be NULL */
-		const char *zName,	/* Name of symbol to add */
-		int nName,	/* Bytes of text in zName */
-		int iVal	/* Value to associate with zName */
-    )
+int *
+sqlVListAdd(int *pIn, const char *zName, int nName, int iVal)
 {
 	int nInt;		/* number of sizeof(int) objects needed for zName */
 	char *z;		/* Pointer to where zName will be stored */
@@ -1250,9 +1085,7 @@ sqlVListAdd(sql * db,	/* The database connection used for malloc() */
 	if (pIn == 0 || pIn[1] + nInt > pIn[0]) {
 		/* Enlarge the allocation */
 		int nAlloc = (pIn ? pIn[0] * 2 : 10) + nInt;
-		VList *pOut = sqlDbRealloc(db, pIn, nAlloc * sizeof(int));
-		if (pOut == 0)
-			return pIn;
+		VList *pOut = sql_xrealloc(pIn, nAlloc * sizeof(int));
 		if (pIn == 0)
 			pOut[1] = 2;
 		pIn = pOut;
@@ -1309,4 +1142,56 @@ sqlVListNameToNum(VList * pIn, const char *zName, int nName)
 		i += pIn[i + 1];
 	} while (i < mx);
 	return 0;
+}
+
+char *
+sql_escaped_name_new(const char *name)
+{
+	size_t len = strlen(name);
+	size_t count = 0;
+	for (size_t i = 0; i < len; ++i) {
+		if (name[i] == '"')
+			++count;
+	}
+	size_t size = len + count + 2;
+	char *buf = sql_xmalloc(size + 1);
+	buf[0] = '"';
+	for (size_t i = 0, j = 1; i < len; ++i) {
+		buf[j++] = name[i];
+		if (name[i] == '"')
+			buf[j++] = '"';
+	}
+	buf[size - 1] = '"';
+	buf[size] = '\0';
+	return buf;
+}
+
+char *
+sql_legacy_name_new(const char *name, int len)
+{
+	size_t size = len + 1;
+	char *res = sql_xmalloc(size);
+	if (sqlIsquote(name[0])) {
+		memcpy(res, name, len);
+		res[len] = '\0';
+		sqlDequote(res);
+		return res;
+	}
+
+	UErrorCode status = U_ZERO_ERROR;
+	assert(icu_ucase_default_map != NULL);
+	int new_len = ucasemap_utf8ToUpper(icu_ucase_default_map, res, size,
+					   name, len, &status);
+	assert(U_SUCCESS(status) || status == U_BUFFER_OVERFLOW_ERROR);
+	if (new_len <= len)
+		return res;
+	size = new_len + 1;
+	res = sql_xrealloc(res, size);
+	status = U_ZERO_ERROR;
+	new_len = ucasemap_utf8ToUpper(icu_ucase_default_map, res, size,
+				       name, len, &status);
+	assert(U_SUCCESS(status));
+	assert((size_t)new_len < size);
+	(void)new_len;
+	return res;
 }

@@ -11,6 +11,14 @@ s1.is_sync
  | ---
  | - true
  | ...
+s1.state.is_sync
+ | ---
+ | - true
+ | ...
+s1.is_sync == s1.state.is_sync
+ | ---
+ | - true
+ | ...
 pk = s1:create_index('pk')
  | ---
  | ...
@@ -33,6 +41,14 @@ s2 = box.schema.create_space('test2')
 s2.is_sync
  | ---
  | - false
+ | ...
+s2.state.is_sync
+ | ---
+ | - false
+ | ...
+s2.is_sync == s2.state.is_sync
+ | ---
+ | - true
  | ...
 
 -- Net.box takes sync into account.
@@ -162,9 +178,12 @@ box.space.sync:select{}
  | ...
 
 -- Check consistency on replica.
-test_run:cmd('switch replica')
+test_run:switch('replica')
  | ---
  | - true
+ | ...
+test_run:wait_lsn('replica', 'default')
+ | ---
  | ...
 box.space.sync:select{}
  | ---
@@ -256,6 +275,9 @@ test_run:switch('replica')
  | ---
  | - true
  | ...
+test_run:wait_lsn('replica', 'default')
+ | ---
+ | ...
 box.space.test:select{5}
  | ---
  | - - [5]
@@ -292,6 +314,9 @@ box.space.sync:select{6}
 test_run:switch('replica')
  | ---
  | - true
+ | ...
+test_run:wait_lsn('replica', 'default')
+ | ---
  | ...
 box.space.test:select{6}
  | ---
@@ -355,6 +380,9 @@ test_run:switch('replica')
  | ---
  | - true
  | ...
+test_run:wait_lsn('replica', 'default')
+ | ---
+ | ...
 box.space.sync:select{8}
  | ---
  | - - [8]
@@ -409,6 +437,9 @@ test_run:switch('replica')
  | ---
  | - true
  | ...
+test_run:wait_lsn('replica', 'default')
+ | ---
+ | ...
 box.space.sync:select{9}
  | ---
  | - []
@@ -459,6 +490,9 @@ test_run:switch('replica')
  | ---
  | - true
  | ...
+test_run:wait_lsn('replica', 'default')
+ | ---
+ | ...
 box.space.sync:select{10}
  | ---
  | - - [10]
@@ -495,6 +529,9 @@ assert(newlsn >= oldlsn + 2)
 test_run:switch('replica')
  | ---
  | - true
+ | ...
+test_run:wait_lsn('replica', 'default')
+ | ---
  | ...
 box.space.sync:select{7}
  | ---
@@ -543,6 +580,9 @@ box.space.sync:select{11}
 test_run:switch('replica')
  | ---
  | - true
+ | ...
+test_run:wait_lsn('replica', 'default')
+ | ---
  | ...
 box.space.sync:select{11}
  | ---
@@ -612,6 +652,9 @@ test_run:cmd('switch replica')
  | ---
  | - true
  | ...
+test_run:wait_lsn('replica', 'default')
+ | ---
+ | ...
 box.space.sync:count()
  | ---
  | - 100
@@ -634,6 +677,9 @@ for i = 1, 100 do box.space.sync:delete{i} end
 test_run:cmd('switch replica')
  | ---
  | - true
+ | ...
+test_run:wait_lsn('replica', 'default')
+ | ---
  | ...
 box.space.sync:count()
  | ---

@@ -30,6 +30,7 @@
  */
 #include "trivia/util.h"
 
+#include <ctype.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -44,9 +45,14 @@
 
 #include <unicode/utf8.h>
 #include <unicode/uchar.h>
-#include <msgpuck/msgpuck.h> /* mp_char2escape[] table */
 
 #include "say.h"
+#include "tweaks.h"
+
+#ifdef ENABLE_ASAN
+/** If true then LSAN will not be run on Tarantool exit. */
+static bool lsan_is_turned_off = false;
+#endif
 
 /** Find a string in an array of strings.
  *
@@ -59,7 +65,7 @@
  * @return  string index or hmax if the string is not found.
  */
 uint32_t
-strindex(const char **haystack, const char *needle, uint32_t hmax)
+strindex(const char *const *haystack, const char *needle, uint32_t hmax)
 {
 	for (unsigned index = 0; index != hmax && haystack[index]; index++)
 		if (strcasecmp(haystack[index], needle) == 0)
@@ -72,7 +78,8 @@ strindex(const char **haystack, const char *needle, uint32_t hmax)
  * Used, when @a needle is not 0 terminated.
  */
 uint32_t
-strnindex(const char **haystack, const char *needle, uint32_t len, uint32_t hmax)
+strnindex(const char *const *haystack, const char *needle, uint32_t len,
+	  uint32_t hmax)
 {
 	if (len == 0)
 		return hmax;
@@ -113,89 +120,6 @@ close_all_xcpt(int fdc, ...)
 	}
 }
 
-static int
-itoa(int val, char *buf)
-{
-	char *p = buf;
-
-	if (val < 0) {
-		*p++ = '-';
-		val = -val;
-	}
-	/* Print full range if it is an unsigned number. */
-	unsigned uval = val;
-	char *start = p;
-	do {
-		*p++ = '0' + uval % 10;
-		uval /= 10;
-	} while (uval > 0);
-
-	int len = (int)(p - buf);
-
-	*p-- = '\0';
-
-	/* Reverse the resulting string. */
-	do {
-		char tmp = *p;
-		*p = *start;
-		*start = tmp;
-	} while (++start < --p);
-
-	return len;
-}
-
-/**
- * Async-signal-safe implementation of printf() into an fd, to be
- * able to write messages into the error log inside a signal
- * handler. Only supports %s and %d, %u, format specifiers.
- */
-ssize_t
-fdprintf(int fd, const char *format, ...)
-{
-	ssize_t total = 0;
-	char buf[22];
-	va_list args;
-	va_start(args, format);
-
-	while (*format) {
-		const char *start = format;
-		ssize_t len, res;
-		if (*format++ != '%') {
-			while (*format != '\0' && *format != '%')
-				format++;
-			len = format - start;
-			goto out;
-		}
-		switch (*format++) {
-		case '%':
-			len = 1;
-			break;
-		case 's':
-			start = va_arg(args, char *);
-			if (start == NULL)
-				start = "(null)";
-			len = strlen(start);
-			break;
-		case 'd':
-		case 'u':
-			start = buf;
-			len = itoa(va_arg(args, int), buf);
-			break;
-		default:
-			len = 2;
-			break;
-		}
-out:
-		res = write(fd, start, len);
-		if (res > 0)
-			total += res;
-		if (res != len)
-			break;
-	}
-	va_end(args);
-	return total;
-}
-
 /** Allocate and fill an absolute path to a file. */
 char *
 abspath(const char *filename)
@@ -210,9 +134,9 @@ abspath(const char *filename)
 	if (getcwd(abspath, PATH_MAX - strlen(filename) - 1) == NULL)
 		say_syserror("getcwd");
 	else {
-		strcat(abspath, "/");
+		strlcat(abspath, "/", PATH_MAX);
 	}
-	strcat(abspath, filename);
+	strlcat(abspath, filename, PATH_MAX);
 	return abspath;
 }
 
@@ -264,83 +188,247 @@ strlcpy(char *dst, const char *src, size_t size)
 }
 #endif
 
-int
-utf8_check_printable(const char *start, size_t length)
+#ifndef HAVE_STRLCAT
+size_t
+strlcat(char *dst, const char *src, size_t size)
 {
-	const unsigned char *end = (const unsigned char *) start + length;
-	const unsigned char *pointer = (const unsigned char *) start;
+	size_t src1_len = strlen(dst);
+	size_t src2_len = strlen(src);
 
-	while (pointer < end) {
-		unsigned char octet;
-		unsigned int width;
-		unsigned int value;
-		size_t k;
+	if (src1_len >= size)
+		return size + src2_len;
 
-		octet = pointer[0];
-		width = (octet & 0x80) == 0x00 ? 1 :
-			(octet & 0xE0) == 0xC0 ? 2 :
-			(octet & 0xF0) == 0xE0 ? 3 :
-			(octet & 0xF8) == 0xF0 ? 4 : 0;
-		value = (octet & 0x80) == 0x00 ? octet & 0x7F :
-			(octet & 0xE0) == 0xC0 ? octet & 0x1F :
-			(octet & 0xF0) == 0xE0 ? octet & 0x0F :
-			(octet & 0xF8) == 0xF0 ? octet & 0x07 : 0;
-		if (!width)
-			return 0;
-		if (pointer + width > end)
-			return 0;
-		for (k = 1; k < width; k++) {
-			octet = pointer[k];
-			if ((octet & 0xC0) != 0x80) return 0;
-			value = (value << 6) + (octet & 0x3F);
-		}
-		if (!((width == 1) ||
-		      (width == 2 && value >= 0x80) ||
-		      (width == 3 && value >= 0x800) ||
-		      (width == 4 && value >= 0x10000)))
-			return 0;
+	size_t len = src2_len < size - src1_len ?
+		     src2_len : size - src1_len - 1;
 
-		/*
-		 * gh-354: yaml incorrectly escapes special characters in a string
-		 * Check that the string can be actually printed unescaped.
-		 */
-		if (*pointer > 0x7F &&
-		    !((pointer[0] == 0x0A) ||
-		      (pointer[0] >= 0x20 && pointer[0] <= 0x7E) ||
-		      (pointer[0] == 0xC2 && pointer[1] >= 0xA0) ||
-		      (pointer[0]  > 0xC2 && pointer[0]  < 0xED) ||
-		      (pointer[0] == 0xED && pointer[1]  < 0xA0) ||
-		      (pointer[0] == 0xEE) ||
-		      (pointer[0] == 0xEF &&
-		       !(pointer[1] == 0xBB && pointer[2] == 0xBF) &&
-		       !(pointer[1] == 0xBF &&
-			 (pointer[2] == 0xBE || pointer[2] == 0xBF))) ||
-		      (u_isprint(value))
-		      )
-		    ) {
-			return 0;
-		}
-		pointer += width;
-	}
-	return 1;
+	memcpy(dst + src1_len, src, len);
+	dst[src1_len + len] = '\0';
+	return src1_len + src2_len;
 }
+#endif
 
-int
-json_escape(char *buf, int size, const char *data)
+/**
+ * Maps a character code to an escaped string or NULL if the character
+ * doesn't need to be escaped when encoded in JSON.
+ */
+const char *const json_char2escape[256] = {
+	"\\u0000", "\\u0001", "\\u0002", "\\u0003",
+	"\\u0004", "\\u0005", "\\u0006", "\\u0007",
+	"\\b", "\\t", "\\n", "\\u000b",
+	"\\f", "\\r", "\\u000e", "\\u000f",
+	"\\u0010", "\\u0011", "\\u0012", "\\u0013",
+	"\\u0014", "\\u0015", "\\u0016", "\\u0017",
+	"\\u0018", "\\u0019", "\\u001a", "\\u001b",
+	"\\u001c", "\\u001d", "\\u001e", "\\u001f",
+	NULL, NULL, "\\\"", NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, "\\\\", NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, "\\u007f",
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+};
+
+/**
+ * Maps a character code to an escaped string or NULL if the character
+ * doesn't need to be escaped when encoded for syslog according to RFC 3164.
+ */
+const char *const syslog_char2escape[256] = {
+	"\\u0000", "\\u0001", "\\u0002", "\\u0003",
+	"\\u0004", "\\u0005", "\\u0006", "\\u0007",
+	"\\b", "\\t", "\\n", "\\u000b",
+	"\\f", "\\r", "\\u000e", "\\u000f",
+	"\\u0010", "\\u0011", "\\u0012", "\\u0013",
+	"\\u0014", "\\u0015", "\\u0016", "\\u0017",
+	"\\u0018", "\\u0019", "\\u001a", "\\u001b",
+	"\\u001c", "\\u001d", "\\u001e", "\\u001f",
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL, NULL, NULL, "\\u007f",
+	"\\u0080", "\\u0081", "\\u0082", "\\u0083",
+	"\\u0084", "\\u0085", "\\u0086", "\\u0087",
+	"\\u0088", "\\u0089", "\\u008a", "\\u008b",
+	"\\u008c", "\\u008d", "\\u008e", "\\u008f",
+	"\\u0090", "\\u0091", "\\u0092", "\\u0093",
+	"\\u0094", "\\u0095", "\\u0096", "\\u0097",
+	"\\u0098", "\\u0099", "\\u009a", "\\u009b",
+	"\\u009c", "\\u009d", "\\u009e", "\\u009f",
+	"\\u00a0", "\\u00a1", "\\u00a2", "\\u00a3",
+	"\\u00a4", "\\u00a5", "\\u00a6", "\\u00a7",
+	"\\u00a8", "\\u00a9", "\\u00aa", "\\u00ab",
+	"\\u00ac", "\\u00ad", "\\u00ae", "\\u00af",
+	"\\u00b0", "\\u00b1", "\\u00b2", "\\u00b3",
+	"\\u00b4", "\\u00b5", "\\u00b6", "\\u00b7",
+	"\\u00b8", "\\u00b9", "\\u00ba", "\\u00bb",
+	"\\u00bc", "\\u00bd", "\\u00be", "\\u00bf",
+	"\\u00c0", "\\u00c1", "\\u00c2", "\\u00c3",
+	"\\u00c4", "\\u00c5", "\\u00c6", "\\u00c7",
+	"\\u00c8", "\\u00c9", "\\u00ca", "\\u00cb",
+	"\\u00cc", "\\u00cd", "\\u00ce", "\\u00cf",
+	"\\u00d0", "\\u00d1", "\\u00d2", "\\u00d3",
+	"\\u00d4", "\\u00d5", "\\u00d6", "\\u00d7",
+	"\\u00d8", "\\u00d9", "\\u00da", "\\u00db",
+	"\\u00dc", "\\u00dd", "\\u00de", "\\u00df",
+	"\\u00e0", "\\u00e1", "\\u00e2", "\\u00e3",
+	"\\u00e4", "\\u00e5", "\\u00e6", "\\u00e7",
+	"\\u00e8", "\\u00e9", "\\u00ea", "\\u00eb",
+	"\\u00ec", "\\u00ed", "\\u00ee", "\\u00ef",
+	"\\u00f0", "\\u00f1", "\\u00f2", "\\u00f3",
+	"\\u00f4", "\\u00f5", "\\u00f6", "\\u00f7",
+	"\\u00f8", "\\u00f9", "\\u00fa", "\\u00fb",
+	"\\u00fc", "\\u00fd", "\\u00fe", "\\u00ff"
+};
+
+/**
+ * If set, json_encode_char() will also escape '/'.
+ */
+bool json_escape_forward_slash;
+TWEAK_BOOL(json_escape_forward_slash);
+
+typedef const char *
+(*str_escape_char_f)(char c);
+
+/**
+ * Escape special characters in @a data to @a buf using custom escape rules,
+ * defined in @a escape_func.
+ */
+static int
+str_escape(char *buf, int size, const char *data, str_escape_char_f escape_func)
 {
 	int total = 0;
 	int data_len = strlen(data);
 	for (int i = 0; i < data_len; i++) {
-		unsigned char c = (unsigned char ) data[i];
-		if (c < 128 && mp_char2escape[c] != NULL) {
-			/* Escape character */
-			SNPRINT(total, snprintf, buf, size, "%s",
-					  mp_char2escape[c]);
+		char c = data[i];
+		const char *escstr = escape_func(c);
+		if (escstr != NULL) {
+			SNPRINT(total, snprintf, buf, size, "%s", escstr);
 		} else {
 			SNPRINT(total, snprintf, buf, size, "%c", c);
 		}
 	}
 	return total;
+}
+
+int
+json_escape(char *buf, int size, const char *data)
+{
+	return str_escape(buf, size, data, json_escape_char);
+}
+
+int
+json_syslog_escape(char *buf, int size, const char *data)
+{
+	return str_escape(buf, size, data, json_syslog_escape_char);
+}
+
+/**
+ * Escape special characters in @a buf in-place using custom escape rules,
+ * defined in @a escape_func.
+ */
+static int
+str_escape_inplace(char *buf, int size, str_escape_char_f escape_func)
+{
+	/* We need at least one byte for the null terminator later. */
+	if (buf == NULL || size <= 0)
+		return 0;
+
+	int total = 0;
+	int data_len = 0;
+
+	/*
+	 * Calculate the length of the string and the escaped string in on go.
+	 * If the buffer is not large enough, we will "truncate" the input
+	 * string, so the escaped string will fit into the buffer.
+	 */
+	for (char *p = buf; p < buf + size && *p != '\0'; p++) {
+		char c = *p;
+		const char *esc_str = escape_func(c);
+		int esc_len = esc_str != NULL ? strlen(esc_str) : 1;
+
+		if (total + esc_len >= size) {
+			break;
+		}
+
+		total += esc_len;
+		data_len++;
+	}
+
+	/* Write the null terminator. */
+	assert(total + 1 <= size); /* Guaranteed by the loop above. */
+	buf[total + 1] = '\0';
+
+	/* Write the escaped string from the end to the beginning. */
+	char *pw = buf + total;
+	int written = 0;
+	for (char *pr = buf + data_len - 1; pr >= buf; --pr) {
+		char c = *pr;
+		const char *esc_str = escape_func(c);
+
+		if (esc_str != NULL) {
+			int esc_len = strlen(esc_str);
+			pw -= esc_len;
+			assert(pw > pr - 1);
+			memcpy(pw, esc_str, esc_len);
+			written += esc_len;
+		} else {
+			pw--;
+			assert(pw > pr - 1);
+			*pw = c;
+			written++;
+		}
+	}
+
+	assert(pw <= buf);
+	assert(written == total);
+	return written;
+}
+
+int
+json_escape_inplace(char *buf, int size)
+{
+	return str_escape_inplace(buf, size, json_escape_char);
+}
+
+int
+syslog_escape_inplace(char *buf, int size)
+{
+	return str_escape_inplace(buf, size, syslog_escape_char);
+}
+
+int
+json_syslog_escape_inplace(char *buf, int size)
+{
+	return str_escape_inplace(buf, size, json_syslog_escape_char);
 }
 
 const char *precision_fmts[] = {
@@ -464,3 +552,99 @@ thread_sleep(double sec)
 	assert(rc == 0);
 	(void)rc;
 }
+
+/*
+ * 32 4 kilobyte pages seems to be the limit for a single environment variable
+ * or argv element set by the kernel. We use that to limit maximum buffer size
+ * allocated for an env variable.
+ */
+#define MAX_ENV_VAR_SIZE 131072
+
+char *
+getenv_safe(const char *name, char *buf, size_t buf_size)
+{
+	assert(buf != NULL || buf_size == 0);
+	assert(name != NULL);
+
+	char *var = getenv(name);
+	if (var == NULL)
+		return NULL;
+	if (buf == NULL)
+		buf_size = MAX_ENV_VAR_SIZE;
+	size_t var_len = strnlen(var, buf_size);
+	if (var_len >= buf_size) {
+		say_warn("Ignoring environment variable %s because its value "
+			 "is too long (>= %zu)", name, buf_size);
+		return NULL;
+	}
+	char *alloc_buf = NULL;
+	if (buf == NULL) {
+		alloc_buf = xmalloc(var_len + 1);
+		buf = alloc_buf;
+	}
+	memcpy(buf, var, var_len + 1);
+	/*
+	 * The value could have changed during copying so we reset the
+	 * terminating zero explicitly to avoid out-of-bounds access.
+	 * The returned value may still be malformed, intentionally, for
+	 * example, but there's nothing we can really do about it. The user must
+	 * check that the returned value is valid for his use.
+	 */
+	buf[var_len] = '\0';
+	return buf;
+}
+
+char *
+strtolower(char *s)
+{
+	for (size_t i = 0; s[i] != '\0'; ++i)
+		s[i] = (char)tolower(s[i]);
+	return s;
+}
+
+char *
+strtolowerdup(const char *s)
+{
+	size_t len = strlen(s);
+	char *lowercase = xmalloc(len + 1);
+	for (size_t i = 0; i < len; ++i)
+		lowercase[i] = (char)tolower(s[i]);
+	lowercase[len] = '\0';
+	return lowercase;
+}
+
+char *
+strtoupper(char *s)
+{
+	for (size_t i = 0; s[i] != '\0'; ++i)
+		s[i] = (char)toupper(s[i]);
+	return s;
+}
+
+char *
+strtoupperdup(const char *s)
+{
+	size_t len = strlen(s);
+	char *uppercase = xmalloc(len + 1);
+	for (size_t i = 0; i < len; ++i)
+		uppercase[i] = (char)toupper(s[i]);
+	uppercase[len] = '\0';
+	return uppercase;
+}
+
+#ifdef ENABLE_ASAN
+
+/** The function is called by LSAN to check if it should report leaks. */
+int
+__lsan_is_turned_off(void)
+{
+	return lsan_is_turned_off ? 1 : 0;
+}
+
+void
+lsan_turn_off(void)
+{
+	lsan_is_turned_off = true;
+}
+
+#endif

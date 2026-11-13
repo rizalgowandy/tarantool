@@ -65,6 +65,24 @@ struct vy_cache_node {
 	uint8_t left_boundary_level;
 	/* Number of parts in key when the value was the last in EQ search */
 	uint8_t right_boundary_level;
+	/*
+	 * LSN of the left chain link.
+	 *
+	 * A cache node may be a part of a chain. If a read iterator encounters
+	 * a chain, it may skip deeper sources for all keys lying in the chain,
+	 * assuming there's nothing there. Like a single statement, a chain
+	 * may be invisible from the iterator read view, in which case it must
+	 * be ignored. We store the LSNs of the left and right chain links
+	 * in the left_lsn and right_lsn fields of the node, respectively,
+	 * provided they exist. The read iterator must ignore a link if its
+	 * VLSN is less than the LSN of the link. Basically, the LSN of a link
+	 * is initialized as the LSN of the oldest DELETE statement that fell
+	 * between the two linked nodes and hasn't been purged yet, or 0 if
+	 * there's none.
+	 */
+	int64_t left_lsn;
+	/* LSN of the right chain link. See left_lsn for details. */
+	int64_t right_lsn;
 };
 
 /**
@@ -91,7 +109,6 @@ vy_cache_tree_key_cmp(struct vy_cache_node *a, struct vy_entry b,
 
 #define BPS_TREE_NAME vy_cache_tree
 #define BPS_TREE_BLOCK_SIZE 512
-#define BPS_TREE_EXTENT_SIZE VY_CACHE_TREE_EXTENT_SIZE
 #define BPS_TREE_COMPARE(a, b, cmp_def) vy_cache_tree_cmp(a, b, cmp_def)
 #define BPS_TREE_COMPARE_KEY(a, b, cmp_def) vy_cache_tree_key_cmp(a, b, cmp_def)
 #define bps_tree_elem_t struct vy_cache_node *
@@ -103,7 +120,6 @@ vy_cache_tree_key_cmp(struct vy_cache_node *a, struct vy_entry b,
 
 #undef BPS_TREE_NAME
 #undef BPS_TREE_BLOCK_SIZE
-#undef BPS_TREE_EXTENT_SIZE
 #undef BPS_TREE_COMPARE
 #undef BPS_TREE_COMPARE_KEY
 #undef bps_tree_elem_t
@@ -119,6 +135,8 @@ struct vy_cache_env {
 	struct rlist cache_lru;
 	/** Common mempool for vy_cache_node struct */
 	struct mempool cache_node_mempool;
+	/** Common matras extent allocator. */
+	struct matras_allocator allocator;
 	/** Size of memory occupied by cached tuples */
 	size_t mem_used;
 	/** Max memory size that can be used for cache */
@@ -195,15 +213,27 @@ vy_cache_destroy(struct vy_cache *cache);
  * @param cache - pointer to tuple cache.
  * @param curr - statement that was recently read and should be added to the
  * cache.
- * @param prev - previous statement that was read by the reader in one
+ * @param prev - previous statement that was added to the cache
  * sequence (by one iterator).
- * @param direction - direction in which the reader (iterator) observes data,
- *  +1 - forward, -1 - backward.
+ * @param is_first - if set, this is the first statement matching the iteration
+ * criteria.
+ * @param link_lsn - LSN of the inserted cache chain link; for details, see
+ * the comment to vy_cache_node::left_lsn.
+ * @param key - iterator key.
+ * @param order - iterator type.
  */
 void
 vy_cache_add(struct vy_cache *cache, struct vy_entry curr,
-	     struct vy_entry prev, struct vy_entry key,
-	     enum iterator_type order);
+	     struct vy_entry prev, bool is_first, int64_t link_lsn,
+	     struct vy_entry key, enum iterator_type order);
+
+static inline void
+vy_cache_add_point(struct vy_cache *cache, struct vy_entry entry,
+		   struct vy_entry key)
+{
+	vy_cache_add(cache, entry, /*prev=*/vy_entry_none(),
+		     /*is_first=*/true, /*link_lsn=*/0, key, ITER_EQ);
+}
 
 /**
  * Find value in cache.
@@ -222,6 +252,14 @@ vy_cache_get(struct vy_cache *cache, struct vy_entry key);
 void
 vy_cache_on_write(struct vy_cache *cache, struct vy_entry entry,
 		  struct vy_entry *deleted);
+
+/**
+ * Invalidate cache on statement rollback.
+ * @param cache - pointer to tuple cache.
+ * @param entry - rolled back statement.
+ */
+void
+vy_cache_on_rollback(struct vy_cache *cache, struct vy_entry entry);
 
 
 /**
@@ -252,6 +290,11 @@ struct vy_cache_iterator {
 	uint32_t version;
 	/* Is false until first .._get or .._next_.. method is called */
 	bool search_started;
+	/**
+	 * The iterator may return prepared (unconfirmed) statements only if
+	 * this flag is set.
+	 */
+	bool is_prepared_ok;
 };
 
 /**
@@ -260,12 +303,13 @@ struct vy_cache_iterator {
  * @param cache - the cache.
  * @param iterator_type - iterator type (EQ, GT, GE, LT, LE or ALL)
  * @param key - search key data in terms of vinyl, vy_entry_compare argument
- * @param vlsn - LSN visibility, iterator shows values with lsn <= vlsn
+ * @param rv - read view.
+ * @param is_prepared_ok - if set, the iterator may return prepared statements.
  */
 void
 vy_cache_iterator_open(struct vy_cache_iterator *itr, struct vy_cache *cache,
 		       enum iterator_type iterator_type, struct vy_entry key,
-		       const struct vy_read_view **rv);
+		       const struct vy_read_view **rv, bool is_prepared_ok);
 
 /**
  * Advance a cache iterator to the next key.

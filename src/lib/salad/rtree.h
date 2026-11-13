@@ -67,7 +67,7 @@ typedef rb_tree(struct rtree_neighbor) rtnt_t;
 enum {
 	/** Maximal possible R-tree height */
 	RTREE_MAX_HEIGHT = 16,
-	/** Maximal possible R-tree height */
+	/** Maximal possible R-tree dimension */
 	RTREE_MAX_DIMENSION = 20
 };
 
@@ -97,10 +97,6 @@ enum spatial_search_op
 	 * order of distance to given point. Yes, it is KNN iterator */
 	SOP_NEIGHBOR
 };
-
-/* pointers to page allocation and deallocations functions */
-typedef void *(*rtree_extent_alloc_t)(void *ctx);
-typedef void (*rtree_extent_free_t)(void *ctx, void *extent);
 
 /* A box in RTREE_DIMENSION space */
 struct rtree_rect
@@ -228,16 +224,19 @@ rtree_set2dp(struct rtree_rect *rect, coord_t x, coord_t y);
 /**
  * @brief Initialize a tree
  * @param tree - pointer to a tree
+ * @param dimension - tree dimension
+ * @param distance_type - distance type
  * @param extent_size - size of extents allocated by extent_alloc (see next)
  * @param extent_alloc - extent allocation function
  * @param extent_free - extent deallocation function
  * @param alloc_ctx - argument passed to extent allocator
- * @return 0 on success, -1 on error
+ * @param alloc_stats - optional extent allocator statistics
  */
-int
-rtree_init(struct rtree *tree, unsigned dimension, uint32_t extent_size,
-	   rtree_extent_alloc_t extent_alloc, rtree_extent_free_t extent_free,
-	   void *alloc_ctx, enum rtree_distance_type distance_type);
+void
+rtree_init(struct rtree *tree, unsigned dimension,
+	   enum rtree_distance_type distance_type,
+	   struct matras_allocator *allocator,
+	   struct matras_stats *alloc_stats);
 
 /**
  * @brief Destroy a tree

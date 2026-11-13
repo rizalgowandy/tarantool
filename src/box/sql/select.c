@@ -78,6 +78,24 @@ struct DistinctCtx {
 	int addrTnct;		/* Address of OP_OpenEphemeral opcode for cur_eph */
 };
 
+/**
+ * An instance of the following structure controls how keys are compared by
+ * VDBE, see P4_KEYINFO.
+ */
+struct sql_key_info {
+	/**
+	 * Key definition created from this object,
+	 * see sql_key_info_to_key_def().
+	 */
+	struct key_def *key_def;
+	/** Reference counter. */
+	uint32_t refs;
+	/** Number of parts in the key. */
+	uint32_t part_count;
+	/** Definition of the key parts. */
+	struct key_part_def parts[];
+};
+
 /*
  * An instance of the following object is used to record information about
  * the ORDER BY (or GROUP BY) clause of query is being coded.
@@ -110,8 +128,6 @@ sql_space_info_new_from_expr_list(struct Parse *parser, struct ExprList *list,
 	if (has_rowid)
 		++n;
 	struct sql_space_info *info = sql_space_info_new(n, 0);
-	if (info == NULL)
-		return NULL;
 	for (int i = 0; i < list->nExpr; ++i) {
 		bool b;
 		struct coll *coll;
@@ -125,8 +141,10 @@ sql_space_info_new_from_expr_list(struct Parse *parser, struct ExprList *list,
 		if (type == FIELD_TYPE_ANY)
 			type = FIELD_TYPE_SCALAR;
 		uint32_t coll_id;
-		if (sql_expr_coll(parser, expr, &b, &coll_id, &coll) != 0)
+		if (sql_expr_coll(parser, expr, &b, &coll_id, &coll) != 0) {
+			sql_xfree(info);
 			return NULL;
+		}
 		info->types[i] = type;
 		info->coll_ids[i] = coll_id;
 	}
@@ -141,8 +159,6 @@ sql_space_info_new_from_order_by(struct Parse *parser, struct Select *select,
 {
 	int n = order_by->nExpr + 2;
 	struct sql_space_info *info = sql_space_info_new(n, 0);
-	if (info == NULL)
-		return NULL;
 	for (int i = 0; i < order_by->nExpr; ++i) {
 		struct Expr *expr = order_by->a[i].pExpr;
 		enum field_type type = sql_expr_type(expr);
@@ -158,8 +174,10 @@ sql_space_info_new_from_order_by(struct Parse *parser, struct Select *select,
 		if ((expr->flags & EP_Collate) != 0) {
 			bool b;
 			struct coll *coll;
-			if (sql_expr_coll(parser, expr, &b, id, &coll) != 0)
+			if (sql_expr_coll(parser, expr, &b, id, &coll) != 0) {
+				sql_xfree(info);
 				return NULL;
+			}
 			continue;
 		}
 		uint32_t fieldno = order_by->a[i].u.x.iOrderByCol - 1;
@@ -168,7 +186,7 @@ sql_space_info_new_from_order_by(struct Parse *parser, struct Select *select,
 		if (info->coll_ids[i] != COLL_NONE) {
 			const char *name = coll_by_id(info->coll_ids[i])->name;
 			order_by->a[i].pExpr =
-				sqlExprAddCollateString(parser, expr, name);
+				sqlExprAddCollateString(expr, name);
 		}
 	}
 	info->types[order_by->nExpr] = FIELD_TYPE_INTEGER;
@@ -198,8 +216,6 @@ sql_space_info_new_for_sorting(struct Parse *parser, struct ExprList *order_by,
 
 	struct sql_space_info *info =
 		sql_space_info_new(field_count, part_count);
-	if (info == NULL)
-		return NULL;
 	int k;
 	for (k = 0; k < order_by->nExpr - start; ++k) {
 		bool b;
@@ -214,8 +230,10 @@ sql_space_info_new_for_sorting(struct Parse *parser, struct ExprList *order_by,
 		if (type == FIELD_TYPE_ANY)
 			type = FIELD_TYPE_SCALAR;
 		uint32_t coll_id;
-		if (sql_expr_coll(parser, expr, &b, &coll_id, &coll) != 0)
+		if (sql_expr_coll(parser, expr, &b, &coll_id, &coll) != 0) {
+			sql_xfree(info);
 			return NULL;
+		}
 		info->types[k] = type;
 		info->coll_ids[k] = coll_id;
 		info->sort_orders[k] = order_by->a[k + start].sort_order;
@@ -229,12 +247,12 @@ sql_space_info_new_for_sorting(struct Parse *parser, struct ExprList *order_by,
 		bool b;
 		struct Expr *expr = list->a[i].pExpr;
 		enum field_type type = sql_expr_type(expr);
-		if (type == FIELD_TYPE_ANY)
-			type = FIELD_TYPE_SCALAR;
 		uint32_t id;
 		struct coll *coll;
-		if (sql_expr_coll(parser, expr, &b, &id, &coll) != 0)
+		if (sql_expr_coll(parser, expr, &b, &id, &coll) != 0) {
+			sql_xfree(info);
 			return NULL;
+		}
 		info->types[k] = type;
 		info->coll_ids[k] = id;
 		++k;
@@ -250,10 +268,7 @@ sql_key_info_new_from_space_info(const struct sql_space_info *info)
 	assert(part_count > 0);
 	uint32_t size = sizeof(struct sql_key_info) +
 			part_count * sizeof(struct key_part_def);
-	struct sql_key_info *key_info = sqlDbMallocRawNN(sql_get(), size);
-	if (key_info == NULL)
-		return NULL;
-	key_info->db = sql_get();
+	struct sql_key_info *key_info = sql_xmalloc(size);
 	key_info->key_def = NULL;
 	key_info->refs = 1;
 	key_info->part_count = part_count;
@@ -270,27 +285,45 @@ sql_key_info_new_from_space_info(const struct sql_space_info *info)
 	return key_info;
 }
 
+/* Drop fields with type field_type_MAX from space info. */
+static void
+sql_space_info_normalize(struct sql_space_info *info, uint32_t drop_count)
+{
+	for (uint32_t j = 0; j < drop_count; ++j) {
+		uint32_t k = 0;
+		for (; k < info->field_count - j - 1; ++k) {
+			if (info->types[k] == field_type_MAX)
+				break;
+		}
+		for (; k < info->field_count - j - 1; ++k) {
+			info->types[k] = info->types[k + 1];
+			info->coll_ids[k] = info->coll_ids[k + 1];
+		}
+	}
+	info->field_count -= drop_count;
+}
+
 /*
  * Delete all the content of a Select structure.  Deallocate the structure
  * itself only if bFree is true.
  */
 static void
-clearSelect(sql * db, Select * p, int bFree)
+clearSelect(struct Select *p, int bFree)
 {
 	while (p) {
 		Select *pPrior = p->pPrior;
-		sql_expr_list_delete(db, p->pEList);
-		sqlSrcListDelete(db, p->pSrc);
-		sql_expr_delete(db, p->pWhere, false);
-		sql_expr_list_delete(db, p->pGroupBy);
-		sql_expr_delete(db, p->pHaving, false);
-		sql_expr_list_delete(db, p->pOrderBy);
-		sql_expr_delete(db, p->pLimit, false);
-		sql_expr_delete(db, p->pOffset, false);
+		sql_expr_list_delete(p->pEList);
+		sqlSrcListDelete(p->pSrc);
+		sql_expr_delete(p->pWhere);
+		sql_expr_list_delete(p->pGroupBy);
+		sql_expr_delete(p->pHaving);
+		sql_expr_list_delete(p->pOrderBy);
+		sql_expr_delete(p->pLimit);
+		sql_expr_delete(p->pOffset);
 		if (p->pWith)
-			sqlWithDelete(db, p->pWith);
+			sqlWithDelete(p->pWith);
 		if (bFree)
-			sqlDbFree(db, p);
+			sql_xfree(p);
 		p = pPrior;
 		bFree = 1;
 	}
@@ -310,6 +343,20 @@ sqlSelectDestInit(SelectDest * pDest, int eDest, int iParm, int reg_eph)
 	pDest->nSdst = 0;
 }
 
+static bool
+is_same_sorting_direction(const struct ExprList *expr_list)
+{
+	if(expr_list == NULL)
+		return true;
+	enum sort_order reference_order = expr_list->a[0].sort_order;
+	for (int i = 1; i < expr_list->nExpr; i++) {
+		assert(expr_list->a[i].sort_order != SORT_ORDER_UNDEF);
+		if (expr_list->a[i].sort_order != reference_order)
+			return false;
+	}
+	return true;
+}
+
 /*
  * Allocate a new Select structure and return a pointer to that
  * structure.
@@ -327,12 +374,9 @@ sqlSelectNew(Parse * pParse,	/* Parsing context */
 		 Expr * pOffset)	/* OFFSET value.  NULL means no offset */
 {
 	Select standin;
-	sql *db = pParse->db;
 	if (pEList == 0) {
-		struct Expr *expr = sql_expr_new_anon(db, TK_ASTERISK);
-		if (expr == NULL)
-			pParse->is_aborted = true;
-		pEList = sql_expr_list_append(db, NULL, expr);
+		struct Expr *expr = sql_expr_new_anon(TK_ASTERISK);
+		pEList = sql_expr_list_append(NULL, expr);
 	}
 	standin.pEList = pEList;
 	standin.op = TK_SELECT;
@@ -345,12 +389,14 @@ sqlSelectNew(Parse * pParse,	/* Parsing context */
 		sqlSelectTrace = 0xfff;
 	else
 		sqlSelectTrace = 0;
+#else
+	(void)pParse;
 #endif
 	standin.addrOpenEphm[0] = -1;
 	standin.addrOpenEphm[1] = -1;
 	standin.nSelectRow = 0;
 	if (pSrc == 0)
-		pSrc = sqlDbMallocZero(db, sizeof(*pSrc));
+		pSrc = sql_xmalloc0(sizeof(*pSrc));
 	standin.pSrc = pSrc;
 	standin.pWhere = pWhere;
 	standin.pGroupBy = pGroupBy;
@@ -361,15 +407,8 @@ sqlSelectNew(Parse * pParse,	/* Parsing context */
 	standin.pLimit = pLimit;
 	standin.pOffset = pOffset;
 	standin.pWith = 0;
-	assert(pOffset == 0 || pLimit != 0 || pParse->is_aborted
-	       || db->mallocFailed != 0);
-	Select *pNew = sqlDbMallocRawNN(db, sizeof(*pNew));
-	if (db->mallocFailed) {
-		clearSelect(db, &standin, 0);
-		if (pNew != NULL)
-			sqlDbFree(db, pNew);
-		return NULL;
-	}
+	assert(pOffset == NULL || pLimit != NULL || pParse->is_aborted);
+	Select *pNew = sql_xmalloc(sizeof(*pNew));
 	assert(standin.pSrc != 0 || pParse->is_aborted);
 	memcpy(pNew, &standin, sizeof(standin));
 	return pNew;
@@ -389,10 +428,10 @@ sqlSelectSetName(Select * p, const char *zName)
 #endif
 
 void
-sql_select_delete(sql *db, Select *p)
+sql_select_delete(struct Select *p)
 {
 	if (p)
-		clearSelect(db, p, 1);
+		clearSelect(p, 1);
 }
 
 int
@@ -429,38 +468,24 @@ findRightmost(Select * p)
  * normalized: it is parser's business and in struct Select they
  * are already in uppercased or unquoted form.
  *
- * @param db Database handler.
  * @param list List of entries.
  * @param new_name Name of entity to be added.
  * @retval @list with new element on success, old one otherwise.
  */
 static struct SrcList *
-src_list_append_unique(struct sql *db, struct SrcList *list,
-		       const char *new_name)
+src_list_append_unique(struct SrcList *list, const char *new_name)
 {
 	assert(list != NULL);
 	assert(new_name != NULL);
 
 	for (int i = 0; i < list->nSrc; ++i) {
 		const char *name = list->a[i].zName;
-		if (name != NULL && strcmp(new_name, name) == 0)
+		if (strcmp(new_name, name) == 0)
 			return list;
 	}
-	struct SrcList *new_list =
-		sql_src_list_enlarge(db, list, 1, list->nSrc);
-	if (new_list == NULL) {
-		sqlSrcListDelete(db, list);
-		return NULL;
-	}
-	list = new_list;
+	list = sql_src_list_enlarge(list, 1, list->nSrc);
 	struct SrcList_item *pItem = &list->a[list->nSrc - 1];
-	pItem->zName = sqlDbStrNDup(db, new_name, strlen(new_name));
-	if (pItem->zName == NULL) {
-		diag_set(OutOfMemory, strlen(new_name), "sqlDbStrNDup",
-			 "pItem->zName");
-		sqlSrcListDelete(db, list);
-		return NULL;
-	}
+	pItem->zName = sql_xstrdup(new_name);
 	return list;
 }
 
@@ -473,10 +498,9 @@ select_collect_table_names(struct Walker *walker, struct Select *select)
 		if (select->pSrc->a[i].zName == NULL)
 			continue;
 		walker->u.pSrcList =
-			src_list_append_unique(sql_get(), walker->u.pSrcList,
+			src_list_append_unique(walker->u.pSrcList,
 					       select->pSrc->a[i].zName);
-		if (walker->u.pSrcList == NULL)
-			return WRC_Abort;
+		assert(walker->u.pSrcList != NULL);
 	}
 	return WRC_Continue;
 }
@@ -486,17 +510,14 @@ sql_select_expand_from_tables(struct Select *select)
 {
 	assert(select != NULL);
 	struct Walker walker;
-	struct SrcList *table_names = sql_src_list_new(sql_get());
-	if (table_names == NULL)
-		return NULL;
+	struct SrcList *table_names = sql_src_list_new();
+	table_names->nSrc = 0;
 	memset(&walker, 0, sizeof(walker));
 	walker.xExprCallback = sqlExprWalkNoop;
 	walker.xSelectCallback = select_collect_table_names;
 	walker.u.pSrcList = table_names;
-	if (sqlWalkSelect(&walker, select) != 0) {
-		sqlSrcListDelete(sql_get(), walker.u.pSrcList);
-		return NULL;
-	}
+	int rc = sqlWalkSelect(&walker, select);
+	assert(rc == WRC_Continue); (void)rc;
 	return walker.u.pSrcList;
 }
 
@@ -538,98 +559,6 @@ sql_select_constains_cte(struct Select *select, const char *name)
 		}
 	}
 	return false;
-}
-
-/*
- * Given 1 to 3 identifiers preceding the JOIN keyword, determine the
- * type of join.  Return an integer constant that expresses that type
- * in terms of the following bit values:
- *
- *     JT_INNER
- *     JT_CROSS
- *     JT_OUTER
- *     JT_NATURAL
- *     JT_LEFT
- *     JT_RIGHT
- *
- * A full outer join is the combination of JT_LEFT and JT_RIGHT.
- *
- * If an illegal or unsupported join type is seen, then still return
- * a join type, but put an error in the pParse structure.
- */
-int
-sqlJoinType(Parse * pParse, Token * pA, Token * pB, Token * pC)
-{
-	int jointype = 0;
-	Token *apAll[3];
-	Token *p;
-	/*   0123456789 123456789 123456789 123 */
-	static const char zKeyText[] = "naturaleftouterightfullinnercross";
-	static const struct {
-		u8 i;		/* Beginning of keyword text in zKeyText[] */
-		u8 nChar;	/* Length of the keyword in characters */
-		u8 code;	/* Join type mask */
-	} aKeyword[] = {
-		/* natural */  {
-		0, 7, JT_NATURAL},
-		    /* left    */  {
-		6, 4, JT_LEFT | JT_OUTER},
-		    /* outer   */  {
-		10, 5, JT_OUTER},
-		    /* right   */  {
-		14, 5, JT_RIGHT | JT_OUTER},
-		    /* full    */  {
-		19, 4, JT_LEFT | JT_RIGHT | JT_OUTER},
-		    /* inner   */  {
-		23, 5, JT_INNER},
-		    /* cross   */  {
-	28, 5, JT_INNER | JT_CROSS},};
-	int i, j;
-	apAll[0] = pA;
-	apAll[1] = pB;
-	apAll[2] = pC;
-	for (i = 0; i < 3 && apAll[i]; i++) {
-		p = apAll[i];
-		for (j = 0; j < ArraySize(aKeyword); j++) {
-			if (p->n == aKeyword[j].nChar
-			    && sqlStrNICmp((char *)p->z,
-					       &zKeyText[aKeyword[j].i],
-					       p->n) == 0) {
-				jointype |= aKeyword[j].code;
-				break;
-			}
-		}
-		testcase(j == 0 || j == 1 || j == 2 || j == 3 || j == 4
-			 || j == 5 || j == 6);
-		if (j >= ArraySize(aKeyword)) {
-			jointype |= JT_ERROR;
-			break;
-		}
-	}
-	if ((jointype & (JT_INNER | JT_OUTER)) == (JT_INNER | JT_OUTER) ||
-	    (jointype & JT_ERROR) != 0) {
-		assert(pB != 0);
-		const char *err;
-		if (pC == NULL) {
-			err = tt_sprintf("unknown or unsupported join type: "\
-					 "%.*s %.*s", pA->n, pA->z, pB->n,
-					 pB->z);
-		} else {
-			err = tt_sprintf("unknown or unsupported join type: "\
-					 "%.*s %.*s %.*s", pA->n, pA->z, pB->n,
-					 pB->z, pC->n, pC->z);
-		}
-		diag_set(ClientError, ER_SQL_PARSER_GENERIC, err);
-		pParse->is_aborted = true;
-		jointype = JT_INNER;
-	} else if ((jointype & JT_OUTER) != 0
-		   && (jointype & (JT_LEFT | JT_RIGHT)) != JT_LEFT) {
-		diag_set(ClientError, ER_UNSUPPORTED, "Tarantool",
-			 "RIGHT and FULL OUTER JOINs");
-		pParse->is_aborted = true;
-		jointype = JT_INNER;
-	}
-	return jointype;
 }
 
 /*
@@ -700,7 +629,6 @@ addWhereTerm(Parse * pParse,	/* Parsing context */
 	     int isOuterJoin,	/* True if this is an OUTER join */
 	     Expr ** ppWhere)	/* IN/OUT: The WHERE clause to add to */
 {
-	struct sql *db = pParse->db;
 	Expr *pEq;
 
 	assert(iLeft < iRight);
@@ -708,10 +636,8 @@ addWhereTerm(Parse * pParse,	/* Parsing context */
 	assert(pSrc->a[iLeft].space != NULL);
 	assert(pSrc->a[iRight].space != NULL);
 
-	struct Expr *pE1 = sql_expr_new_column(db, pSrc, iLeft, iColLeft);
-	struct Expr *pE2 = sql_expr_new_column(db, pSrc, iRight, iColRight);
-	if (pE1 == NULL || pE2 == NULL)
-		pParse->is_aborted = true;
+	struct Expr *pE1 = sql_expr_new_column(pSrc, iLeft, iColLeft);
+	struct Expr *pE2 = sql_expr_new_column(pSrc, iRight, iColRight);
 	pEq = sqlPExpr(pParse, TK_EQ, pE1, pE2);
 	if (pEq && isOuterJoin) {
 		ExprSetProperty(pEq, EP_FromJoin);
@@ -719,9 +645,7 @@ addWhereTerm(Parse * pParse,	/* Parsing context */
 		ExprSetVVAProperty(pEq, EP_NoReduce);
 		pEq->iRightJoinTable = (i16) pE2->iTable;
 	}
-	*ppWhere = sql_and_expr_new(db, *ppWhere, pEq);
-	if (*ppWhere == NULL)
-		pParse->is_aborted = true;
+	*ppWhere = sql_and_expr_new(*ppWhere, pEq);
 }
 
 /*
@@ -845,13 +769,12 @@ sqlProcessJoin(Parse * pParse, Select * p)
 		if (pRight->pOn) {
 			if (isOuter)
 				setJoinExpr(pRight->pOn, pRight->iCursor);
-			p->pWhere = sql_and_expr_new(pParse->db, p->pWhere,
-						     pRight->pOn);
-			if (p->pWhere == NULL)
-				pParse->is_aborted = true;
+			p->pWhere = sql_and_expr_new(p->pWhere, pRight->pOn);
 			pRight->pOn = 0;
 		}
 
+		if (pRight->pUsing == NULL)
+			continue;
 		/* Create extra terms on the WHERE clause for each column named
 		 * in the USING clause.  Example: If the two tables to be joined are
 		 * A and B and the USING clause names X, Y, and Z, then add this
@@ -859,32 +782,30 @@ sqlProcessJoin(Parse * pParse, Select * p)
 		 * Report an error if any column mentioned in the USING clause is
 		 * not contained in both tables to be joined.
 		 */
-		if (pRight->pUsing) {
-			const char *err = "cannot join using column %s - "\
-					  "column not present in both tables";
-			IdList *pList = pRight->pUsing;
-			for (j = 0; j < pList->nId; j++) {
-				char *zName;	/* Name of the term in the USING clause */
-				int iLeft;	/* Table on the left with matching column name */
-				int iLeftCol;	/* Column number of matching column on the left */
-				int iRightCol;	/* Column number of matching column on the right */
-
-				zName = pList->a[j].zName;
-				iRightCol = columnIndex(right_space->def, zName);
-				if (iRightCol < 0
-				    || !tableAndColumnIndex(pSrc, i + 1, zName,
-							    &iLeft, &iLeftCol)
-				    ) {
-					err = tt_sprintf(err, zName);
-					diag_set(ClientError,
-						 ER_SQL_PARSER_GENERIC, err);
-					pParse->is_aborted = true;
-					return 1;
-				}
-				addWhereTerm(pParse, pSrc, iLeft, iLeftCol,
-					     i + 1, iRightCol, isOuter,
-					     &p->pWhere);
+		for (int id = 0; id < pRight->pUsing->nId; ++id) {
+			struct IdList_item *item = &pRight->pUsing->a[id];
+			uint32_t fieldno_right = sql_fieldno_by_id(right_space,
+								   item);
+			uint32_t fieldno_left = UINT32_MAX;
+			int n;
+			for (n = 0; n <= i; ++n) {
+				const struct space *space = pSrc->a[n].space;
+				fieldno_left = sql_fieldno_by_id(space, item);
+				if (fieldno_left != UINT32_MAX)
+					break;
 			}
+			if (fieldno_left == UINT32_MAX ||
+			    fieldno_right == UINT32_MAX) {
+				diag_set(ClientError, ER_SQL_PARSER_GENERIC,
+					 tt_sprintf("cannot join using column "
+						    "%s - column not present "
+						    "in both tables",
+						    item->zName));
+				pParse->is_aborted = true;
+				return 1;
+			}
+			addWhereTerm(pParse, pSrc, n, fieldno_left, i + 1,
+				     fieldno_right, isOuter, &p->pWhere);
 		}
 	}
 	return 0;
@@ -983,12 +904,9 @@ pushOntoSorter(Parse * pParse,		/* Parser context */
 			    sqlVdbeAddOp1(v, OP_SequenceTest,
 					      pSort->iECursor);
 		}
-		VdbeCoverage(v);
 		sqlVdbeAddOp3(v, OP_Compare, regPrevKey, regBase,
 				  pSort->nOBSat);
 		pOp = sqlVdbeGetOp(v, pSort->addrSortIndex);
-		if (pParse->db->mallocFailed)
-			return;
 		pOp->p2 = nKey + nData;
 		assert(pOp->opcode == OP_OpenTEphemeral ||
 		       pOp->opcode == OP_SorterOpen);
@@ -1018,7 +936,6 @@ pushOntoSorter(Parse * pParse,		/* Parser context */
 		}
 		addrJmp = sqlVdbeCurrentAddr(v);
 		sqlVdbeAddOp3(v, OP_Jump, addrJmp + 1, 0, addrJmp + 1);
-		VdbeCoverage(v);
 		pSort->labelBkOut = sqlVdbeMakeLabel(v);
 		pSort->regReturn = ++pParse->nMem;
 		sqlVdbeAddOp2(v, OP_Gosub, pSort->regReturn,
@@ -1037,9 +954,9 @@ pushOntoSorter(Parse * pParse,		/* Parser context */
 	if (pSort->sortFlags & SORTFLAG_UseSorter) {
 		sqlVdbeAddOp2(v, OP_SorterInsert, pSort->iECursor,
 				  regRecord);
-	} else {
-		sqlVdbeAddOp2(v, OP_IdxInsert, regRecord, pSort->reg_eph);
+		return;
 	}
+	sqlVdbeAddOp2(v, OP_IdxInsert, regRecord, pSort->reg_eph);
 
 	if (iLimit) {
 		int addr;
@@ -1050,7 +967,6 @@ pushOntoSorter(Parse * pParse,		/* Parser context */
 		 * Thus we never hold more than the LIMIT+OFFSET rows in memory at once
 		 */
 		addr = sqlVdbeAddOp1(v, OP_IfNotZero, iLimit);
-		VdbeCoverage(v);
 		if (pSort->sortFlags & SORTFLAG_DESC) {
 			int iNextInstr = sqlVdbeCurrentAddr(v) + 1;
 			sqlVdbeAddOp2(v, OP_Rewind, pSort->iECursor, iNextInstr);
@@ -1074,7 +990,6 @@ pushOntoSorter(Parse * pParse,		/* Parser context */
 			int iBrk = sqlVdbeCurrentAddr(v) + 2;
 			sqlVdbeAddOp3(v, OP_Eq, regBase + nExpr, iBrk, r1);
 			sqlVdbeChangeP5(v, SQL_NULLEQ);
-			VdbeCoverage(v);
 		}
 		sqlVdbeJumpHere(v, addr);
 	}
@@ -1090,7 +1005,6 @@ codeOffset(Vdbe * v,		/* Generate code into this VM */
 {
 	if (iOffset > 0) {
 		sqlVdbeAddOp3(v, OP_IfPos, iOffset, iContinue, 1);
-		VdbeCoverage(v);
 		VdbeComment((v, "OFFSET"));
 	}
 }
@@ -1248,18 +1162,19 @@ selectInnerLoop(Parse * pParse,		/* The parser context */
 				if (op->opcode != OP_OpenTEphemeral)
 					continue;
 				struct sql_space_info *info = op->p4.space_info;
-				--info->field_count;
-				for (int k = j; k < pEList->nExpr; ++k) {
-					int n = k + pSort->pOrderBy->nExpr + 1;
-					info->types[n - 1] = info->types[n];
-					info->coll_ids[n - 1] =
-						info->coll_ids[n];
-				}
+				/* Mark fields to drop in info. */
+				info->types[j + pSort->pOrderBy->nExpr] =
+					field_type_MAX;
 			}
 			if (op->opcode != OP_OpenTEphemeral) {
 				assert(op->p2 - excess_field_count > 0);
 				sqlVdbeChangeP2(v, pSort->addrSortIndex,
 						op->p2 - excess_field_count);
+			} else {
+				struct sql_space_info *info = op->p4.space_info;
+				assert(info != NULL);
+				sql_space_info_normalize(info,
+							 excess_field_count);
 			}
 			regOrig = 0;
 			assert(eDest == SRT_Set || eDest == SRT_Mem
@@ -1322,13 +1237,11 @@ selectInnerLoop(Parse * pParse,		/* The parser context */
 								  regResult + i,
 								  iJump,
 								  regPrev + i);
-						VdbeCoverage(v);
 					} else {
 						sqlVdbeAddOp3(v, OP_Eq,
 								  regResult + i,
 								  iContinue,
 								  regPrev + i);
-						VdbeCoverage(v);
 					}
 					if (coll != NULL) {
 						sqlVdbeChangeP4(v, -1,
@@ -1337,8 +1250,7 @@ selectInnerLoop(Parse * pParse,		/* The parser context */
 					}
 					sqlVdbeChangeP5(v, SQL_NULLEQ);
 				}
-				assert(sqlVdbeCurrentAddr(v) == iJump
-				       || pParse->db->mallocFailed);
+				assert(sqlVdbeCurrentAddr(v) == iJump);
 				sqlVdbeAddOp3(v, OP_Copy, regResult,
 						  regPrev, nResultCol - 1);
 				break;
@@ -1402,10 +1314,6 @@ selectInnerLoop(Parse * pParse,		/* The parser context */
 	case SRT_Table:
 	case SRT_EphemTab:{
 			int r1 = sqlGetTempRange(pParse, nPrefixReg + 1);
-			testcase(eDest == SRT_Table);
-			testcase(eDest == SRT_EphemTab);
-			testcase(eDest == SRT_Fifo);
-			testcase(eDest == SRT_DistFifo);
 			sqlVdbeAddOp3(v, OP_MakeRecord, regResult,
 					  nResultCol, r1 + nPrefixReg);
 			/* Set flag to save memory allocating one by malloc. */
@@ -1421,7 +1329,6 @@ selectInnerLoop(Parse * pParse,		/* The parser context */
 				int addr = sqlVdbeCurrentAddr(v) + 6;
 				sqlVdbeAddOp4Int(v, OP_Found, iParm + 1,
 						     addr, r1, 0);
-				VdbeCoverage(v);
 				sqlVdbeAddOp2(v, OP_IdxInsert, r1,
 						  pDest->reg_eph + 1);
 				assert(pSort == 0);
@@ -1459,34 +1366,31 @@ selectInnerLoop(Parse * pParse,		/* The parser context */
 		 * item into the set table with bogus data.
 		 */
 	case SRT_Set:{
-			if (pSort) {
-				/* At first glance you would think we could optimize out the
-				 * ORDER BY in this case since the order of entries in the set
-				 * does not matter.  But there might be a LIMIT clause, in which
-				 * case the order does matter.
-				 */
-				pushOntoSorter(pParse, pSort, p, regResult,
-					       regOrig, nResultCol, nPrefixReg);
-			} else {
-				int r1 = sqlGetTempReg(pParse);
-				enum field_type *types =
-					field_type_sequence_dup(pParse,
-								pDest->dest_type,
-								nResultCol);
-				sqlVdbeAddOp4(v, OP_MakeRecord, regResult,
-						  nResultCol, r1, (char *)types,
-						  P4_DYNAMIC);
-				sql_expr_type_cache_change(pParse,
-							   regResult,
-							   nResultCol);
-				sqlVdbeAddOp2(v, OP_IdxInsert, r1, pDest->reg_eph);
-				sqlReleaseTempReg(pParse, r1);
-			}
-			break;
+		if (pSort != NULL) {
+			/*
+			 * At first glance you would think we could optimize out
+			 * the ORDER BY in this case since the order of entries
+			 * in the set does not matter. But there might be a
+			 * LIMIT clause, in which case the order does matter.
+			 */
+			pushOntoSorter(pParse, pSort, p, regResult,
+				       regOrig, nResultCol, nPrefixReg);
+		} else {
+			int r1 = sqlGetTempReg(pParse);
+			enum field_type *types =
+				field_type_sequence_dup(pDest->dest_type,
+							nResultCol);
+			sqlVdbeAddOp4(v, OP_MakeRecord, regResult, nResultCol,
+				      r1, (char *)types, P4_DYNAMIC);
+			sql_expr_type_cache_change(pParse, regResult,
+						   nResultCol);
+			sqlVdbeAddOp2(v, OP_IdxInsert, r1, pDest->reg_eph);
+			sqlReleaseTempReg(pParse, r1);
 		}
+		break;
+	}
 
-		/* If any row exist in the result set, record that fact and abort.
-		 */
+	/* If any row exist in the result set, record that fact and abort. */
 	case SRT_Exists:{
 			sqlVdbeAddOp2(v, OP_Bool, true, iParm);
 			/* The LIMIT clause will terminate the loop for us */
@@ -1512,8 +1416,6 @@ selectInnerLoop(Parse * pParse,		/* The parser context */
 
 	case SRT_Coroutine:	/* Send data to a co-routine */
 	case SRT_Output:{	/* Return the results */
-			testcase(eDest == SRT_Coroutine);
-			testcase(eDest == SRT_Output);
 			if (pSort) {
 				pushOntoSorter(pParse, pSort, p, regResult,
 					       regOrig, nResultCol, nPrefixReg);
@@ -1556,7 +1458,6 @@ selectInnerLoop(Parse * pParse,		/* The parser context */
 				    sqlVdbeAddOp4Int(v, OP_Found, iParm + 1,
 							 0, regResult,
 							 nResultCol);
-				VdbeCoverage(v);
 			}
 			sqlVdbeAddOp3(v, OP_MakeRecord, regResult,
 					  nResultCol, r3);
@@ -1595,10 +1496,8 @@ selectInnerLoop(Parse * pParse,		/* The parser context */
 	 * there is a sorter, in which case the sorter has already limited
 	 * the output for us.
 	 */
-	if (pSort == 0 && p->iLimit) {
+	if (pSort == 0 && p->iLimit)
 		sqlVdbeAddOp2(v, OP_DecrJumpZero, p->iLimit, iBreak);
-		VdbeCoverage(v);
-	}
 }
 
 static inline size_t
@@ -1608,16 +1507,15 @@ sql_key_info_sizeof(uint32_t part_count)
 		part_count * sizeof(struct key_part_def);
 }
 
-struct sql_key_info *
-sql_key_info_new(sql *db, uint32_t part_count)
+/**
+ * Allocate a key_info object sufficient for an index with
+ * the given number of key columns.
+ */
+static struct sql_key_info *
+sql_key_info_new(uint32_t part_count)
 {
-	struct sql_key_info *key_info = sqlDbMallocRawNN(db,
-				sql_key_info_sizeof(part_count));
-	if (key_info == NULL) {
-		sqlOomFault(db);
-		return NULL;
-	}
-	key_info->db = db;
+	struct sql_key_info *key_info =
+		sql_xmalloc(sql_key_info_sizeof(part_count));
 	key_info->key_def = NULL;
 	key_info->refs = 1;
 	key_info->part_count = part_count;
@@ -1652,7 +1550,7 @@ sql_key_info_unref(struct sql_key_info *key_info)
 	if (--key_info->refs == 0) {
 		if (key_info->key_def != NULL)
 			key_def_delete(key_info->key_def);
-		sqlDbFree(key_info->db, key_info);
+		sql_xfree(key_info);
 	}
 }
 
@@ -1661,7 +1559,7 @@ sql_key_info_to_key_def(struct sql_key_info *key_info)
 {
 	if (key_info->key_def == NULL) {
 		key_info->key_def = key_def_new(key_info->parts,
-						key_info->part_count, false);
+						key_info->part_count, 0);
 	}
 	return key_info->key_def;
 }
@@ -1670,9 +1568,7 @@ static struct sql_key_info *
 sql_expr_list_to_key_info(struct Parse *parse, struct ExprList *list, int start)
 {
 	int expr_count = list->nExpr;
-	struct sql_key_info *key_info = sql_key_info_new(parse->db, expr_count);
-	if (key_info == NULL)
-		return NULL;
+	struct sql_key_info *key_info = sql_key_info_new(expr_count);
 	struct ExprList_item *item = list->a + start;
 	for (int i = start; i < expr_count; ++i, ++item) {
 		struct key_part_def *part = &key_info->parts[i - start];
@@ -1681,7 +1577,7 @@ sql_expr_list_to_key_info(struct Parse *parse, struct ExprList *list, int start)
 		struct coll *unused_coll;
 		if (sql_expr_coll(parse, item->pExpr, &unused, &id,
 				  &unused_coll) != 0) {
-			sqlDbFree(parse->db, key_info);
+			sql_xfree(key_info);
 			return NULL;
 		}
 		part->coll_id = id;
@@ -1727,9 +1623,7 @@ explainTempTable(Parse * pParse, const char *zUsage)
 {
 	if (pParse->explain == 2) {
 		Vdbe *v = pParse->pVdbe;
-		char *zMsg =
-		    sqlMPrintf(pParse->db, "USE TEMP B-TREE FOR %s",
-				   zUsage);
+		char *zMsg = sqlMPrintf("USE TEMP B-TREE FOR %s", zUsage);
 		sqlVdbeAddOp4(v, OP_Explain, pParse->iSelectId, 0, 0, zMsg,
 				  P4_DYNAMIC);
 	}
@@ -1761,13 +1655,10 @@ explainComposite(Parse * pParse,	/* Parse context */
 	       || op == TK_ALL);
 	if (pParse->explain == 2) {
 		Vdbe *v = pParse->pVdbe;
-		char *zMsg =
-		    sqlMPrintf(pParse->db,
-				   "COMPOUND SUBQUERIES %d AND %d %s(%s)",
-				   iSub1, iSub2,
-				   bUseTmp ? "USING TEMP B-TREE " : "",
-				   sql_select_op_name(op)
-		    );
+		char *zMsg = sqlMPrintf("COMPOUND SUBQUERIES %d AND %d %s(%s)",
+					iSub1, iSub2, bUseTmp ?
+					"USING TEMP B-TREE " : "",
+					sql_select_op_name(op));
 		sqlVdbeAddOp4(v, OP_Explain, pParse->iSelectId, 0, 0, zMsg,
 				  P4_DYNAMIC);
 	}
@@ -1825,16 +1716,13 @@ generateSortTail(Parse * pParse,	/* Parsing context */
 	if (pSort->sortFlags & SORTFLAG_UseSorter) {
 		int regSortOut = ++pParse->nMem;
 		iSortTab = pParse->nTab++;
-		if (pSort->labelBkOut) {
+		if (pSort->labelBkOut)
 			addrOnce = sqlVdbeAddOp0(v, OP_Once);
-			VdbeCoverage(v);
-		}
 		sqlVdbeAddOp3(v, OP_OpenPseudo, iSortTab, regSortOut,
 				  nKey + 1 + nSortData);
 		if (addrOnce)
 			sqlVdbeJumpHere(v, addrOnce);
 		addr = 1 + sqlVdbeAddOp2(v, OP_SorterSort, iTab, addrBreak);
-		VdbeCoverage(v);
 		codeOffset(v, p->iOffset, addrContinue);
 		sqlVdbeAddOp3(v, OP_SorterData, iTab, regSortOut, iSortTab);
 		bSeq = 0;
@@ -1844,7 +1732,6 @@ generateSortTail(Parse * pParse,	/* Parsing context */
 		int opPositioning = (pSort->sortFlags & SORTFLAG_DESC) ?
 				    OP_Last : OP_Sort;
 		addr = 1 + sqlVdbeAddOp2(v, opPositioning, iTab, addrBreak);
-		VdbeCoverage(v);
 		codeOffset(v, p->iOffset, addrContinue);
 		iSortTab = iTab;
 		bSeq = 1;
@@ -1875,7 +1762,7 @@ generateSortTail(Parse * pParse,	/* Parsing context */
 		}
 	case SRT_Set:{
 			enum field_type *types =
-				field_type_sequence_dup(pParse, pDest->dest_type,
+				field_type_sequence_dup(pDest->dest_type,
 							nColumn);
 			sqlVdbeAddOp4(v, OP_MakeRecord, regRow, nColumn,
 					  regTupleid, (char *)types,
@@ -1890,8 +1777,6 @@ generateSortTail(Parse * pParse,	/* Parsing context */
 		}
 	default: {
 			assert(eDest == SRT_Output || eDest == SRT_Coroutine);
-			testcase(eDest == SRT_Output);
-			testcase(eDest == SRT_Coroutine);
 			if (eDest == SRT_Output) {
 				sqlVdbeAddOp2(v, OP_ResultRow, pDest->iSdst,
 						  nColumn);
@@ -1916,14 +1801,16 @@ generateSortTail(Parse * pParse,	/* Parsing context */
 	 */
 	sqlVdbeResolveLabel(v, addrContinue);
 	if (pSort->sortFlags & SORTFLAG_UseSorter) {
+		if (p->iLimit != 0) {
+			int iLimit = p->iOffset ? p->iOffset + 1 : p->iLimit;
+			sqlVdbeAddOp2(v, OP_DecrJumpZero, iLimit, addrBreak);
+		}
 		sqlVdbeAddOp2(v, OP_SorterNext, iTab, addr);
-		VdbeCoverage(v);
 	} else {
 		/* In case of DESC sorting cursor should move backward. */
 		int opPositioning = (pSort->sortFlags & SORTFLAG_DESC) ?
 				    OP_Prev : OP_Next;
 		sqlVdbeAddOp2(v, opPositioning, iTab, addr);
-		VdbeCoverage(v);
 	}
 	if (pSort->regReturn)
 		sqlVdbeAddOp1(v, OP_Return, pSort->regReturn);
@@ -1945,23 +1832,14 @@ generate_column_metadata(struct Parse *pParse, struct SrcList *pTabList,
 {
 	Vdbe *v = pParse->pVdbe;
 	int i, j;
-	sql *db = pParse->db;
 	/* If this is an EXPLAIN, skip this step */
 	if (pParse->explain) {
 		return;
 	}
 
-	if (pParse->colNamesSet || db->mallocFailed)
+	if (pParse->colNamesSet)
 		return;
 	assert(v != 0);
-	size_t size;
-	uint32_t *var_pos =
-		region_alloc_array(&pParse->region, typeof(var_pos[0]),
-				   pParse->nVar, &size);
-	if (var_pos == NULL) {
-		diag_set(OutOfMemory, size, "region_alloc_array", "var_pos");
-		return;
-	}
 	assert(pTabList != 0);
 	pParse->colNamesSet = 1;
 	bool is_full_meta = (pParse->sql_flags & SQL_FullMetadata) != 0;
@@ -1972,8 +1850,8 @@ generate_column_metadata(struct Parse *pParse, struct SrcList *pTabList,
 		p = pEList->a[i].pExpr;
 		if (NEVER(p == 0))
 			continue;
-		if (p->op == TK_VARIABLE)
-			var_pos[var_count++] = i;
+		if (sql_token_is_variable(p->op))
+			var_count++;
 		enum field_type type = sql_expr_type(p);
 		vdbe_metadata_set_col_type(v, i, field_type_strs[type]);
 		if (is_full_meta && (type == FIELD_TYPE_STRING ||
@@ -2048,13 +1926,14 @@ generate_column_metadata(struct Parse *pParse, struct SrcList *pTabList,
 	}
 	if (var_count == 0)
 		return;
-	v->var_pos = (uint32_t *) malloc(var_count * sizeof(uint32_t));
-	if (v->var_pos ==  NULL) {
-		diag_set(OutOfMemory, var_count * sizeof(uint32_t),
-			 "malloc", "v->var_pos");
-		return;
+	uint32_t *var_pos = xmalloc(var_count * sizeof(*var_pos));
+	for (int i = 0, j = 0; i < pEList->nExpr; i++) {
+		struct Expr *e = pEList->a[i].pExpr;
+		assert(e != NULL);
+		if (sql_token_is_variable(e->op))
+			var_pos[j++] = i;
 	}
-	memcpy(v->var_pos, var_pos, var_count * sizeof(uint32_t));
+	v->var_pos = var_pos;
 	v->res_var_count = var_count;
 }
 
@@ -2063,26 +1942,13 @@ generate_column_metadata(struct Parse *pParse, struct SrcList *pTabList,
  * that form the result set of a SELECT statement) compute appropriate
  * column names for a table that would hold the expression list.
  *
- * All column names will be unique.
- *
  * Only the column names are computed.  Column.zType, Column.zColl,
  * and other fields of Column are zeroed.
- *
- * Return 0 on success.  If a memory allocation error occurs,
- * store NULL in *paCol and 0 in *pnCol and return -1.
  */
-int
+void
 sqlColumnsFromExprList(Parse * parse, ExprList * expr_list,
 			   struct space_def *space_def)
 {
-	/* Database connection */
-	sql *db = parse->db;
-	u32 cnt;		/* Index added to make the name unique */
-	char *zName;		/* Column name */
-	int nName;		/* Size of name in zName[] */
-	Hash ht;		/* Hash table of column names */
-
-	sqlHashInit(&ht);
 	uint32_t column_count =
 		expr_list != NULL ? (uint32_t)expr_list->nExpr : 0;
 	/*
@@ -2092,13 +1958,13 @@ sqlColumnsFromExprList(Parse * parse, ExprList * expr_list,
 	 */
 	assert(space_def->fields == NULL);
 	struct region *region = &parse->region;
-	size_t size;
-	space_def->fields =
-		region_alloc_array(region, typeof(space_def->fields[0]),
-				   column_count, &size);
-	if (space_def->fields == NULL) {
-		sqlOomFault(db);
-		goto cleanup;
+	if (column_count > 0) {
+		space_def->fields =
+			xregion_alloc_array(region,
+					    typeof(space_def->fields[0]),
+					    column_count);
+	} else {
+		space_def->fields = NULL;
 	}
 	for (uint32_t i = 0; i < column_count; i++) {
 		memcpy(&space_def->fields[i], &field_def_default,
@@ -2113,7 +1979,8 @@ sqlColumnsFromExprList(Parse * parse, ExprList * expr_list,
 		 * Check if the column contains an "AS <name>"
 		 * phrase.
 		 */
-		if ((zName = expr_list->a[i].zName) == 0) {
+		const char *name = expr_list->a[i].zName;
+		if (name == NULL) {
 			struct Expr *pColExpr = expr_list->a[i].pExpr;
 			struct space_def *space_def = NULL;
 			while (pColExpr->op == TK_DOT) {
@@ -2126,62 +1993,22 @@ sqlColumnsFromExprList(Parse * parse, ExprList * expr_list,
 				int iCol = pColExpr->iColumn;
 				assert(iCol >= 0);
 				space_def = pColExpr->space_def;
-				zName = space_def->fields[iCol].name;
+				name = space_def->fields[iCol].name;
 			} else if (pColExpr->op == TK_ID) {
 				assert(!ExprHasProperty(pColExpr, EP_IntValue));
-				zName = pColExpr->u.zToken;
+				name = pColExpr->u.zToken;
 			}
 		}
-		if (zName == NULL) {
+		if (name == NULL) {
 			uint32_t idx = ++parse->autoname_i;
-			zName = sqlDbStrDup(db, sql_generate_column_name(idx));
-		} else {
-			zName = sqlDbStrDup(db, zName);
+			name = sql_generate_column_name(idx);
 		}
-
-		/* Make sure the column name is unique.  If the name is not unique,
-		 * append an integer to the name so that it becomes unique.
-		 */
-		cnt = 0;
-		while (zName && sqlHashFind(&ht, zName) != 0) {
-			nName = sqlStrlen30(zName);
-			if (nName > 0) {
-				int j;
-				for (j = nName - 1;
-				     j > 0 && sqlIsdigit(zName[j]); j--);
-				if (zName[j] == '_')
-					nName = j;
-			}
-			zName =
-			    sqlMPrintf(db, "%.*z_%u", nName, zName, ++cnt);
-		}
-		size_t name_len = strlen(zName);
-		void *field = &space_def->fields[i];
-		if (zName != NULL &&
-		    sqlHashInsert(&ht, zName, field) == field)
-			sqlOomFault(db);
-		space_def->fields[i].name = region_alloc(region, name_len + 1);
-		if (space_def->fields[i].name == NULL) {
-			sqlOomFault(db);
-			goto cleanup;
-		} else {
-			memcpy(space_def->fields[i].name, zName, name_len);
-			space_def->fields[i].name[name_len] = '\0';
-		}
+		size_t len = strlen(name);
+		assert(name != NULL);
+		space_def->fields[i].name = xregion_alloc(region, len + 1);
+		memcpy(space_def->fields[i].name, name, len);
+		space_def->fields[i].name[len] = '\0';
 	}
-cleanup:
-	sqlHashClear(&ht);
-	if (db->mallocFailed) {
-		/*
-		 * pTable->def could be not temporal in
-		 * sqlViewGetColumnNames so we need clean-up.
-		 */
-		space_def->fields = NULL;
-		space_def->field_count = 0;
-		return -1;
-	}
-	return 0;
-
 }
 
 /*
@@ -2200,19 +2027,12 @@ sqlSelectAddColumnTypeAndCollation(struct Parse *pParse,
 				       struct space_def *def,
 				       struct Select *pSelect)
 {
-	sql *db = pParse->db;
-	NameContext sNC;
 	Expr *p;
 	struct ExprList_item *a;
 
 	assert(pSelect != 0);
 	assert((pSelect->selFlags & SF_Resolved) != 0);
-	assert((int)def->field_count == pSelect->pEList->nExpr ||
-	       db->mallocFailed);
-	if (db->mallocFailed)
-		return;
-	memset(&sNC, 0, sizeof(sNC));
-	sNC.pSrcList = pSelect->pSrc;
+	assert((int)def->field_count == pSelect->pEList->nExpr);
 	a = pSelect->pEList->a;
 	for (uint32_t i = 0; i < def->field_count; i++) {
 		p = a[i].pExpr;
@@ -2227,59 +2047,21 @@ sqlSelectAddColumnTypeAndCollation(struct Parse *pParse,
 	}
 }
 
-/*
- * Given a SELECT statement, generate a space structure that describes
- * the result set of that SELECT.
- */
-struct space *
-sqlResultSetOfSelect(Parse * pParse, Select * pSelect)
-{
-	sql *db = pParse->db;
-
-	uint32_t saved_flags = pParse->sql_flags;
-	pParse->sql_flags = 0;
-	sqlSelectPrep(pParse, pSelect, 0);
-	if (pParse->is_aborted)
-		return NULL;
-	while (pSelect->pPrior)
-		pSelect = pSelect->pPrior;
-	pParse->sql_flags = saved_flags;
-	struct space *space = sql_template_space_new(pParse, NULL);
-	if (space == NULL)
-		return NULL;
-	/* The sqlResultSetOfSelect() is only used in contexts where lookaside
-	 * is disabled
-	 */
-	assert(db->lookaside.bDisable);
-	sqlColumnsFromExprList(pParse, pSelect->pEList, space->def);
-	sqlSelectAddColumnTypeAndCollation(pParse, space->def, pSelect);
-	if (db->mallocFailed)
-		return NULL;
-	return space;
-}
-
-/*
- * Get a VDBE for the given parser context.  Create a new one if necessary.
- * If an error occurs, return NULL and leave a message in pParse.
- */
+/** Get a VDBE for the given parser context. Create a new one if necessary. */
 static SQL_NOINLINE Vdbe *
 allocVdbe(Parse * pParse)
 {
-	Vdbe *v = pParse->pVdbe = sqlVdbeCreate(pParse);
-	if (v == NULL)
-		return NULL;
+	struct Vdbe *v = sqlVdbeCreate(pParse);
+	pParse->pVdbe = v;
 	v->sql_flags = pParse->sql_flags;
 	sqlVdbeAddOp2(v, OP_Init, 0, 1);
-	if (pParse->pToplevel == 0
-	    && OptimizationEnabled(pParse->db, SQL_FactorOutConst)
-	    ) {
+	if (pParse->pToplevel == 0 && OptimizationEnabled(SQL_FactorOutConst))
 		pParse->okConstFactor = 1;
-	}
 	return v;
 }
 
-Vdbe *
-sqlGetVdbe(Parse * pParse)
+struct Vdbe *
+sqlGetVdbe(struct Parse *pParse)
 {
 	Vdbe *v = pParse->pVdbe;
 	return v ? v : allocVdbe(pParse);
@@ -2329,9 +2111,8 @@ computeLimitRegisters(Parse * pParse, Select * p, int iBreak)
 		if((p->pLimit->flags & EP_Collate) != 0 ||
 		   (p->pOffset != NULL &&
 		   (p->pOffset->flags & EP_Collate) != 0)) {
-			diag_set(ClientError, ER_SQL_SYNTAX_NEAR_TOKEN,
-				 pParse->line_count, sizeof("COLLATE"),
-				 "COLLATE");
+			diag_set(ClientError, ER_SQL_PARSER_GENERIC,
+				 "COLLATE cannot be used in LIMIT and OFFSET");
 			pParse->is_aborted = true;
 			return;
 		}
@@ -2347,16 +2128,14 @@ computeLimitRegisters(Parse * pParse, Select * p, int iBreak)
 		sqlVdbeAddOp2(v, OP_Integer, 0, r1);
 		sqlVdbeAddOp3(v, OP_Ge, r1, positive_limit_label, iLimit);
 		/* Otherwise return an error and stop */
-		const char *err = tt_sprintf(tnt_errcode_desc(ER_SQL_EXECUTE),
-					     "Only positive integers are "\
-					     "allowed in the LIMIT clause");
+		const char *err = "Only positive integers are allowed in the "
+				  "LIMIT clause";
 		sqlVdbeResolveLabel(v, halt_label);
 		sqlVdbeAddOp4(v, OP_SetDiag, ER_SQL_EXECUTE, 0, 0, err,
 			      P4_STATIC);
 		sqlVdbeAddOp1(v, OP_Halt, -1);
 
 		sqlVdbeResolveLabel(v, positive_limit_label);
-		VdbeCoverage(v);
 		VdbeComment((v, "LIMIT counter"));
 		sqlVdbeAddOp3(v, OP_Eq, r1, iBreak, iLimit);
 		sqlReleaseTempReg(pParse, r1);
@@ -2380,10 +2159,8 @@ computeLimitRegisters(Parse * pParse, Select * p, int iBreak)
 				sqlVdbeAddOp2(v, OP_Integer, 1, r1);
 				int no_err = sqlVdbeMakeLabel(v);
 				sqlVdbeAddOp3(v, OP_Eq, iLimit, no_err, r1);
-				err = tnt_errcode_desc(ER_SQL_EXECUTE);
-				err = tt_sprintf(err, "Expression subquery "\
-						 "could be limited only "\
-						 "with 1");
+				err = "Expression subquery could be limited "
+				      "only with 1";
 				sqlVdbeAddOp4(v, OP_SetDiag, ER_SQL_EXECUTE, 0,
 					      0, err, P4_STATIC);
 				sqlVdbeAddOp1(v, OP_Halt, -1);
@@ -2407,9 +2184,8 @@ computeLimitRegisters(Parse * pParse, Select * p, int iBreak)
 
             		sqlVdbeAddOp3(v, OP_Ge, r1, positive_offset_label, iOffset);
 			/* Otherwise return an error and stop */
-			err = tt_sprintf(tnt_errcode_desc(ER_SQL_EXECUTE),
-					 "Only positive integers are allowed "\
-					 "in the OFFSET clause");
+			err = "Only positive integers are allowed in the "
+			      "OFFSET clause";
 			sqlVdbeResolveLabel(v, offset_error_label);
 			sqlVdbeAddOp4(v, OP_SetDiag, ER_SQL_EXECUTE, 0, 0, err,
 				      P4_STATIC);
@@ -2417,7 +2193,6 @@ computeLimitRegisters(Parse * pParse, Select * p, int iBreak)
 
 			sqlVdbeResolveLabel(v, positive_offset_label);
             		sqlReleaseTempReg(pParse, r1);
-			VdbeCoverage(v);
 			VdbeComment((v, "OFFSET counter"));
 			sqlVdbeAddOp3(v, OP_OffsetLimit, iLimit,
 					  iOffset + 1, iOffset);
@@ -2502,13 +2277,7 @@ sql_multiselect_orderby_to_key_info(struct Parse *parse, struct Select *s,
 				   int extra)
 {
 	int ob_count = s->pOrderBy->nExpr;
-	struct sql_key_info *key_info = sql_key_info_new(parse->db,
-							 ob_count + extra);
-	if (key_info == NULL) {
-		sqlOomFault(parse->db);
-		return NULL;
-	}
-
+	struct sql_key_info *key_info = sql_key_info_new(ob_count + extra);
 	ExprList *order_by = s->pOrderBy;
 	for (int i = 0; i < ob_count; i++) {
 		struct key_part_def *part = &key_info->parts[i];
@@ -2519,16 +2288,17 @@ sql_multiselect_orderby_to_key_info(struct Parse *parse, struct Select *s,
 		if ((term->flags & EP_Collate) != 0) {
 			struct coll *unused_coll;
 			if (sql_expr_coll(parse, term, &unused, &id,
-					  &unused_coll) != 0)
-				return 0;
+					  &unused_coll) != 0) {
+				sql_xfree(key_info);
+				return NULL;
+			}
 		} else {
 			id = multi_select_coll_seq(parse, s,
 						   item->u.x.iOrderByCol - 1);
 			if (id != COLL_NONE) {
 				const char *name = coll_by_id(id)->name;
 				order_by->a[i].pExpr =
-					sqlExprAddCollateString(parse, term,
-								    name);
+					sqlExprAddCollateString(term, name);
 			}
 		}
 		part->coll_id = id;
@@ -2646,6 +2416,8 @@ generateWithRecursiveQuery(Parse * pParse,	/* Parsing context */
 		info = sql_space_info_new_from_expr_list(pParse, p->pEList,
 							 true);
 	}
+	/* Detach the ORDER BY clause from the compound SELECT */
+	p->pOrderBy = NULL;
 	if (info == NULL) {
 		pParse->is_aborted = true;
 		goto end_of_recursive_query;
@@ -2661,9 +2433,6 @@ generateWithRecursiveQuery(Parse * pParse,	/* Parsing context */
 		VdbeComment((v, "Distinct table"));
 	}
 
-	/* Detach the ORDER BY clause from the compound SELECT */
-	p->pOrderBy = 0;
-
 	/* Store the results of the setup-query in Queue. */
 	pSetup->pNext = 0;
 	rc = sqlSelect(pParse, pSetup, &destQueue);
@@ -2673,7 +2442,6 @@ generateWithRecursiveQuery(Parse * pParse,	/* Parsing context */
 
 	/* Find the next row in the Queue and output that row */
 	addrTop = sqlVdbeAddOp2(v, OP_Rewind, iQueue, addrBreak);
-	VdbeCoverage(v);
 
 	/* Transfer the next row in Queue over to Current */
 	sqlVdbeAddOp1(v, OP_NullRow, iCurrent);	/* To reset column cache */
@@ -2690,10 +2458,8 @@ generateWithRecursiveQuery(Parse * pParse,	/* Parsing context */
 	codeOffset(v, regOffset, addrCont);
 	selectInnerLoop(pParse, p, p->pEList, iCurrent,
 			0, 0, pDest, addrCont, addrBreak);
-	if (regLimit) {
+	if (regLimit)
 		sqlVdbeAddOp2(v, OP_DecrJumpZero, regLimit, addrBreak);
-		VdbeCoverage(v);
-	}
 	sqlVdbeResolveLabel(v, addrCont);
 
 	/* Execute the recursive SELECT taking the single row in Current as
@@ -2715,7 +2481,7 @@ generateWithRecursiveQuery(Parse * pParse,	/* Parsing context */
 	sqlVdbeResolveLabel(v, addrBreak);
 
  end_of_recursive_query:
-	sql_expr_list_delete(pParse->db, p->pOrderBy);
+	sql_expr_list_delete(p->pOrderBy);
 	p->pOrderBy = pOrderBy;
 	p->pLimit = pLimit;
 	p->pOffset = pOffset;
@@ -2820,7 +2586,6 @@ multiSelect(Parse * pParse,	/* Parsing context */
 	Vdbe *v;		/* Generate code to this VDBE */
 	SelectDest dest;	/* Alternative data destination */
 	Select *pDelete = 0;	/* Chain of simple selects to delete */
-	sql *db;		/* Database connection */
 	int iSub1 = 0;		/* EQP id of left-hand query */
 	int iSub2 = 0;		/* EQP id of right-hand query */
 
@@ -2830,7 +2595,6 @@ multiSelect(Parse * pParse,	/* Parsing context */
 	assert(p && p->pPrior);	/* Calling function guarantees this much */
 	assert((p->selFlags & SF_Recursive) == 0 || p->op == TK_ALL
 	       || p->op == TK_UNION);
-	db = pParse->db;
 	pPrior = p->pPrior;
 	dest = *pDest;
 	if (pPrior->pOrderBy) {
@@ -2936,7 +2700,6 @@ multiSelect(Parse * pParse,	/* Parsing context */
 				}
 				iSub2 = pParse->iNextSelectId;
 				rc = sqlSelect(pParse, p, &dest);
-				testcase(rc != 0);
 				pDelete = p->pPrior;
 				p->pPrior = pPrior;
 				p->nSelectRow =
@@ -2966,8 +2729,6 @@ multiSelect(Parse * pParse,	/* Parsing context */
 				int addr;
 				SelectDest uniondest;
 
-				testcase(p->op == TK_EXCEPT);
-				testcase(p->op == TK_UNION);
 				priorOp = SRT_Union;
 				if (dest.eDest == priorOp) {
 					/* We can reuse a temporary table generated by a SELECT to our
@@ -3022,11 +2783,10 @@ multiSelect(Parse * pParse,	/* Parsing context */
 				uniondest.eDest = op;
 				iSub2 = pParse->iNextSelectId;
 				rc = sqlSelect(pParse, p, &uniondest);
-				testcase(rc != 0);
 				/* Query flattening in sqlSelect() might refill p->pOrderBy.
 				 * Be sure to delete p->pOrderBy, therefore, to avoid a memory leak.
 				 */
-				sql_expr_list_delete(db, p->pOrderBy);
+				sql_expr_list_delete(p->pOrderBy);
 				pDelete = p->pPrior;
 				p->pPrior = pPrior;
 				p->pOrderBy = 0;
@@ -3036,7 +2796,7 @@ multiSelect(Parse * pParse,	/* Parsing context */
 							     pPrior->
 							     nSelectRow);
 				}
-				sql_expr_delete(db, p->pLimit, false);
+				sql_expr_delete(p->pLimit);
 				p->pLimit = pLimit;
 				p->pOffset = pOffset;
 				p->iLimit = 0;
@@ -3064,7 +2824,6 @@ multiSelect(Parse * pParse,	/* Parsing context */
 							      iBreak);
 					sqlVdbeAddOp2(v, OP_Rewind,
 							  unionTab, iBreak);
-					VdbeCoverage(v);
 					iStart = sqlVdbeCurrentAddr(v);
 					selectInnerLoop(pParse, p, p->pEList,
 							unionTab, 0, 0, &dest,
@@ -3072,7 +2831,6 @@ multiSelect(Parse * pParse,	/* Parsing context */
 					sqlVdbeResolveLabel(v, iCont);
 					sqlVdbeAddOp2(v, OP_Next, unionTab,
 							  iStart);
-					VdbeCoverage(v);
 					sqlVdbeResolveLabel(v, iBreak);
 					sqlVdbeAddOp2(v, OP_Close, unionTab,
 							  0);
@@ -3134,12 +2892,11 @@ multiSelect(Parse * pParse,	/* Parsing context */
 				intersectdest.reg_eph = reg_eph2;
 				iSub2 = pParse->iNextSelectId;
 				rc = sqlSelect(pParse, p, &intersectdest);
-				testcase(rc != 0);
 				pDelete = p->pPrior;
 				p->pPrior = pPrior;
 				if (p->nSelectRow > pPrior->nSelectRow)
 					p->nSelectRow = pPrior->nSelectRow;
-				sql_expr_delete(db, p->pLimit, false);
+				sql_expr_delete(p->pLimit);
 				p->pLimit = pLimit;
 				p->pOffset = pOffset;
 
@@ -3159,19 +2916,16 @@ multiSelect(Parse * pParse,	/* Parsing context */
 				iCont = sqlVdbeMakeLabel(v);
 				computeLimitRegisters(pParse, p, iBreak);
 				sqlVdbeAddOp2(v, OP_Rewind, tab1, iBreak);
-				VdbeCoverage(v);
 				r1 = sqlGetTempReg(pParse);
 				iStart =
 				    sqlVdbeAddOp2(v, OP_RowData, tab1, r1);
 				sqlVdbeAddOp4Int(v, OP_NotFound, tab2,
 						     iCont, r1, 0);
-				VdbeCoverage(v);
 				sqlReleaseTempReg(pParse, r1);
 				selectInnerLoop(pParse, p, p->pEList, tab1,
 						0, 0, &dest, iCont, iBreak);
 				sqlVdbeResolveLabel(v, iCont);
 				sqlVdbeAddOp2(v, OP_Next, tab1, iStart);
-				VdbeCoverage(v);
 				sqlVdbeResolveLabel(v, iBreak);
 				sqlVdbeAddOp2(v, OP_Close, tab2, 0);
 				sqlVdbeAddOp2(v, OP_Close, tab1, 0);
@@ -3194,10 +2948,6 @@ multiSelect(Parse * pParse,	/* Parsing context */
 		assert(p->pNext == NULL);
 		int nCol = p->pEList->nExpr;
 		struct sql_space_info *info = sql_space_info_new(nCol, 0);
-		if (info == NULL) {
-			pParse->is_aborted = true;
-			goto multi_select_end;
-		}
 		for (int i = 0; i < nCol; ++i)
 			info->coll_ids[i] = multi_select_coll_seq(pParse, p, i);
 		bool is_info_used = false;
@@ -3220,13 +2970,13 @@ multiSelect(Parse * pParse,	/* Parsing context */
 			}
 		}
 		if (!is_info_used)
-			sqlDbFree(pParse->db, info);
+			sql_xfree(info);
 	}
 
  multi_select_end:
 	pDest->iSdst = dest.iSdst;
 	pDest->nSdst = dest.nSdst;
-	sql_select_delete(db, pDelete);
+	sql_select_delete(pDelete);
 	return rc;
 }
 
@@ -3280,21 +3030,17 @@ generateOutputSubroutine(struct Parse *parse, struct Select *p,
 	if (reg_prev) {
 		int addr1, addr2;
 		addr1 = sqlVdbeAddOp1(v, OP_IfNot, reg_prev);
-		VdbeCoverage(v);
 		addr2 =
 		    sqlVdbeAddOp4(v, OP_Compare, in->iSdst, reg_prev + 1,
 				      in->nSdst,
 				      (char *)sql_key_info_ref(key_info),
 				      P4_KEYINFO);
 		sqlVdbeAddOp3(v, OP_Jump, addr2 + 2, iContinue, addr2 + 2);
-		VdbeCoverage(v);
 		sqlVdbeJumpHere(v, addr1);
 		sqlVdbeAddOp3(v, OP_Copy, in->iSdst, reg_prev + 1,
 				  in->nSdst - 1);
 		sqlVdbeAddOp2(v, OP_Bool, true, reg_prev);
 	}
-	if (parse->db->mallocFailed)
-		return 0;
 
 	/* Suppress the first OFFSET entries if there is an OFFSET clause
 	 */
@@ -3325,10 +3071,9 @@ generateOutputSubroutine(struct Parse *parse, struct Select *p,
 		 */
 	case SRT_Set:{
 			int r1;
-			testcase(in->nSdst > 1);
 			r1 = sqlGetTempReg(parse);
 			enum field_type *types =
-				field_type_sequence_dup(parse, dest->dest_type,
+				field_type_sequence_dup(dest->dest_type,
 							in->nSdst);
 			sqlVdbeAddOp4(v, OP_MakeRecord, in->iSdst,
 					  in->nSdst, r1, (char *)types,
@@ -3346,7 +3091,6 @@ generateOutputSubroutine(struct Parse *parse, struct Select *p,
 		 */
 	case SRT_Mem:{
 			assert(in->nSdst == 1 || parse->is_aborted);
-			testcase(in->nSdst != 1);
 			sqlExprCodeMove(parse, in->iSdst, dest->iSDParm,
 					    1);
 			/* The LIMIT clause will jump out of the loop for us */
@@ -3386,10 +3130,8 @@ generateOutputSubroutine(struct Parse *parse, struct Select *p,
 
 	/* Jump to the end of the loop if the LIMIT is reached.
 	 */
-	if (p->iLimit) {
+	if (p->iLimit)
 		sqlVdbeAddOp2(v, OP_DecrJumpZero, p->iLimit, break_addr);
-		VdbeCoverage(v);
-	}
 
 	/* Generate the subroutine return
 	 */
@@ -3521,7 +3263,6 @@ multiSelectOrderBy(Parse * pParse,	/* Parsing context */
 	struct sql_key_info *key_info_dup = NULL;
 	/* Comparison information for merging rows */
 	struct sql_key_info *key_info_merge;
-	sql *db;		/* Database connection */
 	ExprList *pOrderBy;	/* The ORDER BY clause */
 	int nOrderBy;		/* Number of terms in the ORDER BY clause */
 	int *aPermute;		/* Mapping from ORDER BY terms to result set columns */
@@ -3529,7 +3270,6 @@ multiSelectOrderBy(Parse * pParse,	/* Parsing context */
 	int iSub2;		/* EQP id of right-hand query */
 
 	assert(p->pOrderBy != 0);
-	db = pParse->db;
 	v = pParse->pVdbe;
 	assert(v != 0);		/* Already thrown the error if VDBE alloc failed */
 	labelEnd = sqlVdbeMakeLabel(v);
@@ -3549,7 +3289,7 @@ multiSelectOrderBy(Parse * pParse,	/* Parsing context */
 	 * terms to the ORDER BY clause as necessary.
 	 */
 	if (op != TK_ALL) {
-		for (i = 1; db->mallocFailed == 0 && i <= p->pEList->nExpr; i++) {
+		for (i = 1; i <= p->pEList->nExpr; i++) {
 			struct ExprList_item *pItem;
 			for (j = 0, pItem = pOrderBy->a; j < nOrderBy;
 			     j++, pItem++) {
@@ -3559,18 +3299,12 @@ multiSelectOrderBy(Parse * pParse,	/* Parsing context */
 			}
 			if (j == nOrderBy) {
 				struct Expr *pNew =
-					sql_expr_new_anon(db, TK_INTEGER);
-				if (pNew == NULL) {
-					pParse->is_aborted = true;
-					return 1;
-				}
+					sql_expr_new_anon(TK_INTEGER);
 				pNew->flags |= EP_IntValue;
 				pNew->u.iValue = i;
-				pOrderBy = sql_expr_list_append(pParse->db,
-								pOrderBy, pNew);
-				if (pOrderBy)
-					pOrderBy->a[nOrderBy++].u.x.
-					    iOrderByCol = (u16) i;
+				pNew->type = FIELD_TYPE_INTEGER;
+				pOrderBy = sql_expr_list_append(pOrderBy, pNew);
+				pOrderBy->a[nOrderBy++].u.x.iOrderByCol = i;
 			}
 		}
 	}
@@ -3582,25 +3316,20 @@ multiSelectOrderBy(Parse * pParse,	/* Parsing context */
 	 * to the right and the left are evaluated, they use the correct
 	 * collation.
 	 */
-	aPermute = sqlDbMallocRawNN(db, sizeof(int) * (nOrderBy + 1));
-	if (aPermute) {
-		struct ExprList_item *pItem;
-		aPermute[0] = nOrderBy;
-		for (i = 1, pItem = pOrderBy->a; i <= nOrderBy; i++, pItem++) {
-			assert(pItem->u.x.iOrderByCol > 0);
-			assert(pItem->u.x.iOrderByCol <= p->pEList->nExpr);
-			aPermute[i] = pItem->u.x.iOrderByCol - 1;
-		}
-		key_info_merge = sql_multiselect_orderby_to_key_info(pParse,
-								     p, 1);
-	} else {
-		key_info_merge = NULL;
+	aPermute = sql_xmalloc(sizeof(int) * (nOrderBy + 1));
+	struct ExprList_item *pItem;
+	aPermute[0] = nOrderBy;
+	for (i = 1, pItem = pOrderBy->a; i <= nOrderBy; i++, pItem++) {
+		assert(pItem->u.x.iOrderByCol > 0);
+		assert(pItem->u.x.iOrderByCol <= p->pEList->nExpr);
+		aPermute[i] = pItem->u.x.iOrderByCol - 1;
 	}
+	key_info_merge = sql_multiselect_orderby_to_key_info(pParse, p, 1);
 
 	/* Reattach the ORDER BY clause to the query.
 	 */
 	p->pOrderBy = pOrderBy;
-	pPrior->pOrderBy = sql_expr_list_dup(pParse->db, pOrderBy, 0);
+	pPrior->pOrderBy = sql_expr_list_dup(pOrderBy, 0);
 
 	/* Allocate a range of temporary registers and the key_info needed
 	 * for the logic that removes duplicate result rows when the
@@ -3610,16 +3339,14 @@ multiSelectOrderBy(Parse * pParse,	/* Parsing context */
 		regPrev = 0;
 	} else {
 		int expr_count = p->pEList->nExpr;
-		assert(nOrderBy >= expr_count || db->mallocFailed);
+		assert(nOrderBy >= expr_count);
 		regPrev = pParse->nMem + 1;
 		pParse->nMem += expr_count + 1;
 		sqlVdbeAddOp2(v, OP_Bool, 0, regPrev);
-		key_info_dup = sql_key_info_new(db, expr_count);
-		if (key_info_dup != NULL) {
-			for (int i = 0; i < expr_count; i++) {
-				key_info_dup->parts[i].coll_id =
-					multi_select_coll_seq(pParse, p, i);
-			}
+		key_info_dup = sql_key_info_new(expr_count);
+		for (int i = 0; i < expr_count; i++) {
+			key_info_dup->parts[i].coll_id =
+				multi_select_coll_seq(pParse, p, i);
 		}
 	}
 
@@ -3645,9 +3372,9 @@ multiSelectOrderBy(Parse * pParse,	/* Parsing context */
 	} else {
 		regLimitA = regLimitB = 0;
 	}
-	sql_expr_delete(db, p->pLimit, false);
+	sql_expr_delete(p->pLimit);
 	p->pLimit = 0;
-	sql_expr_delete(db, p->pOffset, false);
+	sql_expr_delete(p->pOffset);
 	p->pOffset = 0;
 
 	regAddrA = ++pParse->nMem;
@@ -3718,7 +3445,6 @@ multiSelectOrderBy(Parse * pParse,	/* Parsing context */
 		addrEofA = sqlVdbeAddOp2(v, OP_Gosub, regOutB, addrOutB);
 		addrEofA_noB =
 		    sqlVdbeAddOp2(v, OP_Yield, regAddrB, labelEnd);
-		VdbeCoverage(v);
 		sqlVdbeGoto(v, addrEofA);
 		p->nSelectRow =
 		    sqlLogEstAdd(p->nSelectRow, pPrior->nSelectRow);
@@ -3735,7 +3461,6 @@ multiSelectOrderBy(Parse * pParse,	/* Parsing context */
 		VdbeNoopComment((v, "eof-B subroutine"));
 		addrEofB = sqlVdbeAddOp2(v, OP_Gosub, regOutA, addrOutA);
 		sqlVdbeAddOp2(v, OP_Yield, regAddrA, labelEnd);
-		VdbeCoverage(v);
 		sqlVdbeGoto(v, addrEofB);
 	}
 
@@ -3744,7 +3469,6 @@ multiSelectOrderBy(Parse * pParse,	/* Parsing context */
 	VdbeNoopComment((v, "A-lt-B subroutine"));
 	addrAltB = sqlVdbeAddOp2(v, OP_Gosub, regOutA, addrOutA);
 	sqlVdbeAddOp2(v, OP_Yield, regAddrA, addrEofA);
-	VdbeCoverage(v);
 	sqlVdbeGoto(v, labelCmpr);
 
 	/* Generate code to handle the case of A==B
@@ -3757,7 +3481,6 @@ multiSelectOrderBy(Parse * pParse,	/* Parsing context */
 	} else {
 		VdbeNoopComment((v, "A-eq-B subroutine"));
 		addrAeqB = sqlVdbeAddOp2(v, OP_Yield, regAddrA, addrEofA);
-		VdbeCoverage(v);
 		sqlVdbeGoto(v, labelCmpr);
 	}
 
@@ -3769,16 +3492,13 @@ multiSelectOrderBy(Parse * pParse,	/* Parsing context */
 		sqlVdbeAddOp2(v, OP_Gosub, regOutB, addrOutB);
 	}
 	sqlVdbeAddOp2(v, OP_Yield, regAddrB, addrEofB);
-	VdbeCoverage(v);
 	sqlVdbeGoto(v, labelCmpr);
 
 	/* This code runs once to initialize everything.
 	 */
 	sqlVdbeJumpHere(v, addr1);
 	sqlVdbeAddOp2(v, OP_Yield, regAddrA, addrEofA_noB);
-	VdbeCoverage(v);
 	sqlVdbeAddOp2(v, OP_Yield, regAddrB, addrEofB);
-	VdbeCoverage(v);
 
 	/* Implement the main merge loop
 	 */
@@ -3789,7 +3509,6 @@ multiSelectOrderBy(Parse * pParse,	/* Parsing context */
 			  (char *)key_info_merge, P4_KEYINFO);
 	sqlVdbeChangeP5(v, OPFLAG_PERMUTE);
 	sqlVdbeAddOp3(v, OP_Jump, addrAltB, addrAeqB, addrAgtB);
-	VdbeCoverage(v);
 
 	/* Jump to the this point in order to terminate the query.
 	 */
@@ -3808,7 +3527,7 @@ multiSelectOrderBy(Parse * pParse,	/* Parsing context */
 	 * by the calling function
 	 */
 	if (p->pPrior) {
-		sql_select_delete(db, p->pPrior);
+		sql_select_delete(p->pPrior);
 	}
 	p->pPrior = pPrior;
 	pPrior->pNext = p;
@@ -3842,7 +3561,6 @@ substExpr(Parse * pParse,	/* Report errors here */
 	  int iTable,		/* Table to be substituted */
 	  ExprList * pEList)	/* Substitute expressions */
 {
-	sql *db = pParse->db;
 	if (pExpr == 0)
 		return 0;
 	if (pExpr->op == TK_COLUMN_REF && pExpr->iTable == iTable) {
@@ -3861,13 +3579,13 @@ substExpr(Parse * pParse,	/* Report errors here */
 					 expr_count, 1);
 				pParse->is_aborted = true;
 			} else {
-				pNew = sqlExprDup(db, pCopy, 0);
+				pNew = sqlExprDup(pCopy, 0);
 				if (pNew && (pExpr->flags & EP_FromJoin)) {
 					pNew->iRightJoinTable =
 					    pExpr->iRightJoinTable;
 					pNew->flags |= EP_FromJoin;
 				}
-				sql_expr_delete(db, pExpr, false);
+				sql_expr_delete(pExpr);
 				pExpr = pNew;
 			}
 		}
@@ -3920,13 +3638,8 @@ substSelect(Parse * pParse,	/* Report errors here */
 		p->pWhere = substExpr(pParse, p->pWhere, iTable, pEList);
 		pSrc = p->pSrc;
 		assert(pSrc != 0);
-		for (i = pSrc->nSrc, pItem = pSrc->a; i > 0; i--, pItem++) {
+		for (i = pSrc->nSrc, pItem = pSrc->a; i > 0; i--, pItem++)
 			substSelect(pParse, pItem->pSelect, iTable, pEList, 1);
-			if (pItem->fg.isTabFunc) {
-				substExprList(pParse, pItem->u1.pFuncArg,
-					      iTable, pEList);
-			}
-		}
 	} while (doPrior && (p = p->pPrior) != 0);
 }
 
@@ -4086,13 +3799,12 @@ flattenSubquery(Parse * pParse,		/* Parsing context */
 	int i;			/* Loop counter */
 	Expr *pWhere;		/* The WHERE clause */
 	struct SrcList_item *pSubitem;	/* The subquery */
-	sql *db = pParse->db;
 
 	/* Check to see if flattening is permitted.  Return 0 if not.
 	 */
 	assert(p != 0);
 	assert(p->pPrior == 0);	/* Unable to flatten compound queries */
-	if (OptimizationDisabled(db, SQL_QueryFlattener))
+	if (OptimizationDisabled(SQL_QueryFlattener))
 		return 0;
 	pSrc = p->pSrc;
 	assert(pSrc && iFrom >= 0 && iFrom < pSrc->nSrc);
@@ -4147,8 +3859,6 @@ flattenSubquery(Parse * pParse,		/* Parsing context */
 	if (pSub->pLimit && (p->selFlags & SF_Distinct) != 0) {
 		return 0;	/* Restriction (21) */
 	}
-	testcase(pSub->selFlags & SF_Recursive);
-	testcase(pSub->selFlags & SF_MinMaxAgg);
 	if (pSub->selFlags & (SF_Recursive | SF_MinMaxAgg)) {
 		return 0;	/* Restrictions (22) and (24) */
 	}
@@ -4206,12 +3916,6 @@ flattenSubquery(Parse * pParse,		/* Parsing context */
 			/* Restriction 20 */
 			if (pSub1->pOrderBy != NULL)
 				return 0;
-			testcase((pSub1->
-				  selFlags & (SF_Distinct | SF_Aggregate)) ==
-				 SF_Distinct);
-			testcase((pSub1->
-				  selFlags & (SF_Distinct | SF_Aggregate)) ==
-				 SF_Aggregate);
 			assert(pSub->pSrc != 0);
 			assert(pSub->pEList->nExpr == pSub1->pEList->nExpr);
 			if ((pSub1->selFlags & (SF_Distinct | SF_Aggregate)) !=
@@ -4219,7 +3923,6 @@ flattenSubquery(Parse * pParse,		/* Parsing context */
 			    || pSub1->pSrc->nSrc < 1) {
 				return 0;
 			}
-			testcase(pSub1->pSrc->nSrc > 1);
 		}
 
 		/* Restriction 18. */
@@ -4280,7 +3983,7 @@ flattenSubquery(Parse * pParse,		/* Parsing context */
 		p->pPrior = 0;
 		p->pLimit = 0;
 		p->pOffset = 0;
-		pNew = sqlSelectDup(db, p, 0);
+		pNew = sqlSelectDup(p, 0);
 		sqlSelectSetName(pNew, pSub->zSelName);
 		p->pOffset = pOffset;
 		p->pLimit = pLimit;
@@ -4299,8 +4002,6 @@ flattenSubquery(Parse * pParse,		/* Parsing context */
 				    ("compound-subquery flattener creates %s.%p as peer\n",
 				     pNew->zSelName, pNew));
 		}
-		if (db->mallocFailed)
-			return 1;
 	}
 
 	/*
@@ -4312,10 +4013,12 @@ flattenSubquery(Parse * pParse,		/* Parsing context */
 	/* Delete the transient table structure associated with the
 	 * subquery
 	 */
-	sqlDbFree(db, pSubitem->zName);
-	sqlDbFree(db, pSubitem->zAlias);
+	sql_xfree(pSubitem->zName);
+	sql_xfree(pSubitem->zAlias);
+	sql_xfree(pSubitem->legacy_name);
 	pSubitem->zName = 0;
 	pSubitem->zAlias = 0;
+	pSubitem->legacy_name = NULL;
 	pSubitem->pSelect = 0;
 
 	/* Deletion of the pSubitem->space will be done when a corresponding
@@ -4348,12 +4051,8 @@ flattenSubquery(Parse * pParse,		/* Parsing context */
 			jointype = pSubitem->fg.jointype;
 		} else {
 			assert(pParent != p);	/* 2nd and subsequent times through the loop */
-			pSrc = pParent->pSrc =
-			    sql_src_list_append(db, 0, 0);
-			if (pSrc == NULL) {
-				pParse->is_aborted = true;
-				break;
-			}
+			pSrc = sql_src_list_append(NULL, NULL);
+			pParent->pSrc = pSrc;
 		}
 
 		/* The subquery uses a single slot of the FROM clause of the outer
@@ -4373,12 +4072,8 @@ flattenSubquery(Parse * pParse,		/* Parsing context */
 		 */
 		if (nSubSrc > 1) {
 			struct SrcList *new_list =
-				sql_src_list_enlarge(db, pSrc, nSubSrc - 1,
+				sql_src_list_enlarge(pSrc, nSubSrc - 1,
 						     iFrom + 1);
-			if (new_list == NULL) {
-				pParse->is_aborted = true;
-				break;
-			}
 			pParent->pSrc = pSrc = new_list;
 		}
 
@@ -4386,8 +4081,7 @@ flattenSubquery(Parse * pParse,		/* Parsing context */
 		 * outer query.
 		 */
 		for (i = 0; i < nSubSrc; i++) {
-			sqlIdListDelete(db, pSrc->a[i + iFrom].pUsing);
-			assert(pSrc->a[i + iFrom].fg.isTabFunc == 0);
+			sqlIdListDelete(pSrc->a[i + iFrom].pUsing);
 			pSrc->a[i + iFrom] = pSubSrc->a[i];
 			memset(&pSubSrc->a[i], 0, sizeof(pSubSrc->a[i]));
 		}
@@ -4408,14 +4102,14 @@ flattenSubquery(Parse * pParse,		/* Parsing context */
 		pList = pParent->pEList;
 		for (i = 0; i < pList->nExpr; i++) {
 			if (pList->a[i].zName == 0) {
-				char *str = pList->a[i].zSpan;
-				int len = strlen(str);
-				char *name =
-					sql_normalized_name_db_new(db, str,
-								   len);
-				if (name == NULL)
-					pParse->is_aborted = true;
+				const char *str = pList->a[i].zSpan;
+				size_t len = strlen(str);
+				char *name = sql_name_new(str, len);
 				pList->a[i].zName = name;
+				if (pList->a[i].zSpan[0] != '"') {
+					pList->a[i].legacy_name =
+						sql_legacy_name_new(str, len);
+				}
 			}
 		}
 		if (pSub->pOrderBy) {
@@ -4439,28 +4133,23 @@ flattenSubquery(Parse * pParse,		/* Parsing context */
 			pParent->pOrderBy = pOrderBy;
 			pSub->pOrderBy = 0;
 		}
-		pWhere = sqlExprDup(db, pSub->pWhere, 0);
+		pWhere = sqlExprDup(pSub->pWhere, 0);
 		if (subqueryIsAgg) {
 			assert(pParent->pHaving == 0);
 			pParent->pHaving = pParent->pWhere;
 			pParent->pWhere = pWhere;
-			struct Expr *sub_having =
-				sqlExprDup(db, pSub->pHaving, 0);
+			struct Expr *sub_having = sqlExprDup(pSub->pHaving, 0);
 			if (sub_having != NULL || pParent->pHaving != NULL) {
 				pParent->pHaving =
-					sql_and_expr_new(db, sub_having,
+					sql_and_expr_new(sub_having,
 							 pParent->pHaving);
-				if (pParent->pHaving == NULL)
-					pParse->is_aborted = true;
 			}
 			assert(pParent->pGroupBy == 0);
 			pParent->pGroupBy =
-			    sql_expr_list_dup(db, pSub->pGroupBy, 0);
+				sql_expr_list_dup(pSub->pGroupBy, 0);
 		} else if (pWhere != NULL || pParent->pWhere != NULL) {
 			pParent->pWhere =
-				sql_and_expr_new(db, pWhere, pParent->pWhere);
-			if (pParent->pWhere == NULL)
-				pParse->is_aborted = true;
+				sql_and_expr_new(pWhere, pParent->pWhere);
 		}
 		substSelect(pParse, pParent, iParent, pSub->pEList, 0);
 
@@ -4484,7 +4173,7 @@ flattenSubquery(Parse * pParse,		/* Parsing context */
 	/* Finially, delete what is left of the subquery and return
 	 * success.
 	 */
-	sql_select_delete(db, pSub1);
+	sql_select_delete(pSub1);
 
 #ifdef SQL_DEBUG
 	if (sqlSelectTrace & 0x100) {
@@ -4544,9 +4233,6 @@ pushDownWhereTerms(Parse * pParse,	/* Parse context (for malloc() and error repo
 		return 0;
 	for (pX = pSubq; pX; pX = pX->pPrior) {
 		if ((pX->selFlags & (SF_Aggregate | SF_Recursive)) != 0) {
-			testcase(pX->selFlags & SF_Aggregate);
-			testcase(pX->selFlags & SF_Recursive);
-			testcase(pX != pSubq);
 			return 0;	/* restrictions (1) and (2) */
 		}
 	}
@@ -4563,12 +4249,9 @@ pushDownWhereTerms(Parse * pParse,	/* Parse context (for malloc() and error repo
 	if (sqlExprIsTableConstant(pWhere, iCursor)) {
 		nChng++;
 		while (pSubq) {
-			pNew = sqlExprDup(pParse->db, pWhere, 0);
+			pNew = sqlExprDup(pWhere, 0);
 			pNew = substExpr(pParse, pNew, iCursor, pSubq->pEList);
-			pSubq->pWhere = sql_and_expr_new(pParse->db,
-							 pSubq->pWhere, pNew);
-			if (pSubq->pWhere == NULL)
-				pParse->is_aborted = true;
+			pSubq->pWhere = sql_and_expr_new(pSubq->pWhere, pNew);
 			pSubq = pSubq->pPrior;
 		}
 	}
@@ -4647,9 +4330,7 @@ is_simple_count(struct Select *select, struct AggInfo *agg_info)
 		return NULL;
 	if (NEVER(agg_info->nFunc == 0))
 		return NULL;
-	assert(agg_info->aFunc->func->def->language ==
-	       FUNC_LANGUAGE_SQL_BUILTIN);
-	if (sql_func_flag_is_set(agg_info->aFunc->func, SQL_FUNC_COUNT) ||
+	if (strcmp(agg_info->aFunc->func->def->name, "COUNT") != 0 ||
 	    (agg_info->aFunc->pExpr->x.pList != NULL &&
 	     agg_info->aFunc->pExpr->x.pList->nExpr > 0))
 		return NULL;
@@ -4668,25 +4349,17 @@ is_simple_count(struct Select *select, struct AggInfo *agg_info)
 int
 sqlIndexedByLookup(Parse * pParse, struct SrcList_item *pFrom)
 {
-	if (pFrom->space != NULL && pFrom->fg.isIndexedBy) {
-		struct space *space = pFrom->space;
-		char *zIndexedBy = pFrom->u1.zIndexedBy;
-		struct index *idx = NULL;
-		for (uint32_t i = 0; i < space->index_count; ++i) {
-			if (strcmp(space->index[i]->def->name,
-				   zIndexedBy) == 0) {
-				idx = space->index[i];
-				break;
-			}
-		}
-		if (idx == NULL) {
-			diag_set(ClientError, ER_NO_SUCH_INDEX_NAME,
-				 zIndexedBy, space->def->name);
-			pParse->is_aborted = true;
-			return -1;
-		}
-		pFrom->pIBIndex = idx->def;
+	if (pFrom->space == NULL || pFrom->fg.isIndexedBy == 0)
+		return 0;
+	uint32_t index_id = sql_index_id_by_src(pFrom);
+	if (index_id == UINT32_MAX) {
+		diag_set(ClientError, ER_NO_SUCH_INDEX_NAME,
+			 pFrom->indexed_by, pFrom->space->def->name);
+		pParse->is_aborted = true;
+		return -1;
 	}
+	assert(index_id <= pFrom->space->index_id_max);
+	pFrom->pIBIndex = pFrom->space->index_map[index_id]->def;
 	return 0;
 }
 
@@ -4713,13 +4386,12 @@ sqlIndexedByLookup(Parse * pParse, struct SrcList_item *pFrom)
 static int
 convertCompoundSelectToSubquery(Walker * pWalker, Select * p)
 {
+	(void)pWalker;
 	int i;
 	Select *pNew;
 	Select *pX;
-	sql *db;
 	struct ExprList_item *a;
 	SrcList *pNewSrc;
-	Parse *pParse;
 	Token dummy;
 
 	if (p->pPrior == 0)
@@ -4741,22 +4413,13 @@ convertCompoundSelectToSubquery(Walker * pWalker, Select * p)
 
 	/* If we reach this point, that means the transformation is required. */
 
-	pParse = pWalker->pParse;
-	db = pParse->db;
-	pNew = sqlDbMallocZero(db, sizeof(*pNew));
-	if (pNew == 0)
-		return WRC_Abort;
+	pNew = sql_xmalloc0(sizeof(*pNew));
 	memset(&dummy, 0, sizeof(dummy));
-	pNewSrc =
-	    sqlSrcListAppendFromTerm(pParse, 0, 0, &dummy, pNew, 0, 0);
-	if (pNewSrc == 0)
-		return WRC_Abort;
+	pNewSrc = sqlSrcListAppendFromTerm(0, 0, &dummy, pNew, 0, 0, false);
 	*pNew = *p;
 	p->pSrc = pNewSrc;
-	struct Expr *expr = sql_expr_new_anon(db, TK_ASTERISK);
-	if (expr == NULL)
-		pParse->is_aborted = true;
-	p->pEList = sql_expr_list_append(pParse->db, NULL, expr);
+	struct Expr *expr = sql_expr_new_anon(TK_ASTERISK);
+	p->pEList = sql_expr_list_append(NULL, expr);
 	p->op = TK_SELECT;
 	p->pWhere = 0;
 	pNew->pGroupBy = 0;
@@ -4848,7 +4511,6 @@ static int
 withExpand(Walker * pWalker, struct SrcList_item *pFrom)
 {
 	Parse *pParse = pWalker->pParse;
-	sql *db = pParse->db;
 	struct Cte *pCte;	/* Matched CTE (or NULL if no match) */
 	With *pWith;		/* WITH clause that pCte belongs to */
 
@@ -4873,21 +4535,10 @@ withExpand(Walker * pWalker, struct SrcList_item *pFrom)
 			pParse->is_aborted = true;
 			return -1;
 		}
-		if (pFrom->fg.isTabFunc) {
-			const char *err = "'%s' is not a function";
-			diag_set(ClientError, ER_SQL_PARSER_GENERIC,
-				 tt_sprintf(err, pFrom->zName));
-			pParse->is_aborted = true;
-			return -1;
-		}
 
 		assert(pFrom->space == NULL);
 		pFrom->space = sql_template_space_new(pParse, pCte->zName);
-		if (pFrom->space == NULL)
-			return WRC_Abort;
-		pFrom->pSelect = sqlSelectDup(db, pCte->pSelect, 0);
-		if (db->mallocFailed)
-			return -1;
+		pFrom->pSelect = sqlSelectDup(pCte->pSelect, 0);
 		assert(pFrom->pSelect);
 
 		/* Check if this is a recursive CTE. */
@@ -5032,14 +4683,10 @@ selectExpander(Walker * pWalker, Select * p)
 	SrcList *pTabList;
 	ExprList *pEList;
 	struct SrcList_item *pFrom;
-	sql *db = pParse->db;
 	Expr *pE, *pRight, *pExpr;
-	u16 selFlags = p->selFlags;
+	u32 selFlags = p->selFlags;
 
 	p->selFlags |= SF_Expanded;
-	if (db->mallocFailed) {
-		return WRC_Abort;
-	}
 	if (NEVER(p->pSrc == 0) || (selFlags & SF_Expanded) != 0) {
 		return WRC_Prune;
 	}
@@ -5084,14 +4731,13 @@ selectExpander(Walker * pWalker, Select * p)
 			struct space *space =
 				sql_template_space_new(sqlParseToplevel(pParse),
 						       name);
-			if (space == NULL)
-				return WRC_Abort;
 			pFrom->space = space;
 			/*
 			 * Rewrite old name with correct pointer.
 			 */
-			name = tt_sprintf("sql_sq_%llX", (void *)space);
-			sprintf(space->def->name, "%s", name);
+			name = tt_sprintf("sql_sq_%llX", (long long)space);
+			snprintf(space->def->name, strlen(space->def->name) + 1,
+				 "%s", name);
 			while (pSel->pPrior) {
 				pSel = pSel->pPrior;
 			}
@@ -5105,18 +4751,9 @@ selectExpander(Walker * pWalker, Select * p)
 			struct space *space = sql_lookup_space(pParse, pFrom);
 			if (space == NULL)
 				return WRC_Abort;
-			if (pFrom->fg.isTabFunc) {
-				const char *err =
-					tt_sprintf("'%s' is not a function",
-						   pFrom->zName);
-				diag_set(ClientError, ER_SQL_PARSER_GENERIC,
-					 err);
-				pParse->is_aborted = true;
-				return WRC_Abort;
-			}
 			if (space->def->opts.is_view) {
 				struct Select *select =
-					sql_view_compile(db, space->def->opts.sql);
+					sql_view_compile(space->def->opts.sql);
 				if (select == NULL)
 					return WRC_Abort;
 				sqlSrcListAssignCursors(pParse,
@@ -5136,9 +4773,8 @@ selectExpander(Walker * pWalker, Select * p)
 
 	/* Process NATURAL keywords, and ON and USING clauses of joins.
 	 */
-	if (db->mallocFailed || sqlProcessJoin(pParse, p)) {
+	if (sqlProcessJoin(pParse, p))
 		return WRC_Abort;
-	}
 
 	/* For every "*" that occurs in the column list, insert the names of
 	 * all columns in all tables.  And for every TABLE.* insert the names
@@ -5166,193 +4802,159 @@ selectExpander(Walker * pWalker, Select * p)
 		    expr_autoname_is_required(pE)) {
 			uint32_t idx = ++pParse->autoname_i;
 			pEList->a[k].zName =
-				sqlDbStrDup(db, sql_generate_column_name(idx));
+				sql_xstrdup(sql_generate_column_name(idx));
 		}
 	}
-	if (has_asterisk) {
+	if (!has_asterisk)
+		goto end;
+	/*
+	 * If we get here it means the result set contains one or more "*"
+	 * operators that need to be expanded.  Loop through each expression
+	 * in the result set and expand them one by one.
+	 */
+	struct ExprList_item *a = pEList->a;
+	struct ExprList *pNew = NULL;
+	uint32_t flags = pParse->sql_flags;
+	int longNames = (flags & SQL_FullColNames) != 0;
+
+	for (k = 0; k < pEList->nExpr; k++) {
+		pE = a[k].pExpr;
+		pRight = pE->pRight;
+		assert(pE->op != TK_DOT || pRight != 0);
+		if (pE->op != TK_ASTERISK &&
+		    (pE->op != TK_DOT || pRight->op != TK_ASTERISK)) {
+			/*
+			 * This particular expression does not need to be
+			 * expanded.
+			 */
+			pNew = sql_expr_list_append(pNew, a[k].pExpr);
+			pNew->a[pNew->nExpr - 1].zName = a[k].zName;
+			pNew->a[pNew->nExpr - 1].zSpan = a[k].zSpan;
+			pNew->a[pNew->nExpr - 1].legacy_name = a[k].legacy_name;
+			a[k].zName = 0;
+			a[k].zSpan = 0;
+			a[k].pExpr = 0;
+			a[k].legacy_name = NULL;
+			continue;
+		}
 		/*
-		 * If we get here it means the result set contains one or more "*"
-		 * operators that need to be expanded.  Loop through each expression
-		 * in the result set and expand them one by one.
+		 * This expression is a "*" or a "TABLE.*" and needs to be
+		 * expanded.
 		 */
-		struct ExprList_item *a = pEList->a;
-		ExprList *pNew = 0;
-		uint32_t flags = pParse->sql_flags;
-		int longNames = (flags & SQL_FullColNames) != 0;
+		/* Set to 1 when TABLE matches */
+		int tableSeen = 0;
+		/* text of name of TABLE */
+		char *zTName = NULL;
+		if (pE->op == TK_DOT) {
+			assert(pE->pLeft != NULL);
+			assert(!ExprHasProperty(pE->pLeft, EP_IntValue));
+			zTName = pE->pLeft->u.zToken;
+		}
+		for (i = 0, pFrom = pTabList->a;
+		     i < pTabList->nSrc; i++, pFrom++) {
+			struct space *space = pFrom->space;
+			struct Select *pSub = pFrom->pSelect;
+			char *zTabName = pFrom->zAlias;
+			if (zTabName == NULL)
+				zTabName = space->def->name;
+			if (pSub != NULL &&
+			    (pSub->selFlags & SF_NestedFrom) == 0)
+				pSub = NULL;
+			if (pSub == NULL && zTName != NULL &&
+			    strcmp(zTName, zTabName) != 0)
+				continue;
+			for (j = 0; j < (int)space->def->field_count; j++) {
+				char *zName = space->def->fields[j].name;
+				/* The computed column name */
+				char *zColname;
+				/* Malloced string that needs to be freed */
+				char *zToFree;
+				/* Computed column name as a token */
+				Token sColname;
 
-		for (k = 0; k < pEList->nExpr; k++) {
-			pE = a[k].pExpr;
-			pRight = pE->pRight;
-			assert(pE->op != TK_DOT || pRight != 0);
-			if (pE->op != TK_ASTERISK
-			    && (pE->op != TK_DOT || pRight->op != TK_ASTERISK)
-			    ) {
-				/* This particular expression does not need to be expanded.
+				assert(zName != NULL);
+				if (zTName != NULL && pSub != NULL &&
+				    sqlMatchSpanName(pSub->pEList->a[j].zSpan,
+						     NULL, zTName, NULL,
+						     NULL) == 0)
+					continue;
+				tableSeen = 1;
+
+				/*
+				 * In a NATURAL join, omit the join columns from
+				 * the table to the right of the join
 				 */
-				pNew = sql_expr_list_append(pParse->db, pNew,
-							    a[k].pExpr);
-				if (pNew != NULL) {
-					pNew->a[pNew->nExpr - 1].zName =
-					    a[k].zName;
-					pNew->a[pNew->nExpr - 1].zSpan =
-					    a[k].zSpan;
-					a[k].zName = 0;
-					a[k].zSpan = 0;
-				}
-				a[k].pExpr = 0;
-			} else {
-				/* This expression is a "*" or a "TABLE.*" and needs to be
-				 * expanded.
+				if (i > 0 && zTName == NULL &&
+				    (pFrom->fg.jointype & JT_NATURAL) != 0 &&
+				    tableAndColumnIndex(pTabList, i, zName, 0,
+							0) != 0)
+					continue;
+				/*
+				 * In a join with a USING clause, omit columns
+				 * in the using clause from the table on the
+				 * right.
 				 */
-				int tableSeen = 0;	/* Set to 1 when TABLE matches */
-				char *zTName = 0;	/* text of name of TABLE */
-				if (pE->op == TK_DOT) {
-					assert(pE->pLeft != 0);
-					assert(!ExprHasProperty
-					       (pE->pLeft, EP_IntValue));
-					zTName = pE->pLeft->u.zToken;
-				}
-				for (i = 0, pFrom = pTabList->a;
-				     i < pTabList->nSrc; i++, pFrom++) {
-					struct space *space = pFrom->space;
-					Select *pSub = pFrom->pSelect;
-					char *zTabName = pFrom->zAlias;
-					if (zTabName == NULL)
-						zTabName = space->def->name;
-					if (db->mallocFailed)
-						break;
-					if (pSub == 0
-					    || (pSub->
-						selFlags & SF_NestedFrom) ==
-					    0) {
-						pSub = 0;
-						if (zTName != NULL
-						    && strcmp(zTName, zTabName)
-						    != 0) {
-							continue;
-						}
+				if (i > 0 && zTName == NULL &&
+				    sqlIdListIndex(pFrom->pUsing, zName) >= 0)
+					continue;
+				pRight = sql_expr_new_named(TK_ID, zName);
+				zColname = zName;
+				zToFree = NULL;
+				if (longNames != 0 || pTabList->nSrc > 1) {
+					struct Expr *pLeft;
+					pLeft = sql_expr_new_named(TK_ID,
+								   zTabName);
+					pExpr = sqlPExpr(pParse, TK_DOT, pLeft,
+							 pRight);
+					if (longNames != 0) {
+						zColname = sqlMPrintf("%s.%s",
+								      zTabName,
+								      zName);
+						zToFree = zColname;
 					}
-					for (j = 0; j < (int)space->def->field_count; j++) {
-						char *zName = space->def->fields[j].name;
-						char *zColname;	/* The computed column name */
-						char *zToFree;	/* Malloced string that needs to be freed */
-						Token sColname;	/* Computed column name as a token */
-
-						assert(zName);
-						if (zTName && pSub
-						    && sqlMatchSpanName(pSub->pEList->a[j].zSpan,
-									    0,
-									    zTName) == 0) {
-							continue;
-						}
-						tableSeen = 1;
-
-						if (i > 0 && zTName == 0) {
-							if ((pFrom->fg.jointype & JT_NATURAL) != 0
-							    && tableAndColumnIndex(pTabList, i, zName, 0, 0)) {
-								/* In a NATURAL join, omit the join columns from the
-								 * table to the right of the join
-								 */
-								continue;
-							}
-							if (sqlIdListIndex(pFrom->pUsing, zName) >= 0) {
-								/* In a join with a USING clause, omit columns in the
-								 * using clause from the table on the right.
-								 */
-								continue;
-							}
-						}
-						pRight = sql_expr_new_named(db,
-								TK_ID, zName);
-						if (pRight == NULL)
-							pParse->is_aborted = true;
-						zColname = zName;
-						zToFree = 0;
-						if (longNames
-						    || pTabList->nSrc > 1) {
-							Expr *pLeft;
-							pLeft = sql_expr_new_named(
-									db,
-									TK_ID,
-									zTabName);
-							if (pLeft == NULL) {
-								pParse->
-								is_aborted = true;
-							}
-							pExpr =
-							    sqlPExpr(pParse,
-									 TK_DOT,
-									 pLeft,
-									 pRight);
-							if (longNames) {
-								zColname =
-								    sqlMPrintf
-								    (db,
-								     "%s.%s",
-								     zTabName,
-								     zName);
-								zToFree =
-								    zColname;
-							}
-						} else {
-							pExpr = pRight;
-						}
-						pNew = sql_expr_list_append(
-							pParse->db, pNew, pExpr);
-						sqlTokenInit(&sColname, zColname);
-						sqlExprListSetName(pParse,
-								       pNew,
-								       &sColname,
-								       0);
-						if (pNew != NULL
-						    && (p->
-							selFlags &
-							SF_NestedFrom) != 0) {
-							struct ExprList_item *pX
-							    =
-							    &pNew->a[pNew->
-								     nExpr - 1];
-							if (pSub) {
-								pX->zSpan = sqlDbStrDup(db,
-											    pSub->pEList->a[j].zSpan);
-								testcase(pX->zSpan == 0);
-							} else {
-								pX->zSpan = sqlMPrintf(db,
-											   "%s.%s",
-											   zTabName,
-											   zColname);
-								testcase(pX->zSpan == 0);
-							}
-							pX->bSpanIsTab = 1;
-						}
-						sqlDbFree(db, zToFree);
-					}
+				} else {
+					pExpr = pRight;
 				}
-				if (!tableSeen) {
-					if (zTName) {
-						diag_set(ClientError,
-							 ER_NO_SUCH_SPACE,
-							 zTName);
-					} else {
-						diag_set(ClientError,
-							 ER_SQL_SELECT_WILDCARD);
-					}
-					pParse->is_aborted = true;
+				pNew = sql_expr_list_append(pNew, pExpr);
+				sqlTokenInit(&sColname, zColname);
+				sqlExprListSetName(pParse, pNew, &sColname, 0);
+				if ((p->selFlags & SF_NestedFrom) == 0) {
+					sql_xfree(zToFree);
+					continue;
 				}
+				struct ExprList_item *pX =
+					&pNew->a[pNew->nExpr - 1];
+				if (pSub != NULL) {
+					const char *str =
+						pSub->pEList->a[j].zSpan;
+					pX->zSpan = sql_xstrdup(str);
+				} else {
+					pX->zSpan = sqlMPrintf("%s.%s",
+							       zTabName,
+							       zColname);
+				}
+				pX->bSpanIsTab = 1;
+				sql_xfree(zToFree);
 			}
 		}
-		sql_expr_list_delete(db, pEList);
-		p->pEList = pNew;
+		if (tableSeen == 0) {
+			if (zTName != NULL)
+				diag_set(ClientError, ER_NO_SUCH_SPACE, zTName);
+			else
+				diag_set(ClientError, ER_SQL_SELECT_WILDCARD);
+			pParse->is_aborted = true;
+		}
 	}
-#if SQL_MAX_COLUMN
-	if (p->pEList && p->pEList->nExpr > db->aLimit[SQL_LIMIT_COLUMN]) {
+	sql_expr_list_delete(pEList);
+	p->pEList = pNew;
+end:
+	if (p->pEList && p->pEList->nExpr > SQL_MAX_COLUMN) {
 		diag_set(ClientError, ER_SQL_PARSER_LIMIT, "The number of "\
 			 "columns in result set", p->pEList->nExpr,
-			 db->aLimit[SQL_LIMIT_COLUMN]);
+			 SQL_MAX_COLUMN);
 		pParse->is_aborted = true;
 		return WRC_Abort;
 	}
-#endif
 	return WRC_Continue;
 }
 
@@ -5382,8 +4984,7 @@ sqlExprWalkNoop(Walker * NotUsed, Expr * NotUsed2)
  * name resolution is performed.
  *
  * If anything goes wrong, an error message is written into pParse.
- * The calling function can detect the problem by looking at pParse->is_aborted
- * and/or pParse->db->mallocFailed.
+ * The calling function can detect the problem by looking at pParse->is_aborted.
  */
 static void
 sqlSelectExpand(Parse * pParse, Select * pSelect)
@@ -5482,19 +5083,15 @@ sqlSelectPrep(Parse * pParse,	/* The parser context */
 		  NameContext * pOuterNC	/* Name context for container */
     )
 {
-	sql *db;
 	if (NEVER(p == 0))
-		return;
-	db = pParse->db;
-	if (db->mallocFailed)
 		return;
 	if (p->selFlags & SF_HasTypeInfo)
 		return;
 	sqlSelectExpand(pParse, p);
-	if (pParse->is_aborted || db->mallocFailed)
+	if (pParse->is_aborted)
 		return;
 	sqlResolveSelectNames(pParse, p, pOuterNC);
-	if (pParse->is_aborted || db->mallocFailed)
+	if (pParse->is_aborted)
 		return;
 	sqlSelectAddTypeInfo(pParse, p);
 }
@@ -5561,6 +5158,22 @@ resetAccumulator(Parse * pParse, AggInfo * pAggInfo)
 	}
 }
 
+static inline void
+finalize_agg_function(struct Vdbe *vdbe, const struct AggInfo_func *agg_func)
+{
+	if (agg_func->func->def->language == FUNC_LANGUAGE_SQL_BUILTIN) {
+		sqlVdbeAddOp1(vdbe, OP_AggFinal, agg_func->iMem);
+		sqlVdbeAppendP4(vdbe, agg_func->func, P4_FUNC);
+		return;
+	}
+	if (sql_func_finalize(agg_func->pExpr->u.zToken) == NULL)
+		return;
+	const char *name = tt_sprintf("%s_finalize", agg_func->pExpr->u.zToken);
+	const char *str = sql_xstrdup(name);
+	sqlVdbeAddOp4(vdbe, OP_FunctionByName, 1, agg_func->iMem,
+		      agg_func->iMem, str, P4_DYNAMIC);
+}
+
 /*
  * Invoke the OP_AggFinalize opcode for every aggregate function
  * in the AggInfo structure.
@@ -5572,11 +5185,8 @@ finalizeAggFunctions(Parse * pParse, AggInfo * pAggInfo)
 	int i;
 	struct AggInfo_func *pF;
 	for (i = 0, pF = pAggInfo->aFunc; i < pAggInfo->nFunc; i++, pF++) {
-		ExprList *pList = pF->pExpr->x.pList;
 		assert(!ExprHasProperty(pF->pExpr, EP_xIsSelect));
-		sqlVdbeAddOp2(v, OP_AggFinal, pF->iMem,
-				  pList ? pList->nExpr : 0);
-		sqlVdbeAppendP4(v, pF->func, P4_FUNC);
+		finalize_agg_function(v, pF);
 	}
 }
 
@@ -5603,7 +5213,7 @@ updateAccumulator(Parse * pParse, AggInfo * pAggInfo)
 		assert(!ExprHasProperty(pF->pExpr, EP_xIsSelect));
 		if (pList) {
 			nArg = pList->nExpr;
-			regAgg = sqlGetTempRange(pParse, nArg);
+			regAgg = pF->iMem - nArg;
 			sqlExprCodeExprList(pParse, pList, regAgg, 0,
 						SQL_ECEL_DUP);
 		} else {
@@ -5612,8 +5222,6 @@ updateAccumulator(Parse * pParse, AggInfo * pAggInfo)
 		}
 		if (pF->iDistinct >= 0) {
 			addrNext = sqlVdbeMakeLabel(v);
-			testcase(nArg == 0);	/* Error condition */
-			testcase(nArg > 1);	/* Also an error */
 			vdbe_insert_distinct(pParse, pF->iDistinct, pF->reg_eph,
 					     addrNext, 1, regAgg);
 		}
@@ -5638,15 +5246,19 @@ updateAccumulator(Parse * pParse, AggInfo * pAggInfo)
 				regHit = ++pParse->nMem;
 			sqlVdbeAddOp1(v, OP_SkipLoad, regHit);
 		}
-		struct sql_context *ctx = sql_context_new(pF->func, coll);
-		if (ctx == NULL) {
-			pParse->is_aborted = true;
-			return;
+		if (pF->func->def->language == FUNC_LANGUAGE_SQL_BUILTIN) {
+			struct sql_context *ctx =
+				sql_context_new(pF->func, coll);
+			sqlVdbeAddOp3(v, OP_AggStep, nArg, regAgg, pF->iMem);
+			sqlVdbeAppendP4(v, ctx, P4_FUNCCTX);
+		} else {
+			const char *name = pF->func->def->name;
+			uint32_t len = pF->func->def->name_len;
+			const char *str = sql_xstrndup(name, len);
+			assert(regAgg == pF->iMem - nArg);
+			sqlVdbeAddOp4(v, OP_FunctionByName, nArg + 1, regAgg,
+				      pF->iMem, str, P4_DYNAMIC);
 		}
-		sqlVdbeAddOp3(v, OP_AggStep, nArg, regAgg, pF->iMem);
-		sqlVdbeAppendP4(v, ctx, P4_FUNCCTX);
-		sql_expr_type_cache_change(pParse, regAgg, nArg);
-		sqlReleaseTempRange(pParse, regAgg, nArg);
 		if (addrNext) {
 			sqlVdbeResolveLabel(v, addrNext);
 			sqlExprCacheClear(pParse);
@@ -5663,10 +5275,8 @@ updateAccumulator(Parse * pParse, AggInfo * pAggInfo)
 	 * Another solution would be to change the OP_SCopy used to copy cached
 	 * values to an OP_Copy.
 	 */
-	if (regHit) {
+	if (regHit)
 		addrHitTest = sqlVdbeAddOp1(v, OP_If, regHit);
-		VdbeCoverage(v);
-	}
 	sqlExprCacheClear(pParse);
 	for (i = 0, pC = pAggInfo->aCol; i < pAggInfo->nAccumulator; i++, pC++) {
 		sqlExprCode(pParse, pC->pExpr, pC->iMem);
@@ -5691,8 +5301,7 @@ static void
 explain_simple_count(struct Parse *parse_context, const char *table_name)
 {
 	if (parse_context->explain == 2) {
-		char *zEqp = sqlMPrintf(parse_context->db, "B+tree count %s",
-					    table_name);
+		char *zEqp = sqlMPrintf("B+tree count %s", table_name);
 		sqlVdbeAddOp4(parse_context->pVdbe, OP_Explain,
 				  parse_context->iSelectId, 0, 0, zEqp,
 				  P4_DYNAMIC);
@@ -5717,9 +5326,7 @@ vdbe_code_raise_on_multiple_rows(struct Parse *parser, int limit_reg, int end_ma
 	int r1 = sqlGetTempReg(parser);
 	sqlVdbeAddOp2(v, OP_Integer, 0, r1);
 	sqlVdbeAddOp3(v, OP_Ne, r1, end_mark, limit_reg);
-	const char *error = tt_sprintf(tnt_errcode_desc(ER_SQL_EXECUTE),
-				       "Expression subquery returned more "\
-				       "than 1 row");
+	const char *error = "Expression subquery returned more than 1 row";
 	sqlVdbeAddOp4(v, OP_SetDiag, ER_SQL_EXECUTE, 0, 0, error, P4_STATIC);
 	sqlVdbeAddOp1(v, OP_Halt, -1);
 	sqlReleaseTempReg(parser, r1);
@@ -5756,14 +5363,11 @@ sqlSelect(Parse * pParse,		/* The parser context */
 	SortCtx sSort;		/* Info on how to code the ORDER BY clause */
 	AggInfo sAggInfo;	/* Information used by aggregate queries */
 	int iEnd;		/* Address of the end of the query */
-	sql *db;		/* The database connection */
 	int iRestoreSelectId = pParse->iSelectId;
 	pParse->iSelectId = pParse->iNextSelectId++;
 
-	db = pParse->db;
-	if (p == 0 || db->mallocFailed || pParse->is_aborted) {
+	if (p == NULL || pParse->is_aborted)
 		return 1;
-	}
 	memset(&sAggInfo, 0, sizeof(sAggInfo));
 #ifdef SQL_DEBUG
 	pParse->nSelectIndent++;
@@ -5788,7 +5392,7 @@ sqlSelect(Parse * pParse,		/* The parser context */
 		/* If ORDER BY makes no difference in the output then neither does
 		 * DISTINCT so it can be removed too.
 		 */
-		sql_expr_list_delete(db, p->pOrderBy);
+		sql_expr_list_delete(p->pOrderBy);
 		p->pOrderBy = 0;
 		p->selFlags &= ~SF_Distinct;
 	}
@@ -5796,9 +5400,8 @@ sqlSelect(Parse * pParse,		/* The parser context */
 	memset(&sSort, 0, sizeof(sSort));
 	sSort.pOrderBy = p->pOrderBy;
 	pTabList = p->pSrc;
-	if (pParse->is_aborted || db->mallocFailed) {
+	if (pParse->is_aborted)
 		goto select_end;
-	}
 	assert(p->pEList != 0);
 	isAgg = (p->selFlags & SF_Aggregate) != 0;
 #ifdef SQL_DEBUG
@@ -5839,8 +5442,6 @@ sqlSelect(Parse * pParse,		/* The parser context */
 			i = -1;
 		}
 		pTabList = p->pSrc;
-		if (db->mallocFailed)
-			goto select_end;
 		if (!IgnorableOrderby(pDest)) {
 			sSort.pOrderBy = p->pOrderBy;
 		}
@@ -5850,8 +5451,6 @@ sqlSelect(Parse * pParse,		/* The parser context */
 	 * does not already exist
 	 */
 	v = sqlGetVdbe(pParse);
-	if (v == 0)
-		goto select_end;
 
 	/* Handle compound SELECT statements using the separate multiSelect()
 	 * procedure.
@@ -5935,10 +5534,11 @@ sqlSelect(Parse * pParse,		/* The parser context */
 		 * TODO: Are there other reasons beside (1) to use a co-routine
 		 * implementation?
 		 */
-		if (i == 0 && (pTabList->nSrc == 1 || (pTabList->a[1].fg.jointype & (JT_LEFT | JT_CROSS)) != 0)	/* (1) */
-		    &&(p->selFlags & SF_All) == 0	/* (2) */
-		    && OptimizationEnabled(db, SQL_SubqCoroutine)	/* (3) */
-		    ) {
+		if (i == 0 && (pTabList->nSrc == 1 ||
+			       (pTabList->a[1].fg.jointype &
+				(JT_LEFT | JT_CROSS)) != 0) &&
+		    (p->selFlags & SF_All) == 0 &&
+		    OptimizationEnabled(SQL_SubqCoroutine)) {
 			/* Implement a co-routine that will return a single row of the result
 			 * set on each invocation.
 			 */
@@ -5984,7 +5584,6 @@ sqlSelect(Parse * pParse,		/* The parser context */
 				 * value of the subquery once.
 				 */
 				onceAddr = sqlVdbeAddOp0(v, OP_Once);
-				VdbeCoverage(v);
 				VdbeComment((v, "materialize \"%s\"",
 					     pItem->space->def->name));
 			} else {
@@ -6003,8 +5602,6 @@ sqlSelect(Parse * pParse,		/* The parser context */
 			sqlVdbeChangeP1(v, topAddr, retAddr);
 			sqlClearTempRegCache(pParse);
 		}
-		if (db->mallocFailed)
-			goto select_end;
 		pParse->nHeight -= sqlSelectExprHeight(p);
 	}
 
@@ -6043,7 +5640,8 @@ sqlSelect(Parse * pParse,		/* The parser context */
 	if ((p->selFlags & (SF_Distinct | SF_Aggregate)) == SF_Distinct
 	    && sqlExprListCompare(sSort.pOrderBy, pEList, -1) == 0) {
 		p->selFlags &= ~SF_Distinct;
-		pGroupBy = p->pGroupBy = sql_expr_list_dup(db, pEList, 0);
+		pGroupBy = sql_expr_list_dup(pEList, 0);
+		p->pGroupBy = pGroupBy;
 		/* Notice that even thought SF_Distinct has been cleared from p->selFlags,
 		 * the sDistinct.isTnct is still set.  Hence, isTnct represents the
 		 * original setting of the SF_Distinct flag, not the current setting
@@ -6113,7 +5711,13 @@ sqlSelect(Parse * pParse,		/* The parser context */
 		p->nSelectRow = 320;	/* 4 billion rows */
 	}
 	computeLimitRegisters(pParse, p, iEnd);
-	if (p->iLimit == 0 && sSort.addrSortIndex >= 0) {
+	/*
+	 * At the moment we don't have iterators where the fields are sorted in
+	 * a different order. Because of this, we have to sort all the data and
+	 * select only the required number of rows.
+	 */
+	if (sSort.addrSortIndex >= 0 &&
+	    (p->iLimit == 0 || !is_same_sorting_direction(sSort.pOrderBy))) {
 		struct VdbeOp *op = sqlVdbeGetOp(v, sSort.addrSortIndex);
 		struct sql_key_info *key_info =
 			sql_key_info_new_from_space_info(op->p4.space_info);
@@ -6415,7 +6019,6 @@ sqlSelect(Parse * pParse,		/* The parser context */
 				sqlVdbeAddOp2(v, OP_SorterSort,
 						  sAggInfo.sortingIdx, addrEnd);
 				VdbeComment((v, "GROUP BY sort"));
-				VdbeCoverage(v);
 				sAggInfo.useSortingIdx = 1;
 				sqlExprCacheClear(pParse);
 
@@ -6429,10 +6032,9 @@ sqlSelect(Parse * pParse,		/* The parser context */
 			 * Use the SQL_GroupByOrder flag with SQL_TESTCTRL_OPTIMIZER to
 			 * disable this optimization for testing purposes.
 			 */
-			if (orderByGrp
-			    && OptimizationEnabled(db, SQL_GroupByOrder)
-			    && (groupBySort || sqlWhereIsSorted(pWInfo))
-			    ) {
+			if (orderByGrp != 0 &&
+			    OptimizationEnabled(SQL_GroupByOrder) &&
+			    (groupBySort || sqlWhereIsSorted(pWInfo))) {
 				sSort.pOrderBy = 0;
 				sqlVdbeChangeToNoop(v, sSort.addrSortIndex);
 				sqlVdbeChangeToNoop(v, sSort.addrSortIndex + 1);
@@ -6468,7 +6070,6 @@ sqlSelect(Parse * pParse,		/* The parser context */
 					  P4_KEYINFO);
 			addr1 = sqlVdbeCurrentAddr(v);
 			sqlVdbeAddOp3(v, OP_Jump, addr1 + 1, 0, addr1 + 1);
-			VdbeCoverage(v);
 
 			/* Generate code that runs whenever the GROUP BY changes.
 			 * Changes in the GROUP BY are detected by the previous code
@@ -6485,7 +6086,6 @@ sqlSelect(Parse * pParse,		/* The parser context */
 					  addrOutputRow);
 			VdbeComment((v, "output one row"));
 			sqlVdbeAddOp2(v, OP_IfPos, iAbortFlag, addrEnd);
-			VdbeCoverage(v);
 			VdbeComment((v, "check abort flag"));
 			sqlVdbeAddOp2(v, OP_Gosub, regReset, addrReset);
 			VdbeComment((v, "reset accumulator"));
@@ -6495,8 +6095,6 @@ sqlSelect(Parse * pParse,		/* The parser context */
 			 */
 			sqlVdbeJumpHere(v, addr1);
 			updateAccumulator(pParse, &sAggInfo);
-			if (pParse->is_aborted)
-				goto select_end;
 			sqlVdbeAddOp2(v, OP_Integer, 1, iUseFlag);
 			VdbeComment((v, "indicate data in accumulator"));
 
@@ -6506,11 +6104,12 @@ sqlSelect(Parse * pParse,		/* The parser context */
 				sqlVdbeAddOp2(v, OP_SorterNext,
 						  sAggInfo.sortingIdx,
 						  addrTopOfLoop);
-				VdbeCoverage(v);
 			} else {
 				sqlWhereEnd(pWInfo);
 				sqlVdbeChangeToNoop(v, addrSortingIdx);
 			}
+			if (pParse->is_aborted)
+				goto select_end;
 
 			/* Output the final row of result
 			 */
@@ -6537,7 +6136,6 @@ sqlSelect(Parse * pParse,		/* The parser context */
 			addrOutputRow = sqlVdbeCurrentAddr(v);
 			sqlVdbeAddOp2(v, OP_IfPos, iUseFlag,
 					  addrOutputRow + 2);
-			VdbeCoverage(v);
 			VdbeComment((v,
 				     "Groupby result generator entry point"));
 			sqlVdbeAddOp1(v, OP_Return, regOutputRow);
@@ -6633,18 +6231,14 @@ sqlSelect(Parse * pParse,		/* The parser context */
 					   && pMinMax->nExpr == 1));
 
 				if (flag) {
-					pMinMax =
-					    sql_expr_list_dup(db, pMinMax, 0);
+					pMinMax = sql_expr_list_dup(pMinMax, 0);
 					pDel = pMinMax;
-					assert(db->mallocFailed
-					       || pMinMax != 0);
-					if (!db->mallocFailed) {
-						pMinMax->a[0].sort_order =
-						    flag !=
-						    WHERE_ORDERBY_MIN ? 1 : 0;
-						pMinMax->a[0].pExpr->op =
-						    TK_COLUMN_REF;
-					}
+					assert(pMinMax != 0);
+					pMinMax->a[0].sort_order =
+						flag != WHERE_ORDERBY_MIN ?
+						1 : 0;
+					pMinMax->a[0].pExpr->op =
+						TK_COLUMN_REF;
 				}
 
 				/* This case runs if the aggregate has no GROUP BY clause.  The
@@ -6656,12 +6250,14 @@ sqlSelect(Parse * pParse,		/* The parser context */
 				    sqlWhereBegin(pParse, pTabList, pWhere,
 						      pMinMax, 0, flag, 0);
 				if (pWInfo == 0) {
-					sql_expr_list_delete(db, pDel);
+					sql_expr_list_delete(pDel);
 					goto select_end;
 				}
 				updateAccumulator(pParse, &sAggInfo);
-				if (pParse->is_aborted)
+				if (pParse->is_aborted) {
+					whereInfoFree(pWInfo);
 					goto select_end;
+				}
 				assert(pMinMax == 0 || pMinMax->nExpr == 1);
 				if (sqlWhereIsOrdered(pWInfo) > 0) {
 					sqlVdbeGoto(v,
@@ -6674,7 +6270,7 @@ sqlSelect(Parse * pParse,		/* The parser context */
 				}
 				sqlWhereEnd(pWInfo);
 				finalizeAggFunctions(pParse, &sAggInfo);
-				sql_expr_list_delete(db, pDel);
+				sql_expr_list_delete(pDel);
 			}
 
 			sSort.pOrderBy = 0;
@@ -6724,8 +6320,8 @@ sqlSelect(Parse * pParse,		/* The parser context */
 		generate_column_metadata(pParse, pTabList, pEList);
 	}
 
-	sqlDbFree(db, sAggInfo.aCol);
-	sqlDbFree(db, sAggInfo.aFunc);
+	sql_xfree(sAggInfo.aCol);
+	sql_xfree(sAggInfo.aFunc);
 #ifdef SQL_DEBUG
 	SELECTTRACE(1, pParse, p, ("end processing\n"));
 	pParse->nSelectIndent--;
@@ -6733,28 +6329,10 @@ sqlSelect(Parse * pParse,		/* The parser context */
 	return rc;
 }
 
-void
-sql_expr_extract_select(struct Parse *parser, struct Select *select)
-{
-	struct ExprList *expr_list = select->pEList;
-	assert(expr_list->nExpr == 1);
-	parser->parsed_ast_type = AST_TYPE_EXPR;
-	/*
-	 * Extract a copy of parsed expression.
-	 * We cannot use EXPRDUP_REDUCE flag in sqlExprDup call
-	 * because some compiled Expr (like Checks expressions)
-	 * may require further resolve with sqlResolveExprNames.
-	 */
-	parser->parsed_ast.expr =
-		sqlExprDup(parser->db, expr_list->a->pExpr, 0);
-}
-
 struct sql_context *
 sql_context_new(struct func *func, struct coll *coll)
 {
-	struct sql_context *ctx = sqlDbMallocRawNN(sql_get(), sizeof(*ctx));
-	if (ctx == NULL)
-		return NULL;
+	struct sql_context *ctx = sql_xmalloc(sizeof(*ctx));
 	ctx->pOut = NULL;
 	ctx->func = func;
 	ctx->is_aborted = false;
@@ -6766,5 +6344,5 @@ sql_context_new(struct func *func, struct coll *coll)
 void
 sql_context_delete(struct sql_context *ctx)
 {
-	sqlDbFree(sql_get(), ctx);
+	sql_xfree(ctx);
 }

@@ -52,24 +52,20 @@ error_to_mpstream(const struct error *error, struct mpstream *stream);
 void
 error_to_mpstream_noext(const struct error *error, struct mpstream *stream);
 
+/**
+ * Unpack MP_ERROR without and checks or validation, unsafe version of
+ * `error_unpack`.
+ */
 struct error *
 error_unpack_unsafe(const char **data);
 
 /**
- * @brief Unpack MP_ERROR to error.
+ * @brief Check and safely unpack MP_ERROR to error.
  * @param data pointer to MP_ERROR.
- * @param len data size.
  * @return struct error * or NULL if failed.
  */
-static inline struct error *
-error_unpack(const char **data, uint32_t len)
-{
-	const char *end = *data + len;
-	struct error *e = error_unpack_unsafe(data);
-	(void)end;
-	assert(*data == end);
-	return e;
-}
+struct error *
+error_unpack(const char **data, uint32_t len);
 
 /**
  * @brief Calculate the exact buffer size needed to encode an error in MsgPack.
@@ -114,6 +110,16 @@ mp_snprint_error(char *buf, int size, const char **data, int depth);
  */
 int
 mp_fprint_error(FILE *file, const char **data, int depth);
+
+/**
+ * Check that the buffer contains a valid packed error representation.
+ * @param data MessagePack encoded error, without MP_EXT header.
+ * @param len  Length of @a data.
+ * @retval 1   Error. The buffer doesn't contain a parseable error.
+ * @retval 0   Ok.
+ */
+int
+mp_validate_error(const char *data, uint32_t len);
 
 #if defined(__cplusplus)
 } /* extern "C" */

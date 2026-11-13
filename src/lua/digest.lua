@@ -4,13 +4,12 @@ local ffi = require('ffi')
 local crypto = require('crypto')
 local bit = require('bit')
 local buffer = require('buffer')
+local utils = require('internal.utils')
 local cord_ibuf_take = buffer.internal.cord_ibuf_take
 local cord_ibuf_put = buffer.internal.cord_ibuf_put
+local check_param = utils.check_param
 
 ffi.cdef[[
-    /* internal implementation */
-    unsigned char *SHA1internal(const unsigned char *d, size_t n, unsigned char *md);
-
     /* from libc */
     int snprintf(char *str, size_t size, const char *format, ...);
 
@@ -20,8 +19,9 @@ ffi.cdef[[
     extern crc32_func crc32_calc;
 
     /* base64 */
-    int base64_bufsize(int binsize, int options);
+    int base64_decode_bufsize(int base64_len);
     int base64_decode(const char *in_base64, int in_len, char *out_bin, int out_len);
+    int base64_encode_bufsize(int bin_len, int options);
     int base64_encode(const char *in_bin, int in_len, char *out_base64, int out_len, int options);
 
     /* random */
@@ -85,6 +85,7 @@ local BASE64_NOWRAP = 2
 local BASE64_URLSAFE = 7
 
 local digest_shortcuts = {
+    sha1    = 'SHA1',
     sha224  = 'SHA224',
     sha256  = 'SHA256',
     sha384  = 'SHA384',
@@ -92,14 +93,15 @@ local digest_shortcuts = {
     md5     = 'MD5',
     md4     = 'MD4',
 }
-local internal = require("digest")
+local internal = require("digest.lib")
 
 local PMurHash
 local PMurHash_methods = {
 
     update = function(self, str)
         if type(str) ~= 'string' then
-            error("Usage: murhash:update(string)")
+            box.error(box.error.ILLEGAL_PARAMS,
+                      'Usage: murhash:update(string)', 2)
         end
         builtin.PMurHash32_Process(self.seed, self.value, str, string.len(str))
         self.total_length = self.total_length + string.len(str)
@@ -141,7 +143,8 @@ PMurHash = {
 setmetatable(PMurHash, {
     __call = function(self, str)
         if type(str) ~= 'string' then
-            error("Usage: digest.murhash(string)")
+            box.error(box.error.ILLEGAL_PARAMS,
+                      'Usage: digest.murhash(string)', 2)
         end
         return builtin.PMurHash32(PMurHash.default_seed, str, string.len(str))
     end
@@ -149,13 +152,6 @@ setmetatable(PMurHash, {
 
 local CRC32
 local CRC32_methods = {
-    update = function(self, str)
-        if type(str) ~= 'string' then
-            error("Usage crc32:update(string)")
-        end
-        self.value = builtin.crc32_calc(self.value, str, string.len(str))
-    end,
-
     result = function(self)
         return self.value
     end,
@@ -181,29 +177,29 @@ CRC32 = {
     end
 }
 
+local __crc32 = require('crc32.internal')(CRC32)
+
+CRC32_methods.update = __crc32.update
+
 setmetatable(CRC32, {
-    __call = function(self, str)
-        if type(str) ~= 'string' then
-            error("Usage digest.crc32(string)")
-        end
-        return builtin.crc32_calc(CRC32.crc_begin, str, string.len(str))
-    end
+    __call = __crc32.__call
 })
 
 local pbkdf2 = function(pass, salt, iters, digest_len)
     if type(pass) ~= 'string' or type(salt) ~= 'string' then
-        error("Usage: digest.pbkdf2(pass, salt[,iters][,digest_len])")
+        box.error(box.error.ILLEGAL_PARAMS,
+                  'Usage: digest.pbkdf2(pass, salt[,iters][,digest_len])', 2)
     end
     if iters and type(iters) ~= 'number' then
-        error("iters must be a number")
+        box.error(box.error.ILLEGAL_PARAMS, 'iters must be a number', 2)
     end
     if digest_len and type(digest_len) ~= 'number' then
-        error("digest_len must be a number")
+        box.error(box.error.ILLEGAL_PARAMS, 'digest_len must be a number', 2)
     end
     iters = iters or 100000
     digest_len = digest_len or 128
     if digest_len > 128 then
-        error("too big digest size")
+        box.error(box.error.ILLEGAL_PARAMS, 'too big digest size', 2)
     end
     return internal.pbkdf2(pass, salt, iters, digest_len)
 end
@@ -212,7 +208,8 @@ local m = {
     base64_encode = function(bin, options)
         if type(bin) ~= 'string' or
            options ~= nil and type(options) ~= 'table' then
-            error('Usage: digest.base64_encode(string[, table])')
+            box.error(box.error.ILLEGAL_PARAMS,
+                      'Usage: digest.base64_encode(string[, table])', 2)
         end
         local mask = 0
         if options ~= nil then
@@ -227,7 +224,7 @@ local m = {
             end
         end
         local blen = #bin
-        local slen = builtin.base64_bufsize(blen, mask)
+        local slen = builtin.base64_encode_bufsize(blen, mask)
         local ibuf = cord_ibuf_take()
         local str = ibuf:alloc(slen)
         local len = builtin.base64_encode(bin, blen, str, slen, mask)
@@ -238,10 +235,11 @@ local m = {
 
     base64_decode = function(str)
         if type(str) ~= 'string' then
-            error('Usage: digest.base64_decode(string)')
+            box.error(box.error.ILLEGAL_PARAMS,
+                      'Usage: digest.base64_decode(string)', 2)
         end
         local slen = #str
-        local blen = math.ceil(slen * 3 / 4)
+        local blen = builtin.base64_decode_bufsize(slen);
         local ibuf = cord_ibuf_take()
         local bin = ibuf:alloc(blen)
         local len = builtin.base64_decode(str, slen, bin, blen)
@@ -254,34 +252,21 @@ local m = {
 
     crc32_update = function(crc, str)
         if type(str) ~= 'string' then
-            error("Usage: digest.crc32_update(string)")
+            box.error(box.error.ILLEGAL_PARAMS,
+                      'Usage: digest.crc32_update(string)', 2)
         end
         return builtin.crc32_calc(tonumber(crc), str, string.len(str))
     end,
 
-    sha1 = function(str)
-        if type(str) ~= 'string' then
-            error("Usage: digest.sha1(string)")
-        end
-        local r = builtin.SHA1internal(str, #str, nil)
-        return ffi.string(r, 20)
-    end,
-
-    sha1_hex = function(str)
-        if type(str) ~= 'string' then
-            error("Usage: digest.sha1_hex(string)")
-        end
-        local r = builtin.SHA1internal(str, #str, nil)
-        return string.hex(ffi.string(r, 20))
-    end,
-
     guava = function(state, buckets)
+        check_param(state, 'state', 'number', 2)
+        check_param(buckets, 'buckets', 'number', 2)
         return builtin.guava(state, buckets)
     end,
 
     urandom = function(n)
         if n == nil then
-            error('Usage: digest.urandom(len)')
+            box.error(box.error.ILLEGAL_PARAMS, 'Usage: digest.urandom(len)', 2)
         end
         local ibuf = cord_ibuf_take()
         local buf = ibuf:alloc(n)
@@ -297,7 +282,8 @@ local m = {
 
     pbkdf2_hex = function(pass, salt, iters, digest_len)
         if type(pass) ~= 'string' or type(salt) ~= 'string' then
-            error("Usage: digest.pbkdf2_hex(pass, salt)")
+            box.error(box.error.ILLEGAL_PARAMS,
+                      'Usage: digest.pbkdf2_hex(pass, salt)', 2)
         end
         return string.hex(pbkdf2(pass, salt, iters, digest_len))
     end
@@ -309,7 +295,8 @@ for digest, _ in pairs(digest_shortcuts) do
     end
     m[digest .. '_hex'] = function (str)
         if type(str) ~= 'string' then
-            error('Usage: digest.'..digest..'_hex(string)')
+            box.error(box.error.ILLEGAL_PARAMS,
+                      'Usage: digest.'..digest..'_hex(string)', 2)
         end
         return string.hex(crypto.digest[digest](str))
     end
@@ -335,8 +322,8 @@ for _, var in ipairs({'32', '64'}) do
 
     local function update(self, str)
         if type(str) ~= 'string' then
-            local message = string.format("Usage xxhash%s:update(string)", var)
-            error(message, 2)
+            local message = string.format("Usage: xxhash%s:update(string)", var)
+            box.error(box.error.ILLEGAL_PARAMS, message, 2)
         end
         builtin[update_fn_name](self.value, str, #str)
     end
@@ -380,8 +367,9 @@ for _, var in ipairs({'32', '64'}) do
     setmetatable(xxHash, {
         __call = function(_, str, seed)
             if type(str) ~= 'string' then
-                local message = string.format("Usage digest.xxhash%s(string[, unsigned number])", var)
-                error(message, 2)
+                local message = string.format(
+                    'Usage: digest.xxhash%s(string[, unsigned number])', var)
+                box.error(box.error.ILLEGAL_PARAMS, message, 2)
             end
             if seed == nil then
                 seed = 0

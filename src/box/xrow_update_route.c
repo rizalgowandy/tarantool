@@ -45,7 +45,7 @@
  * @param child Current field from which the branch happens. It
  *        already contains an update subtree.
  */
-static int
+static void
 xrow_update_route_branch_array(struct xrow_update_field *next_hop,
 			       const char *parent,
 			       const struct xrow_update_field *child,
@@ -79,30 +79,23 @@ xrow_update_route_branch_array(struct xrow_update_field *next_hop,
 	 * There is a tricky thing though - why not to just redo
 	 * all operations here, for the sake of code simplicity?
 	 * It would allow to remove 'create_with_child' crutch.
-	 * The answer is - it is not possible. If a field is
-	 * copyable, it is not re-applicable. And vice-versa. For
-	 * example, if it is not a leaf, then there may be many
-	 * operations, not one. A subtree just can't be
-	 * 're-applied'.
-	 *
-	 * If the operation is scalar and a leaf, then its result
-	 * has already overridden its arguments. This is because
-	 * scalar operations save result into the arguments, to
-	 * save memory. A second operation appliance would lead
-	 * to very surprising results.
+	 * The reason is it is not easy to reapply a subtree in
+	 * case child is route.
 	 *
 	 * Another reason - performance. This path should be
 	 * quite hot, and to copy a struct is for sure much faster
 	 * than to reapply an operation using a virtual function.
 	 * Operations '!' and '#' are quite rare, so their
 	 * optimization is not a critical goal.
+	 *
+	 * '=' is reapplied though for the sake of code simplicity.
 	 */
 	if (/* (1) Not a bar. */
 	    child->type != XUPDATE_BAR ||
 	    /* (2) Bar, but not a leaf. */
 	    child->bar.path_len > 0 ||
 	    /* (3) Leaf, bar, but a scalar operation. */
-	    (op->opcode != '!' && op->opcode != '#')) {
+	    xrow_update_op_is_scalar(op)) {
 		return xrow_update_array_create_with_child(next_hop, parent,
 							   child, field_no);
 	}
@@ -118,17 +111,18 @@ xrow_update_route_branch_array(struct xrow_update_field *next_hop,
 	const char *end = data;
 	for (uint32_t i = 0; i < field_count; ++i)
 		mp_next(&end);
-	if (xrow_update_array_create(next_hop, parent, data, end,
-				     field_count) != 0)
-		return -1;
-	return op->meta->do_op(op, next_hop);
+	xrow_update_array_create(next_hop, parent, data, end, field_count);
+	int rc = op->meta->do_op(op, next_hop);
+	/* Should not fail as we already applied it before successfully. */
+	assert(rc == 0);
+	(void)rc;
 }
 
 /**
  * Do the actual branch, but by a map and a key in that map. Works
  * exactly the same as the array-counterpart.
  */
-static int
+static void
 xrow_update_route_branch_map(struct xrow_update_field *next_hop,
 			     const char *parent,
 			     const struct xrow_update_field *child,
@@ -136,7 +130,7 @@ xrow_update_route_branch_map(struct xrow_update_field *next_hop,
 {
 	struct xrow_update_op *op = child->bar.op;
 	if (child->type != XUPDATE_BAR || child->bar.path_len > 0 ||
-	    (op->opcode != '!' && op->opcode != '#')) {
+	    xrow_update_op_is_scalar(op)) {
 		return xrow_update_map_create_with_child(next_hop, parent,
 							 child, key, key_len);
 	}
@@ -151,10 +145,11 @@ xrow_update_route_branch_map(struct xrow_update_field *next_hop,
 		mp_next(&end);
 		mp_next(&end);
 	}
-	if (xrow_update_map_create(next_hop, parent, data, end,
-				   field_count) != 0)
-		return -1;
-	return op->meta->do_op(op, next_hop);
+	xrow_update_map_create(next_hop, parent, data, end, field_count);
+	int rc = op->meta->do_op(op, next_hop);
+	/* Should not fail as we already applied it before successfully. */
+	assert(rc == 0);
+	(void)rc;
 }
 
 struct xrow_update_field *
@@ -207,33 +202,38 @@ xrow_update_route_branch(struct xrow_update_field *field,
 			xrow_update_err_bad_json(new_op, rc);
 			return NULL;
 		}
-		if (json_token_cmp(&old_token, &new_token) != 0)
+		if (json_token_cmp(&old_token, &new_token) != 0 ||
+		    json_lexer_is_eof(&old_path_lexer) ||
+		    json_lexer_is_eof(&new_op->lexer))
 			break;
+		const char *next_pos = parent;
 		switch(new_token.type) {
 		case JSON_TOKEN_NUM:
-			rc = tuple_field_go_to_index(&parent, new_token.num);
+			rc = tuple_field_go_to_index(&next_pos, new_token.num);
 			break;
 		case JSON_TOKEN_STR:
-			rc = tuple_field_go_to_key(&parent, new_token.str,
-						   new_token.len);
+			rc = tuple_field_go_to_key(&next_pos, new_token.str,
+						   new_token.len,
+						   /*field_key=*/NULL);
 			break;
 		default:
-			/*
-			 * Can't be JSON_TOKEN_ANY, because old
-			 * and new tokens are equal, but '*' is
-			 * considered invalid and the old was
-			 * already checked for that. So the new is
-			 * valid too. And can't have type ANY.
-			 */
-			assert(new_token.type == JSON_TOKEN_END);
-			xrow_update_err_double(new_op);
+			unreachable();
 			return NULL;
 		}
-		/*
-		 * Must always find a field, because the old
-		 * token already went that path.
-		 */
-		assert(rc == 0);
+		if (rc != 0) {
+			/*
+			 * Could fail only if the target location is inserted by
+			 * the bar operation as new. Then it won't be found in
+			 * the original parent container. In that case simply
+			 * branch right here so as the newly inserted field and
+			 * existing fields would be all visible together and the
+			 * branching could proceed.
+			 */
+			assert(field->type == XUPDATE_BAR);
+			assert(field->bar.op->opcode == '!');
+			break;
+		}
+		parent = next_pos;
 	} while (true);
 	enum mp_type type = mp_typeof(*parent);
 	/*
@@ -243,18 +243,11 @@ xrow_update_route_branch(struct xrow_update_field *field,
 	 */
 	bool transform_root = (saved_old_offset == 0);
 	struct xrow_update_field *next_hop;
-	if (!transform_root) {
-		size_t size;
-		next_hop = region_alloc_object(&fiber()->gc, typeof(*next_hop),
-					       &size);
-		if (next_hop == NULL) {
-			diag_set(OutOfMemory, size, "region_alloc_object",
-				 "next_hop");
-			return NULL;
-		}
-	} else {
+	if (!transform_root)
+		next_hop = xregion_alloc_object(&fiber()->gc,
+						typeof(*next_hop));
+	else
 		next_hop = field;
-	}
 
 	int path_offset = old_path_lexer.offset;
 	struct xrow_update_field child = *field;
@@ -267,15 +260,16 @@ xrow_update_route_branch(struct xrow_update_field *field,
 		assert(child.type == XUPDATE_BAR);
 		child.bar.path += path_offset;
 		child.bar.path_len -= path_offset;
+		/* Turn leaf scalar bar to scalar. */
+		if (child.bar.path_len == 0 &&
+		    xrow_update_op_is_scalar(child.bar.op)) {
+			struct xrow_update_scalar s = child.bar.scalar;
+			child.type = XUPDATE_SCALAR;
+			child.scalar = s;
+		}
 		/*
-		 * Yeah, bar length can become 0 here, but it is
-		 * ok as long as it is a scalar operation (not '!'
-		 * and not '#'). When a bar is scalar, it operates
-		 * on one concrete field and works even if its
-		 * path len is 0. Talking of '#' and '!' - they
-		 * are handled by array and map 'branchers'
-		 * internally, below. They reapply such
-		 * operations.
+		 * Non scalar leaf bar (path length is 0) will be
+		 * reapplied in array and map 'branchers'.
 		 */
 	}
 
@@ -288,9 +282,8 @@ xrow_update_route_branch(struct xrow_update_field *field,
 		new_op->is_token_consumed = false;
 		new_op->token_type = JSON_TOKEN_NUM;
 		new_op->field_no = new_token.num;
-		if (xrow_update_route_branch_array(next_hop, parent, &child,
-						   old_token.num) != 0)
-			return NULL;
+		xrow_update_route_branch_array(next_hop, parent, &child,
+					       old_token.num);
 	} else if (type == MP_MAP) {
 		if (new_token.type != JSON_TOKEN_STR) {
 			xrow_update_err(new_op, "can not update map by "\
@@ -301,10 +294,8 @@ xrow_update_route_branch(struct xrow_update_field *field,
 		new_op->token_type = JSON_TOKEN_STR;
 		new_op->key = new_token.str;
 		new_op->key_len = new_token.len;
-		if (xrow_update_route_branch_map(next_hop, parent, &child,
-						 old_token.str,
-						 old_token.len) != 0)
-			return NULL;
+		xrow_update_route_branch_map(next_hop, parent, &child,
+					     old_token.str, old_token.len);
 	} else {
 		xrow_update_err_no_such_field(new_op);
 		return NULL;

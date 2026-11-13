@@ -39,6 +39,7 @@
 #include "trivia/util.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <string.h>
 #include <math.h>
 #include <limits.h>
@@ -52,8 +53,9 @@
 #include "mp_extension_types.h" /* MP_DECIMAL, MP_UUID */
 #include "diag.h"
 #include "tt_static.h"
-#include "uuid/tt_uuid.h" /* tt_uuid_to_string(), UUID_STR_LEN */
+#include "core/datetime.h"
 #include "cord_buf.h"
+#include "tt_uuid.h" /* tt_uuid_to_string(), UUID_STR_LEN */
 
 typedef enum {
     T_OBJ_BEGIN,
@@ -96,8 +98,6 @@ static const char *json_token_type_name[] = {
     NULL
 };
 
-static struct luaL_serializer *luaL_json_default;
-
 static json_token_type_t ch2token[256];
 static char escape2char[256];  /* Decoding */
 
@@ -123,45 +123,6 @@ typedef struct {
     int string_len;
 } json_token_t;
 
-static const char *char2escape[256] = {
-    "\\u0000", "\\u0001", "\\u0002", "\\u0003",
-    "\\u0004", "\\u0005", "\\u0006", "\\u0007",
-    "\\b", "\\t", "\\n", "\\u000b",
-    "\\f", "\\r", "\\u000e", "\\u000f",
-    "\\u0010", "\\u0011", "\\u0012", "\\u0013",
-    "\\u0014", "\\u0015", "\\u0016", "\\u0017",
-    "\\u0018", "\\u0019", "\\u001a", "\\u001b",
-    "\\u001c", "\\u001d", "\\u001e", "\\u001f",
-    NULL, NULL, "\\\"", NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, "\\/",
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, "\\\\", NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, "\\u007f",
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-};
-
 #if 0
 static int json_destroy_config(lua_State *l)
 {
@@ -176,6 +137,7 @@ static int json_destroy_config(lua_State *l)
 }
 #endif
 
+__attribute__((constructor))
 static void json_create_tokens()
 {
     int i;
@@ -249,7 +211,7 @@ static void json_append_string(struct luaL_serializer *cfg, strbuf_t *json,
 
     strbuf_append_char_unsafe(json, '\"');
     for (i = 0; i < len; i++) {
-        escstr = char2escape[(unsigned char)str[i]];
+        escstr = json_escape_char(str[i]);
         if (escstr)
             strbuf_append_string(json, escstr);
         else
@@ -333,42 +295,64 @@ static void json_append_number(struct luaL_serializer *cfg, strbuf_t *json,
 static void json_append_object(lua_State *l, struct luaL_serializer *cfg,
                                int current_depth, strbuf_t *json)
 {
-    int comma;
+    int comma = 0;
 
     /* Object */
     strbuf_append_char(json, '{');
 
+    /* const table */
     lua_pushnil(l);
-    /* table, startkey */
-    comma = 0;
-    while (lua_next(l, -2) != 0) {
+    lua_pushnil(l);
+    /* const table, key_idx(nil), key(nil) */
+
+    while (luaL_next_field(l, cfg) != 0) {
+        /* Skip nil values */
+        if (lua_isnil(l, -1)) {
+            /* const table, (table ?), key_idx, key, value */
+            lua_pop(l, 1);
+            /* const table, (table ?), key_idx, key */
+            continue;
+        }
+
         if (comma)
             strbuf_append_char(json, ',');
         else
             comma = 1;
 
-    struct luaL_field field;
-    luaL_checkfield(l, cfg, -2, &field);
-    if (field.type == MP_UINT) {
-        strbuf_append_char(json, '"');
-        json_append_uint(cfg, json, field.ival);
-        strbuf_append_mem(json, "\":", 2);
-    } else if (field.type == MP_INT) {
-        strbuf_append_char(json, '"');
-        json_append_int(cfg, json, field.ival);
-        strbuf_append_mem(json, "\":", 2);
-    } else if (field.type == MP_STR) {
-        json_append_string(cfg, json, field.sval.data, field.sval.len);
-        strbuf_append_char(json, ':');
-    } else {
-        luaL_error(l, "table key must be a number or string");
-    }
+        struct luaL_field field;
+        /* Push a copy of the key on top of the stack. */
+        lua_pushvalue(l, -2);
+        /* const table, (table ?), key_idx, key, value, key */
+        luaL_checkfield(l, cfg, -3, &field);
+        /* const table, (table ?), key_idx, key_ser, value, key */
+        switch (field.type) {
+        case MP_UINT:
+            strbuf_append_char(json, '"');
+            json_append_uint(cfg, json, field.ival);
+            strbuf_append_mem(json, "\":", 2);
+            break;
+        case MP_INT:
+            strbuf_append_char(json, '"');
+            json_append_int(cfg, json, field.ival);
+            strbuf_append_mem(json, "\":", 2);
+            break;
+        case MP_STR:
+            json_append_string(cfg, json, field.sval.data, field.sval.len);
+            strbuf_append_char(json, ':');
+            break;
+        default:
+            luaL_error(l, "table key must be a number or string");
+            break;
+        }
 
-        /* table, key, value */
+        /* Replace the serialized key with the original form. */
+        lua_replace(l, -3);
+        /* const table, (table ?), key_idx, key, value */
         json_append_data(l, cfg, current_depth, json);
         lua_pop(l, 1);
-        /* table, key */
+        /* const table, (table ?), key_idx, key */
     }
+    /* const table */
 
     strbuf_append_char(json, '}');
 }
@@ -432,6 +416,18 @@ static void json_append_data(lua_State *l, struct luaL_serializer *cfg,
             const char *str = field.errorval->errmsg;
             return json_append_string(cfg, json, str, strlen(str));
         }
+        case MP_DATETIME:
+        {
+            char buf[DT_TO_STRING_BUFSIZE];
+            size_t sz = datetime_snprint(buf, sizeof(buf), field.dateval);
+            return json_append_string(cfg, json, buf, sz);
+        }
+        case MP_INTERVAL:
+        {
+            char buf[DT_IVAL_TO_STRING_BUFSIZE];
+            size_t sz = interval_snprint(buf, sizeof(buf), field.interval);
+            return json_append_string(cfg, json, buf, sz);
+        }
         default:
             assert(false);
         }
@@ -449,10 +445,21 @@ static int json_encode(lua_State *l) {
     struct luaL_serializer *cfg = luaL_checkserializer(l);
 
     if (lua_gettop(l) == 2) {
-        struct luaL_serializer user_cfg = *cfg;
-        luaL_serializer_parse_options(l, &user_cfg);
+        /*
+         * user_cfg is per-call local version of serializer instance
+         * options: it is used if a user passes custom options to
+         * :encode() method within a separate argument. In this case
+         * it is required to avoid modifying options of the instance.
+         * Life span of user_cfg is restricted by the scope of
+         * :encode() so it is ok to push it onto the Lua stack to be collected
+         * by the garbage collector.
+         */
+        struct luaL_serializer *user_cfg = luaL_newserializer_config(l);
+        lua_insert(l, -3);
+        luaL_serializer_copy_options(user_cfg, cfg);
+        luaL_serializer_parse_options(l, user_cfg);
         lua_pop(l, 1);
-        json_append_data(l, &user_cfg, 0, &encode_buf);
+        json_append_data(l, user_cfg, 0, &encode_buf);
     } else {
         json_append_data(l, cfg, 0, &encode_buf);
     }
@@ -726,10 +733,11 @@ static void json_next_number_token(json_parse_t *json, json_token_t *token)
 {
     char *endptr;
 
-
+    errno = 0;
     token->type = T_INT;
     token->value.ival = strtoll(json->ptr, &endptr, 10);
     if (token->value.ival == LLONG_MAX) {
+        errno = 0;
         token->type = T_UINT;
         token->value.ival = strtoull(json->ptr, &endptr, 10);
     }
@@ -738,10 +746,18 @@ static void json_next_number_token(json_parse_t *json, json_token_t *token)
         token->value.number = fpconv_strtod(json->ptr, &endptr);
     }
 
-    if (json->ptr == endptr)
+    if (json->ptr == endptr) {
         json_set_token_error(token, json, "invalid number");
-    else
-        json->ptr = endptr;     /* Skip the processed number */
+        return;
+    }
+    if (token->type != T_NUMBER && errno == ERANGE &&
+        json->cfg->decode_overflow == JSON_DECODE_OVERFLOW_ERROR) {
+        json_set_token_error(token, json, "integer outside the supported "
+                             "range [INT64_MIN, UINT64_MAX]");
+        return;
+    }
+    /* strtoll()/strtoull() already clamp overflowing integers. */
+    json->ptr = endptr;     /* Skip the processed number */
 }
 
 /* Fills in the token struct.
@@ -1074,28 +1090,26 @@ static int json_decode(lua_State *l)
 
     struct luaL_serializer *cfg = luaL_checkserializer(l);
 
-    /*
-     * user_cfg is per-call local version of serializer instance
-     * options: it is used if a user passes custom options to
-     * :decode() method within a separate argument. In this case
-     * it is required to avoid modifying options of the instance.
-     * Life span of user_cfg is restricted by the scope of
-     * :decode() so it is enough to allocate it on the stack.
-     */
-    struct luaL_serializer user_cfg;
     json.cfg = cfg;
     if (lua_gettop(l) == 2) {
         /*
-         * on_update triggers are left uninitialized for user_cfg.
-         * The decoding code don't (and shouldn't) run them.
+         * user_cfg is per-call local version of serializer instance
+         * options: it is used if a user passes custom options to
+         * :decode() method within a separate argument. In this case
+         * it is required to avoid modifying options of the instance.
+         * Life span of user_cfg is restricted by the scope of
+         * :decode() so it is ok to push it onto the Lua stack to be collected
+         * by the garbage collector.
          */
-        luaL_serializer_copy_options(&user_cfg, cfg);
-        luaL_serializer_parse_options(l, &user_cfg);
+        struct luaL_serializer *user_cfg = luaL_newserializer_config(l);
+        lua_insert(l, -3);
+        luaL_serializer_copy_options(user_cfg, cfg);
+        luaL_serializer_parse_options(l, user_cfg);
         lua_pop(l, 1);
-        json.cfg = &user_cfg;
+        json.cfg = user_cfg;
     }
 
-    json.data = luaL_checklstring(l, 1, &json_len);
+    json.data = luaL_checklstring(l, -1, &json_len);
     json.current_depth = 0;
     json.ptr = json.data;
     json.line_count = 1;
@@ -1154,8 +1168,7 @@ json_new(lua_State *L)
 int
 luaopen_json(lua_State *L)
 {
-    json_create_tokens();
-    luaL_json_default = luaL_newserializer(L, "json", jsonlib);
+    luaL_newserializer(L, "json", jsonlib);
     luaL_pushnull(L);
     lua_setfield(L, -2, "null"); /* compatibility with cjson */
     return 1;

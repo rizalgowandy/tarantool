@@ -40,17 +40,24 @@
 #include "lib/core/decimal.h" /* decimal_t */
 #include "lib/core/mp_extension_types.h"
 #include "lua/error.h"
+#include "lua/decimal.h"
 
+#include "datetime.h"
 #include "trivia/util.h"
 #include "diag.h"
 #include "lua/utils.h"
+#include "tt_static.h"
 
-int luaL_map_metatable_ref = LUA_REFNIL;
-int luaL_array_metatable_ref = LUA_REFNIL;
-extern uint32_t CTID_UUID;
-extern uint32_t CTID_DECIMAL;
+__thread int luaL_map_metatable_ref = LUA_REFNIL;
+__thread int luaL_array_metatable_ref = LUA_REFNIL;
 
 /* {{{ luaL_serializer manipulations */
+
+/** Names accepted by the JSON integer overflow option. */
+static const char *const json_decode_overflow_strs[] = {
+	[JSON_DECODE_OVERFLOW_CLAMP] = "clamp",
+	[JSON_DECODE_OVERFLOW_ERROR] = "error",
+};
 
 #define OPTION(type, name, defvalue) { #name, \
 	offsetof(struct luaL_serializer, name), type, defvalue}
@@ -64,6 +71,8 @@ static struct {
 	int type;
 	int defvalue;
 } OPTIONS[] = {
+	/* Reject invalid overflow modes before applying any other options. */
+	OPTION(LUA_TSTRING,  decode_overflow, JSON_DECODE_OVERFLOW_CLAMP),
 	OPTION(LUA_TBOOLEAN, encode_sparse_convert, 1),
 	OPTION(LUA_TNUMBER,  encode_sparse_ratio, 2),
 	OPTION(LUA_TNUMBER,  encode_sparse_safe, 10),
@@ -75,6 +84,7 @@ static struct {
 	OPTION(LUA_TBOOLEAN, encode_use_tostring, 0),
 	OPTION(LUA_TBOOLEAN, encode_invalid_as_nil, 0),
 	OPTION(LUA_TBOOLEAN, encode_error_as_ext, 1),
+	OPTION(LUA_TTABLE,   encode_key_order, 0),
 	OPTION(LUA_TBOOLEAN, decode_invalid_numbers, 1),
 	OPTION(LUA_TBOOLEAN, decode_save_metatables, 1),
 	OPTION(LUA_TNUMBER,  decode_max_depth, 128),
@@ -86,8 +96,26 @@ luaL_serializer_create(struct luaL_serializer *cfg)
 {
 	rlist_create(&cfg->on_update);
 	for (int i = 0; OPTIONS[i].name != NULL; i++) {
-		int *pval = (int *) ((char *) cfg + OPTIONS[i].offset);
-		*pval = OPTIONS[i].defvalue;
+		switch (OPTIONS[i].type) {
+		case LUA_TBOOLEAN:
+		case LUA_TSTRING:
+		case LUA_TNUMBER: {
+			int *pval = (int *)((char *)cfg + OPTIONS[i].offset);
+			*pval = OPTIONS[i].defvalue;
+			break;
+		}
+		case LUA_TTABLE: {
+			if (strcmp(OPTIONS[i].name, "encode_key_order") != 0) {
+				unreachable();
+			}
+
+			char **p = (char **)((char *)cfg + OPTIONS[i].offset);
+			*p = NULL;
+			break;
+		}
+		default:
+			unreachable();
+		}
 	}
 }
 
@@ -95,7 +123,117 @@ void
 luaL_serializer_copy_options(struct luaL_serializer *dst,
 			     const struct luaL_serializer *src)
 {
+	luaL_serializer_options_delete(dst);
 	memcpy(dst, src, offsetof(struct luaL_serializer, end_of_options));
+
+	/*
+	 * Do a deep copy of the encoder key order. Not doing so would lead to
+	 * double free.
+	 */
+	size_t encode_key_order_len = 0;
+	while (src->encode_key_order != NULL &&
+	       src->encode_key_order[encode_key_order_len] != NULL) {
+		encode_key_order_len++;
+	}
+
+	if (encode_key_order_len > 0) {
+		dst->encode_key_order = xcalloc(
+			encode_key_order_len + 1, sizeof(char *));
+
+		for (size_t i = 0; i < encode_key_order_len; i++) {
+			size_t len = strlen(src->encode_key_order[i]);
+			dst->encode_key_order[i] = xcalloc(len + 1,
+							   sizeof(char));
+			memcpy(dst->encode_key_order[i],
+			       src->encode_key_order[i],
+			       len);
+		}
+	} else {
+		dst->encode_key_order = NULL;
+	}
+}
+
+/**
+ * Free memory allocated for encode_key_order.
+ * @param cfg Serializer configuration.
+ */
+static void
+luaL_serializer_free_encode_key_order(struct luaL_serializer *cfg)
+{
+	if (cfg->encode_key_order == NULL) {
+		return;
+	}
+
+	for (size_t i = 0; cfg->encode_key_order[i] != NULL; i++) {
+		free(cfg->encode_key_order[i]);
+	}
+
+	free(cfg->encode_key_order);
+	cfg->encode_key_order = NULL;
+}
+
+void
+luaL_serializer_options_delete(struct luaL_serializer *cfg)
+{
+	assert(cfg);
+	luaL_serializer_free_encode_key_order(cfg);
+	/* This is a partial TRASH(cfg), only for options. */
+	memset(cfg, '#', offsetof(struct luaL_serializer, end_of_options));
+}
+
+/**
+ * Destroy the serializer object, freeing all allocated memory.
+ * @param L Lua stack.
+ * @retval 0.
+ */
+static int
+luaL_serializer_destroy(struct lua_State *L)
+{
+	struct luaL_serializer *cfg = lua_touserdata(L, 1);
+	luaL_serializer_options_delete(cfg);
+	return 0;
+}
+
+/**
+ * Parse encode_key_order table from stack into serializer config.
+ * @param L Lua stack.
+ * @param cfg Serializer configuration.
+ */
+static void
+luaL_serializer_parse_encode_key_order(struct lua_State *L,
+				       struct luaL_serializer *cfg)
+{
+	if (!(lua_istable(L, -1) || lua_isnil(L, -1) || luaL_isnull(L, -1))) {
+		luaL_error(L, "encode_key_order option must be a table");
+		unreachable();
+		return;
+	}
+
+	luaL_serializer_free_encode_key_order(cfg);
+
+	size_t key_order_len = lua_objlen(L, -1);
+	if (key_order_len > 0) {
+		cfg->encode_key_order = xcalloc(
+			key_order_len + 1, sizeof(char *));
+	}
+
+	for (size_t i = 0, j = 0; i < key_order_len; i++) {
+		lua_pushinteger(L, i + 1);
+		lua_gettable(L, -2);
+
+		/* Skip keys that are not strings or numbers. */
+		if (!lua_isstring(L, -1)) {
+			lua_pop(L, 1);
+			continue;
+		}
+
+		size_t len = 0;
+		const char *key = lua_tolstring(L, -1, &len);
+		cfg->encode_key_order[j] = xcalloc(len + 1, sizeof(char));
+		memcpy(cfg->encode_key_order[j], key, len);
+		lua_pop(L, 1);
+		j++;
+	}
 }
 
 /**
@@ -111,7 +249,7 @@ static int *
 luaL_serializer_parse_option(struct lua_State *L, int i,
 			     struct luaL_serializer *cfg)
 {
-	lua_getfield(L, 2, OPTIONS[i].name);
+	lua_getfield(L, -1, OPTIONS[i].name);
 	if (lua_isnil(L, -1))
 		return NULL;
 	/*
@@ -126,6 +264,34 @@ luaL_serializer_parse_option(struct lua_State *L, int i,
 	case LUA_TNUMBER:
 		*pval = lua_tointeger(L, -1);
 		break;
+	case LUA_TSTRING: {
+		assert(strcmp(OPTIONS[i].name, "decode_overflow") == 0);
+		size_t len;
+		const char *value = lua_tolstring(L, -1, &len);
+		int mode = json_decode_overflow_MAX;
+		if (value != NULL) {
+			for (mode = 0; mode < json_decode_overflow_MAX;
+			     mode++) {
+				const char *name =
+					json_decode_overflow_strs[mode];
+				if (strlen(name) == len &&
+				    memcmp(name, value, len) == 0)
+					break;
+			}
+		}
+		if (mode == json_decode_overflow_MAX) {
+			luaL_error(L, "Invalid decode_overflow: expected "
+				   "'clamp' or 'error'");
+		}
+		*pval = mode;
+		break;
+	}
+	case LUA_TTABLE:
+		if (strcmp(OPTIONS[i].name, "encode_key_order") == 0) {
+			luaL_serializer_parse_encode_key_order(L, cfg);
+			break;
+		}
+		unreachable();
 	default:
 		unreachable();
 	}
@@ -171,6 +337,33 @@ luaL_serializer_cfg(struct lua_State *L)
 	return 0;
 }
 
+void
+luaL_push_encode_key_order(struct lua_State *L, struct luaL_serializer *cfg)
+{
+	if (cfg->encode_key_order == NULL) {
+		lua_pushnil(L);
+		return;
+	}
+
+	lua_newtable(L);
+	for (size_t i = 0; cfg->encode_key_order[i] != NULL; i++) {
+		lua_pushinteger(L, i + 1);
+		lua_pushstring(L, cfg->encode_key_order[i]);
+		lua_settable(L, -3);
+	}
+}
+
+struct luaL_serializer *
+luaL_newserializer_config(struct lua_State *L)
+{
+	struct luaL_serializer *serializer = (struct luaL_serializer *)
+		lua_newuserdata(L, sizeof(*serializer));
+	luaL_getmetatable(L, LUAL_SERIALIZER);
+	lua_setmetatable(L, -2);
+	luaL_serializer_create(serializer);
+	return serializer;
+}
+
 struct luaL_serializer *
 luaL_newserializer(struct lua_State *L, const char *modname,
 		   const luaL_Reg *reg)
@@ -181,11 +374,7 @@ luaL_newserializer(struct lua_State *L, const char *modname,
 	lua_newtable(L);
 
 	/* Create new configuration */
-	struct luaL_serializer *serializer = (struct luaL_serializer *)
-			lua_newuserdata(L, sizeof(*serializer));
-	luaL_getmetatable(L, LUAL_SERIALIZER);
-	lua_setmetatable(L, -2);
-	luaL_serializer_create(serializer);
+	struct luaL_serializer *serializer = luaL_newserializer_config(L);
 
 	for (; reg->name != NULL; reg++) {
 		/* push luaL_serializer as upvalue */
@@ -212,6 +401,16 @@ luaL_newserializer(struct lua_State *L, const char *modname,
 		case LUA_TNUMBER:
 			lua_pushinteger(L, *pval);
 			break;
+		case LUA_TSTRING:
+			assert(strcmp(OPTIONS[i].name, "decode_overflow") == 0);
+			lua_pushstring(L, json_decode_overflow_strs[*pval]);
+			break;
+		case LUA_TTABLE:
+			if (strcmp(OPTIONS[i].name, "encode_key_order") == 0) {
+				luaL_push_encode_key_order(L, serializer);
+				break;
+			}
+			unreachable();
 		default:
 			unreachable();
 		}
@@ -229,12 +428,9 @@ luaL_newserializer(struct lua_State *L, const char *modname,
 	lua_setfield(L, -2, "map_mt");
 
 	if (modname != NULL) {
-		/* Register module */
-		lua_getfield(L, LUA_REGISTRYINDEX, "_LOADED");
-		lua_pushstring(L, modname); /* add alias */
-		lua_pushvalue(L, -3);
-		lua_settable(L, -3);
-		lua_pop(L, 1); /* _LOADED */
+		/* Register module. */
+		lua_pushvalue(L, -1);
+		luaT_setmodule(L, modname);
 	}
 
 	return serializer;
@@ -251,12 +447,12 @@ lua_gettable_wrapper(lua_State *L)
 	return 1;
 }
 
-static void
+static int
 lua_field_inspect_ucdata(struct lua_State *L, struct luaL_serializer *cfg,
 			int idx, struct luaL_field *field)
 {
 	if (!cfg->encode_load_metatables)
-		return;
+		return 0;
 
 	/*
 	 * Try to call LUAL_SERIALIZE method on udata/cdata
@@ -268,17 +464,24 @@ lua_field_inspect_ucdata(struct lua_State *L, struct luaL_serializer *cfg,
 	lua_pushvalue(L, idx);
 	lua_pushliteral(L, LUAL_SERIALIZE);
 	if (lua_pcall(L, 2, 1, 0) == 0  && !lua_isnil(L, -1)) {
-		if (!lua_isfunction(L, -1))
-			luaL_error(L, "invalid " LUAL_SERIALIZE  " value");
+		if (!lua_isfunction(L, -1)) {
+			diag_set(LuajitError,
+				 "invalid " LUAL_SERIALIZE " value");
+			return -1;
+		}
 		/* copy object itself */
 		lua_pushvalue(L, idx);
-		lua_pcall(L, 1, 1, 0);
+		if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
+			diag_set(LuajitError, lua_tostring(L, -1));
+			return -1;
+		}
 		/* replace obj with the unpacked value */
 		lua_replace(L, idx);
 		if (luaL_tofield(L, cfg, idx, field) < 0)
-			luaT_error(L);
+			return -1;
 	} /* else ignore lua_gettable exceptions */
 	lua_settop(L, top); /* remove temporary objects */
+	return 0;
 }
 
 /**
@@ -414,7 +617,7 @@ lua_field_inspect_table(struct lua_State *L, struct luaL_serializer *cfg,
 	return 0;
 }
 
-static void
+static int
 lua_field_tostring(struct lua_State *L, struct luaL_serializer *cfg, int idx,
 		   struct luaL_field *field)
 {
@@ -424,14 +627,169 @@ lua_field_tostring(struct lua_State *L, struct luaL_serializer *cfg, int idx,
 	lua_call(L, 1, 1);
 	lua_replace(L, idx);
 	lua_settop(L, top);
-	if (luaL_tofield(L, cfg, idx, field) < 0)
-		luaT_error(L);
+	return luaL_tofield(L, cfg, idx, field);
+}
+
+/**
+ * Get the next field from the leftovers table in unsorted order.
+ * @param L Lua stack.
+ * @retval 0 if there are no more fields in the table.
+ */
+static int
+luaL_next_field_unsorted(struct lua_State *L)
+{
+	assert(lua_gettop(L) >= 4);
+	assert(lua_isnil(L, -2));
+	assert(lua_istable(L, -3));
+	assert(lua_istable(L, -4));
+
+	/* const table, table, nil, key */
+	int r = lua_next(L, -3);
+
+	if (r == 0) {
+		/*
+		 * No more elements in the table. Delete the copy of the table.
+		 * const table, table, nil
+		 */
+		lua_pop(L, 2);
+		/* const table */
+		return 0;
+	}
+
+	return r;
+}
+
+/**
+ * Get the next field from the initial table in unsorted order.
+ * @param L Lua stack.
+ * @retval 0 if there are no more fields in the table.
+ */
+static int
+luaL_next_field_fallback(struct lua_State *L)
+{
+	assert(lua_gettop(L) >= 3);
+	assert(lua_isnil(L, -2));
+	assert(lua_istable(L, -3));
+
+	/* const table, nil, key */
+	int r = lua_next(L, -3);
+
+	if (r == 0) {
+		/* const table, nil */
+		lua_pop(L, 1);
+		/* const table */
+		return 0;
+	}
+
+	/* const table, nil, key, value */
+	return r;
+}
+
+int
+luaL_next_field(struct lua_State *L, struct luaL_serializer *cfg)
+{
+	/* const table, (table ?), key_idx, key */
+	assert(lua_gettop(L) >= 3);
+	assert(lua_isnil(L, -2) || lua_isnumber(L, -2));
+	assert(lua_istable(L, -3));
+
+	/* No need to sort anything */
+	if (cfg->encode_key_order == NULL) {
+		return luaL_next_field_fallback(L);
+	}
+
+	/*
+	 * Both key_idx and key are nil, first call, copy the table
+	 * so that we can remove printed elements from its copy, leaving
+	 * the initial table intact.
+	 */
+	if (lua_isnil(L, -1) && lua_isnil(L, -2)) {
+		/* const table, nil, nil */
+		lua_pop(L, 2);
+		lua_newtable(L);
+		/* const table, table */
+
+		/* Copy the table. */
+		lua_pushnil(L);
+		/* const table, table, nil */
+		while (lua_next(L, -3)) {
+			/* const table, table, key, value */
+			lua_pushvalue(L, -2);
+			/* const table, table, key, value, key */
+			lua_pushvalue(L, -2);
+			/* const table, table, key, value, key, value */
+			lua_settable(L, -5);
+			/* const table, table, key, value */
+			lua_pop(L, 1);
+			/* const table, table, key */
+		}
+		/* const table, table */
+		lua_pushnil(L);
+		lua_pushnil(L);
+		/* const table, table, nil, nil */
+	}
+
+	/* Going through the unsorted part */
+	if (!lua_isnil(L, -1) && lua_isnil(L, -2)) {
+		return luaL_next_field_unsorted(L);
+	}
+
+	/**
+	 * We are iterating through sorted part of the table
+	 * don't need to know the key.
+	 * const table, table, key_idx, key
+	 */
+	lua_pop(L, 1);
+	/* const table, table, key_idx */
+
+	assert(lua_isnil(L, -1) || lua_isnumber(L, -1));
+
+	/* Start with the first key */
+	lua_Integer key_idx = 0;
+	if (lua_isnumber(L, -1)) {
+		/* Get next key index if it is a number */
+		key_idx = lua_tointeger(L, -1) + 1;
+		assert(key_idx >= 0);
+	}
+	/* const table, table, key_idx */
+	lua_pop(L, 1);
+	/* const table, table */
+
+	/* Find the key in the key order. */
+	char *key = cfg->encode_key_order[key_idx];
+
+	/* encode_key_order end, continue iterating over the unsorted part. */
+	if (key == NULL) {
+		/* const table, table */
+		lua_pushnil(L);
+		lua_pushnil(L);
+		/* const table, table, nil, nil */
+		return luaL_next_field_unsorted(L);
+	}
+
+	/* Push current key_idx, key and value. */
+	/* const table, table */
+	lua_pushinteger(L, key_idx);
+	lua_pushstring(L, key);
+	lua_getfield(L, -3, key);
+	/* const table, table, key_idx, key, value */
+
+	/* Remove the key from the table. */
+	lua_pushnil(L);
+	lua_setfield(L, -5, key);
+
+	/* const table, table, key_idx, key, value */
+	return 5;
 }
 
 int
 luaL_tofield(struct lua_State *L, struct luaL_serializer *cfg, int index,
 	     struct luaL_field *field)
 {
+	field->type = MP_NIL;
+	field->ext_type = MP_UNKNOWN_EXTENSION;
+	field->compact = false;
+
 	if (index < 0)
 		index = lua_gettop(L) + index + 1;
 
@@ -468,11 +826,11 @@ luaL_tofield(struct lua_State *L, struct luaL_serializer *cfg, int index,
 		return 0;
 	case LUA_TCDATA:
 	{
-		GCcdata *cd = cdataV(L->base + index - 1);
-		void *cdata = (void *)cdataptr(cd);
+		uint32_t ctypeid;
+		void *cdata = luaL_tocpointer(L, index, &ctypeid);
 
 		int64_t ival;
-		switch (cd->ctypeid) {
+		switch (ctypeid) {
 		case CTID_BOOL:
 			field->type = MP_BOOL;
 			field->bval = *(bool*) cdata;
@@ -530,18 +888,33 @@ luaL_tofield(struct lua_State *L, struct luaL_serializer *cfg, int index,
 				field->type = MP_NIL;
 				return 0;
 			}
-			/* Fall through */
-		default:
 			field->type = MP_EXT;
-			if (cd->ctypeid == CTID_DECIMAL) {
+			field->ext_type = MP_UNKNOWN_EXTENSION;
+			return 0;
+		default:
+			if (ctypeid == CTID_VARBINARY) {
+				field->type = MP_BIN;
+				field->sval.data = luaT_tovarbinary(
+					L, index, &field->sval.len);
+				assert(field->sval.data != NULL);
+				return 0;
+			}
+			field->type = MP_EXT;
+			if (ctypeid == CTID_DECIMAL) {
 				field->ext_type = MP_DECIMAL;
 				field->decval = (decimal_t *) cdata;
-			} else if (cd->ctypeid == CTID_UUID) {
+			} else if (ctypeid == CTID_UUID) {
 				field->ext_type = MP_UUID;
 				field->uuidval = (struct tt_uuid *) cdata;
-			} else if (cd->ctypeid == CTID_CONST_STRUCT_ERROR_REF) {
+			} else if (ctypeid == CTID_CONST_STRUCT_ERROR_REF) {
 				field->ext_type = MP_ERROR;
 				field->errorval = *(struct error **)cdata;
+			} else if (ctypeid == CTID_DATETIME) {
+				field->ext_type = MP_DATETIME;
+				field->dateval = (struct datetime *)cdata;
+			} else if (ctypeid == CTID_INTERVAL) {
+				field->ext_type = MP_INTERVAL;
+				field->interval = (struct interval *)cdata;
 			} else {
 				field->ext_type = MP_UNKNOWN_EXTENSION;
 			}
@@ -561,10 +934,7 @@ luaL_tofield(struct lua_State *L, struct luaL_serializer *cfg, int index,
 		field->type = MP_STR;
 		return 0;
 	case LUA_TTABLE:
-	{
-		field->compact = false;
 		return lua_field_inspect_table(L, cfg, index, field);
-	}
 	case LUA_TLIGHTUSERDATA:
 	case LUA_TUSERDATA:
 		field->sval.data = NULL;
@@ -582,13 +952,13 @@ luaL_tofield(struct lua_State *L, struct luaL_serializer *cfg, int index,
 	return 0;
 }
 
-void
+int
 luaL_convertfield(struct lua_State *L, struct luaL_serializer *cfg, int idx,
 		  struct luaL_field *field)
 {
 	if (idx < 0)
 		idx = lua_gettop(L) + idx + 1;
-	assert(field->type == MP_EXT && field->ext_type == MP_UNKNOWN_EXTENSION); /* must be called after tofield() */
+	assert(field->type == MP_EXT); /* must be called after tofield() */
 
 	if (cfg->encode_load_metatables) {
 		int type = lua_type(L, idx);
@@ -597,11 +967,14 @@ luaL_convertfield(struct lua_State *L, struct luaL_serializer *cfg, int idx,
 			 * Don't call __serialize on primitive types
 			 * https://github.com/tarantool/tarantool/issues/1226
 			 */
-			GCcdata *cd = cdataV(L->base + idx - 1);
-			if (cd->ctypeid > CTID_CTYPEID)
-				lua_field_inspect_ucdata(L, cfg, idx, field);
+			uint32_t ctypeid;
+			luaL_tocpointer(L, idx, &ctypeid);
+			if (ctypeid > CTID_CTYPEID &&
+			    lua_field_inspect_ucdata(L, cfg, idx, field) != 0)
+				return -1;
 		} else if (type == LUA_TUSERDATA) {
-			lua_field_inspect_ucdata(L, cfg, idx, field);
+			if (lua_field_inspect_ucdata(L, cfg, idx, field) != 0)
+				return -1;
 		}
 	}
 
@@ -610,23 +983,176 @@ luaL_convertfield(struct lua_State *L, struct luaL_serializer *cfg, int idx,
 		lua_field_tostring(L, cfg, idx, field);
 
 	if (field->type != MP_EXT || field->ext_type != MP_UNKNOWN_EXTENSION)
-		return;
+		return 0;
 
 	if (cfg->encode_invalid_as_nil) {
 		field->type = MP_NIL;
-		return;
+		return 0;
 	}
 
-	luaL_error(L, "unsupported Lua type '%s'",
-		   lua_typename(L, lua_type(L, idx)));
+	diag_set(LuajitError,
+		 tt_sprintf("unsupported Lua type '%s'",
+			    lua_typename(L, lua_type(L, idx))));
+	return -1;
 }
 
 /* }}} Fill luaL_field */
+
+/* {{{ luaT_reftable */
+
+/**
+ * Traversal context for creating a table of references from
+ * original objects to serialized ones.
+ */
+struct reftable_new_ctx {
+	/** Serialization options. */
+	struct luaL_serializer *cfg;
+	/** Index of a references table on the Lua stack. */
+	int reftable_index;
+	/** Index of a visited objects table on the Lua stack. */
+	int visited_index;
+};
+
+/**
+ * Serialize the object given at top of the Lua stack and all the
+ * descendant ones recursively and fill a mapping from the
+ * original objects to the resulting ones.
+ *
+ * The serialization is performed using luaL_checkfield().
+ *
+ * The function leaves the Lua stack size unchanged.
+ */
+static void
+luaT_reftable_new_impl(struct lua_State *L, struct reftable_new_ctx *ctx)
+{
+	struct luaL_field field;
+
+	/*
+	 * We're not interested in values that can't have
+	 * __serialize or __tostring metamethods.
+	 */
+	if (!lua_istable(L, -1) &&
+	    !luaL_iscdata(L, -1) &&
+	    !lua_isuserdata(L, -1))
+		return;
+
+	/*
+	 * Check if the object is already visited.
+	 *
+	 * Just to don't go into the infinite recursion.
+	 */
+	if (luaT_hasfield(L, -1, ctx->visited_index))
+		return;
+
+	/* Mark the object as visited. */
+	lua_pushvalue(L, -1);
+	lua_pushboolean(L, true);
+	lua_settable(L, ctx->visited_index);
+
+	/*
+	 * Check if the object is already saved in the reference
+	 * table.
+	 */
+	if (luaT_hasfield(L, -1, ctx->reftable_index))
+		return;
+
+	/*
+	 * Copy the original object and serialize it. The
+	 * luaL_checkfield() function replaces the value on the
+	 * Lua stack with the serialized one (or left it as is).
+	 */
+	lua_pushvalue(L, -1);
+	luaL_checkfield(L, ctx->cfg, -1, &field);
+
+	/*
+	 * Save {original object -> serialized object} in the
+	 * reference table.
+	 */
+	if (!lua_rawequal(L, -1, -2)) {
+		lua_pushvalue(L, -2); /* original object */
+		lua_pushvalue(L, -2); /* serialized object */
+		lua_settable(L, ctx->reftable_index);
+	}
+
+	/*
+	 * Check if the serialized object is already saved in the
+	 * reference table.
+	 */
+	if (luaT_hasfield(L, -1, ctx->reftable_index)) {
+		lua_pop(L, 1);
+		return;
+	}
+
+	/*
+	 * Go down into the recursion to analyze the fields if the
+	 * serialized object is a table.
+	 */
+	if (lua_istable(L, -1)) {
+		lua_pushnil(L);
+		while (lua_next(L, -2)) {
+			luaT_reftable_new_impl(L, ctx);
+			lua_pop(L, 1);
+			luaT_reftable_new_impl(L, ctx);
+		}
+	}
+
+	/* Pop the serialized value, leave the original one. */
+	lua_pop(L, 1);
+}
+
+int
+luaT_reftable_new(struct lua_State *L, struct luaL_serializer *cfg, int idx)
+{
+	/*
+	 * Fill the traversal context.
+	 *
+	 * Create a reference table and a visited objects table.
+	 */
+	struct reftable_new_ctx ctx;
+	ctx.cfg = cfg;
+	lua_newtable(L);
+	ctx.reftable_index = lua_gettop(L);
+	lua_newtable(L);
+	ctx.visited_index = lua_gettop(L);
+
+	/*
+	 * Copy the given object on top of the Lua stack and
+	 * traverse all its descendants recursively.
+	 *
+	 * Fill the reference table for all the met objects that
+	 * are changed by the serialization.
+	 */
+	lua_pushvalue(L, idx);
+	luaT_reftable_new_impl(L, &ctx);
+
+	/*
+	 * Pop the copy of the given object and the visited
+	 * objects table. Leave the reference table on the top.
+	 */
+	lua_pop(L, 2);
+
+	return 1;
+}
+
+void
+luaT_reftable_serialize(struct lua_State *L, int reftable_index)
+{
+	lua_pushvalue(L, -1);
+	lua_gettable(L, reftable_index);
+	if (lua_isnil(L, -1)) {
+		lua_pop(L, 1);
+	} else {
+		lua_replace(L, -2);
+	}
+}
+
+/* }}} luaT_reftable */
 
 int
 tarantool_lua_serializer_init(struct lua_State *L)
 {
 	static const struct luaL_Reg serializermeta[] = {
+		{"__gc", luaL_serializer_destroy},
 		{NULL, NULL},
 	};
 	luaL_register_type(L, LUAL_SERIALIZER, serializermeta);

@@ -15,8 +15,10 @@
 #include "assoc.h"
 #include "diag.h"
 #include "fiber.h"
+#include "msgpuck.h"
 #include "small/rlist.h"
 #include "trivia/util.h"
+#include "tt_static.h"
 
 /**
  * Global watchable object used by box.
@@ -67,6 +69,25 @@ watchable_node_delete(struct watchable_node *node)
 }
 
 /**
+ * Looks up an returns a node by key name. Returns NULL if not found.
+ */
+static struct watchable_node *
+watchable_find_node(struct watchable *watchable,
+		    const char *key, size_t key_len)
+{
+	struct mh_strnptr_t *h = watchable->node_by_key;
+	uint32_t key_hash = mh_strn_hash(key, key_len);
+	struct mh_strnptr_key_t k = {key, key_len, key_hash};
+	mh_int_t i = mh_strnptr_find(h, &k, NULL);
+	if (i != mh_end(h)) {
+		struct watchable_node *node = mh_strnptr_node(h, i)->val;
+		assert(strncmp(node->key, key, key_len) == 0);
+		return node;
+	}
+	return NULL;
+}
+
+/**
  * Looks up and returns a node by key name. Creates a new node if not found.
  */
 static struct watchable_node *
@@ -99,7 +120,7 @@ watchable_drop_node(struct watchable *watchable, struct watchable_node *node)
 	struct mh_strnptr_t *h = watchable->node_by_key;
 	const char *key = node->key;
 	size_t key_len = node->key_len;
-	mh_int_t i = mh_strnptr_find_inp(h, key, key_len);
+	mh_int_t i = mh_strnptr_find_str(h, key, key_len);
 	assert(i != mh_end(h));
 	assert(mh_strnptr_node(h, i)->val == node);
 	mh_strnptr_del(h, i, NULL);
@@ -115,13 +136,12 @@ watchable_worker_f(va_list);
 static void
 watchable_wakeup_worker(struct watchable *watchable)
 {
+	if (watchable->is_shutdown)
+		return;
 	if (watchable->worker == NULL) {
-		watchable->worker = fiber_new("box.watchable",
-					      watchable_worker_f);
-		if (watchable->worker == NULL) {
-			diag_log();
-			panic("failed to start box.watchable worker fiber");
-		}
+		watchable->worker = fiber_new_system("box.watchable",
+						     watchable_worker_f);
+		fiber_set_joinable(watchable->worker, true);
 		watchable->worker->f_arg = watchable;
 	}
 	fiber_wakeup(watchable->worker);
@@ -161,7 +181,7 @@ watchable_schedule_node(struct watchable *watchable,
 	if (!rlist_empty(&node->idle_watchers)) {
 		rlist_splice_tail(&watchable->pending_watchers,
 				  &node->idle_watchers);
-		fiber_wakeup(watchable->worker);
+		watchable_wakeup_worker(watchable);
 	}
 }
 
@@ -296,11 +316,8 @@ watcher_run(struct watcher *watcher)
 	if ((watcher->flags & WATCHER_RUN_ASYNC) != 0) {
 		struct fiber *fiber = fiber_new("box.watcher",
 						watcher_run_async_f);
-		if (fiber != NULL) {
-			fiber_start(fiber, watcher);
-			return;
-		}
-		diag_log();
+		fiber_start(fiber, watcher);
+		return;
 	}
 	watcher_do_run(watcher);
 }
@@ -328,9 +345,10 @@ watchable_worker_f(va_list ap)
 	struct watchable *watchable = fiber()->f_arg;
 	assert(watchable->worker == fiber());
 	while (!fiber_is_cancelled()) {
+		fiber_check_gc();
 		if (!watchable_run(watchable)) {
 			/* No more watchers to run, wait... */
-			fiber_sleep(TIMEOUT_INFINITY);
+			fiber_yield();
 		}
 	}
 	return 0;
@@ -342,15 +360,27 @@ watchable_create(struct watchable *watchable)
 	watchable->node_by_key = mh_strnptr_new();
 	rlist_create(&watchable->pending_watchers);
 	watchable->worker = NULL;
+	watchable->is_shutdown = false;
+}
+
+/**
+ * Shutdown watchable. After shutdown it still can be used but
+ * notifications are stopped.
+ */
+static void
+watchable_shutdown(struct watchable *watchable)
+{
+	watchable->is_shutdown = true;
+	if (watchable->worker != NULL) {
+		fiber_cancel(watchable->worker);
+		fiber_join(watchable->worker);
+		watchable->worker = NULL;
+	}
 }
 
 static void
 watchable_destroy(struct watchable *watchable)
 {
-	if (watchable->worker != NULL) {
-		fiber_cancel(watchable->worker);
-		watchable->worker = NULL;
-	}
 	struct mh_strnptr_t *h = watchable->node_by_key;
 	mh_int_t i;
 	mh_foreach(h, i) {
@@ -414,9 +444,45 @@ box_broadcast(const char *key, size_t key_len,
 }
 
 void
+box_broadcast_fmt(const char *key, const char *format, ...)
+{
+	va_list ap;
+	va_start(ap, format);
+	size_t size = mp_vformat(NULL, 0, format, ap);
+	va_end(ap);
+	if (size > TT_STATIC_BUF_LEN)
+		panic("not enough buffer space to broadcast '%s'", key);
+	char *data = tt_static_buf();
+	va_start(ap, format);
+	if (mp_vformat(data, size, format, ap) != size)
+		unreachable();
+	va_end(ap);
+	box_broadcast(key, strlen(key), data, data + size);
+}
+
+const char *
+box_watch_once(const char *key, size_t key_len, const char **end)
+{
+	struct watchable_node *node = watchable_find_node(&box_watchable,
+							  key, key_len);
+	if (node == NULL) {
+		*end = NULL;
+		return NULL;
+	}
+	*end = node->data_end;
+	return node->data;
+}
+
+void
 box_watcher_init(void)
 {
 	watchable_create(&box_watchable);
+}
+
+void
+box_watcher_shutdown(void)
+{
+	watchable_shutdown(&box_watchable);
 }
 
 void

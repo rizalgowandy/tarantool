@@ -49,6 +49,7 @@ extern "C" {
 
 struct xrow_header;
 struct region;
+struct space_def;
 struct tuple_format;
 struct tuple_dictionary;
 struct tuple_bloom;
@@ -75,15 +76,10 @@ struct vy_stmt_env {
 	 */
 	size_t max_tuple_size;
 	/**
-	 * Tuple format used for creating key statements (e.g.
-	 * statements read from secondary index runs). It doesn't
-	 * impose any restrictions on tuple fields, neither does
-	 * it setup offset map.
-	 *
-	 * Note, all key statements must use this format, because
-	 * vy_stmt_is_key() is built upon that assumption.
+	 * Size of memory occupied by all vinyl tuples allocated
+	 * in the main thread.
 	 */
-	struct tuple_format *key_format;
+	size_t sum_tuple_size;
 };
 
 /** Initialize a vinyl statement environment. */
@@ -94,12 +90,15 @@ vy_stmt_env_create(struct vy_stmt_env *env);
 void
 vy_stmt_env_destroy(struct vy_stmt_env *env);
 
-/** Create a vinyl statement format. */
+/** Create a simple vinyl statement format. */
 struct tuple_format *
-vy_stmt_format_new(struct vy_stmt_env *env, struct key_def *const *keys,
-		   uint16_t key_count, const struct field_def *fields,
-		   uint32_t field_count, uint32_t exact_field_count,
-		   struct tuple_dictionary *dict);
+vy_simple_stmt_format_new(struct vy_stmt_env *env,
+			  struct key_def *const *keys, uint16_t key_count);
+
+/** Create a vinyl space statement format. */
+struct tuple_format *
+vy_space_stmt_format_new(struct vy_stmt_env *env, struct key_def *const *keys,
+			 uint16_t key_count, const struct space_def *space_def);
 
 /** Statement flags. */
 enum {
@@ -136,6 +135,16 @@ enum {
 	 * compaction. It is never written to disk.
 	 */
 	VY_STMT_UPDATE			= 1 << 2,
+	/**
+	 * Set for statements in the key format:
+	 * - Keys created for read queries.
+	 * - DELETE statements (except for surrogate DELETEs).
+	 * - INSERT and REPLACE statements recovered from disk for
+	 *   secondary indexes.
+	 * This flag isn't written to disk because we can recover it
+	 * from the context.
+	 */
+	VY_STMT_KEY			= 1 << 3,
 	/**
 	 * Bit mask of all statement flags.
 	 */
@@ -203,6 +212,23 @@ vy_stmt_set_lsn(struct tuple *stmt, int64_t lsn)
 	((struct vy_stmt *) stmt)->lsn = lsn;
 }
 
+/**
+ * Return true if the given LSN is a PLSN, i.e. an LSN used for a prepared
+ * (not yet written to WAL) statement.
+ */
+static inline bool
+vy_lsn_is_prepared(int64_t lsn)
+{
+	return lsn >= MAX_LSN;
+}
+
+/** Return true if the statement was prepared, but not yet written to WAL. */
+static inline bool
+vy_stmt_is_prepared(struct tuple *stmt)
+{
+	return vy_lsn_is_prepared(vy_stmt_lsn(stmt));
+}
+
 /** Get type of the vinyl statement. */
 static inline enum iproto_type
 vy_stmt_type(struct tuple *stmt)
@@ -255,19 +281,11 @@ vy_stmt_set_n_upserts(struct tuple *stmt, uint8_t n)
 	((struct vy_stmt *)stmt)->n_upserts = n;
 }
 
-/** Return true if the given format is a key format. */
-static inline bool
-vy_stmt_is_key_format(const struct tuple_format *format)
-{
-	struct vy_stmt_env *env = format->engine;
-	return env->key_format == format;
-}
-
 /** Return true if the vinyl statement has key format. */
 static inline bool
 vy_stmt_is_key(struct tuple *stmt)
 {
-	return vy_stmt_is_key_format(tuple_format(stmt));
+	return (vy_stmt_flags(stmt) & VY_STMT_KEY) != 0;
 }
 
 /**
@@ -309,6 +327,14 @@ vy_stmt_is_empty_key(struct tuple *stmt)
 }
 
 /**
+ * Return true if there cannot be more than one tuple equal to
+ * the given vinyl statement in an index.
+ */
+bool
+vy_stmt_is_exact_key(struct tuple *stmt, struct key_def *cmp_def,
+		     struct key_def *key_def, bool is_unique);
+
+/**
  * Duplicate the statememnt.
  *
  * @param stmt statement
@@ -333,45 +359,6 @@ vy_stmt_dup_lsregion(struct tuple *stmt, struct lsregion *lsregion,
 		     int64_t alloc_id);
 
 /**
- * Return true if @a stmt can be referenced. Now to be not refable
- * it must be allocated on lsregion.
- * @param stmt a statement
- * @retval true if @a stmt was allocated on lsregion
- * @retval false otherwise
- */
-static inline bool
-vy_stmt_is_refable(struct tuple *stmt)
-{
-	return !tuple_is_unreferenced(stmt);
-}
-
-/**
- * Ref tuple, if it exists (!= NULL) and can be referenced.
- * @sa vy_stmt_is_refable.
- *
- * @param tuple Tuple to ref or NULL.
- */
-static inline void
-vy_stmt_ref_if_possible(struct tuple *stmt)
-{
-	if (vy_stmt_is_refable(stmt))
-		tuple_ref(stmt);
-}
-
-/**
- * Unref tuple, if it exists (!= NULL) and can be unreferenced.
- * @sa vy_stmt_is_refable.
- *
- * @param tuple Tuple to unref or NULL.
- */
-static inline void
-vy_stmt_unref_if_possible(struct tuple *stmt)
-{
-	if (vy_stmt_is_refable(stmt))
-		tuple_unref(stmt);
-}
-
-/**
  * Return a comparison hint of a vinyl statement.
  */
 static inline hint_t
@@ -384,6 +371,20 @@ vy_stmt_hint(struct tuple *stmt, struct key_def *key_def)
 	} else {
 		return tuple_hint(stmt, key_def);
 	}
+}
+
+/**
+ * Compare two keys with MessagePack array header.
+ */
+static inline int
+vy_key_compare(const char *key_a, hint_t key_a_hint,
+	       const char *key_b, hint_t key_b_hint,
+	       struct key_def *key_def)
+{
+	uint32_t part_count_a = mp_decode_array(&key_a);
+	uint32_t part_count_b = mp_decode_array(&key_b);
+	return key_compare(key_a, part_count_a, key_a_hint,
+			   key_b, part_count_b, key_b_hint, key_def);
 }
 
 /**
@@ -411,8 +412,8 @@ vy_stmt_compare(struct tuple *a, hint_t a_hint,
 					       a_hint, key_def);
 	} else {
 		assert(!a_is_tuple && !b_is_tuple);
-		return key_compare(tuple_data(a), a_hint,
-				   tuple_data(b), b_hint, key_def);
+		return vy_key_compare(tuple_data(a), a_hint,
+				      tuple_data(b), b_hint, key_def);
 	}
 }
 
@@ -431,7 +432,8 @@ vy_stmt_compare_with_raw_key(struct tuple *stmt, hint_t stmt_hint,
 					      part_count, key_hint,
 					      key_def);
 	}
-	return key_compare(tuple_data(stmt), stmt_hint, key, key_hint, key_def);
+	return vy_key_compare(tuple_data(stmt), stmt_hint,
+			      key, key_hint, key_def);
 }
 
 /**
@@ -447,14 +449,6 @@ vy_stmt_compare_with_raw_key(struct tuple *stmt, hint_t stmt_hint,
  */
 struct tuple *
 vy_key_new(struct tuple_format *format, const char *key, uint32_t part_count);
-
-/**
- * Copy the key in a new memory area.
- * @retval not NULL Success.
- * @retval     NULL Memory error.
- */
-char *
-vy_key_dup(const char *key);
 
 /**
  * Create a new surrogate DELETE from @a tuple using @a format.
@@ -547,6 +541,16 @@ struct tuple *
 vy_stmt_new_upsert(struct tuple_format *format,
 		   const char *tuple_begin, const char *tuple_end,
 		   struct iovec *operations, uint32_t ops_cnt);
+
+/**
+ * Create a copy of a statement using a new format.
+ *
+ * @param stmt statement
+ * @param format new statement format
+ * @return new statement of the same type with the same data.
+ */
+struct tuple *
+vy_stmt_new_copy(struct tuple_format *format, struct tuple *stmt);
 
 /**
  * Create REPLACE statement from UPSERT statement.
@@ -683,7 +687,21 @@ vy_stmt_encode_secondary(struct tuple *value, struct key_def *cmp_def,
  * @retval NULL on error
  */
 struct tuple *
-vy_stmt_decode(struct xrow_header *xrow, struct tuple_format *format);
+vy_stmt_decode(struct xrow_header *xrow, struct tuple_format *format,
+	       struct tuple_format *key_format, bool is_primary);
+
+/**
+ * Extract a raw key from xrow.
+ *
+ * @retval key data on success
+ * @retval NULL on error
+ *
+ * Returned key data either points to the xrow body or is allocated
+ * from the fiber gc region.
+ */
+const char *
+vy_key_from_xrow(struct xrow_header *xrow, struct key_def *cmp_def,
+		 bool is_primary);
 
 /**
  * Format a statement into string.
@@ -694,6 +712,7 @@ vy_stmt_snprint(char *buf, int size, struct tuple *stmt);
 
 /*
  * Format a statement into string using a static buffer.
+ * Crops at TT_STATIC_BUF_LEN.
  * Useful for gdb and say_debug().
  * \sa vy_stmt_snprint()
  */
@@ -784,7 +803,9 @@ vy_entry_compare_with_raw_key(struct vy_entry entry,
 	      ((entry).hint = !(key_def)->is_multikey ?			\
 			vy_stmt_hint((src_stmt), (key_def)) :		\
 			multikey_idx), true);				\
-	     ++multikey_idx)
+	     ++multikey_idx)						\
+		if (!tuple_key_is_excluded(src_stmt, key_def,		\
+					   multikey_idx))
 
 #if defined(__cplusplus)
 } /* extern "C" */

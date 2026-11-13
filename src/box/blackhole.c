@@ -113,6 +113,8 @@ static const struct space_vtab blackhole_space_vtab = {
 	/* .execute_delete = */ blackhole_space_execute_delete,
 	/* .execute_update = */ blackhole_space_execute_update,
 	/* .execute_upsert = */ blackhole_space_execute_upsert,
+	/* .execute_insert_arrow = */ generic_space_execute_insert_arrow,
+	/* .execute_delete_range = */ generic_space_execute_delete_range,
 	/* .ephemeral_replace = */ generic_space_ephemeral_replace,
 	/* .ephemeral_delete = */ generic_space_ephemeral_delete,
 	/* .ephemeral_rowid_next = */ generic_space_ephemeral_rowid_next,
@@ -126,11 +128,13 @@ static const struct space_vtab blackhole_space_vtab = {
 	/* .build_index = */ generic_space_build_index,
 	/* .swap_index = */ generic_space_swap_index,
 	/* .prepare_alter = */ generic_space_prepare_alter,
+	/* .finish_alter = */ generic_space_finish_alter,
+	/* .prepare_upgrade = */ generic_space_prepare_upgrade,
 	/* .invalidate = */ generic_space_invalidate,
 };
 
 static void
-blackhole_engine_shutdown(struct engine *engine)
+blackhole_engine_free(struct engine *engine)
 {
 	free(engine);
 }
@@ -153,10 +157,8 @@ blackhole_engine_create_space(struct engine *engine, struct space_def *def,
 
 	/* Allocate tuples on runtime arena, but check space format. */
 	struct tuple_format *format;
-	format = tuple_format_new(&tuple_format_runtime->vtab, NULL, NULL, 0,
-				  def->fields, def->field_count,
-				  def->exact_field_count, def->dict, false,
-				  false);
+	format = space_tuple_format_new(&tuple_format_runtime->vtab,
+					NULL, NULL, 0, def);
 	if (format == NULL) {
 		free(space);
 		return NULL;
@@ -173,8 +175,10 @@ blackhole_engine_create_space(struct engine *engine, struct space_def *def,
 }
 
 static const struct engine_vtab blackhole_engine_vtab = {
-	/* .shutdown = */ blackhole_engine_shutdown,
+	/* .free = */ blackhole_engine_free,
+	/* .shutdown = */ generic_engine_shutdown,
 	/* .create_space = */ blackhole_engine_create_space,
+	/* .create_read_view = */ generic_engine_create_read_view,
 	/* .prepare_join = */ generic_engine_prepare_join,
 	/* .join = */ generic_engine_join,
 	/* .complete_join = */ generic_engine_complete_join,
@@ -184,7 +188,9 @@ static const struct engine_vtab blackhole_engine_vtab = {
 	/* .commit = */ generic_engine_commit,
 	/* .rollback_statement = */ generic_engine_rollback_statement,
 	/* .rollback = */ generic_engine_rollback,
-	/* .switch_to_ro = */ generic_engine_switch_to_ro,
+	/* .destroy_savepoint = */ generic_engine_destroy_savepoint,
+	/* .send_to_read_view = */ generic_engine_send_to_read_view,
+	/* .abort_with_conflict = */ generic_engine_abort_with_conflict,
 	/* .bootstrap = */ generic_engine_bootstrap,
 	/* .begin_initial_recovery = */ generic_engine_begin_initial_recovery,
 	/* .begin_final_recovery = */ generic_engine_begin_final_recovery,

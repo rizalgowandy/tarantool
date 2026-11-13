@@ -50,6 +50,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <assert.h>
+#include "trivia/util.h"
 
 #if defined(__cplusplus)
 extern "C" {
@@ -92,10 +93,10 @@ struct avl_node ***
 avl_route_to_next(struct avl_node ***path, int dir,
 		  int32_t adjust_size);
 
-struct avl_node *
+const struct avl_node *
 avl_iter_start(struct avl_iter *it);
 
-struct avl_node *
+const struct avl_node *
 avl_iter_next(struct avl_iter *it);
 
 void
@@ -150,12 +151,15 @@ avl_iter_check(struct avl_iter *iter);
 #define rope_append rope_api(append)
 #define rope_extract_node rope_api(extract_node)
 #define rope_extract rope_api(extract)
+#define rope_adjust_size rope_api(adjust_size)
+#define rope_erase_step rope_api(erase_step)
 #define rope_erase rope_api(erase)
 #define rope_iter_create rope_api(iter_create)
 #define rope_iter_new rope_api(iter_new)
 #define rope_iter_start rope_api(iter_start)
 #define rope_iter_next rope_api(iter_next)
 #define rope_iter_delete rope_api(iter_delete)
+#define rope_visit_f rope_api(visit_f)
 #define rope_traverse rope_api(traverse)
 #define rope_check rope_api(check)
 #define rope_node_print rope_api(node_print)
@@ -192,33 +196,33 @@ struct rope {
 
 struct rope_iter {
 	/** rope->free is used to free the iterator. */
-	struct rope *rope;
+	const struct rope *rope;
 	/** End of the traversal path. */
-	struct rope_node **top;
+	const struct rope_node **top;
 	/** Traversal path */
-	struct rope_node *path[ROPE_HEIGHT_MAX];
+	const struct rope_node *path[ROPE_HEIGHT_MAX];
 };
 
 static inline rope_size_t
-rope_node_size(struct rope_node *node)
+rope_node_size(const struct rope_node *node)
 {
 	return node ? node->tree_size : 0;
 }
 
 static inline rope_size_t
-rope_leaf_size(struct rope_node *node)
+rope_leaf_size(const struct rope_node *node)
 {
 	return node->leaf_size;
 }
 
 static inline rope_data_t
-rope_leaf_data(struct rope_node *node)
+rope_leaf_data(const struct rope_node *node)
 {
 	return node->data;
 }
 
 static inline rope_size_t
-rope_size(struct rope *rope)
+rope_size(const struct rope *rope)
 {
 	return rope_node_size(rope->root);
 }
@@ -280,6 +284,23 @@ rope_clear(struct rope *rope)
 	}
 #endif /* ROPE_FREE_F */
 	rope->root = NULL;
+}
+
+/**
+ * Add @a size to subtree size of every node in nodes path.
+ *
+ * @param path Path begin.
+ * @param end Path end.
+ * @param size Size to adjust subtree size of nodes to (addition).
+ */
+static inline void
+rope_adjust_size(struct rope_node ***path, struct rope_node ***end,
+		 ssize_t size)
+{
+	for (; path <= end; path++) {
+		struct rope_node *node = **path;
+		node->tree_size += size;
+	}
 }
 
 /** Delete a rope allocated with rope_new() */
@@ -440,74 +461,95 @@ rope_extract(struct rope *rope, rope_size_t offset)
 }
 
 /**
- * Erase a single element from the rope. This is a straightforward
- * implementation for a single-element deletion from a rope. A
- * generic cut from a rope involves 2 tree splits and one merge.
+ * Erase @a p_size elements from the rope if it fits into single node.
+ * Otherwise erase as many elements as fits into the node which holds data
+ * at @a offset. Upon return @a p_size is decreased to the number of
+ * deleted elements.
  *
- * When deleting a single element, 3 cases are possible:
- * - offset falls at a node with a single element. In this case we
- *   perform a normal AVL tree delete.
- * - offset falls at the end or the beginning of an existing node
- *   with leaf_size > 1. In that case we trim the existing node
- *   and return.
- * - offset falls inside an existing node. In that case we split
+ * When deleting, 3 cases are possible:
+ * - offset is at the beginning of the node and number of deleted elements
+ *   is more than or equal to the number elements in the node. In this
+ *   case delete the entire node.
+ * - deleted elements reside at the beginning or at the end of the node.
+ *   In that case trim the existing node and return.
+ * - deleted elements reside inside the node. In that case split
  *   the existing node at offset, and insert the tail.
  *
  * The implementation is a copycat of rope_insert(). If you're
  * trying to understand the code, it's recommended to start from
  * rope_insert().
+ *
+ * @param rope A rope.
+ * @param offset Offset at which to start erasure at.
+ * @param[out] p_size Size of data to be erased.
+ *
+ * @retval 0 Success.
+ * @retval -1 OOM.
  */
 static inline int
-rope_erase(struct rope *rope, rope_size_t offset)
+rope_erase_step(struct rope *rope, rope_size_t offset, rope_size_t *p_size)
 {
-	assert(offset < rope_size(rope));
+	size_t size = *p_size;
 
 	struct rope_node **path[ROPE_HEIGHT_MAX];
 	path[0] = &rope->root;
 
+	/*
+	 * Optimistically adjust subtree size to -size along the route. If
+	 * erasion fits into single node then we are good. Otherwise we
+	 * fix the adjustion to correct size when we know it.
+	 */
 	struct rope_node ***p_end = (struct rope_node ***)
-		avl_route_to_offset((struct avl_node ***) path, &offset, -1);
+		avl_route_to_offset((struct avl_node ***)path, &offset, -size);
 
 	struct rope_node *node = **p_end;
 
-	if (node->leaf_size > 1) {
+	if (offset > 0 || size < node->leaf_size) {
 		/* Check if we can simply trim the node. */
 		if (offset == 0) {
 			/* Cut the head. */
 			node->data = ROPE_SPLIT_F(rope->ctx, node->data,
-						  node->leaf_size, 1);
-			node->leaf_size -= 1;
+						  node->leaf_size, size);
+			node->leaf_size -= size;
+			*p_size = 0;
 			return 0;
 		}
-		rope_size_t size = node->leaf_size;
 		/* Cut the tail */
+		rope_size_t leaf_size = node->leaf_size;
 		rope_data_t next = ROPE_SPLIT_F(rope->ctx, node->data,
 						node->leaf_size, offset);
 		node->leaf_size = offset;
-		if (offset == size - 1)
+		rope_size_t tail_size = leaf_size - offset;
+		if (size >= tail_size) {
+			rope_adjust_size(path, p_end, size - tail_size);
+			*p_size -= tail_size;
 			return 0; /* Trimmed the tail, nothing else to do */
+		}
 		/*
 		 * Offset falls inside a substring. Erase the
 		 * first field and insert the tail.
 		 */
-		next = ROPE_SPLIT_F(rope->ctx, next, size - offset, 1);
+		next = ROPE_SPLIT_F(rope->ctx, next, tail_size, size);
 		struct rope_node *new_node =
-			rope_node_new(rope, next, size - offset - 1);
+			rope_node_new(rope, next, tail_size - size);
 		if (new_node == NULL)
 			return -1;
 		/* Trim the old node. */
 		p_end = (struct rope_node ***)
-			avl_route_to_next((struct avl_node ***) p_end, 1,
+			avl_route_to_next((struct avl_node ***)p_end, 1,
 					  new_node->tree_size);
 		**p_end = new_node;
-		avl_rebalance_after_insert((struct avl_node ***) path,
-					   (struct avl_node ***) p_end,
+		avl_rebalance_after_insert((struct avl_node ***)path,
+					   (struct avl_node ***)p_end,
 					   new_node->height);
+		*p_size = 0;
 		return 0;
 	}
 	/* We need to delete the node. */
 	assert(offset == 0);
 	int direction;
+	rope_adjust_size(path, p_end, size - node->leaf_size);
+	*p_size -= node->leaf_size;
 	if (node->link[0] != NULL && node->link[1] != NULL) {
 		/*
 		 * The node has two non-NULL leaves. We can't
@@ -522,7 +564,7 @@ rope_erase(struct rope *rope, rope_size_t offset)
 		struct rope_node *save = node;
 		direction = node->link[1]->height > node->link[0]->height;
 		p_end = (struct rope_node ***)
-			avl_route_to_next((struct avl_node ***) p_end,
+			avl_route_to_next((struct avl_node ***)p_end,
 					  direction, 0) - 1;
 		node = **p_end;
 		/* Move the data pointers. */
@@ -547,21 +589,47 @@ rope_erase(struct rope *rope, rope_size_t offset)
 	}
 	**p_end = node->link[direction];
 	ROPE_FREE(rope->ctx, node);
-	avl_rebalance_after_delete((struct avl_node ***) path,
-				   (struct avl_node ***) p_end);
+	avl_rebalance_after_delete((struct avl_node ***)path,
+				   (struct avl_node ***)p_end);
+	return 0;
+}
+
+/**
+ * Erase @a size elements from the @a rope at given @a offset. Rope size,
+ * @a size and @a offset must satisfy the assertions at the beginning of
+ * the function.
+ *
+ * @param rope A rope.
+ * @param offset Offset at which to start erasure at.
+ * @param size Size of data to be erased in bytes.
+ *
+ * @retval 0 Success.
+ * @retval -1 OOM.
+ */
+static inline int
+rope_erase(struct rope *rope, rope_size_t offset, rope_size_t size)
+{
+	assert(size > 0);
+	assert(offset < rope_size(rope));
+	assert(offset + size <= rope_size(rope));
+
+	do {
+		if (rope_erase_step(rope, offset, &size) != 0)
+			return -1;
+	} while (size > 0);
 	return 0;
 }
 
 /** Initialize an iterator. */
 static inline void
-rope_iter_create(struct rope_iter *it, struct rope *rope)
+rope_iter_create(struct rope_iter *it, const struct rope *rope)
 {
 	it->rope = rope;
 }
 
 /** Create an iterator. */
 static inline struct rope_iter *
-rope_iter_new(struct rope *rope)
+rope_iter_new(const struct rope *rope)
 {
 	struct rope_iter *it =
 		(struct rope_iter *) ROPE_ALLOC_F(rope->ctx, sizeof(*it));
@@ -574,7 +642,7 @@ rope_iter_new(struct rope *rope)
  * Begin iteration.
  * @retval NULL the rope is empty
  */
-static inline struct rope_node *
+static inline const struct rope_node *
 rope_iter_start(struct rope_iter *it)
 {
 	return (struct rope_node *) avl_iter_start((struct avl_iter *) it);
@@ -587,10 +655,10 @@ rope_iter_start(struct rope_iter *it)
  *          has advanced beyond the last
  *          node.
  */
-static struct rope_node *
+static const struct rope_node *
 rope_iter_next(struct rope_iter *it)
 {
-	return (struct rope_node *) avl_iter_next((struct avl_iter *) it);
+	return (const struct rope_node *)avl_iter_next((struct avl_iter *)it);
 }
 
 /** Free iterator. */
@@ -600,26 +668,28 @@ rope_iter_delete(struct rope_iter *it)
 	ROPE_FREE(it->rope->ctx, it);
 }
 
+typedef void (*rope_visit_f)(rope_data_t data, size_t size, void *cb_arg);
+
 /** Apply visit_leaf function to every rope leaf. */
 static void
-rope_traverse(struct rope *rope, void (*visit_leaf)(rope_data_t, size_t))
+rope_traverse(const struct rope *rope, rope_visit_f visit_leaf, void *cb_arg)
 {
 	struct rope_iter iter;
 	rope_iter_create(&iter, rope);
 
-	struct rope_node *leaf;
+	const struct rope_node *leaf;
 
 	for (leaf = rope_iter_start(&iter);
 	     leaf != NULL;
 	     leaf = rope_iter_next(&iter)) {
 
-		visit_leaf(leaf->data, leaf->leaf_size);
+		visit_leaf(leaf->data, leaf->leaf_size, cb_arg);
 	}
 }
 
 /** Check AVL tree consistency. */
 static inline void
-rope_check(struct rope *rope)
+rope_check(const struct rope *rope)
 {
 	struct rope_iter iter;
 	rope_iter_create(&iter, rope);
@@ -627,7 +697,7 @@ rope_check(struct rope *rope)
 }
 
 static void
-rope_node_print(struct rope_node *node, void (*print)(rope_data_t, size_t),
+rope_node_print(const struct rope_node *node, rope_visit_f print, void *cb_arg,
 		const char *prefix, int dir)
 {
 	const char *conn[] = { "┌──", "└──" };
@@ -635,12 +705,12 @@ rope_node_print(struct rope_node *node, void (*print)(rope_data_t, size_t),
 	const char *padding[] = { "│   ", "   " };
 
 	rope_size_t child_prefix_len = strlen(prefix) + strlen(padding[0]) + 1;
-	char *child_prefix = malloc(child_prefix_len);
+	char *child_prefix = (char *)xmalloc(child_prefix_len);
 
 	if (node && (node->link[0] || node->link[1])) {
 		snprintf(child_prefix, child_prefix_len - 1,
 			 "%s%s", prefix, padding[!dir]);
-		rope_node_print(node->link[0], print, child_prefix, 0);
+		rope_node_print(node->link[0], print, cb_arg, child_prefix, 0);
 	}
 
 	snprintf(child_prefix, child_prefix_len - 1, "%s%s",
@@ -653,11 +723,12 @@ rope_node_print(struct rope_node *node, void (*print)(rope_data_t, size_t),
 
 		printf("{ len = %zu, height = %d, data = '",
 		       (size_t) node->leaf_size, node->height);
-		print(node->data, node->leaf_size);
+		print(node->data, node->leaf_size, cb_arg);
 		printf("'}\n");
 
 		if (node->link[0] || node->link[1])
-			rope_node_print(node->link[1], print, child_prefix, 1);
+			rope_node_print(node->link[1], print, cb_arg,
+					child_prefix, 1);
 	}
 
 	free(child_prefix);
@@ -665,12 +736,13 @@ rope_node_print(struct rope_node *node, void (*print)(rope_data_t, size_t),
 
 /** Pretty print a rope. */
 static inline void
-rope_pretty_print(struct rope *rope, void (*print_leaf)(rope_data_t, size_t))
+rope_pretty_print(const struct rope *rope, rope_visit_f print_leaf,
+		  void *cb_arg)
 {
 	printf("size = %zu\nstring = '", (size_t) rope_size(rope));
-	rope_traverse(rope, print_leaf);
+	rope_traverse(rope, print_leaf, cb_arg);
 	printf("'\n");
-	rope_node_print(rope->root, print_leaf, "", true);
+	rope_node_print(rope->root, print_leaf, cb_arg, "", true);
 	printf("\n");
 }
 
@@ -697,12 +769,15 @@ rope_pretty_print(struct rope *rope, void (*print_leaf)(rope_data_t, size_t))
 #undef rope_append
 #undef rope_extract_node
 #undef rope_extract
+#undef rope_adjust_size
+#undef rope_erase_step
 #undef rope_erase
 #undef rope_iter_create
 #undef rope_iter_new
 #undef rope_iter_start
 #undef rope_iter_next
 #undef rope_iter_delete
+#undef rope_visit_f
 #undef rope_traverse
 #undef rope_check
 #undef rope_node_print

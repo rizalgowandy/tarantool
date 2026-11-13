@@ -51,7 +51,7 @@ static int systemd_fd = -1;
 static const char *sd_unix_path = NULL;
 
 int systemd_init(void) {
-	sd_unix_path = getenv("NOTIFY_SOCKET");
+	sd_unix_path = getenv_safe("NOTIFY_SOCKET", NULL, 0);
 	if (sd_unix_path == NULL) {
 		/* Do nothing if the path is not set. */
 		return 0;
@@ -100,6 +100,7 @@ error:
 		close(systemd_fd);
 		systemd_fd = -1;
 	}
+	free((char *)sd_unix_path);
 	sd_unix_path = NULL;
 	return -1;
 }
@@ -107,6 +108,7 @@ error:
 void systemd_free(void) {
 	if (systemd_fd > 0)
 		close(systemd_fd);
+	free((char *)sd_unix_path);
 }
 
 int systemd_notify(const char *message) {
@@ -117,7 +119,7 @@ int systemd_notify(const char *message) {
 		.sun_family = AF_UNIX,
 	};
 
-	strncpy(sa.sun_path, sd_unix_path, sizeof(sa.sun_path) - 1);
+	strlcpy(sa.sun_path, sd_unix_path, sizeof(sa.sun_path));
 	if (sa.sun_path[0] == '@')
 		sa.sun_path[0] = '\0';
 

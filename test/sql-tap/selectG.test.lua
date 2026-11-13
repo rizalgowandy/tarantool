@@ -1,5 +1,6 @@
 #!/usr/bin/env tarantool
 local test = require("sqltester")
+local tarantool = require('tarantool')
 test:plan(1)
 
 --!./tcltestrunner.lua
@@ -27,9 +28,14 @@ test:plan(1)
 -- the insert run for over a minute.
 --
 local engine = test:engine()
-local time_quota =
-    engine == 'memtx' and 25 or (
-    engine == 'vinyl' and 50 or 0) -- seconds
+local time_quota
+if tarantool.build.asan then
+    time_quota = engine == 'memtx' and 80 or (
+                 engine == 'vinyl' and 140 or 0) -- seconds
+else
+    time_quota = engine == 'memtx' and 25 or (
+                 engine == 'vinyl' and 50 or 0) -- seconds
+end
 test:do_test(
     100,
     function()
@@ -44,7 +50,7 @@ test:do_test(
         test:execsql(sql)
         local end_time = os.time()
         -- max run time was increased because of parallel test run
-        return test:execsql(("SELECT count(x), sum(x), avg(x), %d<%d FROM t1;")
+        return test:execsql(("SELECT COUNT(x), SUM(x), AVG(x), %d<%d FROM t1;")
             :format(end_time - start_time, time_quota))
     end, {
         -- <100>

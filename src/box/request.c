@@ -44,6 +44,7 @@
 #include "tuple.h"
 #include "xrow.h"
 #include "iproto_constants.h"
+#include "txn.h"
 
 /**
  * Whenever we update a request, we must update its header as well.
@@ -55,52 +56,54 @@
  * the master's component of the replica's vclock and hence won't
  * try to apply the same row again on reconnect.
  */
-static int
-request_update_header(struct request *request, struct xrow_header *row)
+static void
+request_update_header(struct request *request, struct xrow_header *row,
+		      struct region *region)
 {
 	if (row == NULL)
-		return 0;
+		return;
 	row->type = request->type;
-	row->bodycnt = xrow_encode_dml(request, &fiber()->gc, row->body);
-	if (row->bodycnt < 0)
-		return -1;
+	xrow_encode_dml(request, region, row->body, &row->bodycnt);
 	request->header = row;
-	return 0;
 }
 
 int
 request_create_from_tuple(struct request *request, struct space *space,
-			  struct tuple *old_tuple, struct tuple *new_tuple)
+			  const char *old_data, uint32_t old_size,
+			  const char *new_data, uint32_t new_size,
+			  struct region *region, bool preserve_request_type)
 {
+	const char *upsert_ops = request->ops;
+	const char *upsert_ops_end = request->ops_end;
+	enum iproto_type request_type = request->type;
 	struct xrow_header *row = request->header;
 	memset(request, 0, sizeof(*request));
 
-	if (old_tuple == new_tuple) {
+	if (old_data == new_data) {
 		/*
 		 * Old and new tuples are the same,
 		 * turn this request into no-op.
 		 */
 		request->type = IPROTO_NOP;
-		return request_update_header(request, row);
+		request_update_header(request, row, region);
+		return 0;
 	}
 	/*
 	 * Space pointer may be zero in case of NOP, in which case
 	 * this line is not reached.
 	 */
 	request->space_id = space->def->id;
-	if (new_tuple == NULL) {
-		uint32_t size, key_size;
-		const char *data = tuple_data_range(old_tuple, &size);
-		request->key = tuple_extract_key_raw(data, data + size,
-				space->index[0]->def->key_def, MULTIKEY_NONE,
-				&key_size);
+	if (new_data == NULL) {
+		uint32_t key_size;
+		request->key = tuple_extract_key_raw_to_region(
+					old_data, old_data + old_size,
+					space->index[0]->def->key_def,
+					MULTIKEY_NONE, &key_size, region);
 		if (request->key == NULL)
 			return -1;
 		request->key_end = request->key + key_size;
 		request->type = IPROTO_DELETE;
 	} else {
-		uint32_t size;
-		const char *data = tuple_data_range(new_tuple, &size);
 		/*
 		 * We have to copy the tuple data to region, because
 		 * the tuple is allocated on runtime arena and not
@@ -108,28 +111,32 @@ request_create_from_tuple(struct request *request, struct space *space,
 		 * current transaction ends while we need to write
 		 * the tuple data to WAL on commit.
 		 */
-		char *buf = region_alloc(&fiber()->gc, size);
-		if (buf == NULL) {
-			diag_set(OutOfMemory, size, "region_alloc", "tuple");
-			return -1;
-		}
-		memcpy(buf, data, size);
+		char *buf = xregion_alloc(region, new_size);
+		memcpy(buf, new_data, new_size);
 		request->tuple = buf;
-		request->tuple_end = buf + size;
-		request->type = IPROTO_REPLACE;
+		request->tuple_end = buf + new_size;
+		request->type = preserve_request_type ? request_type :
+							IPROTO_REPLACE;
+		if (request->type == IPROTO_UPSERT) {
+			request->ops = upsert_ops;
+			request->ops_end = upsert_ops_end;
+		}
 	}
-	return request_update_header(request, row);
+	request_update_header(request, row, region);
+	return 0;
 }
 
 void
 request_rebind_to_primary_key(struct request *request, struct space *space,
-			      struct tuple *found_tuple)
+			      struct tuple *found_tuple,
+			      struct region *region)
 {
 	struct index *pk = space_index(space, 0);
 	assert(pk != NULL);
 	uint32_t key_len;
-	char *key = tuple_extract_key(found_tuple, pk->def->key_def,
-				      MULTIKEY_NONE, &key_len);
+	char *key = tuple_extract_key_to_region(
+			found_tuple, pk->def->key_def, MULTIKEY_NONE,
+			&key_len, region);
 	assert(key != NULL);
 	request->key = key;
 	request->key_end = key + key_len;
@@ -139,7 +146,8 @@ request_rebind_to_primary_key(struct request *request, struct space *space,
 }
 
 int
-request_handle_sequence(struct request *request, struct space *space)
+request_handle_sequence(struct request *request, struct space *space,
+			struct region *region)
 {
 	struct sequence *seq = space->sequence;
 
@@ -179,7 +187,8 @@ request_handle_sequence(struct request *request, struct space *space)
 	}
 
 	if (path != NULL) {
-		tuple_go_to_path(&key, path, strlen(path), MULTIKEY_NONE);
+		tuple_go_to_path(&key, path, strlen(path), TUPLE_INDEX_BASE,
+				 MULTIKEY_NONE);
 		if (key == NULL)
 			return 0; /* field not found */
 	}
@@ -200,7 +209,7 @@ request_handle_sequence(struct request *request, struct space *space)
 
 		size_t buf_size = (request->tuple_end - request->tuple) +
 						mp_sizeof_uint(UINT64_MAX);
-		char *tuple = region_alloc(&fiber()->gc, buf_size);
+		char *tuple = region_alloc(region, buf_size);
 		if (tuple == NULL) {
 			diag_set(OutOfMemory, buf_size, "region_alloc", "tuple");
 			return -1;
@@ -231,10 +240,17 @@ request_handle_sequence(struct request *request, struct space *space)
 		 * auto increment request never tries to insert a
 		 * value that is already in the space. Note, this
 		 * code is also invoked on final recovery to restore
-		 * the sequence value from WAL.
+		 * the sequence value from WAL. However, during the
+		 * initial recovery, proper sequence values are stored
+		 * in snapshots, and one should use these because
+		 * otherwise, sequence values would depend on
+		 * the order of recovered spaces which may be
+		 * misleading.
 		 */
-		if (likely(mp_read_int64(&key, &value) == 0))
+		if (likely(mp_read_int64(&key, &value) == 0 &&
+			   recovery_state != INITIAL_RECOVERY))
 			return sequence_update(seq, value);
 	}
-	return request_update_header(request, request->header);
+	request_update_header(request, request->header, region);
+	return 0;
 }

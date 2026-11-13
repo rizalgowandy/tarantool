@@ -31,6 +31,7 @@
 
 #include "msgpuck.h"
 #include "tnt_msgpuck.h"
+#include "mp_interval.h"
 
 char *
 tnt_mp_encode_float(char *data, float num)
@@ -96,4 +97,28 @@ uint32_t
 tnt_mp_sizeof_error(const struct error *error)
 {
 	return mp_sizeof_error(error);
+}
+
+char *
+tnt_mp_encode_datetime(char *data, const struct datetime *date)
+{
+	return mp_encode_datetime(data, date);
+}
+
+uint32_t
+tnt_mp_sizeof_datetime(const struct datetime *date)
+{
+	return mp_sizeof_datetime(date);
+}
+
+char *
+tnt_mp_encode_interval(char *data, const struct interval *itv)
+{
+	return mp_encode_interval(data, itv);
+}
+
+uint32_t
+tnt_mp_sizeof_interval(const struct interval *itv)
+{
+	return mp_sizeof_interval(itv);
 }

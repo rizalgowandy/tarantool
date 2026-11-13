@@ -6,7 +6,7 @@ fio = require 'fio'
 xlog = require 'xlog'
 fun = require 'fun'
 
-space = box.schema.space.create('test', {engine='vinyl'})
+space = box.schema.space.create('test', {engine = 'vinyl', defer_deletes = true})
 _ = space:create_index('pk', {parts = {{1, 'string', collation = 'unicode'}}, run_count_per_level=3})
 _ = space:create_index('sk', {parts = {{2, 'unsigned'}}, run_count_per_level=3})
 
@@ -62,5 +62,6 @@ box.backup.stop() -- resume the garbage collection process
 
 test_run:cmd("push filter 'timestamp: .*' to 'timestamp: <timestamp>'")
 test_run:cmd("push filter 'offset: .*' to 'offset: <offset>'")
+test_run:cmd("push filter 'data: .*' to 'data: <data>'")
 result
 test_run:cmd("clear filter")

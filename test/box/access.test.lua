@@ -33,6 +33,19 @@ session.su('admin')
 box.schema.user.grant('test', 'write', 'space', '_space')
 
 test_run:cmd("setopt delimiter ';'")
+function delete_user(uid_or_name)
+    local t
+    if type(uid_or_name) == 'string' then
+        t = box.space._user.index.name:delete({uid_or_name})
+    else
+        t = box.space._user:delete({uid_or_name})
+    end
+    if box.tuple.is(t) and type(t[7]) == 'number' then
+        t = t:totable()
+        t[7] = 0
+    end
+    return t
+end;
 function usermax()
     local i = 1
     while true do
@@ -55,11 +68,11 @@ box.schema.user.grant('rich', 'read,write', 'space', '_func')
 box.schema.user.grant('rich', 'create', 'function')
 session.su('rich')
 uid = session.uid()
-box.schema.func.create('dummy')
+box.schema.func.create('dummy', {body = 'function() end', is_sandboxed = true})
 session.su('admin')
-box.space['_user']:delete{uid}
+delete_user(uid)
 box.schema.func.drop('dummy')
-box.space['_user']:delete{uid}
+delete_user(uid)
 box.schema.user.revoke('rich', 'public')
 box.schema.user.revoke('rich', 'read,write', 'space', '_func')
 box.schema.user.revoke('rich', 'alter', 'user', 'rich')
@@ -67,7 +80,7 @@ box.schema.user.revoke('rich', 'create', 'function')
 box.schema.user.disable("rich")
 -- test double disable is a no op
 box.schema.user.disable("rich")
-box.space['_user']:delete{uid}
+delete_user(uid)
 box.schema.user.drop('test')
 
 -- gh-944 name is too long
@@ -156,6 +169,38 @@ box.schema.user.grant('testus', 'write', 'space', 'admin_space')
 s:drop()
 box.snapshot()
 test_run:cmd('restart server default')
+test_run:cmd("setopt delimiter ';'")
+function delete_user(uid_or_name)
+    local t
+    if type(uid_or_name) == 'string' then
+        t = box.space._user.index.name:delete({uid_or_name})
+    else
+        t = box.space._user:delete({uid_or_name})
+    end
+    if box.tuple.is(t) and type(t[7]) == 'number' then
+        t = t:totable()
+        t[7] = 0
+    end
+    return t
+end;
+function select_user(uid_or_name)
+    local ret
+    if type(uid_or_name) == 'string' then
+        ret = box.space._user.index.name:select({uid_or_name})
+    else
+        ret = box.space._user:select({uid_or_name})
+    end
+    local ret2 = {}
+    for _, t in ipairs(ret) do
+        if box.tuple.is(t) and type(t[7]) == 'number' then
+            t = t:totable()
+            t[7] = 0
+        end
+        table.insert(ret2, t)
+    end
+    return ret2
+end;
+test_run:cmd("setopt delimiter ''");
 net = require('net.box')
 box.schema.user.drop('testus')
 -- ------------------------------------------------------------
@@ -199,21 +244,21 @@ box.schema.user.drop('grantor')
 -- guest can't read _user table, add a test case
 -- ----------------------------------------------------------
 session.su('guest')
-box.space._user:select{0}
-box.space._user:select{1}
+select_user(0)
+select_user(1)
 session.su('admin')
 -- ----------------------------------------------------------
 -- A test case for gh-358 Change user does not work from lua
 -- Correct the update syntax in schema.lua
 -- ----------------------------------------------------------
 box.schema.user.create('user1')
-box.space._user.index.name:select{'user1'}
+select_user('user1')
 session.su('user1')
 box.schema.user.passwd('new_password')
 session.su('admin')
-box.space._user.index.name:select{'user1'}
+select_user('user1')
 box.schema.user.passwd('user1', 'extra_new_password')
-box.space._user.index.name:select{'user1'}
+select_user('user1')
 box.schema.user.passwd('invalid_user', 'some_password')
 box.schema.user.passwd()
 session.su('user1')
@@ -221,7 +266,7 @@ session.su('user1')
 box.schema.user.passwd('admin', 'xxx')
 session.su('admin')
 box.schema.user.drop('user1')
-box.space._user.index.name:select{'user1'}
+select_user('user1')
 -- ----------------------------------------------------------
 -- A test case for gh-421 Granting a privilege revokes an
 -- existing grant
@@ -246,8 +291,8 @@ box.space._priv:select{id}
 -- Be a bit more rigorous in what is accepted in space _user
 -- -----------------------------------------------------------
 utils = require('utils')
-box.space._user:insert{10, 1, 'name', 'strange-object-type', utils.setmap({})}
-box.space._user:insert{10, 1, 'name', 'role', utils.setmap{'password'}}
+box.space._user:insert{10, 1, 'name', 'strange-object-type', utils.setmap({}), {}, 0}
+box.space._user:insert{10, 1, 'name', 'role', utils.setmap{'password'}, {}, 0}
 session = nil
 -- -----------------------------------------------------------
 -- admin can't manage grants on not owned objects
@@ -263,7 +308,7 @@ box.schema.user.grant('twostep', 'read,write', 'space', '_func')
 box.session.su('twostep')
 twostep = box.schema.space.create('twostep')
 index2 = twostep:create_index('primary')
-box.schema.func.create('test')
+box.schema.func.create('test', {body = 'function() end', is_sandboxed = true})
 box.session.su('admin')
 box.schema.user.create('twostep_client')
 box.schema.user.grant('twostep_client', 'execute', 'function', 'test')
@@ -317,23 +362,29 @@ box.schema.user.passwd('guest', 'sesame')
 -- gh-1205 box.schema.user.info fails
 box.schema.user.drop('guest')
 box.schema.role.drop('guest')
-box.space._user.index.name:delete{'guest'}
-box.space._user:delete{box.schema.GUEST_ID}
+delete_user('guest')
+delete_user(box.schema.GUEST_ID)
 #box.schema.user.info('guest') > 0
 box.schema.user.drop('admin')
 box.schema.role.drop('admin')
-box.space._user.index.name:delete{'admin'}
-box.space._user:delete{box.schema.ADMIN_ID}
+delete_user('admin')
+delete_user(box.schema.ADMIN_ID)
 #box.schema.user.info('admin') > 0
 box.schema.user.drop('public')
 box.schema.role.drop('public')
-box.space._user.index.name:delete{'public'}
-box.space._user:delete{box.schema.PUBLIC_ROLE_ID}
+delete_user('public')
+delete_user(box.schema.PUBLIC_ROLE_ID)
 #box.schema.role.info('public') > 0
+-- gh-11848 replication role must be treated as system
+box.schema.role.drop('replication')
+box.schema.user.drop('replication')
+delete_user('replication')
+delete_user(box.schema.REPLICATION_ROLE_ID)
+#box.schema.role.info('replication') > 0
 box.schema.role.drop('super')
 box.schema.user.drop('super')
-box.space._user.index.name:delete{'super'}
-box.space._user:delete{box.schema.SUPER_ROLE_ID}
+delete_user('super')
+delete_user(box.schema.SUPER_ROLE_ID)
 #box.schema.role.info('super') > 0
 
 -- gh-944 name is too long
@@ -351,15 +402,15 @@ box.schema.func.drop(name)
 -- very large space id, no crash occurs.
 LISTEN = require('uri').parse(box.cfg.listen)
 c = net.connect(LISTEN.host, LISTEN.service)
-c:_request(net._method.select, nil, nil, nil, 1, box.index.EQ, 0, 0, 0xFFFFFFFF, {})
-c:_request(net._method.select, nil, nil, nil, 65537, box.index.EQ, 0, 0, 0xFFFFFFFF, {})
-c:_request(net._method.select, nil, nil, nil, 4294967295, box.index.EQ, 0, 0, 0xFFFFFFFF, {})
+c:_request('SELECT', nil, nil, nil, 1, box.index.EQ, 0, 0, 0xFFFFFFFF, {}, nil, false)
+c:_request('SELECT', nil, nil, nil, 65537, box.index.EQ, 0, 0, 0xFFFFFFFF, {}, nil, false)
+c:_request('SELECT', nil, nil, nil, 4294967295, box.index.EQ, 0, 0, 0xFFFFFFFF, {}, nil, false)
 c:close()
 
 session = box.session
 box.schema.user.create('test')
 box.schema.user.grant('test', 'read', 'space', '_collation')
---box.schema.user.grant('test', 'write', 'space', '_collation')
+box.schema.user.grant('test', 'write', 'space', '_collation')
 -- FIXME: granting create on 'collation' only doesn't work
 box.schema.user.grant('test', 'create', 'universe')
 session.su('test')
@@ -543,6 +594,7 @@ box.schema.func.create('test_func')
 box.session.su("admin")
 box.schema.user.grant("tester", "read", "space", "_user")
 box.schema.user.grant("tester", "read", "space", "_func")
+box.schema.user.grant("tester", "read", "space", "_truncate")
 -- failed create
 box.session.su("tester")
 box.schema.space.create("test_space")
@@ -571,7 +623,7 @@ box.session.su("tester")
 s1 = box.schema.space.create("test_space")
 _ = s1:create_index("primary")
 _ = box.schema.user.create('test_user')
-_ = box.schema.func.create('test_func')
+_ = box.schema.func.create('test_func', {body = 'function() end', is_sandboxed = true})
 seq1 = box.schema.sequence.create('test_seq')
 
 -- successful drop of owned objects
@@ -628,7 +680,7 @@ box.session.su("tester", box.schema.user.drop, "test")
 box.session.su("tester", box.schema.func.drop, "test")
 
 box.session.su("admin")
-box.schema.user.grant("tester", "drop", "universe")
+box.schema.user.grant("tester", "drop,grant", "universe")
 -- successful drop
 box.session.su("tester", s.drop, s)
 box.session.su("tester", seq.drop, seq)
@@ -785,20 +837,20 @@ box.schema.user.create("user2")
 box.schema.user.create("user3")
 box.schema.user.grant("user1", "write", "space", "_user")
 box.schema.user.grant("user1", "read", "space", "_user")
-box.space._user:select{}
+select_user()
 box.session.su("user1")
 -- can alter itself, but can't alter others without privileges.
 box.schema.user.passwd("user1", "abcd")
 box.schema.user.passwd("user2", "abcd")
 box.session.su("admin")
-box.space._user:select{}
+select_user()
 box.schema.user.grant("user1", "alter", "user", "user2")
 box.session.su("user1")
 box.schema.user.passwd("user2", "abcd")
 -- still fails
 box.schema.user.passwd("user3", "qewr")
 box.session.su("admin")
-box.space._user:select{}
+select_user()
 box.schema.user.drop("user1")
 box.schema.user.drop("user2")
 box.schema.user.drop("user3")
@@ -819,12 +871,12 @@ box.schema.user.grant('guest', 'read,write,execute', 'universe')
 
 -- Expected behavior of grant() error shouldn't change otherwise.
 sp = box.schema.create_space('not_universe')
-box.schema.user.grant('guest', 'read,write,execute', 'space', 'not_universe')
-box.schema.user.grant('guest', 'read,write,execute', 'space', 'not_universe')
+box.schema.user.grant('guest', 'read,write', 'space', 'not_universe')
+box.schema.user.grant('guest', 'read,write', 'space', 'not_universe')
 
 -- Clean up.
 box.schema.user.revoke('guest', 'read,write,execute', 'universe')
-box.schema.user.revoke('guest', 'read,write,execute', 'space', 'not_universe')
+box.schema.user.revoke('guest', 'read,write', 'space', 'not_universe')
 sp:drop()
 
 --
@@ -841,6 +893,9 @@ _ = box.schema.func.call("LUA", "return box.space._space:count()")
 _ = box.schema.func.call("box.schema.user.info", 0)
 _ = box.schema.func.call("box.schema.user.info", 1)
 session.su('admin')
+c = net.connect(LISTEN.host, LISTEN.service)
+c:call('LUA', {'return 1'})
+c:close()
 
 -- gh-5389: make sure that granting privileges from guest does not lead
 -- to crash or assertion fault.

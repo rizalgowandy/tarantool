@@ -59,7 +59,7 @@ session.su('test')
 -- in future we may  introduce a separate privilege
 box.schema.space.create('test')
 ---
-- error: Write access to space '_schema' is denied for user 'test'
+- error: Write access to space '_space' is denied for user 'test'
 ...
 -- su() goes through because called from admin
 -- console, and it has no access checks
@@ -73,6 +73,21 @@ box.schema.user.grant('test', 'write', 'space', '_space')
 test_run:cmd("setopt delimiter ';'")
 ---
 - true
+...
+function delete_user(uid_or_name)
+    local t
+    if type(uid_or_name) == 'string' then
+        t = box.space._user.index.name:delete({uid_or_name})
+    else
+        t = box.space._user:delete({uid_or_name})
+    end
+    if box.tuple.is(t) and type(t[7]) == 'number' then
+        t = t:totable()
+        t[7] = 0
+    end
+    return t
+end;
+---
 ...
 function usermax()
     local i = 1
@@ -119,20 +134,20 @@ session.su('rich')
 uid = session.uid()
 ---
 ...
-box.schema.func.create('dummy')
+box.schema.func.create('dummy', {body = 'function() end', is_sandboxed = true})
 ---
 ...
 session.su('admin')
 ---
 ...
-box.space['_user']:delete{uid}
+delete_user(uid)
 ---
 - error: 'Failed to drop user or role ''rich'': the user has objects'
 ...
 box.schema.func.drop('dummy')
 ---
 ...
-box.space['_user']:delete{uid}
+delete_user(uid)
 ---
 - error: 'Failed to drop user or role ''rich'': the user has objects'
 ...
@@ -155,9 +170,9 @@ box.schema.user.disable("rich")
 box.schema.user.disable("rich")
 ---
 ...
-box.space['_user']:delete{uid}
+delete_user(uid)
 ---
-- [33, 1, 'rich', 'user', {}]
+- [33, 1, 'rich', 'user', {}, [], 0]
 ...
 box.schema.user.drop('test')
 ---
@@ -353,6 +368,48 @@ box.snapshot()
 - ok
 ...
 test_run:cmd('restart server default')
+test_run:cmd("setopt delimiter ';'")
+---
+- true
+...
+function delete_user(uid_or_name)
+    local t
+    if type(uid_or_name) == 'string' then
+        t = box.space._user.index.name:delete({uid_or_name})
+    else
+        t = box.space._user:delete({uid_or_name})
+    end
+    if box.tuple.is(t) and type(t[7]) == 'number' then
+        t = t:totable()
+        t[7] = 0
+    end
+    return t
+end;
+---
+...
+function select_user(uid_or_name)
+    local ret
+    if type(uid_or_name) == 'string' then
+        ret = box.space._user.index.name:select({uid_or_name})
+    else
+        ret = box.space._user:select({uid_or_name})
+    end
+    local ret2 = {}
+    for _, t in ipairs(ret) do
+        if box.tuple.is(t) and type(t[7]) == 'number' then
+            t = t:totable()
+            t[7] = 0
+        end
+        table.insert(ret2, t)
+    end
+    return ret2
+end;
+---
+...
+test_run:cmd("setopt delimiter ''");
+---
+- true
+...
 net = require('net.box')
 ---
 ...
@@ -449,11 +506,11 @@ box.schema.user.drop('grantor')
 session.su('guest')
 ---
 ...
-box.space._user:select{0}
+select_user(0)
 ---
 - error: Read access to space '_user' is denied for user 'guest'
 ...
-box.space._user:select{1}
+select_user(1)
 ---
 - error: Read access to space '_user' is denied for user 'guest'
 ...
@@ -467,9 +524,9 @@ session.su('admin')
 box.schema.user.create('user1')
 ---
 ...
-box.space._user.index.name:select{'user1'}
+select_user('user1')
 ---
-- - [32, 1, 'user1', 'user', {}]
+- - [32, 1, 'user1', 'user', {}, [], 0]
 ...
 session.su('user1')
 ---
@@ -480,16 +537,16 @@ box.schema.user.passwd('new_password')
 session.su('admin')
 ---
 ...
-box.space._user.index.name:select{'user1'}
+select_user('user1')
 ---
-- - [32, 1, 'user1', 'user', {'chap-sha1': 'CRO/LiziDOIb+xlhrxJNSSBFjl8='}]
+- - [32, 1, 'user1', 'user', {'chap-sha1': 'CRO/LiziDOIb+xlhrxJNSSBFjl8='}, [], 0]
 ...
 box.schema.user.passwd('user1', 'extra_new_password')
 ---
 ...
-box.space._user.index.name:select{'user1'}
+select_user('user1')
 ---
-- - [32, 1, 'user1', 'user', {'chap-sha1': 'nMc3F1oaUtz37IYbgGYYPZawmfE='}]
+- - [32, 1, 'user1', 'user', {'chap-sha1': 'nMc3F1oaUtz37IYbgGYYPZawmfE='}, [], 0]
 ...
 box.schema.user.passwd('invalid_user', 'some_password')
 ---
@@ -513,7 +570,7 @@ session.su('admin')
 box.schema.user.drop('user1')
 ---
 ...
-box.space._user.index.name:select{'user1'}
+select_user('user1')
 ---
 - []
 ...
@@ -595,11 +652,11 @@ box.space._priv:select{id}
 utils = require('utils')
 ---
 ...
-box.space._user:insert{10, 1, 'name', 'strange-object-type', utils.setmap({})}
+box.space._user:insert{10, 1, 'name', 'strange-object-type', utils.setmap({}), {}, 0}
 ---
 - error: 'Failed to create user ''name'': unknown user type'
 ...
-box.space._user:insert{10, 1, 'name', 'role', utils.setmap{'password'}}
+box.space._user:insert{10, 1, 'name', 'role', utils.setmap{'password'}, {}, 0}
 ---
 - error: 'Failed to create role ''name'': authentication data can not be set for a
     role'
@@ -643,7 +700,7 @@ twostep = box.schema.space.create('twostep')
 index2 = twostep:create_index('primary')
 ---
 ...
-box.schema.func.create('test')
+box.schema.func.create('test', {body = 'function() end', is_sandboxed = true})
 ---
 ...
 box.session.su('admin')
@@ -777,20 +834,20 @@ box.schema.func.drop('dummy')
 -- gh-664 roles: accepting bad syntax for create
 box.schema.user.create('user', 'blah')
 ---
-- error: Illegal parameters, options should be a table
+- error: options should be a table
 ...
 box.schema.user.drop('user', 'blah')
 ---
-- error: Illegal parameters, options should be a table
+- error: options should be a table
 ...
 -- gh-664 roles: accepting bad syntax for create
 box.schema.func.create('func', 'blah')
 ---
-- error: Illegal parameters, options should be a table
+- error: options should be a table
 ...
 box.schema.func.drop('blah', 'blah')
 ---
-- error: Illegal parameters, options should be a table
+- error: options should be a table
 ...
 -- gh-758 attempt to set password for user guest
 box.schema.user.passwd('guest', 'sesame')
@@ -806,11 +863,11 @@ box.schema.role.drop('guest')
 ---
 - error: Role 'guest' is not found
 ...
-box.space._user.index.name:delete{'guest'}
+delete_user('guest')
 ---
 - error: 'Failed to drop user or role ''guest'': the user or the role is a system'
 ...
-box.space._user:delete{box.schema.GUEST_ID}
+delete_user(box.schema.GUEST_ID)
 ---
 - error: 'Failed to drop user or role ''guest'': the user or the role is a system'
 ...
@@ -826,11 +883,11 @@ box.schema.role.drop('admin')
 ---
 - error: Role 'admin' is not found
 ...
-box.space._user.index.name:delete{'admin'}
+delete_user('admin')
 ---
 - error: 'Failed to drop user or role ''admin'': the user or the role is a system'
 ...
-box.space._user:delete{box.schema.ADMIN_ID}
+delete_user(box.schema.ADMIN_ID)
 ---
 - error: 'Failed to drop user or role ''admin'': the user or the role is a system'
 ...
@@ -846,15 +903,36 @@ box.schema.role.drop('public')
 ---
 - error: 'Failed to drop user or role ''public'': the user or the role is a system'
 ...
-box.space._user.index.name:delete{'public'}
+delete_user('public')
 ---
 - error: 'Failed to drop user or role ''public'': the user or the role is a system'
 ...
-box.space._user:delete{box.schema.PUBLIC_ROLE_ID}
+delete_user(box.schema.PUBLIC_ROLE_ID)
 ---
 - error: 'Failed to drop user or role ''public'': the user or the role is a system'
 ...
 #box.schema.role.info('public') > 0
+---
+- true
+...
+-- gh-11848 replication role must be treated as system
+box.schema.role.drop('replication')
+---
+- error: 'Failed to drop user or role ''replication'': the user or the role is a system'
+...
+box.schema.user.drop('replication')
+---
+- error: User 'replication' is not found
+...
+delete_user('replication')
+---
+- error: 'Failed to drop user or role ''replication'': the user or the role is a system'
+...
+delete_user(box.schema.REPLICATION_ROLE_ID)
+---
+- error: 'Failed to drop user or role ''replication'': the user or the role is a system'
+...
+#box.schema.role.info('replication') > 0
 ---
 - true
 ...
@@ -866,11 +944,11 @@ box.schema.user.drop('super')
 ---
 - error: User 'super' is not found
 ...
-box.space._user.index.name:delete{'super'}
+delete_user('super')
 ---
 - error: 'Failed to drop user or role ''super'': the user or the role is a system'
 ...
-box.space._user:delete{box.schema.SUPER_ROLE_ID}
+delete_user(box.schema.SUPER_ROLE_ID)
 ---
 - error: 'Failed to drop user or role ''super'': the user or the role is a system'
 ...
@@ -908,15 +986,15 @@ LISTEN = require('uri').parse(box.cfg.listen)
 c = net.connect(LISTEN.host, LISTEN.service)
 ---
 ...
-c:_request(net._method.select, nil, nil, nil, 1, box.index.EQ, 0, 0, 0xFFFFFFFF, {})
+c:_request('SELECT', nil, nil, nil, 1, box.index.EQ, 0, 0, 0xFFFFFFFF, {}, nil, false)
 ---
 - error: Space '1' does not exist
 ...
-c:_request(net._method.select, nil, nil, nil, 65537, box.index.EQ, 0, 0, 0xFFFFFFFF, {})
+c:_request('SELECT', nil, nil, nil, 65537, box.index.EQ, 0, 0, 0xFFFFFFFF, {}, nil, false)
 ---
 - error: Space '65537' does not exist
 ...
-c:_request(net._method.select, nil, nil, nil, 4294967295, box.index.EQ, 0, 0, 0xFFFFFFFF, {})
+c:_request('SELECT', nil, nil, nil, 4294967295, box.index.EQ, 0, 0, 0xFFFFFFFF, {}, nil, false)
 ---
 - error: Space '4294967295' does not exist
 ...
@@ -932,7 +1010,9 @@ box.schema.user.create('test')
 box.schema.user.grant('test', 'read', 'space', '_collation')
 ---
 ...
---box.schema.user.grant('test', 'write', 'space', '_collation')
+box.schema.user.grant('test', 'write', 'space', '_collation')
+---
+...
 -- FIXME: granting create on 'collation' only doesn't work
 box.schema.user.grant('test', 'create', 'universe')
 ---
@@ -1235,7 +1315,7 @@ box.session.su('guest')
 ...
 box.schema.space.create('test')
 ---
-- error: Write access to space '_schema' is denied for user 'guest'
+- error: Write access to space '_space' is denied for user 'guest'
 ...
 box.schema.user.create('test')
 ---
@@ -1441,7 +1521,7 @@ box.session.su("tester")
 ...
 box.schema.space.create("test_space")
 ---
-- error: Write access to space '_schema' is denied for user 'tester'
+- error: Write access to space '_space' is denied for user 'tester'
 ...
 box.schema.user.create('test_user')
 ---
@@ -1460,13 +1540,16 @@ box.schema.user.grant("tester", "read", "space", "_user")
 box.schema.user.grant("tester", "read", "space", "_func")
 ---
 ...
+box.schema.user.grant("tester", "read", "space", "_truncate")
+---
+...
 -- failed create
 box.session.su("tester")
 ---
 ...
 box.schema.space.create("test_space")
 ---
-- error: Write access to space '_schema' is denied for user 'tester'
+- error: Write access to space '_space' is denied for user 'tester'
 ...
 box.schema.user.create('test_user')
 ---
@@ -1530,7 +1613,7 @@ _ = s1:create_index("primary")
 _ = box.schema.user.create('test_user')
 ---
 ...
-_ = box.schema.func.create('test_func')
+_ = box.schema.func.create('test_func', {body = 'function() end', is_sandboxed = true})
 ---
 ...
 seq1 = box.schema.sequence.create('test_seq')
@@ -1639,7 +1722,7 @@ box.session.su("tester", box.schema.func.drop, "test")
 box.session.su("admin")
 ---
 ...
-box.schema.user.grant("tester", "drop", "universe")
+box.schema.user.grant("tester", "drop,grant", "universe")
 ---
 ...
 -- successful drop
@@ -1664,7 +1747,7 @@ box.schema.user.drop("tester")
 -- gh-3146 gotcha for granting universe with options
 box.schema.user.grant("guest", "read", "universe", {if_not_exists = true})
 ---
-- error: Illegal parameters, wrong object name type
+- error: wrong object name type
 ...
 box.schema.user.grant("guest", "read", "universe", "useless name")
 ---
@@ -1680,11 +1763,11 @@ box.schema.user.grant("guest", "read", "universe", nil, {if_not_exists = true})
 ...
 box.schema.user.grant("guest", "read", "universe", {}, {if_not_exists = true})
 ---
-- error: Illegal parameters, wrong object name type
+- error: wrong object name type
 ...
 box.schema.user.revoke("guest", "read", "universe", {if_exists = true})
 ---
-- error: Illegal parameters, wrong object name type
+- error: wrong object name type
 ...
 box.schema.user.revoke("guest", "read", "universe", "useless name")
 ---
@@ -1700,7 +1783,7 @@ box.schema.user.revoke("guest", "read", "universe", nil, {if_exists = true})
 ...
 box.schema.user.revoke("guest", "read", "universe", {}, {if_exists = true})
 ---
-- error: Illegal parameters, wrong object name type
+- error: wrong object name type
 ...
 --
 -- Check that box.schema.* api is available to non-super user
@@ -2033,16 +2116,16 @@ box.schema.user.grant("user1", "write", "space", "_user")
 box.schema.user.grant("user1", "read", "space", "_user")
 ---
 ...
-box.space._user:select{}
+select_user()
 ---
-- - [0, 1, 'guest', 'user', {'chap-sha1': 'vhvewKp0tNyweZQ+cFKAlsyphfg='}]
-  - [1, 1, 'admin', 'user', {}]
-  - [2, 1, 'public', 'role', {}]
-  - [3, 1, 'replication', 'role', {}]
-  - [31, 1, 'super', 'role', {}]
-  - [32, 1, 'user1', 'user', {}]
-  - [33, 1, 'user2', 'user', {}]
-  - [34, 1, 'user3', 'user', {}]
+- - [0, 1, 'guest', 'user', {'chap-sha1': 'vhvewKp0tNyweZQ+cFKAlsyphfg='}, [], 0]
+  - [1, 1, 'admin', 'user', {}, [], 0]
+  - [2, 1, 'public', 'role', {}, [], 0]
+  - [3, 1, 'replication', 'role', {}, [], 0]
+  - [31, 1, 'super', 'role', {}, [], 0]
+  - [32, 1, 'user1', 'user', {}, [], 0]
+  - [33, 1, 'user2', 'user', {}, [], 0]
+  - [34, 1, 'user3', 'user', {}, [], 0]
 ...
 box.session.su("user1")
 ---
@@ -2058,16 +2141,16 @@ box.schema.user.passwd("user2", "abcd")
 box.session.su("admin")
 ---
 ...
-box.space._user:select{}
+select_user()
 ---
-- - [0, 1, 'guest', 'user', {'chap-sha1': 'vhvewKp0tNyweZQ+cFKAlsyphfg='}]
-  - [1, 1, 'admin', 'user', {}]
-  - [2, 1, 'public', 'role', {}]
-  - [3, 1, 'replication', 'role', {}]
-  - [31, 1, 'super', 'role', {}]
-  - [32, 1, 'user1', 'user', {'chap-sha1': 'oVTFJWXp5/lL/Aih/nAmJO2O/9o='}]
-  - [33, 1, 'user2', 'user', {}]
-  - [34, 1, 'user3', 'user', {}]
+- - [0, 1, 'guest', 'user', {'chap-sha1': 'vhvewKp0tNyweZQ+cFKAlsyphfg='}, [], 0]
+  - [1, 1, 'admin', 'user', {}, [], 0]
+  - [2, 1, 'public', 'role', {}, [], 0]
+  - [3, 1, 'replication', 'role', {}, [], 0]
+  - [31, 1, 'super', 'role', {}, [], 0]
+  - [32, 1, 'user1', 'user', {'chap-sha1': 'oVTFJWXp5/lL/Aih/nAmJO2O/9o='}, [], 0]
+  - [33, 1, 'user2', 'user', {}, [], 0]
+  - [34, 1, 'user3', 'user', {}, [], 0]
 ...
 box.schema.user.grant("user1", "alter", "user", "user2")
 ---
@@ -2086,16 +2169,16 @@ box.schema.user.passwd("user3", "qewr")
 box.session.su("admin")
 ---
 ...
-box.space._user:select{}
+select_user()
 ---
-- - [0, 1, 'guest', 'user', {'chap-sha1': 'vhvewKp0tNyweZQ+cFKAlsyphfg='}]
-  - [1, 1, 'admin', 'user', {}]
-  - [2, 1, 'public', 'role', {}]
-  - [3, 1, 'replication', 'role', {}]
-  - [31, 1, 'super', 'role', {}]
-  - [32, 1, 'user1', 'user', {'chap-sha1': 'oVTFJWXp5/lL/Aih/nAmJO2O/9o='}]
-  - [33, 1, 'user2', 'user', {'chap-sha1': 'oVTFJWXp5/lL/Aih/nAmJO2O/9o='}]
-  - [34, 1, 'user3', 'user', {}]
+- - [0, 1, 'guest', 'user', {'chap-sha1': 'vhvewKp0tNyweZQ+cFKAlsyphfg='}, [], 0]
+  - [1, 1, 'admin', 'user', {}, [], 0]
+  - [2, 1, 'public', 'role', {}, [], 0]
+  - [3, 1, 'replication', 'role', {}, [], 0]
+  - [31, 1, 'super', 'role', {}, [], 0]
+  - [32, 1, 'user1', 'user', {'chap-sha1': 'oVTFJWXp5/lL/Aih/nAmJO2O/9o='}, [], 0]
+  - [33, 1, 'user2', 'user', {'chap-sha1': 'oVTFJWXp5/lL/Aih/nAmJO2O/9o='}, [], 0]
+  - [34, 1, 'user3', 'user', {}, [], 0]
 ...
 box.schema.user.drop("user1")
 ---
@@ -2130,18 +2213,18 @@ box.schema.user.grant('guest', 'read,write,execute', 'universe')
 sp = box.schema.create_space('not_universe')
 ---
 ...
-box.schema.user.grant('guest', 'read,write,execute', 'space', 'not_universe')
+box.schema.user.grant('guest', 'read,write', 'space', 'not_universe')
 ---
 ...
-box.schema.user.grant('guest', 'read,write,execute', 'space', 'not_universe')
+box.schema.user.grant('guest', 'read,write', 'space', 'not_universe')
 ---
-- error: User 'guest' already has read,write,execute access on space 'not_universe'
+- error: User 'guest' already has read,write access on space 'not_universe'
 ...
 -- Clean up.
 box.schema.user.revoke('guest', 'read,write,execute', 'universe')
 ---
 ...
-box.schema.user.revoke('guest', 'read,write,execute', 'space', 'not_universe')
+box.schema.user.revoke('guest', 'read,write', 'space', 'not_universe')
 ---
 ...
 sp:drop()
@@ -2168,10 +2251,11 @@ session.su('guest')
 ...
 _ = box.schema.func.call("LUA", "return 1")
 ---
+- error: Execute access to function 'LUA' is denied for user 'guest'
 ...
 _ = box.schema.func.call("LUA", "return box.space._space:count()")
 ---
-- error: Read access to space '_space' is denied for user 'guest'
+- error: Execute access to function 'LUA' is denied for user 'guest'
 ...
 _ = box.schema.func.call("box.schema.user.info", 0)
 ---
@@ -2181,6 +2265,16 @@ _ = box.schema.func.call("box.schema.user.info", 1)
 - error: User '1' is not found
 ...
 session.su('admin')
+---
+...
+c = net.connect(LISTEN.host, LISTEN.service)
+---
+...
+c:call('LUA', {'return 1'})
+---
+- error: Execute access to function 'LUA' is denied for user 'guest'
+...
+c:close()
 ---
 ...
 -- gh-5389: make sure that granting privileges from guest does not lead

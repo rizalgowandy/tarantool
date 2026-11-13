@@ -6,7 +6,7 @@ local socket = require('socket')
 local fio = require('fio')
 local uuid = require('uuid')
 local msgpack = require('msgpack')
-test:plan(109)
+test:plan(116)
 
 --------------------------------------------------------------------------------
 -- Invalid values
@@ -31,7 +31,6 @@ invalid('replication_timeout', 0)
 invalid('replication_sync_lag', -1)
 invalid('replication_sync_lag', 0)
 invalid('replication_sync_timeout', -1)
-invalid('replication_sync_timeout', 0)
 invalid('replication_connect_timeout', -1)
 invalid('replication_connect_timeout', 0)
 invalid('replication_connect_quorum', -1)
@@ -50,6 +49,15 @@ invalid('vinyl_run_size_ratio', 1)
 invalid('vinyl_bloom_fpr', 0)
 invalid('vinyl_bloom_fpr', 1.1)
 invalid('wal_queue_max_size', -1)
+invalid('memtx_sort_threads', 'all')
+invalid('memtx_sort_threads', -1)
+invalid('memtx_sort_threads', 0)
+invalid('memtx_sort_threads', 257)
+invalid('app_threads', -1)
+invalid('app_threads', 1001)
+invalid('replication_synchro_queue_max_size', -1)
+invalid('replication_reconnect_timeout', -1)
+invalid('replication_synchro_quorum', 'N - Q + 1')
 
 local function invalid_combinations(name, val)
     local status, result = pcall(box.cfg, val)
@@ -57,7 +65,6 @@ local function invalid_combinations(name, val)
 end
 
 invalid_combinations("log, log_nonblock", {log = "1.log", log_nonblock = true})
-invalid_combinations("log, log_format", {log = "syslog:identity=tarantool", log_format = 'json'})
 invalid_combinations("log, log_nonblock", {log_nonblock = true})
 
 test:is(type(box.cfg), 'function', 'box is not started')
@@ -77,7 +84,7 @@ test:ok(not status and result:match('Please call box.cfg{}'),
     'exception on unconfigured box')
 
 status, result = pcall(box.error, box.error.ILLEGAL_PARAMS, 'xx')
-test:ok(not status and result.code == box.error.ILLEGAL_PARAMS, "box.error without box.cfg")
+test:ok(not status and result.type == 'IllegalParams', "box.error without box.cfg")
 status, result = pcall(function() return box.runtime.info() end)
 test:ok(status and type(result) == 'table', "box.runtime without box.cfg")
 status, result = pcall(function() return box.index.EQ end)
@@ -86,6 +93,9 @@ status, result = pcall(function() return box.NULL end)
 test:ok(status and result == msgpack.NULL, "box.NULL without box.cfg")
 status = pcall(box.session.id)
 test:ok(status, "box.session without box.cfg")
+-- emmylua_check: false positive, see
+-- https://github.com/EmmyLuaLs/emmylua-analyzer-rust/issues/1250
+---@diagnostic disable-next-line: missing-parameter
 status, result = pcall(box.tuple.new, {1, 2, 3})
 test:ok(status and result[1] == 1, "box.tuple without box.cfg")
 
@@ -446,7 +456,7 @@ test:is(run_script(code), 0, "check instance_uuid")
 code = [[
 replicaset_uuid = tostring(require('uuid').new())
 box.cfg{replicaset_uuid = replicaset_uuid}
-os.exit(replicaset_uuid == box.info.cluster.uuid and 0 or 1)
+os.exit(replicaset_uuid == box.info.replicaset.uuid and 0 or 1)
 ]]
 test:is(run_script(code), 0, "check replicaset_uuid")
 
@@ -606,5 +616,4 @@ test:ok(not box.info.listen:match(':0'), 'real port in info.listen')
 box.cfg{listen = box.NULL}
 test:is(nil, box.info.listen, 'cfg.listen reset drops info.listen')
 
-test:check()
-os.exit(0)
+os.exit(test:check() == true and 0 or 1)

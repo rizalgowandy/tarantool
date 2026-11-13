@@ -36,7 +36,13 @@
 #include "json/json.h"
 #include "bit/int96.h"
 #include "mp_decimal.h"
+#include "small/region.h"
+#include "diag.h"
 #include <stdint.h>
+
+#if defined(__cplusplus)
+extern "C" {
+#endif /* defined(__cplusplus) */
 
 /**
  * This file is a link between all the update operations for all
@@ -52,10 +58,152 @@
  * xrow_update_op_do_field_<operation_type>(), see them below.
  */
 
+/** Rope allocator for nodes, paths, items etc. */
+static inline void *
+xrow_update_alloc(struct region *region, size_t size)
+{
+	return xregion_aligned_alloc(region, size, alignof(uint64_t));
+}
+
+/**
+ * Split string rope leaf data into two pieces.
+ *
+ * @param data Leaf data pointer.
+ * @param size Leaf data size.
+ * @param offset Offset at which split should be done.
+ *
+ * @return Pointer to the tail part.
+ */
+static inline const char *
+xrow_update_string_split(struct region *region, const char *data, size_t size,
+			 size_t offset)
+{
+	(void)region;
+	(void)size;
+	return data + offset;
+}
+
+#define ROPE_SPLIT_F xrow_update_string_split
+#define ROPE_ALLOC_F xrow_update_alloc
+#define rope_data_t const char *
+#define rope_ctx_t struct region *
+#define rope_name xrow_update_string
+
+#include "salad/rope.h"
+
+#undef rope_name
+#undef rope_ctx_t
+#undef rope_data_t
+#undef ROPE_ALLOC_F
+#undef ROPE_SPLIT_F
+
 struct xrow_update_rope;
 struct xrow_update_field;
 struct xrow_update_op;
 struct tuple_dictionary;
+
+/**
+ * Scalar type.
+ */
+enum xrow_update_scalar_type {
+	/** UNINITIALIZED */
+	XUPDATE_TYPE_NONE = 0,
+	/** decimal_t */
+	XUPDATE_TYPE_DECIMAL = 1,
+	/** double */
+	XUPDATE_TYPE_DOUBLE = 2,
+	/** float */
+	XUPDATE_TYPE_FLOAT = 3,
+	/** struct int96_num */
+	XUPDATE_TYPE_INT = 4,
+	/** xrow_update_string for MP_STR and MP_BIN */
+	XUPDATE_TYPE_STR = 5,
+};
+
+/**
+ * Store type of string (in terms of msgpack it would be MP_STR or MP_BIN)
+ * from which the string was read and to which it should be stored.
+ */
+enum xrow_update_str_store_type {
+	/** MP_STR */
+	XUPDATE_STORE_TYPE_STR,
+	/** MP_BIN */
+	XUPDATE_STORE_TYPE_BIN,
+};
+
+/**
+ * xrow_update_string_type representation type.
+ */
+enum xrow_update_string_type {
+	/**
+	 * String consists of only one chunk. Array representation is used.
+	 * Chunk is stored in the first element.
+	 */
+	XROW_UPDATE_STRING_SINGLE = 0,
+	/**
+	 * String consists of three chunks. Array representation is used.
+	 * Note that any chunk can be of zero length.
+	 */
+	XROW_UPDATE_STRING_THREE = 1,
+	/** Rope representation is used. */
+	XROW_UPDATE_STRING_ROPE = 2,
+};
+
+/**
+ * A continuous chunk of string data. String value is an array of such
+ * chunks in case of chunks count is small.
+ */
+struct xrow_update_string_chunk {
+	/** Pointer to the chunk data. */
+	const char *data;
+	/** Size of the data in bytes. */
+	uint32_t length;
+};
+
+/**
+ * String or varbinary value.
+ */
+struct xrow_update_string {
+	union {
+		/**
+		 * Representation for string consisting of up to 3 chunks.
+		 * Used for string field without update (in this case only
+		 * head chunk is not empty). And after the first update.
+		 * Note that after update any chunk can be empty.
+		 */
+		struct xrow_update_string_chunk array[3];
+		/**
+		 * Representation for string consisting of arbitrary
+		 * number of chunks. Used for more then a single update
+		 * into the same string field.
+		 */
+		struct xrow_update_string_rope rope;
+	};
+	/** String value type. See enum definition for details. */
+	enum xrow_update_string_type type;
+	/** Store type. See enum definition for details. */
+	enum xrow_update_str_store_type store_type;
+};
+
+/**
+ * Scalar value.
+ */
+struct xrow_update_scalar {
+	/** Type of scalar. */
+	enum xrow_update_scalar_type type;
+	union {
+		/** XUPDATE_TYPE_DOUBLE */
+		double dbl;
+		/** XUPDATE_TYPE_FLOAT */
+		float flt;
+		/** XUPDATE_TYPE_INT */
+		struct int96_num int96;
+		/** XUPDATE_TYPE_DECIMAL */
+		decimal_t dec;
+		/** XUPDATE_TYPE_STR */
+		struct xrow_update_string str;
+	};
+};
 
 /* {{{ xrow_update_op */
 
@@ -71,18 +219,7 @@ struct xrow_update_arg_del {
 };
 
 /**
- * MsgPack format code of an arithmetic argument or result.
- * MsgPack codes are not used to simplify type calculation.
- */
-enum xrow_update_arith_type {
-	XUPDATE_TYPE_DECIMAL = 0, /* MP_EXT + MP_DECIMAL */
-	XUPDATE_TYPE_DOUBLE = 1, /* MP_DOUBLE */
-	XUPDATE_TYPE_FLOAT = 2, /* MP_FLOAT */
-	XUPDATE_TYPE_INT = 3 /* MP_INT/MP_UINT */
-};
-
-/**
- * Argument (left and right) and result of ADD, SUBTRACT.
+ * Argument of ADD, SUBTRACT operations.
  *
  * To perform an arithmetic operation, update first loads left
  * and right arguments into corresponding value objects, then
@@ -103,13 +240,8 @@ enum xrow_update_arith_type {
  *   exception is raised for overflow.
  */
 struct xrow_update_arg_arith {
-	enum xrow_update_arith_type type;
-	union {
-		double dbl;
-		float flt;
-		struct int96_num int96;
-		decimal_t dec;
-	};
+	/** Right argument of operation. */
+	struct xrow_update_scalar value;
 };
 
 /** Argument of AND, XOR, OR operations. */
@@ -127,11 +259,6 @@ struct xrow_update_arg_splice {
 	const char *paste;
 	/** New content length. */
 	uint32_t paste_length;
-
-	/** Offset of the tail in the old field. */
-	int32_t tail_offset;
-	/** Size of the tail. */
-	int32_t tail_length;
 };
 
 /** Update operation argument. */
@@ -151,12 +278,6 @@ typedef int
 (*xrow_update_op_do_f)(struct xrow_update_op *op,
 		       struct xrow_update_field *field);
 
-typedef uint32_t
-(*xrow_update_op_store_f)(struct xrow_update_op *op,
-			  struct json_tree *format_tree,
-			  struct json_token *this_node, const char *in,
-			  char *out);
-
 /**
  * A set of functions and properties to initialize, do and store
  * an operation.
@@ -169,10 +290,6 @@ struct xrow_update_op_meta {
 	xrow_update_op_read_arg_f read_arg;
 	/** Virtual function to execute the operation. */
 	xrow_update_op_do_f do_op;
-	/**
-	 * Virtual function to store a result of the operation.
-	 */
-	xrow_update_op_store_f store;
 	/** Argument count. */
 	uint32_t arg_count;
 };
@@ -200,8 +317,6 @@ struct xrow_update_op {
 		};
 		int32_t field_no;
 	};
-	/** Size of a new field after it is updated. */
-	uint32_t new_field_len;
 	/** Opcode symbol: = + - / ... */
 	char opcode;
 	/**
@@ -218,6 +333,29 @@ struct xrow_update_op {
 	 */
 	bool is_for_root;
 };
+
+/**
+ * Return whether operation is scalar (all other than insert/delete/set).
+ */
+static inline bool
+xrow_update_op_is_scalar(const struct xrow_update_op *op)
+{
+	switch (op->opcode) {
+	case '+':
+	case '-':
+	case '&':
+	case '|':
+	case '^':
+	case ':':
+		return true;
+	case '=':
+	case '#':
+	case '!':
+		return false;
+	default:
+		unreachable();
+	};
+}
 
 /**
  * Extract a next token from the operation path lexer. The result
@@ -261,6 +399,44 @@ xrow_update_op_is_term(const struct xrow_update_op *op)
 }
 
 /* }}} xrow_update_op */
+
+/** {{{ Error helpers. */
+/**
+ * All the error helpers below set diag with appropriate error
+ * code, taking into account field_no < 0, complex paths. They all
+ * return -1 to shorten error returning in a caller function to
+ * single line.
+ */
+
+/** Error 'no such field'. */
+int
+xrow_update_err_no_such_field(const struct xrow_update_op *op);
+
+/** Generic error with arbitrary reason. */
+int
+xrow_update_err(const struct xrow_update_op *op, const char *reason);
+
+static inline int
+xrow_update_err_bad_json(const struct xrow_update_op *op, int pos)
+{
+	return xrow_update_err(
+		op, tt_sprintf("invalid JSON in position %d", pos));
+}
+
+static inline int
+xrow_update_err_delete1(const struct xrow_update_op *op)
+{
+	return xrow_update_err(
+		op, "can delete only 1 field from a map in a row");
+}
+
+static inline int
+xrow_update_err_duplicate(const struct xrow_update_op *op)
+{
+	return xrow_update_err(op, "the key exists already");
+}
+
+/** }}} Error helpers. */
 
 /* {{{ xrow_update_field */
 
@@ -336,9 +512,7 @@ struct xrow_update_field {
 		 * This update is terminal. It does a scalar
 		 * operation and has no children fields.
 		 */
-		struct {
-			struct xrow_update_op *op;
-		} scalar;
+		struct xrow_update_scalar scalar;
 		/**
 		 * This update changes an array. Children fields
 		 * are stored in rope nodes.
@@ -351,11 +525,10 @@ struct xrow_update_field {
 		 * intersected with any another update operation.
 		 */
 		struct {
-			/**
-			 * Bar update is a single operation
-			 * always, no children, by definition.
-			 */
+			/** Bar operation. */
 			struct xrow_update_op *op;
+			/** Bar result scalar in case of scalar operation. */
+			struct xrow_update_scalar scalar;
 			/**
 			 * Always has a non-empty path leading
 			 * inside this field's data. This is used
@@ -534,11 +707,8 @@ xrow_update_##type##_store(struct xrow_update_field *field,			\
  * @param data MessagePack data of the array to update.
  * @param data_end End of @a data.
  * @param field_count Field count in @data.
- *
- * @retval  0 Success.
- * @retval -1 Error.
  */
-int
+void
 xrow_update_array_create(struct xrow_update_field *field, const char *header,
 			 const char *data, const char *data_end,
 			 uint32_t field_count);
@@ -560,11 +730,8 @@ xrow_update_array_create(struct xrow_update_field *field, const char *header,
  * @param child A child subtree. The child is copied by value into
  *        the created array.
  * @param field_no Field number of @a child.
- *
- * @retval  0 Success.
- * @retval -1 Error.
  */
-int
+void
 xrow_update_array_create_with_child(struct xrow_update_field *field,
 				    const char *header,
 				    const struct xrow_update_field *child,
@@ -583,11 +750,8 @@ OP_DECL_GENERIC(array)
  * @param data MessagePack data of the map to update.
  * @param data_end End of @a data.
  * @param field_count Key-value pair count in @data.
- *
- * @retval  0 Success.
- * @retval -1 Error.
  */
-int
+void
 xrow_update_map_create(struct xrow_update_field *field, const char *header,
 		       const char *data, const char *data_end, int field_count);
 
@@ -596,7 +760,7 @@ xrow_update_map_create(struct xrow_update_field *field, const char *header,
  * exactly the same as with a similar array constructor. It allows
  * to avoid unnecessary MessagePack decoding.
  */
-int
+void
 xrow_update_map_create_with_child(struct xrow_update_field *field,
 				  const char *header,
 				  const struct xrow_update_field *child,
@@ -679,6 +843,8 @@ xrow_update_op_do_field_##op_type(struct xrow_update_op *op,			\
 				  struct xrow_update_field *field)		\
 {										\
 	switch (field->type) {							\
+	case XUPDATE_SCALAR:							\
+		return xrow_update_err_no_such_field(op);			\
 	case XUPDATE_ARRAY:							\
 		return xrow_update_op_do_array_##op_type(op, field);		\
 	case XUPDATE_NOP:							\
@@ -713,75 +879,90 @@ OP_DECL_GENERIC(splice)
 
 /* {{{ Scalar helpers. */
 
-int
-xrow_update_arith_make(struct xrow_update_op *op,
-		       struct xrow_update_arg_arith arg,
-		       struct xrow_update_arg_arith *ret);
-
+/**
+ * Size of scalar encoded by xrow_update_store_scalar in bytes.
+ */
 uint32_t
-xrow_update_op_store_arith(struct xrow_update_op *op,
-			   struct json_tree *format_tree,
-			   struct json_token *this_node, const char *in,
-			   char *out);
+xrow_update_scalar_sizeof(const struct xrow_update_scalar *scalar);
 
+/**
+ * Encode scalar field as MsgPack.
+ *
+ * Additionally if `this_node` is not NULL then it is consulted whether
+ * we should XUPDATE_TYPE_FLOAT as MP_DOUBLE if field type is double.
+ *
+ * @param scalar Scalar value.
+ * @param this_node Link to the field format (NULL is allowed).
+ * @param out Output buffer.
+ * @param out_end Output buffer end.
+ *
+ * @return Size of encoded scalar in bytes.
+ */
 uint32_t
-xrow_update_arg_arith_sizeof(const struct xrow_update_arg_arith *arg);
+xrow_update_store_scalar(const struct xrow_update_scalar *scalar,
+			 struct json_token *this_node, char *out,
+			 char *out_end);
 
-int
-xrow_update_op_do_arith(struct xrow_update_op *op, const char *old);
+/**
+ * Read scalar MsgPack value.
+ *
+ * @a expr pointer is advanced to the size of value read.
+ *
+ * @param expr Pointer to the data to be read.
+ * @param[out] ret Output argument holding the result.
+ */
+void
+xrow_update_mp_read_scalar(const char **expr,
+			   struct xrow_update_scalar *ret);
 
+/**
+ * Perform arithmetic operation.
+ *
+ * Result type is common greatest type (see struct xrow_update_arg_arith
+ * body for details).
+ *
+ * @param op Arithmetic operation with left argument.
+ * @param[out] scalar Operation right argument and output argument for
+ *                    operation result.
+ *
+ * @retval 0 Success.
+ * @retval -1 Failure (diag is set).
+ */
 int
-xrow_mp_read_arg_arith(struct xrow_update_op *op, const char **expr,
-		       struct xrow_update_arg_arith *ret);
+xrow_update_op_do_arith(struct xrow_update_op *op,
+			struct xrow_update_scalar *scalar);
 
+/**
+ * Perform bitwise operation.
+ *
+ * @param op Bitwise operation with left argument.
+ * @param[out] scalar Operation right argument and output argument for
+ *                    operation result.
+ *
+ * @retval 0 Success.
+ * @retval -1 Failure (diag is set).
+ */
 int
-xrow_update_op_do_bit(struct xrow_update_op *op, const char *old);
+xrow_update_op_do_bit(struct xrow_update_op *op,
+		      struct xrow_update_scalar *scalar);
 
+/**
+ * Perform splice operation.
+ *
+ * @param op Splice operation.
+ * @param scalar Operation operand and output argument for operation result.
+ *
+ * @retval 0 Success.
+ * @retval -1 Failure (diag is set).
+ */
 int
-xrow_update_op_do_splice(struct xrow_update_op *op, const char *old);
+xrow_update_op_do_splice(struct xrow_update_op *op,
+			 struct xrow_update_scalar *scalar);
 
 /* }}} Scalar helpers. */
 
-/** {{{ Error helpers. */
-/**
- * All the error helpers below set diag with appropriate error
- * code, taking into account field_no < 0, complex paths. They all
- * return -1 to shorten error returning in a caller function to
- * single line.
- */
-
-int
-xrow_update_err_no_such_field(const struct xrow_update_op *op);
-
-int
-xrow_update_err(const struct xrow_update_op *op, const char *reason);
-
-static inline int
-xrow_update_err_double(const struct xrow_update_op *op)
-{
-	return xrow_update_err(op, "double update of the same field");
-}
-
-static inline int
-xrow_update_err_bad_json(const struct xrow_update_op *op, int pos)
-{
-	return xrow_update_err(op, tt_sprintf("invalid JSON in position %d",
-					      pos));
-}
-
-static inline int
-xrow_update_err_delete1(const struct xrow_update_op *op)
-{
-	return xrow_update_err(op, "can delete only 1 field from a map in a "\
-			       "row");
-}
-
-static inline int
-xrow_update_err_duplicate(const struct xrow_update_op *op)
-{
-	return xrow_update_err(op, "the key exists already");
-}
-
-/** }}} Error helpers. */
+#if defined(__cplusplus)
+} /* extern "C" */
+#endif /* defined(__cplusplus) */
 
 #endif /* TARANTOOL_BOX_TUPLE_UPDATE_FIELD_H */

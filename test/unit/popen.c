@@ -2,6 +2,8 @@
 #include <stdlib.h>
 
 #include "trivia/util.h"
+
+#define UNIT_TAP_COMPATIBLE 1
 #include "unit.h"
 
 #include "coio.h"
@@ -234,7 +236,7 @@ int
 main(int argc, char *argv[])
 {
 #if 0
-	say_logger_init(NULL, S_DEBUG, 0, "plain", 0);
+	say_logger_init(NULL, S_DEBUG, 0, "plain");
 #endif
 	memory_init();
 

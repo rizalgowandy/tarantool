@@ -36,6 +36,7 @@
 #include "tt_static.h"
 #include "fiber.h"
 #include "errinj.h"
+#include "say.h"
 
 #define MAX_HEADER_LEN 8192
 
@@ -45,7 +46,34 @@ static_assert(MAX_HEADER_LEN < SMALL_STATIC_SIZE,
 /** The HTTP headers that may be set automatically. */
 #define HTTP_ACCEPT_HEADER	"Accept:"
 #define HTTP_CONNECTION_HEADER	"Connection:"
+#define HTTP_CONTENT_LENGTH_HEADER "Content-Length:"
 #define HTTP_KEEP_ALIVE_HEADER	"Keep-Alive:"
+
+/**
+ * libcurl callback for CURLOPT_READFUNCTION
+ * @see https://curl.haxx.se/libcurl/c/CURLOPT_READFUNCTION.html
+ */
+static size_t
+curl_easy_io_read_cb(char *buffer, size_t size, size_t nitems, void *ctx)
+{
+	struct httpc_request *req = (struct httpc_request *)ctx;
+	const size_t buffer_size = size * nitems;
+
+	size_t ibuf_len = ibuf_used(&req->send);
+	if (ibuf_len == 0) {
+		fiber_cond_broadcast(&req->io_send_cond);
+		if (req->io_send_closed)
+			return 0;
+		return CURL_READFUNC_PAUSE;
+	}
+
+	size_t read_len = ibuf_len < buffer_size ? ibuf_len : buffer_size;
+	memcpy(buffer, req->send.rpos, read_len);
+	ibuf_consume(&req->send, read_len);
+
+	fiber_cond_broadcast(&req->io_send_cond);
+	return read_len;
+}
 
 /**
  * libcurl callback for CURLOPT_WRITEFUNCTION
@@ -57,12 +85,17 @@ curl_easy_write_cb(char *ptr, size_t size, size_t nmemb, void *ctx)
 	struct httpc_request *req = (struct httpc_request *) ctx;
 	const size_t bytes = size * nmemb;
 
-	char *p = region_alloc(&req->resp_body, bytes);
+	char *p = region_alloc(&req->recv, bytes);
 	if (p == NULL) {
 		diag_set(OutOfMemory, bytes, "ibuf", "httpc body");
 		return 0;
 	}
+
 	memcpy(p, ptr, bytes);
+
+	if (req->io)
+		fiber_cond_signal(&req->io_recv_cond);
+
 	return bytes;
 }
 
@@ -75,6 +108,20 @@ curl_easy_header_cb(char *buffer, size_t size, size_t nitems, void *ctx)
 {
 	struct httpc_request *req = (struct httpc_request *) ctx;
 	const size_t bytes = size * nitems;
+	/*
+	 * The callback is invoked for the headers of all responses received
+	 * after initiating a request and not just the final response. Since
+	 * we're only interested in the final response headers, we drop all
+	 * accumulated headers on each redirect.
+	 */
+	long redirect_count;
+	curl_easy_getinfo(req->curl_request.easy, CURLINFO_REDIRECT_COUNT,
+			  &redirect_count);
+	if (redirect_count > req->redirect_count) {
+		assert(redirect_count == req->redirect_count + 1);
+		req->redirect_count = redirect_count;
+		region_reset(&req->resp_headers);
+	}
 	char *p = region_alloc(&req->resp_headers, bytes);
 	if (p == NULL) {
 		diag_set(OutOfMemory, bytes, "ibuf", "httpc header");
@@ -82,6 +129,68 @@ curl_easy_header_cb(char *buffer, size_t size, size_t nitems, void *ctx)
 	}
 	memcpy(p, buffer, bytes);
 	return bytes;
+}
+
+/** Log a single libcurl debug line after trimming trailing CRLF. */
+static void
+httpc_log_libcurl_line(char prefix, const char *data, size_t size)
+{
+	while (size > 0 && (data[size - 1] == '\n' || data[size - 1] == '\r'))
+		--size;
+	say_file_line(S_INFO, NULL, 0, NULL, "libcurl: %c %.*s", prefix,
+		      (int)size, data);
+}
+
+/**
+ * libcurl callback for CURLOPT_DEBUGFUNCTION.
+ * @see https://curl.se/libcurl/c/CURLOPT_DEBUGFUNCTION.html
+ */
+static int
+curl_easy_debug_cb(CURL *easy, curl_infotype type, char *data, size_t size,
+		   void *userptr)
+{
+	(void)easy;
+	(void)userptr;
+
+	switch (type) {
+	case CURLINFO_TEXT:
+	case CURLINFO_HEADER_IN:
+	case CURLINFO_HEADER_OUT: {
+		char prefix = type == CURLINFO_TEXT ? '*' :
+			      type == CURLINFO_HEADER_IN ? '<' :
+			      '>';
+
+		while (size > 0) {
+			char *line_end = memchr(data, '\n', size);
+			size_t line_size = line_end == NULL ? size :
+					   (size_t)(line_end - data + 1);
+			httpc_log_libcurl_line(prefix, data, line_size);
+			data += line_size;
+			size -= line_size;
+		}
+		break;
+	}
+	case CURLINFO_DATA_IN:
+		say_file_line(S_INFO, NULL, 0, NULL,
+			      "libcurl: < [%zu bytes data]", size);
+		break;
+	case CURLINFO_DATA_OUT:
+		say_file_line(S_INFO, NULL, 0, NULL,
+			      "libcurl: > [%zu bytes data]", size);
+		break;
+	case CURLINFO_SSL_DATA_IN:
+		say_file_line(S_INFO, NULL, 0, NULL,
+			      "libcurl: < [%zu bytes ssl data]", size);
+		break;
+	case CURLINFO_SSL_DATA_OUT:
+		say_file_line(S_INFO, NULL, 0, NULL,
+			      "libcurl: > [%zu bytes ssl data]", size);
+		break;
+	default:
+		break;
+	}
+
+	return 0;
 }
 
 int
@@ -92,6 +201,15 @@ httpc_env_create(struct httpc_env *env, int max_conns, int max_total_conns)
 			sizeof(struct httpc_request));
 
 	return curl_env_create(&env->curl_env, max_conns, max_total_conns);
+}
+
+void
+httpc_env_finish(struct httpc_env *ctx)
+{
+	assert(ctx);
+
+	curl_env_finish(&ctx->curl_env);
+	ctx->cleanup = 1;
 }
 
 void
@@ -118,8 +236,10 @@ httpc_request_new(struct httpc_env *env, const char *method,
 	req->env = env;
 	req->set_connection_header = true;
 	req->set_keep_alive_header = true;
+	req->content_length = -1;
+
 	region_create(&req->resp_headers, &cord()->slabc);
-	region_create(&req->resp_body, &cord()->slabc);
+	region_create(&req->recv, &cord()->slabc);
 
 	if (curl_request_create(&req->curl_request) != 0)
 		return NULL;
@@ -134,12 +254,14 @@ httpc_request_new(struct httpc_env *env, const char *method,
 		/*
 		 * Set CURLOPT_POSTFIELDS to "" and CURLOPT_POSTFIELDSSIZE 0
 		 * to avoid the read callback in any cases even if user
-		 * forgot to call httpc_set_body() for POST request.
+		 * forgot to call httpc_set_body() or httpc_set_io() for
+		 * POST request.
 		 * @see https://curl.haxx.se/libcurl/c/CURLOPT_POSTFIELDS.html
 		 */
 		curl_easy_setopt(req->curl_request.easy, CURLOPT_POST, 1L);
 		curl_easy_setopt(req->curl_request.easy, CURLOPT_POSTFIELDS, "");
-		curl_easy_setopt(req->curl_request.easy, CURLOPT_POSTFIELDSIZE, 0);
+		curl_easy_setopt(req->curl_request.easy, CURLOPT_POSTFIELDSIZE,
+				 0L);
 		curl_easy_setopt(req->curl_request.easy, CURLOPT_CUSTOMREQUEST, method);
 		req->set_accept_header = true;
 	} else {
@@ -148,17 +270,18 @@ httpc_request_new(struct httpc_env *env, const char *method,
 
 	curl_easy_setopt(req->curl_request.easy, CURLOPT_URL, url);
 
-	curl_easy_setopt(req->curl_request.easy, CURLOPT_FOLLOWLOCATION, 1);
-	curl_easy_setopt(req->curl_request.easy, CURLOPT_SSL_VERIFYPEER, 1);
+	curl_easy_setopt(req->curl_request.easy, CURLOPT_FOLLOWLOCATION, 1L);
+	curl_easy_setopt(req->curl_request.easy, CURLOPT_SSL_VERIFYPEER, 1L);
 	curl_easy_setopt(req->curl_request.easy, CURLOPT_WRITEFUNCTION,
 			 curl_easy_write_cb);
 	curl_easy_setopt(req->curl_request.easy, CURLOPT_HEADERFUNCTION,
 			 curl_easy_header_cb);
 	curl_easy_setopt(req->curl_request.easy, CURLOPT_NOPROGRESS, 1L);
-	curl_easy_setopt(req->curl_request.easy, CURLOPT_HTTP_VERSION,
-			 CURL_HTTP_VERSION_1_1);
+	curl_easy_setopt(req->curl_request.easy, CURLOPT_NOSIGNAL, 1L);
 
-	ibuf_create(&req->body, &cord()->slabc, 1);
+	ibuf_create(&req->send, &cord()->slabc, 1);
+
+	++env->req_count;
 
 	return req;
 }
@@ -166,16 +289,31 @@ httpc_request_new(struct httpc_env *env, const char *method,
 void
 httpc_request_delete(struct httpc_request *req)
 {
+	struct httpc_env *env = req->env;
+	--env->req_count;
+	assert(env->req_count >= 0);
+
 	if (req->headers != NULL)
 		curl_slist_free_all(req->headers);
 
 	curl_request_destroy(&req->curl_request);
 
-	ibuf_destroy(&req->body);
+	ibuf_destroy(&req->send);
 	region_destroy(&req->resp_headers);
-	region_destroy(&req->resp_body);
+	region_destroy(&req->recv);
+
+	if (req->io) {
+		fiber_cond_destroy(&req->io_send_cond);
+		fiber_cond_destroy(&req->io_recv_cond);
+		ibuf_destroy(&req->io_recv);
+	}
 
 	mempool_free(&req->env->req_pool, req);
+
+	if (env->req_count == 0 &&
+	    env->cleanup == 1) {
+		httpc_env_destroy(env);
+	}
 }
 
 int
@@ -201,8 +339,20 @@ httpc_set_header(struct httpc_request *req, const char *fmt, ...)
 	else if (strncasecmp(header, HTTP_CONNECTION_HEADER,
 		 strlen(HTTP_CONNECTION_HEADER)) == 0)
 		req->set_connection_header = false;
-	else if (strncasecmp(header, HTTP_KEEP_ALIVE_HEADER,
-			     strlen(HTTP_KEEP_ALIVE_HEADER)) == 0)
+	else if (strncasecmp(header, HTTP_CONTENT_LENGTH_HEADER,
+			     strlen(HTTP_CONTENT_LENGTH_HEADER)) == 0) {
+		const char *len = header + strlen(HTTP_CONTENT_LENGTH_HEADER);
+		char *end = NULL;
+		long length = strtol(len, &end, 10);
+		if (*end != '\0' || length < 0) {
+			diag_set(IllegalParams,
+				 "Content-Length header value "
+				 "must be a non-negative integer");
+			return -1;
+		}
+		req->content_length = length;
+	} else if (strncasecmp(header, HTTP_KEEP_ALIVE_HEADER,
+			       strlen(HTTP_KEEP_ALIVE_HEADER)) == 0)
 		req->set_keep_alive_header = false;
 
 	struct curl_slist *l = curl_slist_append(req->headers, header);
@@ -217,15 +367,16 @@ httpc_set_header(struct httpc_request *req, const char *fmt, ...)
 int
 httpc_set_body(struct httpc_request *req, const char *body, size_t size)
 {
-	ibuf_reset(&req->body);
-	char *chunk = ibuf_alloc(&req->body, size);
+	ibuf_reset(&req->send);
+	char *chunk = ibuf_alloc(&req->send, size);
 	if (chunk == NULL) {
 		diag_set(OutOfMemory, size, "ibuf", "http request body");
 		return -1;
 	}
 	memcpy(chunk, body, size);
 
-	curl_easy_setopt(req->curl_request.easy, CURLOPT_POSTFIELDS, req->body.buf);
+	curl_easy_setopt(req->curl_request.easy, CURLOPT_POSTFIELDS,
+			 req->send.buf);
 	curl_easy_setopt(req->curl_request.easy, CURLOPT_POSTFIELDSIZE, size);
 
 	if (httpc_set_header(req, "Content-Length: %zu", size) != 0)
@@ -267,6 +418,8 @@ httpc_set_low_speed_limit(struct httpc_request *req, long low_speed_limit)
 void
 httpc_set_verbose(struct httpc_request *req, bool curl_verbose)
 {
+	curl_easy_setopt(req->curl_request.easy, CURLOPT_DEBUGFUNCTION,
+			 curl_easy_debug_cb);
 	curl_easy_setopt(req->curl_request.easy, CURLOPT_VERBOSE,
 			 (long) curl_verbose);
 }
@@ -378,7 +531,233 @@ httpc_set_accept_encoding(struct httpc_request *req, const char *encoding)
 }
 
 int
-httpc_execute(struct httpc_request *req, double timeout)
+httpc_set_http_version(struct httpc_request *req, const char *version)
+{
+	if (strcmp(version, "1.1") == 0) {
+		curl_easy_setopt(req->curl_request.easy, CURLOPT_HTTP_VERSION,
+				 (long)CURL_HTTP_VERSION_1_1);
+	} else if (strcmp(version, "2") == 0) {
+		curl_easy_setopt(req->curl_request.easy, CURLOPT_HTTP_VERSION,
+				 (long)CURL_HTTP_VERSION_2);
+	} else if (strcmp(version, "2-tls") == 0) {
+		curl_easy_setopt(req->curl_request.easy, CURLOPT_HTTP_VERSION,
+				 (long)CURL_HTTP_VERSION_2TLS);
+	} else if (strcmp(version, "2-prior-knowledge") == 0) {
+		curl_easy_setopt(req->curl_request.easy, CURLOPT_HTTP_VERSION,
+				 (long)CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE);
+	} else {
+		diag_set(IllegalParams, "Not a supported http version: %s",
+			 version);
+		return -1;
+	}
+	return 0;
+}
+
+/**
+ * The callback to call after a CURL request is completed.
+ */
+static void
+httpc_curl_done_handler(void *arg)
+{
+	struct httpc_request *req = (struct httpc_request *)arg;
+	fiber_cond_broadcast(&req->io_recv_cond);
+	fiber_cond_broadcast(&req->io_send_cond);
+	req->io_send_closed = true;
+}
+
+int
+httpc_set_io(struct httpc_request *req, const char *method)
+{
+	if (req->io) {
+		diag_set(IllegalParams, "io: request is already io");
+		return -1;
+	}
+
+	req->io = true;
+	fiber_cond_create(&req->io_recv_cond);
+	fiber_cond_create(&req->io_send_cond);
+	ibuf_create(&req->io_recv, &cord()->slabc, 1);
+
+	if (strcmp(method, "POST") == 0 ||
+	    strcmp(method, "PUT") == 0 ||
+	    strcmp(method, "PATCH") == 0) {
+		curl_easy_setopt(req->curl_request.easy, CURLOPT_READDATA,
+				 (void *)req);
+		curl_easy_setopt(req->curl_request.easy, CURLOPT_READFUNCTION,
+				 curl_easy_io_read_cb);
+		curl_easy_setopt(req->curl_request.easy, CURLOPT_UPLOAD, 1L);
+		if (req->content_length >= 0) {
+			curl_easy_setopt(req->curl_request.easy,
+					 CURLOPT_INFILESIZE,
+					 req->content_length);
+		}
+		req->io_send = true;
+		req->io_send_closed = false;
+		req->io_headers_cond = &req->io_send_cond;
+	} else {
+		req->io_send = false;
+		req->io_send_closed = true;
+		req->io_headers_cond = &req->io_recv_cond;
+	}
+
+	req->curl_request.done_handler = httpc_curl_done_handler;
+	req->curl_request.done_handler_arg = req;
+
+	return 0;
+}
+
+ssize_t
+httpc_request_io_read(struct httpc_request *req, char *buf, size_t len,
+		      double timeout)
+{
+	if (!req->io) {
+		diag_set(IllegalParams, "io: request must be io");
+		return -1;
+	}
+
+	size_t ibuf_len = ibuf_used(&req->io_recv);
+	size_t recv_len = region_used(&req->recv);
+	double deadline = ev_monotonic_now(loop()) + timeout;
+	while (req->curl_request.in_progress && timeout > 0 &&
+	       recv_len + ibuf_len == 0) {
+		if (fiber_cond_wait_deadline(&req->io_recv_cond, deadline) != 0)
+			return -1;
+		ibuf_len = ibuf_used(&req->io_recv);
+		recv_len = region_used(&req->recv);
+	}
+
+	if (recv_len + ibuf_len == 0)
+		return 0;
+
+	if (ibuf_len < len && recv_len > (len - ibuf_len)) {
+		size_t uncopy_part = recv_len - (len - ibuf_len);
+		if (ibuf_capacity(&req->io_recv) < uncopy_part) {
+			size_t reserve = uncopy_part - ibuf_len;
+			if (ibuf_reserve(&req->io_recv, reserve) == NULL) {
+				diag_set(OutOfMemory, reserve, "ibuf", "recv");
+				return -1;
+			}
+		}
+		if (region_join(&req->recv, recv_len) == NULL) {
+			diag_set(OutOfMemory, recv_len, "region", "rep_body");
+			return -1;
+		}
+	}
+
+	size_t copied = ibuf_len < len ? ibuf_len : len;
+	if (copied > 0) {
+		memcpy(buf, req->io_recv.rpos, copied);
+		if (copied == ibuf_len)
+			ibuf_reset(&req->io_recv);
+		else
+			ibuf_consume(&req->io_recv, copied);
+	}
+
+	if (copied < len && recv_len > 0) {
+		size_t remain = len - copied;
+		char *recv = region_join(&req->recv, recv_len);
+		if (recv == NULL) {
+			diag_set(OutOfMemory, recv_len, "region", "rep_body");
+			return -1;
+		}
+		if (remain > recv_len)
+			remain = recv_len;
+		memcpy(buf + copied, recv, remain);
+		copied += remain;
+
+		if (recv_len > remain) {
+			const size_t tocopy = recv_len - remain;
+			char *ptr = xibuf_alloc(&req->io_recv, tocopy);
+			memcpy(ptr, recv + remain, tocopy);
+		}
+
+		region_truncate(&req->recv, 0);
+	}
+
+	return copied;
+}
+
+ssize_t
+httpc_request_io_write(struct httpc_request *req, const char *ptr, size_t len,
+		       double timeout)
+{
+	if (!req->io) {
+		diag_set(IllegalParams, "io: request must be io");
+		return -1;
+	}
+
+	if (!req->io_send) {
+		diag_set(IllegalParams,
+			 "io: HTTP request method with no body to send");
+		return -1;
+	}
+
+	if (!req->curl_request.in_progress || req->io_send_closed)
+		return 0;
+
+	size_t ibuf_len = ibuf_used(&req->send);
+	double deadline = ev_monotonic_now(loop()) + timeout;
+	while (req->curl_request.in_progress && ibuf_len && timeout > 0) {
+		if (fiber_cond_wait_deadline(&req->io_send_cond, deadline) != 0)
+			return -1;
+
+		fiber_cond_wait(&req->io_send_cond);
+		ibuf_len = ibuf_used(&req->send);
+	}
+
+	if (ibuf_len) {
+		if (req->curl_request.in_progress) {
+			diag_set(TimedOut);
+			return -1;
+		}
+		return 0;
+	}
+
+	if (len > 0) {
+		ibuf_reset(&req->send);
+		char *buf = xibuf_alloc(&req->send, len);
+		memcpy(buf, ptr, len);
+	} else {
+		req->io_send_closed = true;
+	}
+
+	curl_easy_pause(req->curl_request.easy, CURLPAUSE_SEND_CONT);
+	fiber_cond_wait_deadline(&req->io_send_cond, deadline);
+	if (ibuf_used(&req->send)) {
+		ibuf_reset(&req->send);
+		return 0;
+	}
+
+	return len;
+}
+
+int
+httpc_request_io_finish(struct httpc_request *req, double timeout)
+{
+	if (!req->io) {
+		diag_set(IllegalParams, "io: request must be io");
+		return -1;
+	}
+
+	if (req->curl_request.in_progress && !req->io_send_closed) {
+		double ts = ev_monotonic_now(loop());
+		timeout = timeout > 0 ? timeout : 0;
+		if (httpc_request_io_write(req, NULL, 0, timeout) == 0)
+			req->io_send_closed = true;
+		timeout -= ev_monotonic_now(loop()) - ts;
+	}
+
+	timeout = timeout > 0 ? timeout : 0;
+	if (req->status == 0 && httpc_request_finish(req, timeout))
+		return -1;
+
+	fiber_cond_broadcast(&req->io_send_cond);
+	fiber_cond_broadcast(&req->io_recv_cond);
+	return 0;
+}
+
+int
+httpc_request_start(struct httpc_request *req, double timeout)
 {
 	struct httpc_env *env = req->env;
 	if (req->set_accept_header &&
@@ -401,8 +780,29 @@ httpc_execute(struct httpc_request *req, double timeout)
 
 	++env->stat.total_requests;
 
-	if (curl_execute(&req->curl_request, &env->curl_env, timeout) != CURLM_OK)
+	if (curl_request_start(&req->curl_request, &env->curl_env) != CURLM_OK)
 		return -1;
+
+	if (req->io && req->curl_request.in_progress &&
+	    fiber_cond_wait_timeout(req->io_headers_cond, timeout) != 0) {
+		httpc_request_finish(req, 0);
+		return -1;
+	}
+
+	if (req->io && !req->curl_request.in_progress)
+		return httpc_request_finish(req, 0);
+
+	return 0;
+}
+
+int
+httpc_request_finish(struct httpc_request *req, double timeout)
+{
+	struct httpc_env *env = req->env;
+
+	if (curl_request_finish(&req->curl_request, &env->curl_env, timeout) != CURLM_OK)
+		return -1;
+
 	ERROR_INJECT_RETURN(ERRINJ_HTTPC_EXECUTE);
 	long longval = 0;
 	switch (req->curl_request.code) {
@@ -466,4 +866,13 @@ httpc_execute(struct httpc_request *req, double timeout)
 	}
 
 	return 0;
+}
+
+int
+httpc_execute(struct httpc_request *req, double timeout)
+{
+	int ret = httpc_request_start(req, timeout);
+	if (ret != 0)
+		return ret;
+	return httpc_request_finish(req, timeout);
 }

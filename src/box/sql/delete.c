@@ -39,7 +39,7 @@ sql_lookup_space(struct Parse *parse, struct SrcList_item *space_name)
 {
 	assert(space_name != NULL);
 	assert(space_name->space == NULL);
-	struct space *space = space_by_name(space_name->zName);
+	const struct space *space = sql_space_by_src(space_name);
 	if (space == NULL) {
 		diag_set(ClientError, ER_NO_SUCH_SPACE, space_name->zName);
 		parse->is_aborted = true;
@@ -56,25 +56,21 @@ sql_lookup_space(struct Parse *parse, struct SrcList_item *space_name)
 		parse->is_aborted = true;
 		return NULL;
 	}
-	space_name->space = space;
+	struct space *res = space_by_id(space->def->id);
+	space_name->space = res;
 	if (sqlIndexedByLookup(parse, space_name) != 0)
 		space = NULL;
-	return space;
+	return res;
 }
 
 void
 sql_materialize_view(struct Parse *parse, const char *name, struct Expr *where,
 		     int cursor)
 {
-	struct sql *db = parse->db;
-	struct SrcList *from = sql_src_list_append(db, NULL, NULL);
-	if (from == NULL) {
-		parse->is_aborted = true;
-		return;
-	}
-	where = sqlExprDup(db, where, 0);
+	struct SrcList *from = sql_src_list_append(NULL, NULL);
+	where = sqlExprDup(where, 0);
 	assert(from->nSrc == 1);
-	from->a[0].zName = sqlDbStrDup(db, name);
+	from->a[0].zName = sql_xstrdup(name);
 	assert(from->a[0].pOn == NULL);
 	assert(from->a[0].pUsing == NULL);
 	struct Select *select = sqlSelectNew(parse, NULL, from, where, NULL,
@@ -82,54 +78,36 @@ sql_materialize_view(struct Parse *parse, const char *name, struct Expr *where,
 	struct SelectDest dest;
 	sqlSelectDestInit(&dest, SRT_EphemTab, cursor, ++parse->nMem);
 	sqlSelect(parse, select, &dest);
-	sql_select_delete(db, select);
+	sql_select_delete(select);
 }
 
 void
-sql_table_truncate(struct Parse *parse, struct SrcList *tab_list)
+sql_table_truncate(struct Parse *parse, struct Token *table)
 {
-	assert(tab_list->nSrc == 1);
-
 	struct Vdbe *v = sqlGetVdbe(parse);
-	if (v == NULL)
-		goto cleanup;
-
-	const char *tab_name = tab_list->a->zName;
-	struct space *space = space_by_name(tab_name);
+	const struct space *space = sql_space_by_token(table);
 	if (space == NULL) {
-		diag_set(ClientError, ER_NO_SUCH_SPACE, tab_name);
-		goto tarantool_error;
-	}
-	if (! rlist_empty(&space->parent_fk_constraint)) {
-		const char *err = "can not truncate space '%s' because other "
-				  "objects depend on it";
-		diag_set(ClientError, ER_SQL_EXECUTE,
-			 tt_sprintf(err, space->def->name));
-		goto tarantool_error;
+		diag_set(ClientError, ER_NO_SUCH_SPACE,
+			 sql_tt_name_from_token(table));
+		parse->is_aborted = true;
+		return;
 	}
 	if (space->def->opts.is_view) {
 		const char *err_msg =
 			tt_sprintf("can not truncate space '%s' because space "\
 				   "is a view", space->def->name);
 		diag_set(ClientError, ER_SQL_EXECUTE, err_msg);
-		goto tarantool_error;
+		parse->is_aborted = true;
+		return;
 	}
 	sqlVdbeAddOp2(v, OP_Clear, space->def->id, true);
-cleanup:
-	sqlSrcListDelete(parse->db, tab_list);
-	return;
-
-tarantool_error:
-	parse->is_aborted = true;
-	goto cleanup;
 }
 
 void
 sql_table_delete_from(struct Parse *parse, struct SrcList *tab_list,
 		      struct Expr *where)
 {
-	struct sql *db = parse->db;
-	if (parse->is_aborted || db->mallocFailed)
+	if (parse->is_aborted)
 		goto delete_from_cleanup;
 
 	assert(tab_list->nSrc == 1);
@@ -152,7 +130,7 @@ sql_table_delete_from(struct Parse *parse, struct SrcList *tab_list,
 		goto delete_from_cleanup;
 	trigger_list = sql_triggers_exist(space->def, TK_DELETE,
 					  NULL, parse->sql_flags, NULL);
-	bool is_complex = trigger_list != NULL || fk_constraint_is_required(space, NULL);
+	bool is_complex = trigger_list != NULL;
 	bool is_view = space->def->opts.is_view;
 
 	/* If table is really a view, make sure it has been
@@ -177,11 +155,7 @@ sql_table_delete_from(struct Parse *parse, struct SrcList *tab_list,
 
 	/* Begin generating code.  */
 	struct Vdbe *v = sqlGetVdbe(parse);
-	if (v == NULL)
-		goto delete_from_cleanup;
-
 	sqlVdbeCountChanges(v);
-	sql_set_multi_write(parse, true);
 
 	/* If we are trying to delete from a view, realize that
 	 * view into an ephemeral table.
@@ -228,8 +202,13 @@ sql_table_delete_from(struct Parse *parse, struct SrcList *tab_list,
 		int reg_pk = parse->nMem + 1;
 		int pk_len = is_view ? space->def->field_count + 1 :
 			     space->index[0]->def->key_def->part_count;
+		/*
+		 * This increase should not be necessary, but when filling
+		 * the tab_cursor cursors, an error occurs that causes
+		 * one more cursor to be filled than expected.
+		 */
+		parse->nTab++;
 		int eph_cursor = parse->nTab++;
-		int addr_eph_open = sqlVdbeCurrentAddr(v);
 		struct sql_space_info *info;
 		if (is_view) {
 			/*
@@ -257,13 +236,11 @@ sql_table_delete_from(struct Parse *parse, struct SrcList *tab_list,
 			info = sql_space_info_new_from_index_def(index_def,
 								 false);
 		}
-		if (info == NULL) {
-			parse->is_aborted = true;
-			goto delete_from_cleanup;
-		}
 		parse->nMem += pk_len;
-		sqlVdbeAddOp4(v, OP_OpenTEphemeral, reg_eph, 0, 0, (char *)info,
-			      P4_DYNAMIC);
+		int addr_eph_open = sqlVdbeAddOp4(v, OP_OpenTEphemeral, reg_eph,
+						  0, 0, (char *)info,
+						  P4_DYNAMIC);
+		sqlVdbeAddOp3(v, OP_IteratorOpen, eph_cursor, 0, reg_eph);
 
 		/* Construct a query to find the primary key for
 		 * every row to be deleted, based on the WHERE
@@ -319,6 +296,7 @@ sql_table_delete_from(struct Parse *parse, struct SrcList *tab_list,
 			/* OP_Found will use an unpacked key */
 			key_len = pk_len;
 			sqlVdbeChangeToNoop(v, addr_eph_open);
+			sqlVdbeChangeToNoop(v, addr_eph_open + 1);
 		} else {
 			/* Add the PK key for this row to the
 			 * temporary table.
@@ -354,12 +332,11 @@ sql_table_delete_from(struct Parse *parse, struct SrcList *tab_list,
 		 */
 		if (!is_view) {
 			int iAddrOnce = 0;
-			if (one_pass == ONEPASS_MULTI) {
+			if (one_pass == ONEPASS_MULTI)
 				iAddrOnce = sqlVdbeAddOp0(v, OP_Once);
-				VdbeCoverage(v);
-			}
-			sqlVdbeAddOp4(v, OP_IteratorOpen, tab_cursor, 0, 0,
-					  (void *) space, P4_SPACEPTR);
+			int reg = ++parse->nMem;
+			sqlVdbeAddOp2(v, OP_OpenSpace, reg, space->def->id);
+			sqlVdbeAddOp3(v, OP_IteratorOpen, tab_cursor, 0, reg);
 			VdbeComment((v, "%s", space->index[0]->def->name));
 
 			if (one_pass == ONEPASS_MULTI)
@@ -375,13 +352,8 @@ sql_table_delete_from(struct Parse *parse, struct SrcList *tab_list,
 			assert(key_len == pk_len);
 			sqlVdbeAddOp4Int(v, OP_NotFound, tab_cursor,
 					     addr_bypass, reg_key, key_len);
-
-			VdbeCoverage(v);
 		} else {
-			sqlVdbeAddOp3(v, OP_IteratorOpen,
-					  eph_cursor, 0, reg_eph);
 			addr_loop = sqlVdbeAddOp1(v, OP_Rewind, eph_cursor);
-			VdbeCoverage(v);
 			sqlVdbeAddOp2(v, OP_RowData, eph_cursor, reg_key);
 		}
 
@@ -406,14 +378,13 @@ sql_table_delete_from(struct Parse *parse, struct SrcList *tab_list,
 		} else {
 			sqlVdbeAddOp2(v, OP_Next, eph_cursor,
 					  addr_loop + 1);
-			VdbeCoverage(v);
 			sqlVdbeJumpHere(v, addr_loop);
 		}
 	}
 
  delete_from_cleanup:
-	sqlSrcListDelete(db, tab_list);
-	sql_expr_delete(db, where, false);
+	sqlSrcListDelete(tab_list);
+	sql_expr_delete(where);
 }
 
 void
@@ -428,8 +399,6 @@ sql_generate_row_delete(struct Parse *parse, struct space *space,
 	 * stage.
 	 */
 	assert(v != NULL);
-	VdbeModuleComment((v, "BEGIN: GenRowDel(%d,%d,%d,%d)",
-			   cursor, iIdxCur, reg_pk, (int)nPk));
 
 	/* Seek cursor iCur to the row to delete. If this row no
 	 * longer exists (this can happen if a trigger program has
@@ -437,25 +406,21 @@ sql_generate_row_delete(struct Parse *parse, struct space *space,
 	 * fire any DELETE triggers.
 	 */
 	int label = sqlVdbeMakeLabel(v);
-	if (mode == ONEPASS_OFF) {
+	if (mode == ONEPASS_OFF)
 		sqlVdbeAddOp4Int(v, OP_NotFound, cursor, label, reg_pk, npk);
-		VdbeCoverageIf(v, opSeek == OP_NotFound);
-	}
 
 	int first_old_reg = 0;
 	/* If there are any triggers to fire, allocate a range of registers to
 	 * use for the old.* references in the triggers.
 	 */
-	if (space != NULL &&
-	   (fk_constraint_is_required(space, NULL) || trigger_list != NULL)) {
+	if (space != NULL && trigger_list != NULL) {
 		/* Mask of OLD.* columns in use */
 		/* TODO: Could use temporary registers here. */
 		uint64_t mask =
-			sql_trigger_colmask(parse, trigger_list, 0, 0,
+			sql_trigger_colmask(parse, trigger_list, 0, false,
 					    TRIGGER_BEFORE | TRIGGER_AFTER,
 					    space, onconf);
 		assert(space != NULL);
-		mask |= space->fk_constraint_mask;
 		first_old_reg = parse->nMem + 1;
 		parse->nMem += (1 + (int)space->def->field_count);
 
@@ -486,15 +451,7 @@ sql_generate_row_delete(struct Parse *parse, struct space *space,
 		if (addr_start < sqlVdbeCurrentAddr(v)) {
 			sqlVdbeAddOp4Int(v, OP_NotFound, cursor, label,
 					     reg_pk, npk);
-			VdbeCoverageIf(v, opSeek == OP_NotFound);
 		}
-
-		/* Do FK processing. This call checks that any FK
-		 * constraints that refer to this table (i.e.
-		 * constraints attached to other tables) are not
-		 * violated by deleting this row.
-		 */
-		fk_constraint_emit_check(parse, space, first_old_reg, 0, NULL);
 	}
 
 	/* Delete the index and table entries. Skip this step if
@@ -518,14 +475,6 @@ sql_generate_row_delete(struct Parse *parse, struct space *space,
 	}
 
 	if (space != NULL) {
-		/* Do any ON CASCADE, SET NULL or SET DEFAULT
-		 * operations required to handle rows (possibly
-		 * in other tables) that refer via a foreign
-		 * key to the row just deleted.
-		 */
-
-		fk_constraint_emit_actions(parse, space, first_old_reg, NULL);
-
 		/* Invoke AFTER DELETE trigger programs. */
 		vdbe_code_row_trigger(parse, trigger_list, TK_DELETE, 0,
 				      TRIGGER_AFTER, space, first_old_reg,
@@ -537,5 +486,4 @@ sql_generate_row_delete(struct Parse *parse, struct space *space,
 	 * throws a RAISE(IGNORE) exception.
 	 */
 	sqlVdbeResolveLabel(v, label);
-	VdbeModuleComment((v, "END: GenRowDel()"));
 }

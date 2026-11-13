@@ -170,12 +170,12 @@ static struct action *Action_new(void);
 static struct action *Action_sort(struct action *);
 
 /********** From the file "build.h" ************************************/
-void FindRulePrecedences();
-void FindFirstSets();
-void FindStates();
-void FindLinks();
-void FindFollowSets();
-void FindActions();
+void FindRulePrecedences(struct lemon *xp);
+void FindFirstSets(struct lemon *lemp);
+void FindStates(struct lemon *lemp);
+void FindLinks(struct lemon *lemp);
+void FindFollowSets(struct lemon *lemp);
+void FindActions(struct lemon *lemp);
 
 /********* From the file "configlist.h" *********************************/
 void Configlist_init(void);
@@ -2785,6 +2785,7 @@ void Parse(struct lemon *gp)
   filebuf = (char *)malloc( filesize+1 );
   if( filesize>100000000 || filebuf==0 ){
     ErrorMsg(ps.filename,0,"Input file too large.");
+    free(filebuf);
     gp->errorcnt++;
     fclose(fp);
     return;
@@ -3607,7 +3608,7 @@ PRIVATE int translate_code(struct lemon *lemp, struct rule *rp){
     lhsdirect = 1;
     if( has_destructor(rp->rhs[0],lemp) ){
       append_str(0,0,0,0);
-      append_str("  yy_destructor(yypParser,%d,&yymsp[%d].minor);\n", 0,
+      append_str("  yy_destructor(%d,&yymsp[%d].minor);\n", 0,
                  rp->rhs[0]->index,1-rp->nrhs);
       rp->codePrefix = Strsafe(append_str(0,0,0,0));
       rp->noCode = 0;
@@ -3743,7 +3744,7 @@ PRIVATE int translate_code(struct lemon *lemp, struct rule *rp){
         lemp->errorcnt++;
       }
     }else if( i>0 && has_destructor(rp->rhs[i],lemp) ){
-      append_str("  yy_destructor(yypParser,%d,&yymsp[%d].minor);\n", 0,
+      append_str("  yy_destructor(%d,&yymsp[%d].minor);\n", 0,
          rp->rhs[i]->index,i-rp->nrhs+1);
     }
   }

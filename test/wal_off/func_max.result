@@ -42,11 +42,11 @@ test_run:cmd("setopt delimiter ''");
 ...
 func_limit()
 ---
-- error: 'Failed to create function ''func31936'': function id is too big'
+- error: 'Failed to create function ''func31999'': Max function count is reached'
 ...
 drop_limit_func()
 ---
-- error: Function 'func31936' does not exist
+- error: Function 'func31999' does not exist
 ...
 box.schema.user.create('testuser')
 ---
@@ -57,16 +57,19 @@ box.schema.user.grant('testuser', 'read,write', 'space', '_func')
 box.schema.user.grant('testuser', 'create', 'function')
 ---
 ...
+box.schema.user.grant('testuser', 'execute', 'universe')
+---
+...
 session.su('testuser')
 ---
 ...
 func_limit()
 ---
-- error: 'Failed to create function ''func31936'': function id is too big'
+- error: 'Failed to create function ''func31999'': Max function count is reached'
 ...
 drop_limit_func()
 ---
-- error: Function 'func31936' does not exist
+- error: Function 'func31999' does not exist
 ...
 session.su('admin')
 ---

@@ -53,6 +53,14 @@ extern const struct type_info type_CollationError;
 extern const struct type_info type_SwimError;
 extern const struct type_info type_CryptoError;
 extern const struct type_info type_RaftError;
+/* type_info for FileFormatError exception */
+extern const struct type_info type_FileFormatError;
+/* type_info for FiberSliceIsExceeded exception */
+extern const struct type_info type_FiberSliceIsExceeded;
+/* type_info for EncodeError exception */
+extern const struct type_info type_EncodeError;
+/* type_info for DecodeError exception */
+extern const struct type_info type_DecodeError;
 
 const char *
 exception_get_string(struct error *e, const struct method_info *method);
@@ -74,7 +82,6 @@ public:
 	const char *get_errmsg() const { return errmsg; }
 
 	NORETURN virtual void raise() = 0;
-	virtual void log() const;
 	virtual ~Exception();
 
 	Exception(const Exception &) = delete;
@@ -87,19 +94,30 @@ class SystemError: public Exception {
 public:
 	virtual void raise() { throw this; }
 
-	virtual void log() const;
+	SystemError(const char *file, unsigned line, const char *format,
+		    va_list ap);
 
-	SystemError(const char *file, unsigned line,
-		    const char *format, ...);
+	SystemError()
+		:Exception(&type_SystemError, NULL, 0)
+	{
+	}
+
 protected:
-	SystemError(const struct type_info *type, const char *file, unsigned line);
+	SystemError(const struct type_info *type, const char *file,
+		    unsigned line);
 };
 
 extern const struct type_info type_SocketError;
 class SocketError: public SystemError {
 public:
 	SocketError(const char *file, unsigned line, const char *socketname,
-		    const char *format, ...);
+		    const char *format, va_list ap);
+
+	SocketError()
+		:SystemError(&type_SocketError, NULL, 0)
+	{
+	}
+
 	virtual void raise()
 	{
 		throw this;
@@ -111,18 +129,36 @@ public:
 	OutOfMemory(const char *file, unsigned line,
 		    size_t amount, const char *allocator,
 		    const char *object);
+
+	OutOfMemory()
+		:SystemError(&type_OutOfMemory, NULL, 0)
+	{
+	}
+
 	virtual void raise() { throw this; }
 };
 
 class TimedOut: public SystemError {
 public:
 	TimedOut(const char *file, unsigned line);
+
+	TimedOut()
+		:SystemError(&type_TimedOut, NULL, 0)
+	{
+	}
+
 	virtual void raise() { throw this; }
 };
 
 class ChannelIsClosed: public Exception {
 public:
 	ChannelIsClosed(const char *file, unsigned line);
+
+	ChannelIsClosed()
+		:Exception(&type_ChannelIsClosed, NULL, 0)
+	{
+	}
+
 	virtual void raise() { throw this; }
 };
 
@@ -133,7 +169,28 @@ public:
 class FiberIsCancelled: public Exception {
 public:
 	FiberIsCancelled(const char *file, unsigned line);
-	virtual void log() const;
+
+	FiberIsCancelled()
+		:Exception(&type_FiberIsCancelled, NULL, 0)
+	{
+	}
+
+	virtual void raise() { throw this; }
+};
+
+/**
+ * This is thrown by fiber_* API calls when the fiber
+ * error slice is exceeded.
+ */
+class FiberSliceIsExceeded: public Exception {
+public:
+	FiberSliceIsExceeded(const char *file, unsigned line);
+
+	FiberSliceIsExceeded()
+		: Exception(&type_FiberSliceIsExceeded, NULL, 0)
+	{
+	}
+
 	virtual void raise() { throw this; }
 };
 
@@ -141,55 +198,117 @@ class LuajitError: public Exception {
 public:
 	LuajitError(const char *file, unsigned line,
 		    const char *msg);
+
+	LuajitError()
+		:Exception(&type_LuajitError, NULL, 0)
+	{
+	}
+
 	virtual void raise() { throw this; }
 };
 
 class IllegalParams: public Exception {
 public:
-	IllegalParams(const char *file, unsigned line, const char *format, ...);
+	IllegalParams(const char *file, unsigned line, const char *format,
+		      va_list ap);
+
+	IllegalParams()
+		:Exception(&type_IllegalParams, NULL, 0)
+	{
+	}
+
 	virtual void raise() { throw this; }
 };
 
 class CollationError: public Exception {
 public:
 	CollationError(const char *file, unsigned line, const char *format,
-		       ...);
+		       va_list ap);
+
+	CollationError()
+		:Exception(&type_CollationError, NULL, 0)
+	{
+	}
+
 	virtual void raise() { throw this; }
 };
 
 class SwimError: public Exception {
 public:
-	SwimError(const char *file, unsigned line, const char *format, ...);
+	SwimError(const char *file, unsigned line, const char *format,
+		  va_list ap);
+
+	SwimError()
+		:Exception(&type_SwimError, NULL, 0)
+	{
+	}
+
 	virtual void raise() { throw this; }
 };
 
 class CryptoError: public Exception {
 public:
-	CryptoError(const char *file, unsigned line, const char *format, ...);
+	CryptoError(const char *file, unsigned line, const char *format,
+		    va_list ap);
+
+	CryptoError()
+		:Exception(&type_CryptoError, NULL, 0)
+	{
+	}
+
 	virtual void raise() { throw this; }
 };
 
 class RaftError: public Exception {
 public:
-	RaftError(const char *file, unsigned line, const char *format, ...);
+	RaftError(const char *file, unsigned line, const char *format,
+		  va_list ap);
+
 	virtual void raise() { throw this; }
 };
 
-/**
- * Initialize the exception subsystem.
- */
-void
-exception_init();
+class FileFormatError: public Exception {
+public:
+	FileFormatError(const char *file, unsigned line, const char *format,
+			va_list ap);
 
-#define tnt_error(class, ...) ({					\
-	say_debug("%s at %s:%i", #class, __FILE__, __LINE__);		\
-	class *e = new class(__FILE__, __LINE__, ##__VA_ARGS__);	\
-	diag_set_error(diag_get(), e);					\
-	e;								\
-})
+	FileFormatError()
+		: Exception(&type_FileFormatError, NULL, 0)
+	{
+	}
+
+	virtual void raise() { throw this; }
+};
+
+class EncodeError: public Exception {
+public:
+	EncodeError(const char *file, unsigned line, const char *format,
+		    const char *details);
+
+	EncodeError()
+		: Exception(&type_EncodeError, NULL, 0)
+	{
+	}
+
+	virtual void raise() { throw this; }
+};
+
+class DecodeError: public Exception {
+public:
+	DecodeError(const char *file, unsigned line, const char *format,
+		    const char *details);
+
+	DecodeError()
+		: Exception(&type_DecodeError, NULL, 0)
+	{
+	}
+
+	virtual void raise() { throw this; }
+};
 
 #define tnt_raise(...) do {						\
-	throw tnt_error(__VA_ARGS__);					\
+	diag_set(__VA_ARGS__);						\
+	diag_raise();							\
 } while (0)
 
 #endif /* defined(__cplusplus) */

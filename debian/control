@@ -1,7 +1,9 @@
 Source: tarantool
 Priority: optional
 Maintainer: Alexander Turenko <alexander.turenko@tarantool.org>
-Uploaders: Dmitry E. Oboukhov <unera@debian.org>
+Uploaders:
+ Dmitry E. Oboukhov <unera@debian.org>,
+ PackPack <build@tarantool.org>
 Build-Depends: cdbs (>= 0.4.100), debhelper (>= 9), dpkg-dev (>= 1.16.1~),
 # It is recommended to use debhelper version equal to or greater than
 # compatibility level. This is a workaround for Ubuntu Xenial repos
@@ -16,18 +18,22 @@ Build-Depends: cdbs (>= 0.4.100), debhelper (>= 9), dpkg-dev (>= 1.16.1~),
 # make package manager seek for cmake3 package at first and use it
 # if found or fallback to cmake package (that provides CMake 3+
 # for modern distributions) otherwise.
- cmake3 (>= 3.2) | cmake (>= 3.2),
+ cmake3 (>= 3.3) | cmake (>= 3.7),
  libreadline-dev,
  libncurses5-dev,
  libssl-dev,
- libunwind-dev | libunwind8-dev | libunwind7-dev,
  libicu-dev,
 # libcurl build dependencies
  zlib1g-dev,
 # Install prove to run LuaJIT tests.
  libtest-harness-perl,
+# Install dependencies for functional tests.
+ python3-gevent,
+ python3-yaml,
+# needed for datetime tests
+ tzdata,
 Section: database
-Standards-Version: 3.9.8
+Standards-Version: 4.5.1
 Homepage: http://tarantool.org/
 VCS-Browser: https://github.com/tarantool/tarantool
 VCS-Git: git://github.com/tarantool/tarantool.git
@@ -55,7 +61,7 @@ Depends: ${misc:Depends}, adduser, lsb-base,
 # Deps for built-in package manager
 # https://github.com/tarantool/tarantool/issues/2612
  openssl
-Recommends: tarantool-dev, git, build-essential, cmake
+Recommends: tarantool-dev, git, build-essential, cmake, tt
 Description: Tarantool in-memory database - common files
  Tarantool is an in-memory database and Lua application server.
  This package provides scripts to work with tarantool configuration
@@ -64,8 +70,8 @@ Description: Tarantool in-memory database - common files
 Package: tarantool
 Architecture: i386 amd64 armhf arm64
 Priority: optional
-Depends: ${shlibs:Depends}, ${misc:Depends}, netbase, binutils, libgomp1,
-  openssl, tarantool-common (>= 2.2.1),
+Depends: ${shlibs:Depends}, ${misc:Depends}, netbase,
+  openssl, tarantool-common (>= 2.2.1), tzdata,
 # libcurl dependencies (except ones we have already)
  zlib1g
 Replaces: tarantool-lts

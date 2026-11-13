@@ -34,7 +34,6 @@
  */
 #include "box/index.h"
 #include "box/tuple.h"
-#include "box/fk_constraint.h"
 #include "box/schema.h"
 #include "box/coll_id_cache.h"
 #include "sqlInt.h"
@@ -44,7 +43,6 @@
 #include "box/schema.h"
 #include "box/session.h"
 #include "pragma.h"
-#include "tarantoolInt.h"
 
 /** Set result column names and types for a pragma. */
 static void
@@ -93,37 +91,30 @@ pragmaLocate(const char *zName)
  * - type: Column declaration type;
  * - notnull: True if 'NOT NULL' is part of column declaration;
  * - dflt_value: The default value for the column, if any.
- *
- * @param parse Current parsing context.
- * @param tbl_name Name of table to be examined.
  */
 static void
-sql_pragma_table_info(struct Parse *parse, const char *tbl_name)
+sql_pragma_table_info(struct Parse *parse, const struct space *space)
 {
-	if (tbl_name == NULL)
-		return;
-	struct space *space = space_by_name(tbl_name);
 	if (space == NULL)
 		return;
-	struct index *pk = space_index(space, 0);
 	parse->nMem = 6;
 	if (space->def->opts.is_view)
 		sql_view_assign_cursors(parse, space->def->opts.sql);
 	struct Vdbe *v = sqlGetVdbe(parse);
 	struct field_def *field = space->def->fields;
 	for (uint32_t i = 0, k; i < space->def->field_count; ++i, ++field) {
-		if (pk == NULL) {
+		if (space->index_count == 0) {
 			k = 1;
 		} else if (!sql_space_column_is_in_pk(space, i)) {
 			k = 0;
 		} else {
-			struct key_def *kdef = pk->def->key_def;
+			const struct index *pk = space->index[0];
+			const struct key_def *kdef = pk->def->key_def;
 			k = key_def_find_by_fieldno(kdef, i) - kdef->parts + 1;
 		}
 		sqlVdbeMultiLoad(v, 1, "issisi", i, field->name,
-				     field_type_strs[field->type],
-				     !field->is_nullable, field->default_value,
-				     k);
+				 field_type_strs[field->type],
+				 !field->is_nullable, NULL, k);
 		sqlVdbeAddOp2(v, OP_ResultRow, 1, 6);
 	}
 }
@@ -176,30 +167,17 @@ sql_pragma_table_stats(struct space *space, void *data)
  * - desc: Whether sorting by the column is descending (1 or 0).
  * - coll: Collation name.
  * - type: Type of a column value.
- *
- * @param parse Current parsing content.
- * @param pragma Definition of index_info pragma.
- * @param tbl_name Name of table index belongs to.
- * @param idx_name Name of index to display info about.
  */
 static void
-sql_pragma_index_info(struct Parse *parse,
-		      MAYBE_UNUSED const struct PragmaName *pragma,
-		      const char *tbl_name, const char *idx_name)
+sql_pragma_index_info(struct Parse *parse, const struct space *space,
+		      const struct index *idx)
 {
-	if (idx_name == NULL || tbl_name == NULL)
-		return;
-	struct space *space = space_by_name(tbl_name);
-	if (space == NULL)
-		return;
-	struct index *idx = space_index_by_name(space, idx_name);
-	if (idx == NULL)
+	if (space == NULL || idx == NULL)
 		return;
 	parse->nMem = 6;
 	struct Vdbe *v = sqlGetVdbe(parse);
 	assert(v != NULL);
 	uint32_t part_count = idx->def->key_def->part_count;
-	assert(parse->nMem <= pragma->nPragCName);
 	struct key_part *part = idx->def->key_def->parts;
 	for (uint32_t i = 0; i < part_count; i++, part++) {
 		const char *c_n;
@@ -258,18 +236,10 @@ sql_pragma_collation_list(struct Parse *parse_context)
 	box_iterator_free(it);
 }
 
-/**
- * This function handles PRAGMA INDEX_LIST statement.
- *
- * @param parse Current parsing content.
- * @param table_name Name of table to display list of indexes.
- */
+/** This function handles PRAGMA INDEX_LIST statement. */
 static void
-sql_pragma_index_list(struct Parse *parse, const char *tbl_name)
+sql_pragma_index_list(struct Parse *parse, const struct space *space)
 {
-	if (tbl_name == NULL)
-		return;
-	struct space *space = space_by_name(tbl_name);
 	if (space == NULL)
 		return;
 	parse->nMem = 3;
@@ -282,81 +252,34 @@ sql_pragma_index_list(struct Parse *parse, const char *tbl_name)
 	}
 }
 
-/**
- * This function handles PRAGMA foreign_key_list(<table>).
- *
- * @param parse_context Current parsing content.
- * @param table_name Name of table to display list of FK.
- */
+/** This function handles PRAGMA foreign_key_list(<table>). */
 static void
-sql_pragma_foreign_key_list(struct Parse *parse_context, const char *table_name)
+sql_pragma_foreign_key_list(struct Parse *parser, const struct space *space)
 {
-	if (table_name == NULL)
-		return;
-	struct space *space = space_by_name(table_name);
-	if (space == NULL)
-		return;
-	struct Vdbe *v = sqlGetVdbe(parse_context);
-	assert(v != NULL);
-	int i = 0;
-	parse_context->nMem = 8;
-	struct fk_constraint *fk_c;
-	rlist_foreach_entry(fk_c, &space->child_fk_constraint, in_child_space) {
-		struct fk_constraint_def *fk_def = fk_c->def;
-		struct space *parent = space_by_id(fk_def->parent_id);
-		assert(parent != NULL);
-		const char *on_delete_action =
-			fk_constraint_action_strs[fk_def->on_delete];
-		const char *on_update_action =
-			fk_constraint_action_strs[fk_def->on_update];
-		for (uint32_t j = 0; j < fk_def->field_count; j++) {
-			uint32_t ch_fl = fk_def->links[j].child_field;
-			const char *child_col = space->def->fields[ch_fl].name;
-			uint32_t pr_fl = fk_def->links[j].parent_field;
-			const char *parent_col =
-				parent->def->fields[pr_fl].name;
-			sqlVdbeMultiLoad(v, 1, "iissssss", i, j,
-					 parent->def->name, child_col,
-					 parent_col, on_delete_action,
-					 on_update_action, "NONE");
-			sqlVdbeAddOp2(v, OP_ResultRow, 1, 8);
-		}
-		++i;
-	}
+	(void)parser;
+	(void)space;
+	return;
 }
 
 void
-sqlPragma(struct Parse *pParse, struct Token *pragma, struct Token *table,
-	  struct Token *index)
+sqlPragma(struct Parse *pParse, struct Token *pragma, struct Token *table_name,
+	  struct Token *index_name)
 {
-	char *table_name = NULL;
-	char *index_name = NULL;
-	struct sql *db = pParse->db;
+	assert(pragma != NULL && table_name != NULL && index_name != NULL);
+	const struct space *space = NULL;
+	const struct index *index = NULL;
 	struct Vdbe *v = sqlGetVdbe(pParse);
 
-	if (v == NULL)
-		return;
 	sqlVdbeRunOnlyOnce(v);
 	pParse->nMem = 2;
 
-	char *pragma_name = sql_name_from_token(db, pragma);
-	if (pragma_name == NULL) {
-		pParse->is_aborted = true;
-		goto pragma_out;
-	}
-	if (table != NULL) {
-		table_name = sql_name_from_token(db, table);
-		if (table_name == NULL) {
-			pParse->is_aborted = true;
-			goto pragma_out;
-		}
-	}
-	if (index != NULL) {
-		index_name = sql_name_from_token(db, index);
-		if (index_name == NULL) {
-			pParse->is_aborted = true;
-			goto pragma_out;
-		}
+	char *pragma_name = sql_name_from_token(pragma);
+	if (table_name->n > 0)
+		space = sql_space_by_token(table_name);
+	if (space != NULL && index_name->n > 0) {
+		uint32_t index_id = sql_index_id_by_token(space, index_name);
+		if (index_id <= space->index_id_max)
+			index = space->index_map[index_id];
 	}
 
 	/* Locate the pragma in the lookup table */
@@ -372,29 +295,27 @@ sqlPragma(struct Parse *pParse, struct Token *pragma, struct Token *table,
 	/* Jump to the appropriate pragma handler */
 	switch (pPragma->ePragTyp) {
 	case PRAGMA_TABLE_INFO:
-		sql_pragma_table_info(pParse, table_name);
+		sql_pragma_table_info(pParse, space);
 		break;
 	case PRAGMA_STATS:
 		space_foreach(sql_pragma_table_stats, (void *) pParse);
 		break;
 	case PRAGMA_INDEX_INFO:
-		sql_pragma_index_info(pParse, pPragma, index_name, table_name);
+		sql_pragma_index_info(pParse, space, index);
 		break;
 	case PRAGMA_INDEX_LIST:
-		sql_pragma_index_list(pParse, table_name);
+		sql_pragma_index_list(pParse, space);
 		break;
 	case PRAGMA_COLLATION_LIST:
 		sql_pragma_collation_list(pParse);
 		break;
 	case PRAGMA_FOREIGN_KEY_LIST:
-		sql_pragma_foreign_key_list(pParse, table_name);
+		sql_pragma_foreign_key_list(pParse, space);
 		break;
 	default:
 		unreachable();
 	}
 
  pragma_out:
-	sqlDbFree(db, pragma_name);
-	sqlDbFree(db, table_name);
-	sqlDbFree(db, index_name);
+	sql_xfree(pragma_name);
 }

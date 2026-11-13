@@ -43,6 +43,7 @@
 #include "box/engine.h"
 #include "box/vinyl.h"
 #include "box/sql.h"
+#include "box/memtx_engine.h"
 #include "info/info.h"
 #include "lua/info.h"
 #include "lua/utils.h"
@@ -123,11 +124,36 @@ seek_stat_item(const char *name, int rps, int64_t total, void *cb_ctx)
 	return 1;
 }
 
+/**
+ * Returns false if a box.stat item should be excluded from the output.
+ */
+static bool
+filter_box_stat_item(const char *name)
+{
+	return strcmp(name, "OK") != 0 &&
+	       strcmp(name, "CALL_16") != 0 &&
+	       strcmp(name, "NOP") != 0;
+}
+
+static int
+set_box_stat_item(const char *name, int rps, int64_t total, void *cb_ctx)
+{
+	return filter_box_stat_item(name) ?
+	       set_stat_item(name, rps, total, cb_ctx) : 0;
+}
+
+static int
+seek_box_stat_item(const char *name, int rps, int64_t total, void *cb_ctx)
+{
+	return filter_box_stat_item(name) ?
+	       seek_stat_item(name, rps, total, cb_ctx) : 0;
+}
+
 static int
 lbox_stat_index(struct lua_State *L)
 {
 	luaL_checkstring(L, -1);
-	int res = rmean_foreach(rmean_box, seek_stat_item, L);
+	int res = rmean_foreach(rmean_box, seek_box_stat_item, L);
 	if (res)
 		return res;
 	return rmean_foreach(rmean_error, seek_stat_item, L);
@@ -137,7 +163,7 @@ static int
 lbox_stat_call(struct lua_State *L)
 {
 	lua_newtable(L);
-	rmean_foreach(rmean_box, set_stat_item, L);
+	rmean_foreach(rmean_box, set_box_stat_item, L);
 	rmean_foreach(rmean_error, set_stat_item, L);
 	return 1;
 }
@@ -150,6 +176,27 @@ lbox_stat_vinyl(struct lua_State *L)
 	struct engine *vinyl = engine_by_name("vinyl");
 	assert(vinyl != NULL);
 	vinyl_engine_stat(vinyl, &h);
+	return 1;
+}
+
+/* box.stat.memtx() */
+static int
+lbox_stat_memtx(struct lua_State *L)
+{
+	struct info_handler h;
+	luaT_info_handler_create(&h, L);
+	struct engine *memtx = engine_by_name("memtx");
+	assert(memtx != NULL);
+	memtx_engine_stat((struct memtx_engine *)memtx, &h);
+	return 1;
+}
+
+/* box.stat.memtx.tx() */
+static int
+lbox_stat_memtx_tx(struct lua_State *L)
+{
+	lbox_stat_memtx(L);
+	lua_getfield(L, 1, "tx");
 	return 1;
 }
 
@@ -241,7 +288,7 @@ static int
 lbox_stat_net_thread_index(struct lua_State *L)
 {
 	const int thread_id = luaL_checkinteger(L, -1) - 1;
-	if (thread_id < 0 || thread_id > iproto_threads_count)
+	if (thread_id < 0 || thread_id >= iproto_threads_count)
 		return 0;
 
 	lua_newtable(L);
@@ -297,6 +344,21 @@ static const struct luaL_Reg lbox_stat_net_thread_meta [] = {
 	{NULL, NULL}
 };
 
+/*
+ * Memtx transaction statistics can be obtained not only as box.stat.memtx().tx
+ * but also by calling box.stat.memtx.tx(). This is required only for backward
+ * compatibility. Please don't add new functions to the box.stat.memtx table.
+ */
+static const struct luaL_Reg lbox_stat_memtx_funcs[] = {
+	{"tx", lbox_stat_memtx_tx},
+	{NULL, NULL}
+};
+
+static const struct luaL_Reg lbox_stat_memtx_meta[] = {
+	{"__call", lbox_stat_memtx},
+	{NULL, NULL}
+};
+
 /** Initialize box.stat package. */
 void
 box_lua_stat_init(struct lua_State *L)
@@ -308,29 +370,30 @@ box_lua_stat_init(struct lua_State *L)
 		{NULL, NULL}
 	};
 
-	luaL_register_module(L, "box.stat", statlib);
+	luaL_findtable(L, LUA_GLOBALSINDEX, "box.stat", 0);
+	luaL_setfuncs(L, statlib, 0);
 
 	lua_newtable(L);
-	luaL_register(L, NULL, lbox_stat_meta);
+	luaL_setfuncs(L, lbox_stat_meta, 0);
 	lua_setmetatable(L, -2);
 	lua_pop(L, 1); /* stat module */
 
-	static const struct luaL_Reg netstatlib [] = {
-		{NULL, NULL}
-	};
-
-	luaL_register_module(L, "box.stat.net", netstatlib);
-
+	luaL_findtable(L, LUA_GLOBALSINDEX, "box.stat.net", 0);
 	lua_newtable(L);
-	luaL_register(L, NULL, lbox_stat_net_meta);
+	luaL_setfuncs(L, lbox_stat_net_meta, 0);
 	lua_setmetatable(L, -2);
 	lua_pop(L, 1); /* stat net module */
 
-	luaL_register_module(L, "box.stat.net.thread", netstatlib);
-
+	luaL_findtable(L, LUA_GLOBALSINDEX, "box.stat.net.thread", 0);
 	lua_newtable(L);
-	luaL_register(L, NULL, lbox_stat_net_thread_meta);
+	luaL_setfuncs(L, lbox_stat_net_thread_meta, 0);
 	lua_setmetatable(L, -2);
 	lua_pop(L, 1); /* stat net module */
+
+	luaL_findtable(L, LUA_GLOBALSINDEX, "box.stat.memtx", 0);
+	luaL_setfuncs(L, lbox_stat_memtx_funcs, 0);
+	lua_newtable(L);
+	luaL_setfuncs(L, lbox_stat_memtx_meta, 0);
+	lua_setmetatable(L, -2);
+	lua_pop(L, 1); /* stat memtx module */
 }
-

@@ -1,23 +1,19 @@
 #include <trivia/config.h>
 #include "memory.h"
 #include "fiber.h"
-#include "vy_history.h"
 #include "vy_iterators_helper.h"
+
+static struct key_def *key_def;
+static struct tuple_format *format;
 
 static void
 test_basic(void)
 {
 	header();
 
-	plan(12);
+	plan(9);
 
-	/* Create key_def */
-	uint32_t fields[] = { 0 };
-	uint32_t types[] = { FIELD_TYPE_UNSIGNED };
-	struct key_def *key_def = box_key_def_new(fields, types, 1);
-	assert(key_def != NULL);
 	struct vy_mem *mem = create_test_mem(key_def);
-
 	is(mem->dump_lsn, -1, "mem->dump_lsn on empty mem");
 	const struct vy_stmt_template stmts[] = {
 		STMT_TEMPLATE(100, REPLACE, 1), STMT_TEMPLATE(101, REPLACE, 1),
@@ -46,57 +42,33 @@ test_basic(void)
 	entry = vy_mem_insert_template(mem, &stmts[3]);
 	ok(vy_entry_is_equal(vy_mem_older_lsn(mem, entry), older),
 	   "vy_mem_rollback 1");
-	vy_mem_rollback_stmt(mem, older);
+	vy_mem_rollback_stmt(mem, older, &dummy_count);
 	ok(vy_entry_is_equal(vy_mem_older_lsn(mem, entry), olderolder),
 	   "vy_mem_rollback 2");
 
 	/* Check version  */
 	entry = vy_mem_insert_template(mem, &stmts[4]);
-	is(mem->version, 8, "vy_mem->version")
+	is(mem->version, 8, "vy_mem->version");
 	vy_mem_commit_stmt(mem, entry);
-	is(mem->version, 9, "vy_mem->version")
+	is(mem->version, 9, "vy_mem->version");
 
 	/* Clean up */
 	vy_mem_delete(mem);
-	key_def_delete(key_def);
 
-	fiber_gc();
 	footer();
 
 	check_plan();
 }
 
 static void
-test_iterator_restore_after_insertion()
+test_iterator_restore_after_insertion(void)
 {
 	header();
 
 	plan(1);
 
-	/* Create key_def */
-	uint32_t fields[] = { 0 };
-	uint32_t types[] = { FIELD_TYPE_UNSIGNED };
-	struct key_def *key_def = box_key_def_new(fields, types, 1);
-	assert(key_def != NULL);
-
-	/* Create format */
-	struct tuple_format *format = vy_stmt_format_new(&stmt_env, &key_def, 1,
-							 NULL, 0, 0, NULL);
-	assert(format != NULL);
-	tuple_format_ref(format);
-
-	/* Create lsregion */
-	struct lsregion lsregion;
-	struct slab_cache *slab_cache = cord_slab_cache();
-	lsregion_create(&lsregion, slab_cache->arena);
-
-	struct vy_entry select_key = vy_entry_key_new(stmt_env.key_format,
+	struct vy_entry select_key = vy_entry_key_new(key_format,
 						      key_def, NULL, 0);
-
-	struct mempool history_node_pool;
-	mempool_create(&history_node_pool, cord_slab_cache(),
-		       sizeof(struct vy_history_node));
-
 	uint64_t restore_on_value = 20;
 	uint64_t restore_on_value_reverse = 60;
 	char data[16];
@@ -198,13 +170,13 @@ test_iterator_restore_after_insertion()
 		const struct vy_read_view *prv = &rv;
 		vy_mem_iterator_open(&itr, &stats, mem,
 				     direct ? ITER_GE : ITER_LE, select_key,
-				     &prv);
+				     &prv, /*is_prepared_ok=*/true);
 		struct vy_entry e;
 		struct vy_history history;
 		vy_history_create(&history, &history_node_pool);
 		int rc = vy_mem_iterator_next(&itr, &history);
 		e = vy_history_last_stmt(&history);
-		assert(rc == 0);
+		fail_unless(rc == 0);
 		size_t j = 0;
 		while (e.stmt != NULL) {
 			if (j >= expected_count) {
@@ -225,7 +197,7 @@ test_iterator_restore_after_insertion()
 				break;
 			int rc = vy_mem_iterator_next(&itr, &history);
 			e = vy_history_last_stmt(&history);
-			assert(rc == 0);
+			fail_unless(rc == 0);
 		}
 		if (e.stmt == NULL && j != expected_count)
 			wrong_output = true;
@@ -297,7 +269,7 @@ test_iterator_restore_after_insertion()
 			j++;
 			int rc = vy_mem_iterator_next(&itr, &history);
 			e = vy_history_last_stmt(&history);
-			assert(rc == 0);
+			fail_unless(rc == 0);
 		}
 		if (j != expected_count)
 			wrong_output = true;
@@ -308,37 +280,317 @@ test_iterator_restore_after_insertion()
 
 		vy_history_cleanup(&history);
 		vy_mem_delete(mem);
-		lsregion_gc(&lsregion, 2);
 	}
 
 	ok(!wrong_output, "check wrong_output %d", i_fail);
 
 	/* Clean up */
-	mempool_destroy(&history_node_pool);
-
 	tuple_unref(select_key.stmt);
 	tuple_unref(restore_on_key.stmt);
 	tuple_unref(restore_on_key_reverse.stmt);
-
-	tuple_format_unref(format);
-	lsregion_destroy(&lsregion);
-	key_def_delete(key_def);
-
-	fiber_gc();
 
 	check_plan();
 
 	footer();
 }
 
+static int
+lsn_snprint(char *buf, int size, int64_t lsn)
+{
+	int total = 0;
+	if (lsn == INT64_MAX) {
+		SNPRINT(total, snprintf, buf, size, "INT64_MAX");
+	} else if (lsn > MAX_LSN) {
+		SNPRINT(total, snprintf, buf, size, "MAX_LSN+%lld",
+			(long long)(lsn - MAX_LSN));
+	} else {
+		SNPRINT(total, snprintf, buf, size, "%lld", (long long)lsn);
+	}
+	return total;
+}
+
+static const char *
+lsn_str(int64_t lsn)
+{
+	return TOSTR(lsn_snprint, lsn);
+}
+
+static const char *
+iterator_type_str(int type)
+{
+	switch (type) {
+	case ITER_EQ: return "EQ";
+	case ITER_GE: return "GE";
+	case ITER_GT: return "GT";
+	case ITER_LE: return "LE";
+	case ITER_LT: return "LT";
+	default:
+		unreachable();
+	}
+}
+
+struct test_iterator_expected {
+	struct vy_stmt_template stmt;
+	int64_t min_skipped_plsn;
+};
+
+static void
+test_iterator_helper(
+		struct vy_mem *mem, enum iterator_type type,
+		const struct vy_stmt_template *key_template,
+		int64_t vlsn, bool is_prepared_ok,
+		const struct test_iterator_expected *expected,
+		int expected_count, int64_t min_skipped_plsn)
+{
+	struct vy_read_view rv;
+	rv.vlsn = vlsn;
+	const struct vy_read_view *prv = &rv;
+	struct vy_mem_iterator it;
+	struct vy_mem_iterator_stat stat;
+	memset(&stat, 0, sizeof(stat));
+	struct vy_history history;
+	vy_history_create(&history, &history_node_pool);
+	struct vy_entry key = vy_new_simple_stmt(format, key_def,
+						 key_template);
+	vy_mem_iterator_open(&it, &stat, mem, type, key, &prv, is_prepared_ok);
+	int i;
+	for (i = 0; ; i++) {
+		fail_unless(vy_mem_iterator_next(&it, &history) == 0);
+		struct vy_entry entry = vy_history_last_stmt(&history);
+		if (vy_entry_is_equal(entry, vy_entry_none()))
+			break;
+		ok(i < expected_count &&
+		   it.min_skipped_plsn == expected[i].min_skipped_plsn &&
+		   vy_stmt_are_same(entry, &expected[i].stmt, format, key_def),
+		   "type=%s key=%s vlsn=%s min_skipped_plsn=%s stmt=%s",
+		   iterator_type_str(type), tuple_str(key.stmt), lsn_str(vlsn),
+		   lsn_str(it.min_skipped_plsn), vy_stmt_str(entry.stmt));
+	}
+	ok(i == expected_count && it.min_skipped_plsn == min_skipped_plsn,
+	   "type=%s key=%s vlsn=%s min_skipped_plsn=%s eof",
+	   iterator_type_str(type), tuple_str(key.stmt), lsn_str(vlsn),
+	   lsn_str(it.min_skipped_plsn));
+	vy_mem_iterator_close(&it);
+	vy_history_cleanup(&history);
+	tuple_unref(key.stmt);
+}
+
+static void
+test_iterator_skip_prepared(void)
+{
+	header();
+	plan(44);
+	struct vy_stmt_template stmt_templates[] = {
+		STMT_TEMPLATE(10, REPLACE, 100, 1),
+		STMT_TEMPLATE(20, REPLACE, 100, 2),
+		STMT_TEMPLATE(MAX_LSN + 10, REPLACE, 100, 3),
+		STMT_TEMPLATE(MAX_LSN + 20, REPLACE, 100, 4),
+		STMT_TEMPLATE(15, REPLACE, 200, 1),
+		STMT_TEMPLATE(25, REPLACE, 200, 2),
+		STMT_TEMPLATE(MAX_LSN + 15, REPLACE, 300, 1),
+		STMT_TEMPLATE(MAX_LSN + 5, REPLACE, 400, 1),
+		STMT_TEMPLATE(MAX_LSN + 25, REPLACE, 400, 2),
+		STMT_TEMPLATE_FLAGS(10, REPLACE, VY_STMT_SKIP_READ, 500, 1),
+		STMT_TEMPLATE_FLAGS(15, REPLACE, VY_STMT_SKIP_READ, 500, 2),
+		STMT_TEMPLATE_FLAGS(5, REPLACE, VY_STMT_SKIP_READ, 600, 1),
+		STMT_TEMPLATE(10, REPLACE, 600, 2),
+		STMT_TEMPLATE_FLAGS(15, REPLACE, VY_STMT_SKIP_READ, 600, 3),
+		STMT_TEMPLATE(30, REPLACE, 600, 4),
+		STMT_TEMPLATE_FLAGS(45, REPLACE, VY_STMT_SKIP_READ, 600, 5),
+		STMT_TEMPLATE(MAX_LSN + 20, REPLACE, 600, 5),
+	};
+	struct vy_mem *mem = create_test_mem(key_def);
+	for (int i = 0; i < (int)lengthof(stmt_templates); i++) {
+		vy_mem_insert_template(mem, &stmt_templates[i]);
+	}
+	/* type=GE key=100 vlsn=20 is_prepared_ok=false */
+	{
+		struct vy_stmt_template key = STMT_TEMPLATE(0, SELECT, 100);
+		struct test_iterator_expected expected[] = {
+			{STMT_TEMPLATE(20, REPLACE, 100, 2), INT64_MAX},
+			{STMT_TEMPLATE(15, REPLACE, 200, 1), INT64_MAX},
+			{STMT_TEMPLATE(10, REPLACE, 600, 2), INT64_MAX},
+		};
+		test_iterator_helper(mem, ITER_GE, &key, /*vlsn=*/20,
+				     /*is_prepared_ok=*/false,
+				     expected, lengthof(expected),
+				     /*min_skipped_plsn=*/INT64_MAX);
+	}
+	/* type=GE key=100 vlsn=MAX_LSN+1 is_prepared_ok=false */
+	{
+		struct vy_stmt_template key = STMT_TEMPLATE(0, SELECT, 100);
+		struct test_iterator_expected expected[] = {
+			{STMT_TEMPLATE(20, REPLACE, 100, 2), INT64_MAX},
+			{STMT_TEMPLATE(25, REPLACE, 200, 2), INT64_MAX},
+			{STMT_TEMPLATE(30, REPLACE, 600, 4), INT64_MAX},
+		};
+		test_iterator_helper(mem, ITER_GE, &key, /*vlsn=*/MAX_LSN + 1,
+				     /*is_prepared_ok=*/false,
+				     expected, lengthof(expected),
+				     /*min_skipped_plsn=*/INT64_MAX);
+	}
+	/* type=GE key=100 vlsn=MAX_LSN+20 is_prepared_ok=false */
+	{
+		struct vy_stmt_template key = STMT_TEMPLATE(0, SELECT, 100);
+		struct test_iterator_expected expected[] = {
+			{STMT_TEMPLATE(20, REPLACE, 100, 2), MAX_LSN + 10},
+			{STMT_TEMPLATE(25, REPLACE, 200, 2), MAX_LSN + 10},
+			{STMT_TEMPLATE(30, REPLACE, 600, 4), MAX_LSN + 5},
+		};
+		test_iterator_helper(mem, ITER_GE, &key, /*vlsn=*/MAX_LSN + 20,
+				     /*is_prepared_ok=*/false,
+				     expected, lengthof(expected),
+				     /*min_skipped_plsn=*/MAX_LSN + 5);
+	}
+	/* type=GE key=100 vlsn=MAX_LSN+20 is_prepared_ok=true */
+	{
+		struct vy_stmt_template key = STMT_TEMPLATE(0, SELECT, 100);
+		struct test_iterator_expected expected[] = {
+			{STMT_TEMPLATE(MAX_LSN + 20, REPLACE, 100, 4),
+				INT64_MAX},
+			{STMT_TEMPLATE(25, REPLACE, 200, 2), INT64_MAX},
+			{STMT_TEMPLATE(MAX_LSN + 15, REPLACE, 300, 1),
+				INT64_MAX},
+			{STMT_TEMPLATE(MAX_LSN + 5, REPLACE, 400, 1),
+				INT64_MAX},
+			{STMT_TEMPLATE(MAX_LSN + 20, REPLACE, 600, 5),
+				INT64_MAX},
+		};
+		test_iterator_helper(mem, ITER_GE, &key, /*vlsn=*/MAX_LSN + 20,
+				     /*is_prepared_ok=*/true,
+				     expected, lengthof(expected),
+				     /*min_skipped_plsn=*/INT64_MAX);
+	}
+	/* type=LT key=1000 vlsn=20 is_prepared_ok=false */
+	{
+		struct vy_stmt_template key = STMT_TEMPLATE(0, SELECT, 1000);
+		struct test_iterator_expected expected[] = {
+			{STMT_TEMPLATE(10, REPLACE, 600, 2), INT64_MAX},
+			{STMT_TEMPLATE(15, REPLACE, 200, 1), INT64_MAX},
+			{STMT_TEMPLATE(20, REPLACE, 100, 2), INT64_MAX},
+		};
+		test_iterator_helper(mem, ITER_LT, &key, /*vlsn=*/20,
+				     /*is_prepared_ok=*/false,
+				     expected, lengthof(expected),
+				     /*min_skipped_plsn=*/INT64_MAX);
+	}
+	/* type=LT key=1000 vlsn=MAX_LSN+1 is_prepared_ok=false */
+	{
+		struct vy_stmt_template key = STMT_TEMPLATE(0, SELECT, 1000);
+		struct test_iterator_expected expected[] = {
+			{STMT_TEMPLATE(30, REPLACE, 600, 4), INT64_MAX},
+			{STMT_TEMPLATE(25, REPLACE, 200, 2), INT64_MAX},
+			{STMT_TEMPLATE(20, REPLACE, 100, 2), INT64_MAX},
+		};
+		test_iterator_helper(mem, ITER_LT, &key, /*vlsn=*/MAX_LSN + 1,
+				     /*is_prepared_ok=*/false,
+				     expected, lengthof(expected),
+				     /*min_skipped_plsn=*/INT64_MAX);
+	}
+	/* type=LT key=1000 vlsn=MAX_LSN+20 is_prepared_ok=false */
+	{
+		struct vy_stmt_template key = STMT_TEMPLATE(0, SELECT, 1000);
+		struct test_iterator_expected expected[] = {
+			{STMT_TEMPLATE(30, REPLACE, 600, 4), MAX_LSN + 20},
+			{STMT_TEMPLATE(25, REPLACE, 200, 2), MAX_LSN + 5},
+			{STMT_TEMPLATE(20, REPLACE, 100, 2), MAX_LSN + 5},
+		};
+		test_iterator_helper(mem, ITER_LT, &key, /*vlsn=*/MAX_LSN + 20,
+				     /*is_prepared_ok=*/false,
+				     expected, lengthof(expected),
+				     /*min_skipped_plsn=*/MAX_LSN + 5);
+	}
+	/* type=LT key=1000 vlsn=MAX_LSN+20 is_prepared_ok=true */
+	{
+		struct vy_stmt_template key = STMT_TEMPLATE(0, SELECT, 1000);
+		struct test_iterator_expected expected[] = {
+			{STMT_TEMPLATE(MAX_LSN + 20, REPLACE, 600, 5),
+				INT64_MAX},
+			{STMT_TEMPLATE(MAX_LSN + 5, REPLACE, 400, 1),
+				INT64_MAX},
+			{STMT_TEMPLATE(MAX_LSN + 15, REPLACE, 300, 1),
+				INT64_MAX},
+			{STMT_TEMPLATE(25, REPLACE, 200, 2), INT64_MAX},
+			{STMT_TEMPLATE(MAX_LSN + 20, REPLACE, 100, 4),
+				INT64_MAX},
+		};
+		test_iterator_helper(mem, ITER_LT, &key, /*vlsn=*/MAX_LSN + 20,
+				     /*is_prepared_ok=*/true,
+				     expected, lengthof(expected),
+				     /*min_skipped_plsn=*/INT64_MAX);
+	}
+	/* type=EQ key=600 vlsn=20 is_prepared_ok=false */
+	{
+		struct vy_stmt_template key = STMT_TEMPLATE(0, SELECT, 600);
+		struct test_iterator_expected expected[] = {
+			{STMT_TEMPLATE(10, REPLACE, 600, 2), INT64_MAX},
+		};
+		test_iterator_helper(mem, ITER_EQ, &key, /*vlsn=*/20,
+				     /*is_prepared_ok=*/false,
+				     expected, lengthof(expected),
+				     /*min_skipped_plsn=*/INT64_MAX);
+	}
+	/* type=EQ key=600 vlsn=MAX_LSN+1 is_prepared_ok=false */
+	{
+		struct vy_stmt_template key = STMT_TEMPLATE(0, SELECT, 600);
+		struct test_iterator_expected expected[] = {
+			{STMT_TEMPLATE(30, REPLACE, 600, 4), INT64_MAX},
+		};
+		test_iterator_helper(mem, ITER_EQ, &key, /*vlsn=*/MAX_LSN + 1,
+				     /*is_prepared_ok=*/false,
+				     expected, lengthof(expected),
+				     /*min_skipped_plsn=*/INT64_MAX);
+	}
+	/* type=EQ key=600 vlsn=MAX_LSN+20 is_prepared_ok=false */
+	{
+		struct vy_stmt_template key = STMT_TEMPLATE(0, SELECT, 600);
+		struct test_iterator_expected expected[] = {
+			{STMT_TEMPLATE(30, REPLACE, 600, 4), MAX_LSN + 20},
+		};
+		test_iterator_helper(mem, ITER_EQ, &key, /*vlsn=*/MAX_LSN + 20,
+				     /*is_prepared_ok=*/false,
+				     expected, lengthof(expected),
+				     /*min_skipped_plsn=*/MAX_LSN + 20);
+	}
+	/* type=EQ key=600 vlsn=MAX_LSN+20 is_prepared_ok=true */
+	{
+		struct vy_stmt_template key = STMT_TEMPLATE(0, SELECT, 600);
+		struct test_iterator_expected expected[] = {
+			{STMT_TEMPLATE(MAX_LSN + 20, REPLACE, 600, 5),
+				INT64_MAX},
+		};
+		test_iterator_helper(mem, ITER_EQ, &key, /*vlsn=*/MAX_LSN + 20,
+				     /*is_prepared_ok=*/true,
+				     expected, lengthof(expected),
+				     /*min_skipped_plsn=*/INT64_MAX);
+	}
+	vy_mem_delete(mem);
+	footer();
+	check_plan();
+}
+
 int
-main(int argc, char *argv[])
+main(void)
 {
 	vy_iterator_C_test_init(0);
 
+	plan(3);
+
+	uint32_t fields[] = { 0 };
+	uint32_t types[] = { FIELD_TYPE_UNSIGNED };
+	key_def = box_key_def_new(fields, types, 1);
+	fail_if(key_def == NULL);
+	format = vy_simple_stmt_format_new(&stmt_env, &key_def, 1);
+	fail_if(format == NULL);
+	tuple_format_ref(format);
+
 	test_basic();
 	test_iterator_restore_after_insertion();
+	test_iterator_skip_prepared();
 
+	tuple_format_unref(format);
+	key_def_delete(key_def);
 	vy_iterator_C_test_finish();
-	return 0;
+
+	return check_plan();
 }

@@ -1,5 +1,5 @@
 test_run = require('test_run').new()
-fiber = require('fiber')
+box.cfg{vinyl_defer_deletes = true}
 
 --
 -- Create a space with secondary indexes and check that REPLACE and
@@ -37,13 +37,13 @@ i1:stat().get.rows -- 5
 i1:stat().skip.rows -- 10
 pk:stat().lookup -- 15
 pk:stat().get.rows -- 5
-pk:stat().skip.rows -- 5
+pk:stat().skip.rows -- 10
 i2:select()
 i2:stat().get.rows -- 5
 i2:stat().skip.rows -- 10
 pk:stat().lookup -- 30
 pk:stat().get.rows -- 10
-pk:stat().skip.rows -- 10
+pk:stat().skip.rows -- 20
 
 -- Overwritten/deleted tuples are not stored in the cache so calling
 -- SELECT for a second time does only 5 lookups.
@@ -69,7 +69,7 @@ box.cfg{vinyl_cache = vinyl_cache}
 -- Compact the primary index to generate deferred DELETEs.
 box.snapshot()
 pk:compact()
-while pk:stat().disk.compaction.count == 0 do fiber.sleep(0.001) end
+test_run:wait_cond(function() return pk:stat().disk.compaction.count > 0 end)
 pk:stat().rows -- 5 new REPLACEs
 i1:stat().rows -- 10 old REPLACE + 5 new REPLACEs + 10 deferred DELETEs
 i2:stat().rows -- ditto
@@ -93,7 +93,7 @@ pk:stat().skip.rows -- 10
 
 -- Check that deferred DELETEs are not lost after restart.
 test_run:cmd("restart server default")
-fiber = require('fiber')
+box.cfg{vinyl_defer_deletes = true}
 s = box.space.test
 pk = s.index.pk
 i1 = s.index.i1
@@ -105,9 +105,9 @@ i2:stat().rows -- ditto
 -- Check that they cleanup garbage statements.
 box.snapshot()
 i1:compact()
-while i1:stat().disk.compaction.count == 0 do fiber.sleep(0.001) end
+test_run:wait_cond(function() return i1:stat().disk.compaction.count > 0 end)
 i2:compact()
-while i2:stat().disk.compaction.count == 0 do fiber.sleep(0.001) end
+test_run:wait_cond(function() return i2:stat().disk.compaction.count > 0 end)
 i1:stat().rows -- 5 new REPLACEs
 i2:stat().rows -- ditto
 box.stat.reset()
@@ -169,7 +169,7 @@ box.stat.vinyl().memory.tx
 
 box.snapshot()
 sk:compact()
-while sk:stat().disk.compaction.count == 0 do fiber.sleep(0.001) end
+test_run:wait_cond(function() return sk:stat().disk.compaction.count > 0 end)
 sk:stat().run_count -- 0
 
 s:drop()
@@ -178,6 +178,8 @@ s:drop()
 -- Check that a transaction is aborted if it read a tuple from
 -- a secondary index that was overwritten in the primary index.
 --
+fiber = require('fiber')
+
 s = box.schema.space.create('test', {engine = 'vinyl'})
 pk = s:create_index('pk')
 sk = s:create_index('sk', {parts = {2, 'unsigned'}, unique = false})
@@ -225,12 +227,12 @@ sk:stat().rows - dummy_rows -- 10 old REPLACEs + 5 new REPLACEs
 -- Compact the primary index to generate deferred DELETEs.
 box.snapshot()
 pk:compact()
-while pk:stat().disk.compaction.count == 0 do fiber.sleep(0.001) end
+test_run:wait_cond(function() return pk:stat().disk.compaction.count > 0 end)
 
 -- Compact the secondary index to cleanup garbage.
 box.snapshot()
 sk:compact()
-while sk:stat().disk.compaction.count == 0 do fiber.sleep(0.001) end
+test_run:wait_cond(function() return sk:stat().disk.compaction.count > 0 end)
 
 sk:select({1000}, {iterator = 'le'})
 
@@ -258,7 +260,7 @@ box.snapshot()
 
 -- Generate deferred DELETEs.
 pk:compact()
-while pk:stat().disk.compaction.count == 0 do fiber.sleep(0.001) end
+test_run:wait_cond(function() return pk:stat().disk.compaction.count > 0 end)
 
 sk:select() -- [1, 10, 'c']
 box.snapshot()
@@ -321,8 +323,7 @@ box.cfg{vinyl_cache = vinyl_cache}
 test_run:cmd("create server test with script='vinyl/low_quota.lua'")
 test_run:cmd("start server test with args='1048576'")
 test_run:cmd("switch test")
-
-fiber = require('fiber')
+box.cfg{vinyl_defer_deletes = true}
 
 s = box.schema.space.create('test', {engine = 'vinyl'})
 pk = s:create_index('pk', {run_count_per_level = 10, run_size_ratio = 2})
@@ -336,7 +337,7 @@ for i = 1, dummy_rows do s:replace{i + 1000, i + 1000, pad} end
 box.snapshot()
 pk:compact()
 sk:compact()
-while box.stat.vinyl().scheduler.compaction_queue > 0 do fiber.sleep(0.001) end
+test_run:wait_cond(function() return box.stat.vinyl().scheduler.compaction_queue == 0 end)
 
 pad = string.rep('x', 10 * 1024)
 for i = 1, 120 do s:replace{i, i, pad} end
@@ -354,13 +355,13 @@ box.stat.reset()
 -- Deferred DELETEs won't fit in memory and trigger dump
 -- of the secondary index.
 pk:compact()
-while pk:stat().disk.compaction.count == 0 do fiber.sleep(0.001) end
-
-sk:stat().disk.dump.count -- 1
+test_run:wait_cond(function() return pk:stat().disk.compaction.count > 0 end)
+test_run:wait_cond(function() return sk:stat().disk.dump.count > 0 end)
 
 sk:stat().rows - dummy_rows -- 120 old REPLACEs + 120 new REPLACEs + 120 deferred DELETEs
 
 test_run:cmd("restart server test with args='1048576'")
+box.cfg{vinyl_defer_deletes = true}
 s = box.space.test
 pk = s.index.pk
 sk = s.index.sk

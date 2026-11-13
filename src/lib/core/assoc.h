@@ -52,6 +52,30 @@ extern "C" {
 #define mh_cmp_key(a, b, arg) ((a) != *(b))
 #include "salad/mhash.h"
 
+static inline uint32_t
+mh_ptr_hash(const void *ptr)
+{
+	/*
+	 * The pointer is assumed to be 16-bytes aligned,
+	 * so let's ignore last (insignificant) bits.
+	 */
+	uintptr_t u = (uintptr_t)ptr >> 4;
+	return u ^ (u >> 32);
+}
+
+/**
+ * Set: (void *)
+ */
+#define mh_name _ptr
+#define mh_key_t void *
+#define mh_node_t void *
+#define mh_arg_t void *
+#define mh_hash(a, arg) (mh_ptr_hash(*(a)))
+#define mh_hash_key(a, arg) (mh_ptr_hash(a))
+#define mh_cmp(a, b, arg) (*(a) != *(b))
+#define mh_cmp_key(a, b, arg) ((a) != *(b))
+#include "salad/mhash.h"
+
 /*
  * Map: (i32) => (void *)
  */
@@ -89,6 +113,50 @@ struct mh_i64ptr_node_t {
 #include "salad/mhash.h"
 
 /*
+ * Map: (void *) => (void *)
+ */
+#define mh_name _ptrptr
+#define mh_key_t void *
+
+/** The ptr to ptr hash node. */
+struct mh_ptrptr_node_t {
+	/** The ptr to ptr hash key. */
+	mh_key_t key;
+	/** The ptr to ptr hash value. */
+	void *val;
+};
+
+#define mh_node_t struct mh_ptrptr_node_t
+#define mh_arg_t void *
+#define mh_hash(a, arg) (mh_ptr_hash((a)->key))
+#define mh_hash_key(a, arg) (mh_ptr_hash(a))
+#define mh_cmp(a, b, arg) (((a)->key) != ((b)->key))
+#define mh_cmp_key(a, b, arg) ((a) != ((b)->key))
+#include "salad/mhash.h"
+
+/*
+ * Map: (void *) => (i32)
+ */
+#define mh_name _ptri32
+#define mh_key_t void *
+
+/** The ptr to uint32_t hash node. */
+struct mh_ptri32_node_t {
+	/** Hash key. */
+	mh_key_t key;
+	/** Hash value. */
+	uint32_t value;
+};
+
+#define mh_node_t struct mh_ptri32_node_t
+#define mh_arg_t void *
+#define mh_hash(a, arg) (mh_ptr_hash((a)->key))
+#define mh_hash_key(a, arg) (mh_ptr_hash(a))
+#define mh_cmp(a, b, arg) (((a)->key) != ((b)->key))
+#define mh_cmp_key(a, b, arg) ((a) != ((b)->key))
+#include "salad/mhash.h"
+
+/*
  * Map: (char * with length) => (void *)
  */
 enum {
@@ -96,7 +164,7 @@ enum {
 };
 
 static inline uint32_t
-mh_strn_hash(const char *str, size_t len)
+mh_strn_hash(const char *str, uint32_t len)
 {
 	uint32_t h = MH_STRN_HASH_SEED;
 	uint32_t carry = 0;
@@ -107,14 +175,14 @@ mh_strn_hash(const char *str, size_t len)
 #define mh_name _strnptr
 struct mh_strnptr_key_t {
 	const char *str;
-	size_t len;
+	uint32_t len;
 	uint32_t hash;
 };
 #define mh_key_t struct mh_strnptr_key_t *
 
 struct mh_strnptr_node_t {
 	const char *str;
-	size_t len;
+	uint32_t len;
 	uint32_t hash;
 	void *val;
 };
@@ -129,13 +197,128 @@ struct mh_strnptr_node_t {
 #include "salad/mhash.h"
 
 static inline mh_int_t
-mh_strnptr_find_inp(struct mh_strnptr_t *h, const char *str, size_t len)
+mh_strnptr_find_str(struct mh_strnptr_t *h, const char *str, uint32_t len)
 {
 	uint32_t hash = mh_strn_hash(str, len);
 	struct mh_strnptr_key_t key = {str, len, hash};
 	return mh_strnptr_find(h, &key, NULL);
+}
+
+/*
+ * Map: (char * with length) => (uint32_t)
+ */
+#define mh_name _strnu32
+/**
+ * Key of `mh_strnu32_node_t` hash table.
+ */
+struct mh_strnu32_key_t {
+	/* Key string. */
+	const char *str;
+	/* Key length. */
+	size_t len;
+	/* Key hash calculated using `mh_strn_hash`. */
+	uint32_t hash;
 };
 
+#define mh_key_t struct mh_strnu32_key_t *
+
+/**
+ * Node of `mh_strnu32_node_t` hash table.
+ */
+struct mh_strnu32_node_t {
+	/* Key string. */
+	const char *str;
+	/* Key length. */
+	size_t len;
+	/* Key hash calculated using `mh_strn_hash`. */
+	uint32_t hash;
+	/* Mapped value. */
+	uint32_t val;
+};
+
+#define mh_node_t struct mh_strnu32_node_t
+
+#define mh_arg_t void *
+#define mh_hash(a, arg) ((a)->hash)
+#define mh_hash_key(a, arg) mh_hash(a, arg)
+#define mh_cmp(a, b, arg) ((a)->len != (b)->len || \
+			   memcmp((a)->str, (b)->str, (a)->len))
+#define mh_cmp_key(a, b, arg) mh_cmp(a, b, arg)
+#include "salad/mhash.h"
+
+/**
+ * Helper for looking up strings in `mh_strnu32_t` hash table.
+ */
+static inline mh_int_t
+mh_strnu32_find_str(struct mh_strnu32_t *h, const char *str, uint32_t len)
+{
+	uint32_t hash = mh_strn_hash(str, len);
+	struct mh_strnu32_key_t key = {str, len, hash};
+	return mh_strnu32_find(h, &key, NULL);
+}
+
+/*
+ * Map: (const char *, uint32_t, const char *, uint32_t) => (void *)
+ */
+
+#define mh_name _strnstrnptr
+/**
+ * Key of `mh_strnstrnptr_node_t` hash table.
+ */
+struct mh_strnstrnptr_key_t {
+	/* First string. */
+	const char *s1;
+	/* First string length. */
+	uint32_t s1_len;
+	/* Second string. */
+	const char *s2;
+	/* Second string length. */
+	uint32_t s2_len;
+	/* Key hash calculated using `mh_strnstrnptr_hash`. */
+	uint32_t hash;
+};
+
+/**
+ * Node of `mh_strnstrnptr_node_t` hash table.
+ */
+struct mh_strnstrnptr_node_t {
+	/* First string. */
+	const char *s1;
+	/* First string length. */
+	uint32_t s1_len;
+	/* Second string. */
+	const char *s2;
+	/* Second string length. */
+	uint32_t s2_len;
+	/* Key hash calculated using `mh_strnstrnptr_hash`. */
+	uint32_t hash;
+	/* Mapped value. */
+	void *val;
+};
+
+#define mh_key_t struct mh_strnstrnptr_key_t *
+#define mh_node_t struct mh_strnstrnptr_node_t
+
+#define mh_arg_t void *
+#define mh_hash(a, arg) ((a)->hash)
+#define mh_hash_key(a, arg) ((a)->hash)
+#define mh_cmp(a, b, arg) ((a)->s1_len != (b)->s1_len || \
+			   (a)->s2_len != (b)->s2_len || \
+			   memcmp((a)->s1, (b)->s1, (a)->s1_len) || \
+			   memcmp((a)->s2, (b)->s2, (a)->s2_len))
+#define mh_cmp_key(a, b, arg) mh_cmp(a, b, arg)
+#include "salad/mhash.h"
+
+static inline uint32_t
+mh_strnstrnptr_hash(const char *s1, uint32_t s1_len,
+		    const char *s2, uint32_t s2_len)
+{
+	uint32_t h = MH_STRN_HASH_SEED;
+	uint32_t carry = 0;
+	PMurHash32_Process(&h, &carry, s1, s1_len);
+	PMurHash32_Process(&h, &carry, s2, s2_len);
+	return PMurHash32_Result(h, carry, s1_len + s2_len);
+};
 
 #if defined(__cplusplus)
 } /* extern "C" */

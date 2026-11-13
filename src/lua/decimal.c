@@ -33,6 +33,7 @@
 #include "lib/core/decimal.h"
 #include "lua/utils.h"
 
+#include <string.h>
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
@@ -41,9 +42,9 @@
 static int									\
 ldecimal_##name(struct lua_State *L) {						\
 	assert(lua_gettop(L) == 2);						\
-	decimal_t *lhs = lua_todecimal(L, 1);					\
-	decimal_t *rhs = lua_todecimal(L, 2);					\
-	decimal_t *res = lua_pushdecimal(L);					\
+	decimal_t *lhs = luaT_todecimal(L, 1);					\
+	decimal_t *rhs = luaT_todecimal(L, 2);					\
+	decimal_t *res = luaT_newdecimal(L);					\
 	if (decimal_##opname(res, lhs, rhs) == NULL) {				\
 		lua_pop(L, 1);							\
 		luaL_error(L, "decimal operation failed");			\
@@ -56,8 +57,8 @@ static int									\
 ldecimal_##name(struct lua_State *L) {						\
 	if (lua_gettop(L) < 1)							\
 		return luaL_error(L, "usage: decimal."#name"(decimal)");	\
-	decimal_t *lhs = lua_todecimal(L, 1);					\
-	decimal_t *res = lua_pushdecimal(L);					\
+	decimal_t *lhs = luaT_todecimal(L, 1);					\
+	decimal_t *res = luaT_newdecimal(L);					\
 	if (decimal_##opname(res, lhs) == NULL) {				\
 		lua_pop(L, 1);							\
 		luaL_error(L, "decimal operation failed");			\
@@ -73,24 +74,31 @@ ldecimal_##name(struct lua_State *L) {						\
 		luaL_error(L, "attempt to compare decimal with nil");		\
 		return 1;							\
 	}									\
-	decimal_t *lhs = lua_todecimal(L, 1);					\
-	decimal_t *rhs = lua_todecimal(L, 2);					\
+	decimal_t *lhs = luaT_todecimal(L, 1);					\
+	decimal_t *rhs = luaT_todecimal(L, 2);					\
 	lua_pushboolean(L, decimal_compare(lhs, rhs) cmp 0);			\
 	return 1;								\
 }
 
-uint32_t CTID_DECIMAL;
+__thread uint32_t CTID_DECIMAL;
 
-/** Push a new decimal on the stack and return a pointer to it. */
-decimal_t *
-lua_pushdecimal(struct lua_State *L)
+box_decimal_t *
+luaT_newdecimal(struct lua_State *L)
 {
 	decimal_t *res = luaL_pushcdata(L, CTID_DECIMAL);
 	return res;
 }
 
-void
-lua_pushdecimalstr(struct lua_State *L, const decimal_t *dec)
+box_decimal_t *
+luaT_pushdecimal(struct lua_State *L, const box_decimal_t *dec)
+{
+	decimal_t *res = luaT_newdecimal(L);
+	memcpy(res, dec, sizeof(decimal_t));
+	return res;
+}
+
+static void
+luaT_pushdecimalstr(struct lua_State *L, const decimal_t *dec)
 {
 	/*
 	 * Do not use a global buffer. It might be overwritten if GC starts
@@ -102,25 +110,26 @@ lua_pushdecimalstr(struct lua_State *L, const decimal_t *dec)
 }
 
 /**
- * Returns true if a value at a given index is a decimal
- * and false otherwise
+ * Returns pointer to decimal_t if a value at a given index is
+ * a decimal and NULL otherwise.
  */
-bool
-lua_isdecimal(struct lua_State *L, int index)
+box_decimal_t *
+luaT_isdecimal(struct lua_State *L, int index)
 {
+	assert(CTID_DECIMAL != 0);
 	if (lua_type(L, index) != LUA_TCDATA)
-		return false;
+		return NULL;
 
 	uint32_t ctypeid;
-	luaL_checkcdata(L, index, &ctypeid);
+	void *res = luaL_checkcdata(L, index, &ctypeid);
 	if (ctypeid != CTID_DECIMAL)
-		return false;
-	return true;
+		return NULL;
+	return res;
 }
 
 /** Check whether a value at a given index is a decimal. */
 static decimal_t *
-lua_checkdecimal(struct lua_State *L, int index)
+luaT_checkdecimal(struct lua_State *L, int index)
 {
 	uint32_t ctypeid;
 	decimal_t *res = luaL_checkcdata(L, index, &ctypeid);
@@ -134,7 +143,7 @@ lua_checkdecimal(struct lua_State *L, int index)
  * The possible conversions are string->decimal and number->decimal.
  */
 static decimal_t *
-lua_todecimal(struct lua_State *L, int index)
+luaT_todecimal(struct lua_State *L, int index)
 {
 	/*
 	 * Convert the index, if it is given relative to the top.
@@ -143,7 +152,7 @@ lua_todecimal(struct lua_State *L, int index)
 	 */
 	if (index < 0)
 		index = lua_gettop(L) + index + 1;
-	decimal_t *res = lua_pushdecimal(L);
+	decimal_t *res = luaT_newdecimal(L);
 	switch(lua_type(L, index))
 	{
 	case LUA_TNUMBER:
@@ -271,8 +280,8 @@ ldecimal_eq(struct lua_State *L)
 		lua_pushboolean(L, false);
 		return 1;
 	}
-	decimal_t *lhs = lua_todecimal(L, 1);
-	decimal_t *rhs = lua_todecimal(L, 2);
+	decimal_t *lhs = luaT_todecimal(L, 1);
+	decimal_t *rhs = luaT_todecimal(L, 2);
 	lua_pushboolean(L, decimal_compare(lhs, rhs) == 0);
 	return 1;
 }
@@ -285,8 +294,8 @@ ldecimal_minus(struct lua_State *L)
 	 * http://lua-users.org/lists/lua-l/2016-10/msg00351.html
 	 */
 	assert(lua_gettop(L) == 2);
-	decimal_t *lhs = lua_todecimal(L, 1);
-	decimal_t *res = lua_pushdecimal(L);
+	decimal_t *lhs = luaT_todecimal(L, 1);
+	decimal_t *res = luaT_newdecimal(L);
 	/* _minus never fails. */
 	decimal_minus(res, lhs);
 	return 1;
@@ -297,9 +306,8 @@ ldecimal_new(struct lua_State *L)
 {
 	if (lua_gettop(L) < 1)
 		luaL_error(L, "usage: decimal.new(value)");
-	decimal_t *lhs = lua_todecimal(L, 1);
-	decimal_t *res = lua_pushdecimal(L);
-	*res = *lhs;
+	decimal_t *lhs = luaT_todecimal(L, 1);
+	luaT_pushdecimal(L, lhs);
 	return 1;
 }
 
@@ -308,7 +316,7 @@ ldecimal_isdecimal(struct lua_State *L)
 {
 	if (lua_gettop(L) < 1)
 		luaL_error(L, "usage: decimal.is_decimal(value)");
-	bool is_decimal = lua_isdecimal(L, 1);
+	bool is_decimal = luaT_isdecimal(L, 1) != NULL;
 	lua_pushboolean(L, is_decimal);
 	return 1;
 }
@@ -318,10 +326,9 @@ ldecimal_round(struct lua_State *L)
 {
 	if (lua_gettop(L) < 2)
 		return luaL_error(L, "usage: decimal.round(decimal, scale)");
-	decimal_t *lhs = lua_checkdecimal(L, 1);
+	decimal_t *lhs = luaT_checkdecimal(L, 1);
 	int n = lua_tointeger(L, 2);
-	decimal_t *res = lua_pushdecimal(L);
-	*res = *lhs;
+	decimal_t *res = luaT_pushdecimal(L, lhs);
 	/*
 	 * If the operation fails, it just
 	 * leaves the number intact.
@@ -335,9 +342,8 @@ ldecimal_trim(struct lua_State *L)
 {
 	if (lua_gettop(L) < 1)
 		return luaL_error(L, "usage: decimal.trim(decimal)");
-	decimal_t *lhs = lua_checkdecimal(L, 1);
-	decimal_t *res = lua_pushdecimal(L);
-	*res = *lhs;
+	decimal_t *lhs = luaT_checkdecimal(L, 1);
+	decimal_t *res = luaT_pushdecimal(L, lhs);
 	/* trim never fails */
 	decimal_trim(res);
 	return 1;
@@ -348,10 +354,9 @@ ldecimal_rescale(struct lua_State *L)
 {
 	if (lua_gettop(L) < 2)
 		return luaL_error(L, "usage: decimal.rescale(decimal, scale)");
-	decimal_t *lhs = lua_checkdecimal(L, 1);
+	decimal_t *lhs = luaT_checkdecimal(L, 1);
 	int n = lua_tointeger(L, 2);
-	decimal_t *res = lua_pushdecimal(L);
-	*res = *lhs;
+	decimal_t *res = luaT_pushdecimal(L, lhs);
 	/*
 	 * If the operation fails, it just
 	 * leaves the number intact.
@@ -365,7 +370,7 @@ ldecimal_scale(struct lua_State *L)
 {
 	if (lua_gettop(L) < 1)
 		return luaL_error(L, "usage: decimal.scale(decimal)");
-	decimal_t *lhs = lua_checkdecimal(L, 1);
+	decimal_t *lhs = luaT_checkdecimal(L, 1);
 	int scale = decimal_scale(lhs);
 	lua_pushnumber(L, scale);
 	return 1;
@@ -376,7 +381,7 @@ ldecimal_precision(struct lua_State *L)
 {
 	if (lua_gettop(L) < 1)
 		return luaL_error(L, "usage: decimal.precision(decimal)");
-	decimal_t *lhs = lua_checkdecimal(L, 1);
+	decimal_t *lhs = luaT_checkdecimal(L, 1);
 	int precision = decimal_precision(lhs);
 	lua_pushnumber(L, precision);
 	return 1;
@@ -387,8 +392,8 @@ ldecimal_tostring(struct lua_State *L)
 {
 	if (lua_gettop(L) < 1)
 		return luaL_error(L, "usage: decimal.tostring(decimal)");
-	decimal_t *lhs = lua_checkdecimal(L, 1);
-	lua_pushdecimalstr(L, lhs);
+	decimal_t *lhs = luaT_checkdecimal(L, 1);
+	luaT_pushdecimalstr(L, lhs);
 	return 1;
 }
 
@@ -430,11 +435,11 @@ tarantool_lua_decimal_init(struct lua_State *L)
 				       "int32_t digits;"
 				       "int32_t exponent;"
 				       "uint8_t bits;"
-				       "uint16_t lsu[13];"
+				       "uint16_t lsu[26];"
 			      "} decimal_t;");
 	assert(rc == 0);
 	(void)rc;
-	luaL_register_module(L, "decimal", ldecimal_lib);
+	luaT_newmodule(L, "decimal", ldecimal_lib);
 	lua_pop(L, 1);
 	/*
 	 * luaL_metatype is similar to luaL_ctypeid +

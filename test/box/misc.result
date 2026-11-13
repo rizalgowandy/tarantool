@@ -8,6 +8,9 @@ test_run:cmd("push filter 'table: .*' to 'table: <address>'")
 ---
 - true
 ...
+is_asan = require('tarantool').build.asan
+---
+...
 -- gh-266: box.info() crash on uncofigured box
 package.loaded['box.space'] == nil
 ---
@@ -85,13 +88,16 @@ t
   - index
   - info
   - internal
+  - iproto
   - is_in_txn
   - lib
+  - malloc
   - on_commit
   - on_rollback
   - once
   - prepare
   - priv
+  - read_view
   - rollback
   - rollback_to_savepoint
   - runtime
@@ -105,8 +111,10 @@ t
   - stat
   - tuple
   - txn_id
+  - txn_isolation_level
   - unprepare
   - watch
+  - watch_once
 ...
 t = nil
 ---
@@ -138,21 +146,23 @@ end;
 ...
 t;
 ---
-- - DELETE
-  - COMMIT
-  - SELECT
+- - DELETE_RANGE
+  - INSERT_ARROW
+  - BEGIN
   - ROLLBACK
   - INSERT
-  - EVAL
-  - ERROR
-  - CALL
-  - BEGIN
+  - EXECUTE
   - PREPARE
-  - REPLACE
   - UPSERT
   - AUTH
-  - EXECUTE
   - UPDATE
+  - DELETE
+  - COMMIT
+  - SELECT
+  - EVAL
+  - CALL
+  - REPLACE
+  - ERROR
   - total
   - rps
   - total
@@ -180,6 +190,7 @@ end;
 t;
 ---
 - - 'type : unsigned'
+  - 'exclude_null : false'
   - 'is_nullable : false'
   - 'fieldno : 1'
 ...
@@ -194,7 +205,7 @@ box.slab.info().arena_used >= 0;
 ---
 - true
 ...
-box.slab.info().arena_size > 0;
+is_asan or box.slab.info().arena_size > 0;
 ---
 - true
 ...
@@ -222,7 +233,7 @@ t;
   - arena_size
   - arena_used
 ...
-box.runtime.info().used > 0;
+is_asan or box.runtime.info().used > 0;
 ---
 - true
 ...
@@ -284,7 +295,7 @@ tonumber64(1), 1
 -- Testing 64bit
 tonumber64()
 ---
-- error: 'bad argument #1 to ''?'' (value expected)'
+- error: 'Usage: tonumber64(arg)'
 ...
 tonumber64('invalid number')
 ---
@@ -464,15 +475,15 @@ tonumber64('  0b1  ') == 1
 ...
 tonumber64('  0b1  ', 'badbase')
 ---
-- error: 'bad argument #2 to ''?'' (number expected, got string)'
+- error: expected integer as 2 argument
 ...
 tonumber64('  0b1  ', 123) -- big base
 ---
-- error: 'bad argument #2 to ''?'' (base out of range)'
+- error: invalid argument 2, base out of range
 ...
 tonumber64('12345', 123) -- big base
 ---
-- error: 'bad argument #2 to ''?'' (base out of range)'
+- error: invalid argument 2, base out of range
 ...
 tonumber64('0xfffff') == 1048575
 ---
@@ -610,87 +621,87 @@ tonumber64(ffi.new('double', 10))
 -- number/cdata with custom `base` - is not supported
 tonumber64(100, 2)
 ---
-- error: 'bad argument #1 to ''?'' (string expected)'
+- error: argument 1 is not a string
 ...
 tonumber64(100LL, 2)
 ---
-- error: 'bad argument #1 to ''?'' (string expected)'
+- error: argument 1 is not a string
 ...
 tonumber64(-100LL, 2)
 ---
-- error: 'bad argument #1 to ''?'' (string expected)'
+- error: argument 1 is not a string
 ...
 tonumber64(100ULL, 2)
 ---
-- error: 'bad argument #1 to ''?'' (string expected)'
+- error: argument 1 is not a string
 ...
 tonumber64(ffi.new('char', 10), 2)
 ---
-- error: 'bad argument #1 to ''?'' (string expected)'
+- error: argument 1 is not a string
 ...
 tonumber64(ffi.new('short', 10), 2)
 ---
-- error: 'bad argument #1 to ''?'' (string expected)'
+- error: argument 1 is not a string
 ...
 tonumber64(ffi.new('int', 10), 2)
 ---
-- error: 'bad argument #1 to ''?'' (string expected)'
+- error: argument 1 is not a string
 ...
 tonumber64(ffi.new('int8_t', 10), 2)
 ---
-- error: 'bad argument #1 to ''?'' (string expected)'
+- error: argument 1 is not a string
 ...
 tonumber64(ffi.new('int16_t', 10), 2)
 ---
-- error: 'bad argument #1 to ''?'' (string expected)'
+- error: argument 1 is not a string
 ...
 tonumber64(ffi.new('int32_t', 10), 2)
 ---
-- error: 'bad argument #1 to ''?'' (string expected)'
+- error: argument 1 is not a string
 ...
 tonumber64(ffi.new('int64_t', 10), 2)
 ---
-- error: 'bad argument #1 to ''?'' (string expected)'
+- error: argument 1 is not a string
 ...
 tonumber64(ffi.new('unsigned char', 10), 2)
 ---
-- error: 'bad argument #1 to ''?'' (string expected)'
+- error: argument 1 is not a string
 ...
 tonumber64(ffi.new('unsigned short', 10), 2)
 ---
-- error: 'bad argument #1 to ''?'' (string expected)'
+- error: argument 1 is not a string
 ...
 tonumber64(ffi.new('unsigned int', 10), 2)
 ---
-- error: 'bad argument #1 to ''?'' (string expected)'
+- error: argument 1 is not a string
 ...
 tonumber64(ffi.new('unsigned int', 10), 2)
 ---
-- error: 'bad argument #1 to ''?'' (string expected)'
+- error: argument 1 is not a string
 ...
 tonumber64(ffi.new('uint8_t', 10), 2)
 ---
-- error: 'bad argument #1 to ''?'' (string expected)'
+- error: argument 1 is not a string
 ...
 tonumber64(ffi.new('uint16_t', 10), 2)
 ---
-- error: 'bad argument #1 to ''?'' (string expected)'
+- error: argument 1 is not a string
 ...
 tonumber64(ffi.new('uint32_t', 10), 2)
 ---
-- error: 'bad argument #1 to ''?'' (string expected)'
+- error: argument 1 is not a string
 ...
 tonumber64(ffi.new('uint64_t', 10), 2)
 ---
-- error: 'bad argument #1 to ''?'' (string expected)'
+- error: argument 1 is not a string
 ...
 tonumber64(ffi.new('float', 10), 2)
 ---
-- error: 'bad argument #1 to ''?'' (string expected)'
+- error: argument 1 is not a string
 ...
 tonumber64(ffi.new('double', 10), 2)
 ---
-- error: 'bad argument #1 to ''?'' (string expected)'
+- error: argument 1 is not a string
 ...
 -- invalid types - return nil
 ffi.cdef("struct __tonumber64_test {};")
@@ -843,16 +854,20 @@ not not s:create_index('test3', {parts = {{3, 'string', collation = 'UnIcOdE'}}}
 ...
 s:create_index('test4', {parts = {{4, 'string'}}}).parts
 ---
-- - type: string
+- - fieldno: 4
+    sort_order: asc
+    type: string
+    exclude_null: false
     is_nullable: false
-    fieldno: 4
 ...
 s:create_index('test5', {parts = {{5, 'string', collation = 'Unicode'}}}).parts
 ---
-- - type: string
-    is_nullable: false
+- - fieldno: 5
+    sort_order: asc
+    type: string
+    exclude_null: false
     collation: unicode
-    fieldno: 5
+    is_nullable: false
 ...
 s:drop()
 ---
@@ -899,23 +914,23 @@ s = box.schema.space.create('test')
 ...
 not not s:create_index('test1', {parts = {{1, 'number', collation = 'unicode_ci'}}})
 ---
-- error: 'Wrong index options (field 1): collation is reasonable only for string and
-    scalar parts'
+- error: 'Wrong index part 1: collation is only reasonable for ''string'' and ''scalar''
+    parts'
 ...
 not not s:create_index('test2', {parts = {{2, 'unsigned', collation = 'unicode_ci'}}})
 ---
-- error: 'Wrong index options (field 1): collation is reasonable only for string and
-    scalar parts'
+- error: 'Wrong index part 1: collation is only reasonable for ''string'' and ''scalar''
+    parts'
 ...
 not not s:create_index('test3', {parts = {{3, 'integer', collation = 'unicode_ci'}}})
 ---
-- error: 'Wrong index options (field 1): collation is reasonable only for string and
-    scalar parts'
+- error: 'Wrong index part 1: collation is only reasonable for ''string'' and ''scalar''
+    parts'
 ...
 not not s:create_index('test4', {parts = {{4, 'boolean', collation = 'unicode_ci'}}})
 ---
-- error: 'Wrong index options (field 1): collation is reasonable only for string and
-    scalar parts'
+- error: 'Wrong index part 1: collation is only reasonable for ''string'' and ''scalar''
+    parts'
 ...
 s:drop()
 ---
@@ -990,10 +1005,6 @@ s:drop()
 -- We do not have a way to check cdata in Lua, but there should be
 -- no errors.
 --
--- Without argument it is equivalent to new_tuple_format({})
-tuple_format = box.internal.new_tuple_format()
----
-...
 -- If no type that type == "any":
 format = {}
 ---
@@ -1004,18 +1015,18 @@ format[1] = {}
 format[1].name = 'aaa'
 ---
 ...
-tuple_format = box.internal.new_tuple_format(format)
+tuple_format = box.internal.tuple_format.new(format, true)
 ---
 ...
 -- Function space:format() without arguments returns valid format:
-tuple_format = box.internal.new_tuple_format(box.space._space:format())
+tuple_format = box.internal.tuple_format.new(box.space._space:format(), true)
 ---
 ...
 -- Check is_nullable option fo field
 format[1].is_nullable = true
 ---
 ...
-tuple_format = box.internal.new_tuple_format(format)
+tuple_format = box.internal.tuple_format.new(format, true)
 ---
 ...
 --
@@ -1046,38 +1057,46 @@ i = s:create_index('test2', {parts = {{2, 'string', is_nullable = true, collatio
 ...
 i.parts
 ---
-- - type: string
-    is_nullable: true
+- - fieldno: 2
+    sort_order: asc
+    type: string
+    exclude_null: false
     collation: unicode
-    fieldno: 2
+    is_nullable: true
 ...
 i = s:create_index('test4', {parts = {3, 'string', is_nullable = true}})
 ---
 ...
 i.parts
 ---
-- - type: string
+- - fieldno: 3
+    sort_order: asc
+    type: string
+    exclude_null: false
     is_nullable: true
-    fieldno: 3
 ...
 i = s:create_index('test5', {parts = {3, 'string', collation = 'unicode'}})
 ---
 ...
 i.parts
 ---
-- - type: string
-    is_nullable: false
+- - fieldno: 3
+    sort_order: asc
+    type: string
+    exclude_null: false
     collation: unicode
-    fieldno: 3
+    is_nullable: false
 ...
 i = s:create_index('test6', {parts = {4, 'string'}})
 ---
 ...
 i.parts
 ---
-- - type: string
+- - fieldno: 4
+    sort_order: asc
+    type: string
+    exclude_null: false
     is_nullable: false
-    fieldno: 4
 ...
 s:drop()
 ---
@@ -1091,64 +1110,59 @@ s = box.schema.space.create('test')
 ...
 i = s:create_index('test1', {parts = {1, 'unsigned', unique=false}})
 ---
-- error: 'Wrong index options (field 1): unexpected option ''unique'''
+- error: 'Wrong index part 1: unexpected option ''unique'''
 ...
 i = s:create_index('test1', {parts = {1, 'unsigned', distance=3}})
 ---
-- error: 'Wrong index options (field 1): unexpected option ''distance'''
+- error: 'Wrong index part 1: unexpected option ''distance'''
 ...
 i = s:create_index('test1', {parts = {2, 'string', 3, 'string', unique=false}})
 ---
-- error: 'Illegal parameters, options.parts: expected field_no (number), type (string)
-    pairs'
+- error: 'options.parts: expected field_no (number), type (string) pairs'
 ...
 i = s:create_index('test1', {parts = {2, 'string', 3, 'string', distance=3}})
 ---
-- error: 'Illegal parameters, options.parts: expected field_no (number), type (string)
-    pairs'
+- error: 'options.parts: expected field_no (number), type (string) pairs'
 ...
 i = s:create_index('test1', {parts = {{1,'int', distance=3}, {field=2, type='int'}}})
 ---
-- error: 'Wrong index options (field 1): unexpected option ''distance'''
+- error: 'Wrong index part 1: unexpected option ''distance'''
 ...
 i = s:create_index('test1', {parts = {{1,'int'}, {field=2, type='int', type='hash'}}})
 ---
-- error: 'Wrong index parts: unknown field type; expected field1 id (number), field1
-    type (string), ...'
+- error: 'Wrong index part 2: unknown field type'
 ...
 i = s:create_index('test1', {parts = {{1,'int'}, {2, field=2, type='int'}}})
 ---
-- error: 'Illegal parameters, options.parts[2]: unexpected option 2'
+- error: 'options.parts[2]: unexpected option 2'
 ...
 i = s:create_index('test1', {parts = {{1,'int'}, {field=2, type='int', 'asd'}}})
 ---
-- error: 'Illegal parameters, options.parts[2]: unexpected option asd'
+- error: 'options.parts[2]: unexpected option asd'
 ...
 i = s:create_index('test1', {parts = {1,'int', 'asd'}})
 ---
-- error: 'Illegal parameters, options.parts: expected field_no (number), type (string)
-    pairs'
+- error: 'options.parts: expected field_no (number), type (string) pairs'
 ...
 i = s:create_index('test1', {parts = {{1, 'int'}, {2, 'int', 'asd'}}})
 ---
-- error: 'Illegal parameters, options.parts[2]: unexpected option asd'
+- error: 'options.parts[2]: unexpected option asd'
 ...
 i = s:create_index('test1', {parts = {{2, type='unsigned', 'asd'}, {1, 'int'}}})
 ---
-- error: 'Illegal parameters, options.parts[1]: unexpected option asd'
+- error: 'options.parts[1]: unexpected option asd'
 ...
 i = s:create_index('test1', {parts = {{1, 'int'}, {2, 'asd', type='unsigned'}}})
 ---
-- error: 'Illegal parameters, options.parts[2]: unexpected option asd'
+- error: 'options.parts[2]: unexpected option asd'
 ...
 i = s:create_index('test1', {parts = {{'asd', 2, type='unsigned'}}})
 ---
-- error: 'Illegal parameters, options.parts[1]: field was not found by name ''asd'''
+- error: 'options.parts[1]: field was not found by name ''asd'''
 ...
 i = s:create_index('test1', {parts = {{1, 'int'}, {2, type='asd'}}})
 ---
-- error: 'Wrong index parts: unknown field type; expected field1 id (number), field1
-    type (string), ...'
+- error: 'Wrong index part 2: unknown field type'
 ...
 s:drop()
 ---

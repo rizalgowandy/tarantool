@@ -12,9 +12,9 @@ import subprocess
 # {{{ Redefinitions
 
 # Ensure certain order for known sections.
-SECTIONS_TOP = ['core', 'memtx', 'vinyl', 'replication', 'swim', 'raft',
-                'luajit', 'lua', 'sql']
-SECTIONS_BOTTOM = ['build', 'testing', 'misc']
+SECTIONS_TOP = ['core', 'memtx', 'vinyl', 'replication', 'swim',
+                'raft', 'luajit', 'lua', 'sql']
+SECTIONS_BOTTOM = ['build', 'misc']
 
 # Prettify headers, apply the ordering.
 REDEFINITIONS = {
@@ -51,13 +51,13 @@ BUGFIXES_ANCHOR = '{{BUGFIXES}}'
 OVERVIEW_TEMPLATE = """
 ## Overview
 
-// {{{ BETA X.Y.1
+// {{{ 3.x
 
-**TBD** is the [beta][release_policy] version of the **TBD** release series.
+Tarantool 3.x is the recommended release series. Users of Tarantool 2.11 are
+encouraged to update to the latest 3.x release.
 
-This release introduces {{FEATURES}} new features and resolves {{BUGFIXES}} bugs since
-the **TBD** version. There can be bugs in less common areas. If you find any,
-feel free to [report an issue][issues] on GitHub.
+This release introduces {{FEATURES}} improvements and resolves {{BUGFIXES}}
+bugs since **TBD**.
 
 Notable changes are:
 
@@ -65,88 +65,68 @@ Notable changes are:
 * **TBD**
 * **TBD**
 
-[release_policy]: https://www.tarantool.io/en/doc/latest/dev_guide/release_management/#release-policy
-[issues]: https://github.com/tarantool/tarantool/issues
+// }}} 3.x
 
-// }}} BETA X.Y.1
+// {{{ 2.11
 
-// {{{ STABLE X.Y.{2,3}
+2.x is the old stable release series. Users are encouraged to update to the
+latest 3.x release.
 
-**TBD** is the **TBD**th [stable][release_policy] version of the **TBD** release
-series. It introduces {{FEATURES}} improvements and resolves {{BUGFIXES}} bugs since
-**TBD**.
+This is a bugfix release. It resolves {{BUGFIXES}} issues since the previous
+version.
 
-The "stable" label means that we have all planned features implemented and we
-see no high-impact issues. However, if you encounter an issue, feel free to
-[report it][issues] on GitHub.
+// }}} 2.11
 
-[release_policy]: https://www.tarantool.io/en/doc/latest/dev_guide/release_management/#release-policy
-[issues]: https://github.com/tarantool/tarantool/issues
-
-// }}} STABLE X.Y.{2,3}
-
-// {{{ LTS 1.10.Z
-
-**TBD** is the next stable release in the [long-term support (LTS)
-version][release_policy][release_policy] 1.10.x release series.
-
-The label "stable" means there are 1.10.x-based applications running in
-production for quite a while without known crashes, incorrect results or
-other showstopper bugs.
-
-This release introduces {{FEATURES}} improvements and resolves roughly {{BUGFIXES}}
-issues since the **TBD** version.
-
-[release_policy]: https://www.tarantool.io/en/doc/1.10/dev_guide/release_management/#release-policy
-[issues]: https://github.com/tarantool/tarantool/issues
-
-// }}} LTS 1.10.Z
+Please consider the full list of user-visible changes below.
 """.strip()  # noqa: E501 line too long
 
 COMPATIBILITY_TEMPLATE = """
 ## Compatibility
 
-// {{{ BETA / STABLE 2.Y.Z
+Tarantool 2.x and 3.x are compatible in the binary data layout, client-server
+protocol, and replication protocol. It means upgrade may be performed with zero
+downtime for read requests and the order-of-network-lag downtime for write
+requests.
 
-Tarantool 2.x is backward compatible with Tarantool 1.10.x in the binary data
-layout, client-server protocol, and replication protocol.
+Please follow the [upgrade procedure][upgrade] to plan your update actions.
 
-Please [upgrade][upgrade] using the `box.schema.upgrade()` procedure to unlock
-all the new features of the 2.x series.
+// {{{ 3.x
+
+Users of Tarantool 2.x may be interested in the [compat][compat] options that
+allow to imitate some 2.x behavior. This allows to perform application code
+update step-by-step, not all-at-once.
+
+[compat]: https://www.tarantool.io/en/doc/latest/reference/configuration/configuration_reference/#compat
+
+// }}} 3.x
 
 [upgrade]: https://www.tarantool.io/en/doc/latest/book/admin/upgrades/
+""".strip()  # noqa: E501 line too long
 
-// }}} BETA / STABLE 2.Y.Z
+ENTERPRISE_TEMPLATE = """
+// {{{ ENTERPRISE EDITION ONLY
 
-// {{{ LTS 1.10.Z
+## Community edition
 
-Tarantool 1.10.x is backward compatible with Tarantool 1.9.x in binary data
-layout, client-server protocol and replication protocol.
+Please consult the corresponding [page][ce-release] for details.
 
-Please [upgrade][upgrade] using the `box.schema.upgrade()` procedure to unlock
-all the new features of the 1.10.x series.
+[ce-release]: https://github.com/tarantool/tarantool/releases/tag/**TBD**
 
-[upgrade]: https://www.tarantool.io/en/doc/1.10/book/admin/upgrades/
-
-// }}} LTS 1.10.Z
+// }}} ENTERPRISE EDITION ONLY
 """.strip()  # noqa: E501 line too long
 
 # }}} Templates
 
 
-# {{{ Collecting
+# {{{ Helpers
 
-def changelog_entries_sorted(source_dir, entries_dir_relative):
-    """ Acquire order of appearance from ```git log``.
-
-        Misses uncommitted entries and contains files that were
-        deleted.
+def popen(cmdline):
+    """ Wrapper around Popen.subprocess() that redirects the output to a pipe,
+        correctly handles encoding and raises a RuntimeError if the executable
+        was not found. Works on both Python 2 and 3.
     """
-    cmdline = ['git', 'log', '--reverse', '--pretty=', '--name-only',
-               entries_dir_relative]
     popen_kwargs = {
         'stdout': subprocess.PIPE,
-        'cwd': source_dir,
     }
     if sys.version_info[0] == 3:
         popen_kwargs['encoding'] = 'utf-8'
@@ -155,36 +135,44 @@ def changelog_entries_sorted(source_dir, entries_dir_relative):
         global FileNotFoundError
         FileNotFoundError = OSError
 
-    processed = set()
-    res = []
     try:
-        process = subprocess.Popen(cmdline, **popen_kwargs)
-        for line in process.stdout:
-            entry_file = line.rstrip()
-            if entry_file not in processed and entry_file.endswith('.md'):
-                processed.add(entry_file)
-                res.append(os.path.join(source_dir, entry_file))
-        process.wait()
+        return subprocess.Popen(cmdline, **popen_kwargs)
     except FileNotFoundError as e:
         raise RuntimeError("Unable to find '{}' executable: {}".format(
             cmdline[0], str(e)))
+
+
+# }}} Helpers
+
+
+# {{{ Collecting
+
+def changelog_entries_sorted(entries_dir):
+    """ Acquire order of appearance from ```git log``.
+
+        Misses uncommitted entries and contains files that were
+        deleted.
+    """
+    processed = set()
+    res = []
+    process = popen(['git', '-C', entries_dir, 'log', '--reverse', '--pretty=',
+                     '--name-only', '--relative'])
+    for line in process.stdout:
+        entry_file = line.rstrip()
+        if entry_file not in processed and entry_file.endswith('.md'):
+            processed.add(entry_file)
+            res.append(os.path.join(entries_dir, entry_file))
+    process.wait()
     return res
 
 
-def changelog_entries():
-    """ Return a list of changelog entry files.
+def changelog_entries(entries_dir):
+    """ Return a list of changelog entry files in the given directory.
 
     Sort the entries according to ``git log`` (by a time of the
     first appearance) and append ones out of the git tracking
     afterwards with the alphabetical order.
     """
-    # Be immutable to a caller current working directory.
-    script_file = os.path.realpath(__file__)
-    script_dir = os.path.dirname(script_file)
-    source_dir = os.path.dirname(script_dir)
-
-    entries_dir_relative = os.path.join('changelogs', 'unreleased')
-    entries_dir = os.path.join(source_dir, entries_dir_relative)
     if not os.path.exists(entries_dir):
         raise RuntimeError('The changelog entries directory {} does not '
                            'exist'.format(entries_dir))
@@ -195,7 +183,7 @@ def changelog_entries():
 
     # Uncommitted entries are not present here. Deleted entries
     # are present.
-    entries_sorted = changelog_entries_sorted(source_dir, entries_dir_relative)
+    entries_sorted = changelog_entries_sorted(entries_dir)
     entries_known = set(entries_sorted)
 
     res = []
@@ -208,9 +196,8 @@ def changelog_entries():
     # Add the rest in the alphabetical order.
     entries_glob = os.path.join(entries_dir, '*.md')
     entries = sorted(glob.glob(entries_glob))
-    if not entries:
-        raise RuntimeError('Not found any *.md file in the changelog entries '
-                           'directory {}'.format(entries_dir))
+    # NB: It is perfectly okay to have no entries at all: say, we
+    # just start to work on a future release.
     for entry in entries:
         if entry not in entries_known:
             res.append(entry)
@@ -269,9 +256,10 @@ class Parser:
         if line.startswith('## '):
             header = line.split(' ', 1)[1].strip()
             fst = header.split('/', 1)[0]
-            if fst not in ('feature', 'bugfix'):
+            if fst not in ('feature', 'bugfix', 'tools', 'testing'):
                 raise self.error("Unknown header: '{}', should be "
-                                 "'feature/<...>' or 'bugfix/<...>'"
+                                 "'feature/<...>' or 'bugfix/<...>' or"
+                                 "'tools/<...>' or 'testing/<...>'"
                                  .format(header))
             self.header = header
             self._process = self._wait_content
@@ -312,11 +300,27 @@ class Parser:
 def parse_changelog_entries(changelog_entries):
     """ Parse and structurize changelog entries content.
     """
+    # 'feature' and 'bugfix' sections are always present.
     entry_section = {
         'header': 'main',
         'level': 1,
         'entries': [],
-        'subsections': dict(),
+        'subsections': {
+            'feature': {
+                'header': 'feature',
+                'level': 2,
+                'entries': [],
+                'subsections': dict(),
+                'nested_entry_count': 0,
+            },
+            'bugfix': {
+                'header': 'bugfix',
+                'level': 2,
+                'entries': [],
+                'subsections': dict(),
+                'nested_entry_count': 0,
+            },
+        },
         'nested_entry_count': 0,
     }
     comments = []
@@ -334,15 +338,20 @@ def parse_changelog_entries(changelog_entries):
 
         # Nested slash delimited subcategories.
         for section_header in parser.header.split('/'):
-            if section_header not in section['subsections']:
-                section['subsections'][section_header] = {
+            # Group entries by a section header (case
+            # insensitively). Save first header variant as is (not
+            # lowercased) into the 'header' field to prettify in
+            # ``print_section()`` later.
+            section_key = section_header.lower()
+            if section_key not in section['subsections']:
+                section['subsections'][section_key] = {
                     'header': section_header,
                     'level': section['level'] + 1,
                     'entries': [],
                     'subsections': dict(),
                     'nested_entry_count': 0,
                 }
-            section = section['subsections'][section_header]
+            section = section['subsections'][section_key]
             section['nested_entry_count'] += 1
 
         section['entries'].append(parser.content)
@@ -396,10 +405,11 @@ def print_section(section, redefinitions):
     level = section['level']
     header = section['header']
 
+    # Prettify the header if it is in the lower case.
     redefinition = redefinitions.get((level, header))
     if redefinition:
         section.update(redefinition)
-    else:
+    elif header.islower():
         section['header'] = header.capitalize()
 
     level = section['level']
@@ -422,9 +432,14 @@ def print_section(section, redefinitions):
         if subheader in subsections:
             print_section(subsections[subheader], redefinitions)
 
+    if not section['entries'] and not section['subsections']:
+        print_block('*No changes.*')
+
 
 def print_templates(feature_count, bugfix_count):
-    for template in (OVERVIEW_TEMPLATE, COMPATIBILITY_TEMPLATE):
+    for template in (OVERVIEW_TEMPLATE,
+                     COMPATIBILITY_TEMPLATE,
+                     ENTERPRISE_TEMPLATE):
         block = template                                  \
             .replace(FEATURES_ANCHOR, str(feature_count)) \
             .replace(BUGFIXES_ANCHOR, str(bugfix_count))
@@ -464,7 +479,14 @@ def print_release_notes(entry_section, comments, redefinitions):
 
 if __name__ == '__main__':
     try:
-        entries = changelog_entries()
+        # Be immutable to a caller current working directory.
+        # Sic: Use abspath rather than realpath because the script
+        # may be called via a symlink from another repository.
+        script_file = os.path.abspath(__file__)
+        script_dir = os.path.dirname(script_file)
+        source_dir = os.path.dirname(script_dir)
+        entries_dir = os.path.join(source_dir, 'changelogs', 'unreleased')
+        entries = changelog_entries(entries_dir)
         entry_section, comments = parse_changelog_entries(entries)
         print_release_notes(entry_section, comments, REDEFINITIONS)
     except RuntimeError as e:

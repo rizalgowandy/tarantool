@@ -5,7 +5,7 @@ local LIMIT_INFINITY = 2147483647
 
 local ffi = require('ffi')
 local boxerrno = require('errno')
-local internal = require('socket')
+local internal = require('socket.lib')
 local fiber = require('fiber')
 local fio = require('fio')
 local log = require('log')
@@ -32,6 +32,7 @@ ffi.cdef[[
     ssize_t read(int fd, void *buf, size_t count);
     int listen(int fd, int backlog);
     int socket(int domain, int type, int protocol);
+    int socketpair(int domain, int type, int protocol, int sv[2]);
     int coio_close(int s);
     int shutdown(int s, int how);
     ssize_t send(int sockfd, const void *buf, size_t len, int flags);
@@ -49,13 +50,6 @@ ffi.cdef[[
     int getsockopt(int s, int level, int iname, void *ptr, size_t *optlen);
 
     typedef struct { int active; int timeout; } linger_t;
-
-    struct protoent {
-        char  *p_name;       /* official protocol name */
-        char **p_aliases;    /* alias list */
-        int    p_proto;      /* protocol number */
-    };
-    struct protoent *getprotobyname(const char *name);
 
     void *memmem(const void *haystack, size_t haystacklen,
         const void *needle, size_t needlelen);
@@ -105,17 +99,27 @@ end
 
 local gc_socket_sentinel = ffi.new(gc_socket_t, { fd = -1 })
 
+local function do_detach(socket)
+    -- .fd is const to prevent tampering
+    ffi.copy(socket._gc_socket, gc_socket_sentinel, ffi.sizeof(gc_socket_t))
+end
+
 local function socket_close(socket)
     local fd = check_socket(socket)
     socket._errno = nil
     local r = ffi.C.coio_close(fd)
-    -- .fd is const to prevent tampering
-    ffi.copy(socket._gc_socket, gc_socket_sentinel, ffi.sizeof(gc_socket_t))
+    do_detach(socket)
     if r ~= 0 then
         socket._errno = boxerrno()
         return false
     end
     return true
+end
+
+local function socket_detach(socket)
+    check_socket(socket)
+    socket._errno = nil
+    do_detach(socket)
 end
 
 local soname_mt = {
@@ -197,12 +201,11 @@ local function getprotobyname(name)
     if num ~= nil then
         return num
     end
-    local p = ffi.C.getprotobyname(name)
-    if p == nil then
+    num = internal.getprotobyname(name)
+    if num == nil then
         boxerrno(boxerrno.EPROTOTYPE)
         return nil
     end
-    num = p.p_proto
     -- update cache
     internal.protocols[name] = num
     return num
@@ -694,7 +697,7 @@ local function read(self, limit, timeout, check, ...)
     if len ~= nil then
         self._errno = nil
         local data = ffi.string(rbuf.rpos, len)
-        rbuf.rpos = rbuf.rpos + len
+        rbuf:consume(len)
         return data
     end
 
@@ -709,15 +712,15 @@ local function read(self, limit, timeout, check, ...)
             self._errno = nil
             local len = rbuf:size()
             local data = ffi.string(rbuf.rpos, len)
-            rbuf.rpos = rbuf.rpos + len
+            rbuf:consume(len)
             return data
         elseif res ~= nil then
-            rbuf.wpos = rbuf.wpos + res
+            rbuf:alloc(res)
             local len = check(self, limit, ...)
             if len ~= nil then
                 self._errno = nil
                 local data = ffi.string(rbuf.rpos, len)
-                rbuf.rpos = rbuf.rpos + len
+                rbuf:consume(len)
                 return data
             end
         elseif not errno_is_transient[self._errno] then
@@ -923,7 +926,7 @@ local function socket_sendto(self, host, port, octets, flags)
     return tonumber(res)
 end
 
-local function socket_new(domain, stype, proto)
+local function check_socket_args(domain, stype, proto)
     local idomain = get_ivalue(internal.DOMAIN, domain)
     if idomain == nil then
         boxerrno(boxerrno.EINVAL)
@@ -941,6 +944,14 @@ local function socket_new(domain, stype, proto)
         return nil
     end
 
+    return idomain, itype, iproto
+end
+
+local function socket_new(domain, stype, proto)
+    local idomain, itype, iproto = check_socket_args(domain, stype, proto)
+    if idomain == nil then
+        return nil
+    end
     local fd = ffi.C.socket(idomain, itype, iproto)
     if fd >= 0 then
         local socket = make_socket(fd, itype)
@@ -950,6 +961,41 @@ local function socket_new(domain, stype, proto)
             return socket
         end
     end
+end
+
+local function socket_socketpair(domain, stype, proto)
+    local idomain, itype, iproto = check_socket_args(domain, stype, proto)
+    if idomain == nil then
+        return nil
+    end
+    local sv = ffi.new('int[2]')
+    if ffi.C.socketpair(idomain, itype, iproto, sv) ~= 0 then
+        return nil
+    end
+    local s1 = make_socket(sv[0], itype)
+    local s2 = make_socket(sv[1], itype)
+    if not s1:nonblock(true) or not s2:nonblock(true) then
+        s1:close()
+        s2:close()
+        return nil
+    end
+    return s1, s2
+end
+
+local function socket_from_fd(fd)
+    if type(fd) ~= 'number' then
+        error('fd must be a number')
+    end
+    -- Try to determine the socket type. Ignore errors.
+    local itype = 0
+    local level = internal.SOL_SOCKET
+    local opt = internal.SO_OPT[level].SO_TYPE.iname
+    local value = ffi.new('int[1]')
+    local len = ffi.new('size_t[1]', ffi.sizeof('int'))
+    if ffi.C.getsockopt(fd, level, opt, value, len) == 0 and len[0] == 4 then
+        itype = tonumber(value[0])
+    end
+    return make_socket(fd, itype)
 end
 
 local function getaddrinfo(host, port, timeout, opts)
@@ -1046,8 +1092,11 @@ local function tcp_connect(host, port, timeout)
     end
     local timeout = timeout or TIMEOUT_INFINITY
     local stop = fiber.clock() + timeout
-    local dns, err = getaddrinfo(host, port, timeout, { type = 'SOCK_STREAM',
-        protocol = 'tcp' })
+    local dns, err = getaddrinfo(host, port, timeout, {
+        protocol = 'tcp',
+        type = 'SOCK_STREAM',
+        flags = 'AI_ADDRCONFIG',
+    })
     if dns == nil then
         return nil, err
     end
@@ -1086,7 +1135,9 @@ local function tcp_server_handler(server, sc, from)
     end
 end
 
-local function tcp_server_loop(server, s, addr)
+local function tcp_server_loop_impl(server, s, addr)
+    addr = addr or socket_name(s) or { host = '?', port = '?' }
+
     fiber.name(format("%s/%s:%s", server.name, addr.host, addr.port), {truncate = true})
     log.info("started")
     while socket_readable(s) do
@@ -1113,6 +1164,14 @@ end
 
 local function tcp_server_usage()
     error('Usage: socket.tcp_server(host, port, handler | opts)')
+end
+
+local function tcp_server_create_usage()
+    error('Usage: socket.tcp_server_create(host, port, prepare | opts)')
+end
+
+local function tcp_server_loop_usage()
+    error('Usage: socket.tcp_server_loop(socket, handler | opts)')
 end
 
 local function tcp_server_do_bind(s, addr)
@@ -1168,7 +1227,6 @@ local function tcp_server_bind_addr(s, addr)
     return tcp_server_do_bind(s, addr)
 end
 
-
 local function tcp_server_bind(host, port, prepare, timeout)
     timeout = timeout and tonumber(timeout) or TIMEOUT_INFINITY
     local dns, err
@@ -1176,8 +1234,11 @@ local function tcp_server_bind(host, port, prepare, timeout)
         dns = {{host = host, port = port, family = 'AF_UNIX', protocol = 0,
             type = 'SOCK_STREAM' }}
     else
-        dns, err = getaddrinfo(host, port, timeout, { type = 'SOCK_STREAM',
-            flags = 'AI_PASSIVE'})
+        dns, err = getaddrinfo(host, port, timeout, {
+            protocol = 'tcp',
+            type = 'SOCK_STREAM',
+            flags = {'AI_ADDRCONFIG', 'AI_PASSIVE'},
+        })
         if dns == nil then
             return nil, err
         end
@@ -1206,12 +1267,62 @@ local function tcp_server_bind(host, port, prepare, timeout)
     return nil, boxerrno.strerror()
 end
 
+local function tcp_server_create_impl(host, port, prepare, timeout)
+    local s, addr = tcp_server_bind(host, port, prepare, timeout)
+    if not s then
+        -- addr is error message now.
+        return nil, addr
+    end
+    return s, addr
+end
+
+local function tcp_server_create(host, port, opts, timeout)
+    local prepare
+    if type(opts) == 'function' then
+        prepare = opts
+    elseif type(opts) == 'table' then
+        if opts.prepare ~= nil and
+            type(opts.prepare) ~= 'function' then
+            tcp_server_create_usage()
+        end
+        prepare = opts.prepare
+    else
+        tcp_server_create_usage()
+    end
+    return tcp_server_create_impl(host, port, prepare, timeout)
+end
+
+local function tcp_server_loop(s, opts)
+    local server = {}
+    if type(opts) == 'function' then
+        server.handler = opts
+    elseif type(opts) == 'table' then
+        if type(opts.handler) ~= 'function' then
+            tcp_server_loop_usage()
+        end
+        for k, v in pairs(opts) do
+            server[k] = v
+        end
+    else
+        tcp_server_loop_usage()
+    end
+    if type(server.handler) ~= 'function' then
+        tcp_server_loop_usage()
+    end
+    server.name = server.name or 'server'
+
+    if type(s) == 'number' then
+        s = socket_from_fd(s)
+    end
+    return tcp_server_loop_impl(server, s)
+end
+
 local function tcp_server(host, port, opts, timeout)
     local server = {}
     if type(opts) == 'function' then
         server.handler = opts
     elseif type(opts) == 'table' then
-        if type(opts.handler) ~='function' or (opts.prepare ~= nil and
+        if type(opts.handler) ~= 'function' or (opts.prepare ~= nil and
             type(opts.prepare) ~= 'function') then
             tcp_server_usage()
         end
@@ -1221,19 +1332,27 @@ local function tcp_server(host, port, opts, timeout)
     else
         tcp_server_usage()
     end
+    if type(server.handler) ~= 'function' then
+        tcp_server_usage()
+    end
     server.name = server.name or 'server'
-    local s, addr = tcp_server_bind(host, port, server.prepare, timeout)
+    local s, addr = tcp_server_create_impl(
+        host,
+        port,
+        server.prepare,
+        timeout
+    )
     if not s then
-        -- addr is error message now.
         return nil, addr
     end
-    fiber.create(tcp_server_loop, server, s, addr)
+    fiber.create(tcp_server_loop_impl, server, s, addr)
     return s, addr
 end
 
 socket_mt   = {
     __index = {
         close = socket_close;
+        detach = socket_detach;
         errno = socket_errno;
         error = socket_error;
         sysconnect = socket_sysconnect;
@@ -1297,7 +1416,7 @@ local lsocket_tcp_client_mt
 
 local function lsocket_tcp_tostring(self)
     local fd = check_socket(self)
-    return string.format("tcp{master}: fd=%d", fd)
+    return format("tcp{master}: fd=%d", fd)
 end
 
 local function lsocket_tcp_close(self)
@@ -1411,7 +1530,7 @@ lsocket_tcp_mt = {
 
 local function lsocket_tcp_server_tostring(self)
     local fd = check_socket(self)
-    return string.format("tcp{server}: fd=%d", fd)
+    return format("tcp{server}: fd=%d", fd)
 end
 
 local function lsocket_tcp_accept(self)
@@ -1450,7 +1569,7 @@ lsocket_tcp_server_mt = {
 
 local function lsocket_tcp_client_tostring(self)
     local fd = check_socket(self)
-    return string.format("tcp{client}: fd=%d", fd)
+    return format("tcp{client}: fd=%d", fd)
 end
 
 local function lsocket_tcp_receive(self, pattern, prefix)
@@ -1588,9 +1707,13 @@ end
 --------------------------------------------------------------------------------
 
 return setmetatable({
+    from_fd = socket_from_fd;
+    socketpair = socket_socketpair;
     getaddrinfo = getaddrinfo,
     tcp_connect = tcp_connect,
     tcp_server = tcp_server,
+    tcp_server_create = tcp_server_create,
+    tcp_server_loop = tcp_server_loop,
     iowait = internal.iowait,
     internal = internal,
 }, {

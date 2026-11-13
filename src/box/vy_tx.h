@@ -42,6 +42,7 @@
 #include "iterator_type.h"
 #include "salad/stailq.h"
 #include "trivia/util.h"
+#include "txn.h"
 #include "vy_entry.h"
 #include "vy_lsm.h"
 #include "vy_stat.h"
@@ -140,18 +141,12 @@ write_set_search_key(write_set_t *tree, struct vy_lsm *lsm,
 
 /** Transaction object. */
 struct vy_tx {
-	/** Link in vy_tx_manager::writers. */
-	struct rlist in_writers;
+	/** Link in vy_tx_manager::prepared. */
+	struct rlist in_prepared;
 	/** Transaction manager. */
 	struct vy_tx_manager *xm;
-	/**
-	 * Pointer to the space affected by the last prepared statement.
-	 * We need it so that we can abort a transaction on DDL even
-	 * if it hasn't inserted anything into the write set yet (e.g.
-	 * yielded on unique check) and therefore would otherwise be
-	 * ignored by vy_tx_manager_abort_writers_for_ddl().
-	 */
-	struct space *last_stmt_space;
+	/** Base transaction or NULL for a single read-only statement. */
+	struct txn *txn;
 	/**
 	 * In memory transaction log. Contains both reads
 	 * and writes.
@@ -168,10 +163,12 @@ struct vy_tx {
 	 */
 	uint32_t write_set_version;
 	/**
-	 * Total size of memory occupied by statements of
-	 * the write set.
+	 * Size of memory quota reserved for this transaction.
+	 * Doesn't have to be equal to the size of memory that
+	 * will actually be consumed when the transaction is
+	 * committed.
 	 */
-	size_t write_size;
+	size_t quota_reserved;
 	/** Current state of the transaction.*/
 	enum tx_state state;
 	/** Set if the transaction was started by an applier. */
@@ -193,11 +190,6 @@ struct vy_tx {
 	 * intervals.
 	 */
 	vy_tx_read_set_t read_set;
-	/**
-	 * Prepare sequence number or -1 if the transaction
-	 * is not prepared.
-	 */
-	int64_t psn;
 	/* List of triggers invoked when this transaction ends. */
 	struct rlist on_destroy;
 };
@@ -208,6 +200,44 @@ vy_tx_read_view(struct vy_tx *tx)
 	return (const struct vy_read_view **)&tx->read_view;
 }
 
+/** Return true if the transaction may see prepared statements. */
+static inline bool
+vy_tx_is_prepared_ok(struct vy_tx *tx)
+{
+	enum txn_isolation_level isolation = tx->txn != NULL ?
+		tx->txn->isolation : TXN_ISOLATION_READ_CONFIRMED;
+	switch (isolation) {
+	case TXN_ISOLATION_READ_COMMITTED:
+		return true;
+	case TXN_ISOLATION_READ_CONFIRMED:
+	case TXN_ISOLATION_LINEARIZABLE:
+		return false;
+	case TXN_ISOLATION_BEST_EFFORT:
+		return !stailq_empty(&tx->txn->stmts);
+	default:
+		unreachable();
+	}
+}
+
+/** Check if the transaction is allowed to yield. */
+static inline int
+vy_tx_check_can_yield(struct vy_tx *tx)
+{
+	/*
+	 * Any vinyl statement can yield (to read disk or wait for quota).
+	 * If yields are disallowed in this transaction, it would result
+	 * in rolling back the current statement while it's being executed,
+	 * which is not expected by the transaction manager.
+	 */
+	if (tx->txn != NULL && !txn_has_flag(tx->txn, TXN_CAN_YIELD)) {
+		diag_set(ClientError, ER_UNSUPPORTED, "Vinyl",
+			 "executing a statement in a transaction "
+			 "that is not allowed to yield");
+		return -1;
+	}
+	return 0;
+}
+
 /** Transaction manager object. */
 struct vy_tx_manager {
 	/**
@@ -216,21 +246,10 @@ struct vy_tx_manager {
 	 */
 	int64_t lsn;
 	/**
-	 * A global transaction prepare counter: a transaction
-	 * is assigned an id at the time of vy_prepare(). Is used
-	 * to order statements of prepared but not yet committed
-	 * transactions in vy_mem.
+	 * List of prepared (but not committed) transaction,
+	 * sorted by PSN ascending, linked by vy_tx::in_prepared.
 	 */
-	int64_t psn;
-	/**
-	 * The last prepared (but not committed) transaction,
-	 * or NULL if there are no prepared transactions.
-	 */
-	struct vy_tx *last_prepared_tx;
-	/**
-	 * List of rw transactions, linked by vy_tx::in_writers.
-	 */
-	struct rlist writers;
+	struct rlist prepared;
 	/**
 	 * The list of TXs with a read view in order of vlsn.
 	 */
@@ -289,9 +308,12 @@ vy_tx_manager_delete(struct vy_tx_manager *xm);
 size_t
 vy_tx_manager_mem_used(struct vy_tx_manager *xm);
 
-/** Create or reuse an instance of a read view. */
+/**
+ * Create or reuse an instance of a read view whose vlsn is less than the given
+ * prepared statement LSN. Never fails (never returns NULL).
+ */
 struct vy_read_view *
-vy_tx_manager_read_view(struct vy_tx_manager *xm);
+vy_tx_manager_read_view(struct vy_tx_manager *xm, int64_t plsn);
 
 /** Dereference and possibly destroy a read view. */
 void
@@ -305,18 +327,10 @@ vy_tx_manager_destroy_read_view(struct vy_tx_manager *xm,
  *
  * @need_wal_sync is set if at least one transaction can't be
  * aborted, because it has reached WAL. The caller is supposed
- * to call wal_sync() to flush them.
+ * to call journal_sync() to flush them.
  */
 void
-vy_tx_manager_abort_writers_for_ddl(struct vy_tx_manager *xm,
-                                    struct space *space, bool *need_wal_sync);
-
-/**
- * Abort all local rw transactions that haven't reached WAL yet.
- * Called before switching to read-only mode.
- */
-void
-vy_tx_manager_abort_writers_for_ro(struct vy_tx_manager *xm);
+vy_tx_manager_abort_writers_for_ddl(struct space *space, bool *need_wal_sync);
 
 /** Initialize a tx object. */
 void
@@ -326,9 +340,9 @@ vy_tx_create(struct vy_tx_manager *xm, struct vy_tx *tx);
 void
 vy_tx_destroy(struct vy_tx *tx);
 
-/** Begin a new transaction. */
+/** Begin a new transaction. Never fails (never returns NULL). */
 struct vy_tx *
-vy_tx_begin(struct vy_tx_manager *xm);
+vy_tx_begin(struct vy_tx_manager *xm, struct txn *txn);
 
 /** Prepare a transaction to be committed. */
 int
@@ -354,7 +368,7 @@ vy_tx_rollback(struct vy_tx *tx);
  * to a save point with vy_tx_rollback_statement().
  */
 int
-vy_tx_begin_statement(struct vy_tx *tx, struct space *space, void **savepoint);
+vy_tx_begin_statement(struct vy_tx *tx, void **savepoint);
 
 /**
  * Rollback a transaction statement.
@@ -381,11 +395,8 @@ vy_tx_rollback_statement(struct vy_tx *tx, void *svp);
  * @param right         Right boundary of the read interval.
  * @param right_belongs Set if the right boundary belongs to
  *                      the interval.
- *
- * @retval  0 Success.
- * @retval -1 Memory error.
  */
-int
+void
 vy_tx_track(struct vy_tx *tx, struct vy_lsm *lsm,
 	    struct vy_entry left, bool left_belongs,
 	    struct vy_entry right, bool right_belongs);
@@ -397,16 +408,13 @@ vy_tx_track(struct vy_tx *tx, struct vy_lsm *lsm,
  * @param lsm   LSM tree that was read from.
  * @param entry Key that was read.
  *
- * @retval  0 Success.
- * @retval -1 Memory error.
- *
  * Note, this function isn't just a shortcut to vy_tx_track().
  * Before adding the key to the conflict manager index, it checks
  * if the key was overwritten by the transaction itself. If this
  * is the case, there is no point in tracking the key, because the
  * transaction read it from its own write set.
  */
-int
+void
 vy_tx_track_point(struct vy_tx *tx, struct vy_lsm *lsm, struct vy_entry entry);
 
 /**
@@ -420,6 +428,28 @@ vy_tx_track_point(struct vy_tx *tx, struct vy_lsm *lsm, struct vy_entry entry);
  */
 int
 vy_tx_set(struct vy_tx *tx, struct vy_lsm *lsm, struct tuple *stmt);
+
+/**
+ * Send an active transaction to a read view such that its vlsn is less than
+ * the given prepared statement LSN. The transaction is aborted immediately
+ * if it has any write statements.
+ */
+void
+vy_tx_send_to_read_view(struct vy_tx *tx, int64_t plsn);
+
+/**
+ * Implementation of engine_send_to_read_view callback.
+ * Do not use directly.
+ */
+void
+vy_tx_send_to_read_view_impl(struct vy_tx *tx, int64_t psn);
+
+/**
+ * Implementation of engine_abort_with_conflict callback.
+ * Do not use directly.
+ */
+void
+vy_tx_abort_with_conflict_impl(struct vy_tx *tx);
 
 /**
  * Iterator over the write set of a transaction.

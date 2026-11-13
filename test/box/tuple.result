@@ -205,33 +205,17 @@ box.tuple.new{1}
 ---
 - [1]
 ...
-box.tuple.new(1, 2, 3, 4, 5)
----
-- [1, 2, 3, 4, 5]
-...
 box.tuple.new{1, 2, 3, 4, 5}
 ---
 - [1, 2, 3, 4, 5]
-...
-box.tuple.new({'a', 'b'}, {'c', 'd'}, {'e', 'f'})
----
-- [['a', 'b'], ['c', 'd'], ['e', 'f']]
 ...
 box.tuple.new{{'a', 'b'}, {'c', 'd'}, {'e', 'f'}}
 ---
 - [['a', 'b'], ['c', 'd'], ['e', 'f']]
 ...
-box.tuple.new({1, 2}, 'x', 'y', 'z', {c = 3, d = 4}, {e = 5, f = 6})
----
-- [[1, 2], 'x', 'y', 'z', {'c': 3, 'd': 4}, {'e': 5, 'f': 6}]
-...
 box.tuple.new{{1, 2}, 'x', 'y', 'z', {c = 3, d = 4}, {e = 5, f = 6}}
 ---
 - [[1, 2], 'x', 'y', 'z', {'c': 3, 'd': 4}, {'e': 5, 'f': 6}]
-...
-box.tuple.new('x', 'y', 'z', {1, 2}, {c = 3, d = 4}, {e = 5, f = 6})
----
-- ['x', 'y', 'z', [1, 2], {'c': 3, 'd': 4}, {'e': 5, 'f': 6}]
 ...
 box.tuple.new{'x', 'y', 'z', {1, 2}, {c = 3, d = 4}, {e = 5, f = 6}}
 ---
@@ -534,8 +518,8 @@ gen, init, state = t:pairs()
 gen, init, state
 ---
 - gen: <tuple iterator>
-  param: ['a', 'b', 'c']
-- ['a', 'b', 'c']
+  param: &0 ['a', 'b', 'c']
+- *0
 - null
 ...
 state, val = gen(init, state)
@@ -641,16 +625,16 @@ r
 t:pairs(nil)
 ---
 - gen: <tuple iterator>
-  param: ['a', 'b', 'c']
-- ['a', 'b', 'c']
+  param: &0 ['a', 'b', 'c']
+- *0
 - null
 ...
 t:pairs("fdsaf")
 ---
 - state: fdsaf
   gen: <tuple iterator>
-  param: ['a', 'b', 'c']
-- ['a', 'b', 'c']
+  param: &0 ['a', 'b', 'c']
+- *0
 - fdsaf
 ...
 --------------------------------------------------------------------------------
@@ -1003,24 +987,24 @@ test_run:cmd("setopt delimiter ';'")
 - true
 ...
 null = nil
-t = box.tuple.new({1, -2, 1.2, -1.2}, 'x', 'y', 'z', null, true, false,
+t = box.tuple.new{{1, -2, 1.2, -1.2}, 'x', 'y', 'z', null, true, false,
     {bin = "\x08\x5c\xc2\x80\x12\x2f",
     big_num = tonumber64('18446744073709551615'),
     map = {key = "value"},
     double=1.0000000001,
-    utf8="Кудыкины горы"});
+    utf8="Кудыкины горы"}};
 ---
 ...
 tostring(t);
 ---
 - '[[1, -2, 1.2, -1.2], ''x'', ''y'', ''z'', null, true, false, {''big_num'': 18446744073709551615,
-  ''double'': 1.0000000001, ''utf8'': ''Кудыкины горы'', ''bin'': !!binary CFzCgBIv,
+  ''double'': 1.0000000001, ''utf8'': ''Кудыкины горы'', ''bin'': "\b\\\u0080\x12/",
   ''map'': {''key'': ''value''}}]'
 ...
 t;
 ---
 - [[1, -2, 1.2, -1.2], 'x', 'y', 'z', null, true, false, {'big_num': 18446744073709551615,
-    'double': 1.0000000001, 'utf8': 'Кудыкины горы', 'bin': !!binary CFzCgBIv, 'map': {
+    'double': 1.0000000001, 'utf8': 'Кудыкины горы', 'bin': "\b\\\u0080\x12/", 'map': {
       'key': 'value'}}]
 ...
 test_run:cmd("setopt delimiter ''");
@@ -1277,7 +1261,7 @@ d = box.tuple.new{5, a, 6, b, 7, c, "string"}
 ...
 d
 ---
-- [5, 1, 6, 10000000000, 7, 0.0000000001, 'string']
+- [5, 1, 6, 1E+10, 7, 1E-10, 'string']
 ...
 state, val = d:next()
 ---
@@ -1313,9 +1297,9 @@ d:slice(1)
 ---
 - 1
 - 6
-- 10000000000
+- 1E+10
 - 7
-- 0.0000000001
+- 1E-10
 - string
 ...
 d:slice(-1)
@@ -1324,12 +1308,12 @@ d:slice(-1)
 ...
 d:slice(-2)
 ---
-- 0.0000000001
+- 1E-10
 - string
 ...
 msgpack.decode(msgpackffi.encode(d))
 ---
-- [5, 1, 6, 10000000000, 7, 0.0000000001, 'string']
+- [5, 1, 6, 1E+10, 7, 1E-10, 'string']
 - 24
 ...
 d:bsize()
@@ -1338,11 +1322,11 @@ d:bsize()
 ...
 d:update{{'!', 3, dec.new('1234.5678')}}
 ---
-- [5, 1, 1234.5678, 6, 10000000000, 7, 0.0000000001, 'string']
+- [5, 1, 1234.5678, 6, 1E+10, 7, 1E-10, 'string']
 ...
 d:update{{'=', -1, dec.new('0.12345678910111213')}}
 ---
-- [5, 1, 6, 10000000000, 7, 0.0000000001, 0.12345678910111213]
+- [5, 1, 6, 1E+10, 7, 1E-10, 0.12345678910111213]
 ...
 --
 -- gh-4413: tuple:update arithmetic for decimals
@@ -1392,15 +1376,15 @@ d = box.tuple.new(dec.new('9e37'))
 ...
 d
 ---
-- [90000000000000000000000000000000000000]
+- [9E+37]
 ...
 d:update{{'+', 1, dec.new('1e37')}}
 ---
-- error: Decimal overflow when performing operation '+' on field 1
+- [1.0E+38]
 ...
 d:update{{'-', 1, dec.new('1e37')}}
 ---
-- [80000000000000000000000000000000000000]
+- [8E+37]
 ...
 --
 -- gh-4434: tuple should use global msgpack serializer.
@@ -1409,6 +1393,9 @@ max_depth = msgpack.cfg.encode_max_depth
 ---
 ...
 deep_as_nil = msgpack.cfg.encode_deep_as_nil
+---
+...
+decode_max_depth = msgpack.cfg.decode_max_depth
 ---
 ...
 msgpack.cfg({encode_deep_as_nil = true})
@@ -1434,6 +1421,9 @@ level == max_depth or {level, max_depth}
 - true
 ...
 msgpack.cfg({encode_max_depth = max_depth + 5})
+---
+...
+msgpack.cfg({decode_max_depth = max_depth + 5})
 ---
 ...
 tuple = box.tuple.new(t):totable()
@@ -1505,7 +1495,7 @@ a = uuid.fromstr("c8f0fa1f-da29-438c-a040-393f1126ad39")
 b = uuid.fromstr("83eb4959-3de6-49fb-8890-6fb4423dd186")
 ---
 ...
-t = box.tuple.new(a, 2, b, "string")
+t = box.tuple.new{a, 2, b, "string"}
 ---
 ...
 state, val = t:next()
@@ -1572,6 +1562,12 @@ t:bsize()
 ---
 - 45
 ...
-msgpack.cfg({encode_max_depth = max_depth, encode_deep_as_nil = deep_as_nil})
+msgpack.cfg({encode_max_depth = max_depth})
+---
+...
+msgpack.cfg({encode_deep_as_nil = deep_as_nil})
+---
+...
+msgpack.cfg({decode_max_depth = decode_max_depth})
 ---
 ...

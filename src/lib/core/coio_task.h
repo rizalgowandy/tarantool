@@ -53,6 +53,21 @@ void coio_init(void);
 void coio_enable(void);
 void coio_shutdown(void);
 
+/**
+ * This function is supposed to be called before fork() if the child process
+ * will use coio. It stops coio threads to make sure that all internal coio
+ * locks have been released by the time fork() is called. After fork() is done,
+ * coio_postfork() must be called to restart coio threads.
+ *
+ * This function isn't thread-safe: it may only be called by the main thread.
+ */
+void
+coio_prefork(void);
+
+/** See coio_prefork(). */
+void
+coio_postfork(void);
+
 struct coio_task;
 
 typedef ssize_t (*coio_call_cb)(va_list ap);
@@ -165,7 +180,7 @@ struct addrinfo;
  * @param host host name, i.e. "tarantool.org"
  * @param port service name, i.e. "80" or "http"
  * @param hints hints, see getaddrinfo(3)
- * @param res[out] result, see getaddrinfo(3)
+ * @param[out] res result, see getaddrinfo(3)
  * @param timeout timeout
  * @retval  0 on success, please free @a res using freeaddrinfo(3).
  * @retval -1 on error, check diag.

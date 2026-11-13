@@ -32,7 +32,9 @@
  */
 
 #include "key_def.h"
+#include "mp_util.h"
 #include "opt_def.h"
+#include "schema_def.h"
 #include "small/rlist.h"
 
 #if defined(__cplusplus)
@@ -49,6 +51,13 @@ enum index_type {
 
 extern const char *index_type_strs[];
 
+/** Settings for the hint config option. */
+enum index_hint_cfg {
+	INDEX_HINT_DEFAULT = 0,
+	INDEX_HINT_ON,
+	INDEX_HINT_OFF
+};
+
 enum rtree_index_distance_type {
 	 /* Euclid distance, sqrt(dx*dx + dy*dy) */
 	RTREE_INDEX_DISTANCE_TYPE_EUCLID,
@@ -57,68 +66,6 @@ enum rtree_index_distance_type {
 	rtree_index_distance_type_MAX
 };
 extern const char *rtree_index_distance_type_strs[];
-
-/** Simple alias to represent logarithm metrics. */
-typedef int16_t log_est_t;
-
-/**
- * One sample represents index key and three arrays with
- * statistics concerning tuples distribution.
- * Max number of samples for one index is adjusted by
- * SQL_STAT4_SAMPLES macros. By default it is about 24 entities.
- * Samples are chosen to be selective.
- */
-struct index_sample {
-	/** Key of the sample. */
-	char *sample_key;
-	/** Size of sample key. */
-	size_t key_size;
-	/**
-	 * List of integers: first one is the approximate number
-	 * of entries in the index whose left-most field exactly
-	 * matches the left-most column of the sample;
-	 * second one - est. number of entries in the index where
-	 * the first two columns match the first two columns of
-	 * the sample; and so forth.
-	 */
-	uint32_t *eq;
-	/** The same as eq list, but key is less than sample. */
-	uint32_t *lt;
-	/** The same as lt list, but includes only distinct keys. */
-	uint32_t *dlt;
-};
-
-/**
- * SQL statistics for index, which is used by query planer.
- * This is general statistics, without any relation to used
- * engine and data structures (e.g. B-tree or LSM tree).
- * Statistics appear only after executing ANALYZE statement.
- * It is loaded from _sql_stat1 and _sql_stat4 system spaces.
- */
-struct index_stat {
-	/** An array of samples of them left-most key. */
-	struct index_sample *samples;
-	/** Number of samples. */
-	uint32_t sample_count;
-	/** Number of fields in sample arrays: eq, lt and dlt. */
-	uint32_t sample_field_count;
-	/**
-	 * List of integers: the first is the number of tuples
-	 * in the index; the second one is the average number of
-	 * tuples that have the same key part in the first field
-	 * of the index; the third - for the first two fields;
-	 * and so forth.
-	 */
-	uint32_t *tuple_stat1;
-	/** Logarithms of stat1 data. */
-	log_est_t *tuple_log_est;
-	/** Average eq values for keys not in samples. */
-	uint32_t *avg_eq;
-	/** Use this index for == or IN queries only. */
-	bool is_unordered;
-	/** Don't try to use skip-scan optimization if true. */
-	bool skip_scan_enabled;
-};
 
 /** Index options */
 struct index_opts {
@@ -157,18 +104,28 @@ struct index_opts {
 	 * LSN from the time of index creation.
 	 */
 	int64_t lsn;
-	/**
-	 * SQL specific statistics concerning tuples
-	 * distribution for query planer. It is automatically
-	 * filled after running ANALYZE command.
-	 */
-	struct index_stat *stat;
 	/** Identifier of the functional index function. */
 	uint32_t func_id;
 	/**
 	 * Use hint optimization for tree index.
 	 */
-	bool hint;
+	enum index_hint_cfg hint;
+	/**
+	 * Engine dependent. For engines supporting covering indexes means
+	 * explicitly covered fields. That is fields other then fields of
+	 * index key and primary index key. The latter fields are always
+	 * covered. Sorted in ascending order.
+	 */
+	uint32_t *covered_fields;
+	/**
+	 * Number of covered fields.
+	 */
+	uint32_t covered_field_count;
+	/**
+	 * Engine dependent. MsgPack array with aggregates, each one is
+	 * a MsgPack map.
+	 */
+	char *aggregates;
 };
 
 extern const struct index_opts index_opts_default;
@@ -189,52 +146,73 @@ index_opts_create(struct index_opts *opts)
 static inline void
 index_opts_destroy(struct index_opts *opts)
 {
-	free(opts->stat);
+	free(opts->covered_fields);
+	free(opts->aggregates);
 	TRASH(opts);
 }
 
-static inline int
-index_opts_cmp(const struct index_opts *o1, const struct index_opts *o2)
+static inline bool
+index_opts_is_equal(const struct index_opts *o1, const struct index_opts *o2)
 {
 	if (o1->is_unique != o2->is_unique)
-		return o1->is_unique < o2->is_unique ? -1 : 1;
+		return false;
 	if (o1->dimension != o2->dimension)
-		return o1->dimension < o2->dimension ? -1 : 1;
+		return false;
 	if (o1->distance != o2->distance)
-		return o1->distance < o2->distance ? -1 : 1;
+		return false;
 	if (o1->range_size != o2->range_size)
-		return o1->range_size < o2->range_size ? -1 : 1;
+		return false;
 	if (o1->page_size != o2->page_size)
-		return o1->page_size < o2->page_size ? -1 : 1;
+		return false;
 	if (o1->run_count_per_level != o2->run_count_per_level)
-		return o1->run_count_per_level < o2->run_count_per_level ?
-		       -1 : 1;
+		return false;
 	if (o1->run_size_ratio != o2->run_size_ratio)
-		return o1->run_size_ratio < o2->run_size_ratio ? -1 : 1;
+		return false;
 	if (o1->bloom_fpr != o2->bloom_fpr)
-		return o1->bloom_fpr < o2->bloom_fpr ? -1 : 1;
+		return false;
 	if (o1->func_id != o2->func_id)
-		return o1->func_id - o2->func_id;
+		return false;
 	if (o1->hint != o2->hint)
-		return o1->hint - o2->hint;
-	return 0;
+		return false;
+	if (o1->covered_field_count != o2->covered_field_count)
+		return false;
+	for (uint32_t i = 0; i < o1->covered_field_count; i++) {
+		if (o1->covered_fields[i] != o2->covered_fields[i])
+			return false;
+	}
+	if (o1->aggregates != NULL && o2->aggregates != NULL) {
+		uint32_t o1_aggregates_len = mp_len(o1->aggregates);
+		uint32_t o2_aggregates_len = mp_len(o2->aggregates);
+		if (o1_aggregates_len != o2_aggregates_len)
+			return false;
+		if (memcmp(o1->aggregates, o2->aggregates,
+			   o1_aggregates_len) != 0)
+			return false;
+	} else if (o1->aggregates != NULL || o2->aggregates != NULL) {
+		return false;
+	}
+	return true;
 }
 
 /* Definition of an index. */
 struct index_def {
-	/* A link in key list. */
+	/** A link in key list. */
 	struct rlist link;
 	/** Ordinal index number in the index array. */
 	uint32_t iid;
-	/* Space id. */
+	/** Space id. */
 	uint32_t space_id;
+	/** Space name. */
+	char *space_name;
+	/** Engine name. */
+	char engine_name[ENGINE_NAME_MAX + 1];
 	/** Index name. */
 	char *name;
 	/** Index type. */
 	enum index_type type;
+	/** Index options. */
 	struct index_opts opts;
-
-	/* Index key definition. */
+	/** Index key definition. */
 	struct key_def *key_def;
 	/**
 	 * User-defined key definition, merged with the primary
@@ -242,54 +220,18 @@ struct index_def {
 	 * iterator position.
 	 */
 	struct key_def *cmp_def;
+	/**
+	 * Primary key definition. Despite the fact that cmp_def already
+	 * contains primary key definition, our key_def machinery does not
+	 * allow to work with it in any convenient way. This field allows
+	 * to use primary key definition easily without any dependencies on
+	 * space and its primary index.
+	 */
+	struct key_def *pk_def;
 };
 
 struct index_def *
 index_def_dup(const struct index_def *def);
-
-/**
- * Calculate size of index's statistics.
- * Statistics is located in memory according to following layout:
- *
- * +-------------------------+ <- Allocated memory starts here
- * |    struct index_stat    |
- * |-------------------------|
- * |        stat1 array      | ^
- * |-------------------------| |
- * |      log_est array      | | 3 * array_size + 2 * uint_32
- * |-------------------------| |
- * |       avg_eq array      | v
- * |-------------------------|
- * |   samples struct array  |
- * |-------------------------|
- * | eq | lt | dlt |   key   | <- Content of one sample
- * +-------------------------+
- *            ...              <- Up to 24 samples
- * | eq | lt | dlt |   key   |
- * +-------------------------+
- *
- * array_size = field_count * sizeof(uint_32)
- * offset of one sample = 3 * array_size + key_size
- *
- * @param samples Array of samples needed for calculating
- *                size of keys.
- * @param sample_count Count of samples in samples array.
- * @param field_count Count of fields in statistics arrays.
- * @retval Size needed for statistics allocation in bytes.
- */
-size_t
-index_stat_sizeof(const struct index_sample *samples, uint32_t sample_count,
-		  uint32_t field_count);
-
-/**
- * Duplicate index_stat object.
- * To understand memory layout see index_stat_sizeof() function.
- *
- * @param src Stat to duplicate.
- * @retval Copy of the @src or NULL on OOM.
- */
-struct index_stat *
-index_stat_dup(const struct index_stat *src);
 
 /* Destroy and free an index_def. */
 void
@@ -362,18 +304,19 @@ index_def_list_add(struct rlist *index_def_list, struct index_def *index_def)
 }
 
 /**
- * Create a new index definition definition.
+ * Create a new index definition.
+ * Does not validate identifier - caller must do it manually.
  *
  * @param key_def  key definition, must be fully built
  * @param pk_def   primary key definition, pass non-NULL
  *                 for secondary keys to construct
  *                 index_def::cmp_def
- * @retval not NULL Success.
- * @retval NULL     Memory error.
+ * Never fails, always returns non-NULL value.
  */
 struct index_def *
 index_def_new(uint32_t space_id, uint32_t iid, const char *name,
-	      uint32_t name_len, enum index_type type,
+	      uint32_t name_len, const char *space_name,
+	      const char *engine_name, enum index_type type,
 	      const struct index_opts *opts,
 	      struct key_def *key_def, struct key_def *pk_def);
 
@@ -383,48 +326,46 @@ index_def_new(uint32_t space_id, uint32_t iid, const char *name,
  *
  * @param index_defs List head.
  * @param[out] size  Array size.
- * @retval not NULL  Array of pointers to key_def
- * @retval NULL      Memory error.
+ * @retval Array of pointers to key_def (NULL if size == 0).
  */
 struct key_def **
 index_def_to_key_def(struct rlist *index_defs, int *size);
 
 /**
- * One key definition is greater than the other if it's id is
- * greater, it's name is greater,  it's index type is greater
- * (HASH < TREE < BITSET) or its key part array is greater.
+ * Check whether index definitions def1 and def2 are equals.
+ *
+ * @param def1 index definition 1.
+ * @param def2 index definition 2.
+ * @retval true if definitions are equal, false if not.
  */
-int
-index_def_cmp(const struct index_def *key1, const struct index_def *key2);
+bool
+index_def_is_equal(const struct index_def *def1, const struct index_def *def2);
 
 /**
  * Check a key definition for violation of various limits.
  *
- * @param index_def   index definition
- * @param old_space   space definition
+ * @param index_def index definition
+ * @param space_name space name
+ * @retval 0 Success.
+ * @retval -1 Error. Diag is set.
  */
-bool
-index_def_is_valid(struct index_def *index_def, const char *space_name);
+int
+index_def_check(struct index_def *index_def, const char *space_name);
+
+/**
+ * Check types of tuple fields indexed by `index_def'.
+ *
+ * @param index_def index definition
+ * @param space_name space name
+ * @retval 0 Success.
+ * @retval -1 Error. Diag is set.
+ */
+int
+index_def_check_field_types(struct index_def *index_def,
+			    const char *space_name);
 
 #if defined(__cplusplus)
 } /* extern "C" */
-
-static inline struct index_def *
-index_def_dup_xc(const struct index_def *def)
-{
-	struct index_def *ret = index_def_dup(def);
-	if (ret == NULL)
-		diag_raise();
-	return ret;
-}
-
-static inline void
-index_def_check_xc(struct index_def *index_def, const char *space_name)
-{
-	if (! index_def_is_valid(index_def, space_name))
-		diag_raise();
-}
-
 #endif /* defined(__cplusplus) */
 
 #endif /* TARANTOOL_BOX_INDEX_DEF_H_INCLUDED */

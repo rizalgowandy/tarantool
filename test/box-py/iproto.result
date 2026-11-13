@@ -55,7 +55,7 @@ space = box.schema.space.create('test', { id = 567 })
 index = space:create_index('primary', { type = 'hash' })
 ---
 ...
-box.schema.user.grant('guest', 'read,write,execute', 'space', 'test')
+box.schema.user.grant('guest', 'read,write', 'space', 'test')
 ---
 ...
 - [1, 'baobab']
@@ -170,7 +170,7 @@ box.schema.user.revoke('guest', 'read,write,execute', 'universe')
 # an error code and do not close connection
 
 sync=0, Invalid MsgPack - packet header
-sync=1234, Missing mandatory field 'space id' in request
+sync=1234, Missing mandatory field 'SPACE_ID' in request
 sync=5678, Read access to space '_user' is denied for user 'guest'
 space = box.schema.space.create('test_index_base', { id = 568 })
 ---
@@ -178,7 +178,7 @@ space = box.schema.space.create('test_index_base', { id = 568 })
 index = space:create_index('primary', { type = 'hash' })
 ---
 ...
-box.schema.user.grant('guest', 'read,write,execute', 'space', 'test_index_base')
+box.schema.user.grant('guest', 'read,write', 'space', 'test_index_base')
 ---
 ...
 - [1, 0, 0, 0]
@@ -207,49 +207,53 @@ space:drop()
 Invalid MsgPack - request body
 # Invalid features
 Invalid MsgPack - request body
+# Invalid auth_type
+Invalid MsgPack - request body
 # Empty request body
-version=3, features=[0, 1, 2, 3]
+version=10, features=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12], auth_type=chap-sha1
 # Unknown version and features
-version=3, features=[0, 1, 2, 3]
+version=10, features=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12], auth_type=chap-sha1
+# Unknown request key
+version=10, features=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12], auth_type=chap-sha1
 
 #
 # gh-6257 Watchers
 #
 
 # Missing key
-error: Missing mandatory field 'event key' in request
+error: Missing mandatory field 'EVENT_KEY' in request
 # Invalid key type
 error: Invalid MsgPack - packet body
-# Watch key 'foo'
-# Recieve event
-key='foo', value=None
-# Watch key 'bar'
-# Recieve event
-key='bar', value=None
+# Watch key 'foo', sync=1
+# Receive event
+key='foo', value=None, sync=1
+# Watch key 'bar', sync=2
+# Receive event
+key='bar', value=None, sync=2
 # Unwatch key 'bar'
-# Watch key 'bar'
-# Recieve event
-key='bar', value=None
+# Watch key 'bar', sync=3
+# Receive event
+key='bar', value=None, sync=3
 box.broadcast('foo', {1, 2, 3})
 ---
 ...
-# Recieve event
+# Receive event
    =>  Failed to recv response
 <no event received>
-# Watch key 'foo'
-# Recieve event
-key='foo', value=[1, 2, 3]
-# Watch key 'bar'
+# Watch key 'foo', sync=4
+# Receive event
+key='foo', value=[1, 2, 3], sync=4
+# Watch key 'bar', sync=5
 box.broadcast('bar', 123)
 ---
 ...
-# Recieve event
-key='bar', value=123
+# Receive event
+key='bar', value=123, sync=5
 box.broadcast('bar', 456)
 ---
 ...
 # Unwatch key 'bar'
-# Recieve event
+# Receive event
    =>  Failed to recv response
 <no event received>
 box.broadcast('foo', nil)
@@ -258,3 +262,81 @@ box.broadcast('foo', nil)
 box.broadcast('bar', nil)
 ---
 ...
+
+#
+# gh-6493 IPROTO_WATCH_ONCE
+#
+
+# Schema version
+sync=1001
+Error on invalid schema_id: True
+Got schema_id: True
+sync=1002
+Success on valid schema_id: True
+Same schema_id: True
+# Streaming unsupported
+sync=1003, error: Unable to process WATCH_ONCE request in stream
+# Invalid key
+sync=1004, error: Missing mandatory field 'EVENT_KEY' in request
+sync=1005, error: Invalid MsgPack - packet body
+# Missing key
+sync=1006, ok
+Data: []
+ Existing key
+box.broadcast('foo', {1, 2, 3})
+---
+...
+sync=1007, ok
+Data: [[1, 2, 3]]
+box.broadcast('foo', nil)
+---
+...
+
+#
+# gh-7639 Pagination
+#
+
+space = box.schema.space.create('test', { id = 567 })
+---
+...
+index = space:create_index('primary', { type = 'tree' })
+---
+...
+box.schema.user.grant('guest', 'read,write', 'space', 'test')
+---
+...
+Simple pagination with after_pos
+Page 1
+- [1, 1]
+- [2, 1]
+Page 2
+- [3, 1]
+- [4, 1]
+Page 3
+- [5, 1]
+- [6, 1]
+Page 4
+- [7, 1]
+- [8, 1]
+Page 5
+- [9, 1]
+- [10, 1]
+Page 6
+
+Position after last iteration must does not present in response: True
+Simple pagination with after_tuple
+Page 1
+- [1, 1]
+- [2, 1]
+Page 2
+- [3, 1]
+- [4, 1]
+Page 3
+- [5, 1]
+- [6, 1]
+Page 4
+- [7, 1]
+- [8, 1]
+Page 5
+- [9, 1]
+- [10, 1]

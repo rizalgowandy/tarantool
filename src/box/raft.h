@@ -40,7 +40,7 @@ extern "C" {
  * A public trigger fired on Raft state change, i.e. on a broadcast.
  * It's allowed to yield inside it, and it's run asynchronously.
  */
-extern struct rlist box_raft_on_broadcast;
+extern struct event *box_raft_on_election_event;
 
 enum election_mode {
 	ELECTION_MODE_INVALID = -1,
@@ -48,6 +48,26 @@ enum election_mode {
 	ELECTION_MODE_VOTER = 1,
 	ELECTION_MODE_MANUAL = 2,
 	ELECTION_MODE_CANDIDATE = 3,
+};
+
+/**
+ * Election fencing mode.
+ */
+enum election_fencing_mode {
+	ELECTION_FENCING_MODE_INVALID = -1,
+	/** Leader won't resign leadership when quorum is lost. */
+	ELECTION_FENCING_MODE_OFF = 0,
+	/**
+	 * Leader will resign leadership when quorum is lost.
+	 * Quite possible it will happen after new leader is already elected.
+	 */
+	ELECTION_FENCING_MODE_SOFT = 1,
+	/**
+	 * Leader will resign leadership when quorum is lost, it will resign
+	 * before automatic elections should start in any part of cluster
+	 * (assuming replication_timeout is same on every replica).
+	 */
+	ELECTION_FENCING_MODE_STRICT = 2,
 };
 
 struct raft_request;
@@ -61,6 +81,11 @@ struct raft_request;
  */
 extern enum election_mode box_election_mode;
 
+/**
+ * Current leader fencing mode.
+ */
+extern enum election_fencing_mode box_election_fencing_mode;
+
 /** Raft state of this instance. */
 static inline struct raft *
 box_raft(void)
@@ -68,10 +93,9 @@ box_raft(void)
 	extern struct raft box_raft_global;
 	/**
 	 * Ensure the raft node can be used. I.e. that it is properly
-	 * initialized. Entirely for debug purposes.
+	 * initialized.
 	 */
-	assert(box_raft_global.state != 0);
-	return &box_raft_global;
+	return box_raft_global.state != 0 ? &box_raft_global : NULL;
 }
 
 /**
@@ -81,6 +105,10 @@ box_raft(void)
  */
 void
 box_raft_update_election_quorum(void);
+
+/** Set the node's election_mode to @a mode. */
+void
+box_raft_cfg_election_mode(enum election_mode mode);
 
 /**
  * Recover a single Raft request. Raft state machine is not turned on yet, this
@@ -104,16 +132,55 @@ box_raft_checkpoint_remote(struct raft_request *req);
 int
 box_raft_process(struct raft_request *req, uint32_t source);
 
-/** Block this fiber until the current term's outcome is known. */
+/** Try to elect this node as a leader in a new term bumped one time. */
 int
-box_raft_wait_term_outcome(void);
+box_raft_try_promote(void);
 
 /** Block this fiber until the current volatile term is persisted. */
 int
 box_raft_wait_term_persisted(void);
 
+/** Set the node's election_fencing_mode to @a mode. */
+void
+box_raft_set_election_fencing_mode(enum election_fencing_mode mode);
+
+/**
+ * Pause fencing. Instance will not resign its leader role when it looses
+ * quorum even if fencing is enabled. Useful to prevent fencing while adding
+ * replicas to replicaset or bootstraping.
+ */
+void
+box_raft_election_fencing_pause(void);
+
+/**
+ * Resign RAFT leadership and freeze limbo regardless of
+ * box_election_fencing_mode. It waits until the elections
+ * begin. After the death-timeout expires, it starts a new
+ * round of elections.
+ */
+void
+box_raft_leader_step_off(void);
+
+/**
+ * Check if the current synchronous replication state (consisting of Raft and
+ * limbo) requires this instance to be reqd-only.
+ */
+bool
+box_raft_is_ro(void);
+
+/**
+ * Let the synchronous replication (Raft and limbo) know that the instance has
+ * fully recovered.
+ */
+void
+box_raft_finish_recovery(void);
+
 void
 box_raft_init(void);
+
+/** Stop internal fibers. */
+void
+box_raft_shutdown(void);
 
 void
 box_raft_free(void);

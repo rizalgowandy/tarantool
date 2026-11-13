@@ -55,7 +55,7 @@ BuildXlogGapError(const char *file, unsigned line,
 
 struct error *
 BuildCustomError(const char *file, unsigned int line, const char *custom_type,
-		 uint32_t errcode);
+		 uint32_t errcode, const char *format, ...);
 
 /** \cond public */
 
@@ -122,6 +122,8 @@ box_error_clear(void);
 /**
  * Set the last error.
  *
+ * \param file file name, usually __FILE__ macro
+ * \param line line number in the file, usually __LINE__ macro
  * \param code IPROTO error code (enum \link box_error_code \endlink)
  * \param format (const char * ) - printf()-like format string
  * \param ... - format arguments
@@ -182,6 +184,28 @@ extern const struct type_info type_XlogGapError;
 extern const struct type_info type_AccessDeniedError;
 extern const struct type_info type_CustomError;
 
+/**
+ * Internal triggers fired after access denied error is created.
+ */
+extern struct rlist on_access_denied;
+
+/**
+ * User-definded triggers fired after access denied error is created.
+ */
+extern struct event *on_access_denied_event;
+
+/**
+ * Context passed to on_access_denied trigger.
+ */
+struct on_access_denied_ctx {
+	/** Type of declined access */
+	const char *access_type;
+	/** Type of object the required access was denied to */
+	const char *object_type;
+	/** Name of object the required access was denied to */
+	const char *object_name;
+};
+
 #if defined(__cplusplus)
 } /* extern "C" */
 #include "exception.h"
@@ -203,34 +227,26 @@ public:
 		throw this;
 	}
 
-	virtual void log() const;
-
 	int
 	errcode() const
 	{
-		return m_errcode;
+		return code;
 	}
 
-	ClientError(const char *file, unsigned line, uint32_t errcode, ...);
+	ClientError(const char *file, unsigned line, uint32_t errcode,
+		    va_list ap);
+	ClientError(const char *file, unsigned line, uint32_t errcode,
+		    const char *fmt, va_list ap);
+
+	ClientError()
+		:Exception(&type_ClientError, NULL, 0)
+	{
+	}
 
 	static uint32_t get_errcode(const struct error *e);
-	/* client errno code */
-	int m_errcode;
 protected:
 	ClientError(const type_info *type, const char *file, unsigned line,
 		    uint32_t errcode);
-};
-
-class LoggedError: public ClientError
-{
-public:
-	template <typename ... Args>
-	LoggedError(const char *file, unsigned line, uint32_t errcode, Args ... args)
-		: ClientError(file, line, errcode, args...)
-	{
-		/* TODO: actually calls ClientError::log */
-		log();
-	}
 };
 
 /**
@@ -245,38 +261,28 @@ public:
 			  const char *object_name, const char *user_name,
 			  bool run_trigers = true);
 
-	~AccessDeniedError()
+	AccessDeniedError()
+		:ClientError(&type_AccessDeniedError, NULL, 0, 0)
 	{
-		free(m_object_name);
-		free(m_object_type);
-		free(m_access_type);
 	}
 
 	const char *
-	object_type()
+	object_type() const
 	{
-		return m_object_type;
+		return error_get_str(this, "object_type");
 	}
 
 	const char *
-	object_name()
+	object_name() const
 	{
-		return m_object_name?:"(nil)";
+		return error_get_str(this, "object_name");
 	}
 
 	const char *
-	access_type()
+	access_type() const
 	{
-		return m_access_type;
+		return error_get_str(this, "access_type");
 	}
-
-private:
-	/** Type of object the required access was denied to */
-	char *m_object_type;
-	/** Name of object the required access was denied to */
-	char *m_object_name;
-	/** Type of declined access */
-	char *m_access_type;
 };
 
 /**
@@ -293,6 +299,12 @@ struct XlogError: public Exception
 	{
 		error_vformat_msg(this, format, ap);
 	}
+
+	XlogError()
+		:Exception(&type_XlogError, NULL, 0)
+	{
+	}
+
 	XlogError(const struct type_info *type, const char *file,
 		  unsigned line)
 		:Exception(type, file, line)
@@ -306,8 +318,11 @@ struct XlogGapError: public XlogError
 {
 	XlogGapError(const char *file, unsigned line,
 		     const struct vclock *from, const struct vclock *to);
-	XlogGapError(const char *file, unsigned line,
-		     const char *msg);
+
+	XlogGapError()
+		:XlogError(&type_XlogGapError, NULL, 0)
+	{
+	}
 
 	virtual void raise() { throw this; }
 };
@@ -316,18 +331,19 @@ class CustomError: public ClientError
 {
 public:
 	CustomError(const char *file, unsigned int line,
-		    const char *custom_type, uint32_t errcode);
+		    const char *custom_type, uint32_t errcode, const char *fmt,
+		    va_list ap);
 
-	virtual void log() const;
+	CustomError()
+		:ClientError(&type_CustomError, NULL, 0, 0)
+	{
+	}
 
 	const char*
-	custom_type()
+	custom_type() const
 	{
-		return m_custom_type;
+		return error_get_str(this, "custom_type");
 	}
-private:
-	/** Custom type name. */
-	char m_custom_type[64];
 };
 
 #endif /* defined(__cplusplus) */

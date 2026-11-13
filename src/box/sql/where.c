@@ -46,8 +46,9 @@
 #include "box/coll_id_cache.h"
 #include "box/schema.h"
 
-/* Forward declaration of methods */
-static int whereLoopResize(sql *, WhereLoop *, int);
+/** Increase the memory allocation for p->aLTerm[] to be at least n. */
+static void
+whereLoopResize(struct WhereLoop *p, int n);
 
 /* Test variable that can be set to enable WHERE tracing */
 #ifdef SQL_DEBUG
@@ -300,7 +301,8 @@ whereScanNext(WhereScan * pScan)
 							pX = pTerm->pExpr;
 							enum field_type expr_type =
 								expr_cmp_mutual_type(pX);
-							if (!field_type1_contains_type2(expr_type, pScan->idx_type))
+							if (!field_type1_contains_type2(expr_type, NULL,
+											pScan->idx_type, NULL))
 								continue;
 							if (pScan->is_column_seen) {
 								Parse *pParse =
@@ -706,7 +708,7 @@ termCanDriveIndex(WhereTerm * pTerm,	/* WHERE clause term to check */
 		return 0;
 	enum field_type type = pSrc->space->def->fields[pTerm->u.leftColumn].type;
 	enum field_type expr_type = expr_cmp_mutual_type(pTerm->pExpr);
-	if (!field_type1_contains_type2(expr_type, type))
+	if (!field_type1_contains_type2(expr_type, NULL, type, NULL))
 		return 0;
 	return 1;
 }
@@ -775,7 +777,6 @@ constructAutomaticIndex(Parse * pParse,			/* The parsing context */
 	v = pParse->pVdbe;
 	assert(v != 0);
 	addrInit = sqlVdbeAddOp0(v, OP_Once);
-	VdbeCoverage(v);
 
 	/* Count the number of columns that will be added to the index
 	 * and used to match WHERE clause constraints
@@ -790,11 +791,7 @@ constructAutomaticIndex(Parse * pParse,			/* The parsing context */
 			Bitmask cMask =
 			    iCol >= BMS ? MASKBIT(BMS - 1) : MASKBIT(iCol);
 			if ((idxCols & cMask) == 0) {
-				if (whereLoopResize
-				    (pParse->db, pLoop, nKeyCol + 1)) {
-					pParse->is_aborted = true;
-					return;
-				}
+				whereLoopResize(pLoop, nKeyCol + 1);
 				pLoop->aLTerm[nKeyCol++] = pTerm;
 				idxCols |= cMask;
 			}
@@ -826,22 +823,14 @@ constructAutomaticIndex(Parse * pParse,			/* The parsing context */
 
 	n = 0;
 	idxCols = 0;
-	size_t size;
-	struct key_part_def *parts = region_alloc_array(&pParse->region,
-							typeof(parts[0]),
-							nKeyCol, &size);
-	if (parts == NULL) {
-		diag_set(OutOfMemory, size, "region_alloc_array", "parts");
-		pParse->is_aborted = true;
-		return;
-	}
+	struct key_part_def *parts = xregion_alloc_array(&pParse->region,
+							 typeof(parts[0]),
+							 nKeyCol);
 	for (pTerm = pWC->a; pTerm < pWCEnd; pTerm++) {
 		if (termCanDriveIndex(pTerm, pSrc, notReady)) {
 			int iCol = pTerm->u.leftColumn;
 			Bitmask cMask =
 			    iCol >= BMS ? MASKBIT(BMS - 1) : MASKBIT(iCol);
-			testcase(iCol == BMS - 1);
-			testcase(iCol == BMS);
 			if ((idxCols & cMask) == 0) {
 				idxCols |= cMask;
 				struct field_def *field =
@@ -896,7 +885,7 @@ constructAutomaticIndex(Parse * pParse,			/* The parsing context */
 	}
 	assert(n == nKeyCol);
 
-	struct key_def *key_def = key_def_new(parts, nKeyCol, false);
+	struct key_def *key_def = key_def_new(parts, nKeyCol, 0);
 	if (key_def == NULL) {
 		pParse->is_aborted = true;
 		return;
@@ -907,13 +896,11 @@ constructAutomaticIndex(Parse * pParse,			/* The parsing context */
 	index_opts_create(&opts);
 	const char *idx_name = "ephemeral index";
 	struct index_def *idx_def = index_def_new(space->def->id, 0, idx_name,
-						  strlen(idx_name), TREE, &opts,
-						  key_def, NULL);
+						  strlen(idx_name),
+						  space->def->name,
+						  space->def->engine_name,
+						  TREE, &opts, key_def, NULL);
 	key_def_delete(key_def);
-	if (idx_def == NULL) {
-		pParse->is_aborted = true;
-		return;
-	}
 	pLoop->index_def = idx_def;
 
 	/* Create the automatic index */
@@ -921,10 +908,6 @@ constructAutomaticIndex(Parse * pParse,			/* The parsing context */
 	pLevel->iIdxCur = pParse->nTab++;
 	struct sql_space_info *info = sql_space_info_new_from_index_def(idx_def,
 									true);
-	if (info == NULL) {
-		pParse->is_aborted = true;
-		return;
-	}
 	int reg_eph = sqlGetTempReg(pParse);
 	sqlVdbeAddOp4(v, OP_OpenTEphemeral, reg_eph, 0, 0, (char *)info,
 		      P4_DYNAMIC);
@@ -936,13 +919,11 @@ constructAutomaticIndex(Parse * pParse,			/* The parsing context */
 	assert(pWC->pWInfo->pTabList->a[pLevel->iFrom].fg.viaCoroutine == 0);
 	int cursor = pLevel->iTabCur;
 	addrTop = sqlVdbeAddOp1(v, OP_Rewind, cursor);
-	VdbeCoverage(v);
 	regRecord = sqlGetTempReg(pParse);
 	vdbe_emit_ephemeral_index_tuple(pParse, idx_def->key_def, cursor,
 					regRecord, reg_eph);
 	sqlVdbeAddOp2(v, OP_IdxInsert, regRecord, reg_eph);
 	sqlVdbeAddOp2(v, OP_Next, cursor, addrTop + 1);
-	VdbeCoverage(v);
 	sqlVdbeChangeP5(v, SQL_STMTSTATUS_AUTOINDEX);
 	sqlVdbeJumpHere(v, addrTop);
 	sqlReleaseTempReg(pParse, regRecord);
@@ -951,220 +932,6 @@ constructAutomaticIndex(Parse * pParse,			/* The parsing context */
 
 	/* Jump here when skipping the initialization */
 	sqlVdbeJumpHere(v, addrInit);
-}
-
-/*
- * Estimate the location of a particular key among all keys in an
- * index.  Store the results in aStat as follows:
- *
- *    aStat[0]      Est. number of rows less than pRec
- *    aStat[1]      Est. number of rows equal to pRec
- *
- * Return the index of the sample that is the smallest sample that
- * is greater than or equal to pRec. Note that this index is not an index
- * into the aSample[] array - it is an index into a virtual set of samples
- * based on the contents of aSample[] and the number of fields in record
- * pRec.
- */
-static int
-whereKeyStats(Parse * pParse,	/* Database connection */
-	      struct index_def *idx_def,
-	      UnpackedRecord * pRec,	/* Vector of values to consider */
-	      int roundUp,	/* Round up if true.  Round down if false */
-	      tRowcnt * aStat)	/* OUT: stats written here */
-{
-	struct space *space = space_by_id(idx_def->space_id);
-	assert(space != NULL);
-	struct index *idx = space_index(space, idx_def->iid);
-	assert(idx != NULL && idx->def->opts.stat != NULL);
-	struct index_sample *samples = idx->def->opts.stat->samples;
-	assert(idx->def->opts.stat->sample_count > 0);
-	assert(idx->def->opts.stat->samples != NULL);
-	assert(idx->def->opts.stat->sample_field_count >= pRec->nField);
-	int iCol;		/* Index of required stats in anEq[] etc. */
-	int i;			/* Index of first sample >= pRec */
-	int iSample;		/* Smallest sample larger than or equal to pRec */
-	int iMin = 0;		/* Smallest sample not yet tested */
-	int iTest;		/* Next sample to test */
-	int res;		/* Result of comparison operation */
-	int nField;		/* Number of fields in pRec */
-	tRowcnt iLower = 0;	/* anLt[] + anEq[] of largest sample pRec is > */
-
-#ifndef SQL_DEBUG
-	UNUSED_PARAMETER(pParse);
-#endif
-	assert(pRec != 0);
-	assert(pRec->nField > 0);
-
-	/* Do a binary search to find the first sample greater than or equal
-	 * to pRec. If pRec contains a single field, the set of samples to search
-	 * is simply the aSample[] array. If the samples in aSample[] contain more
-	 * than one fields, all fields following the first are ignored.
-	 *
-	 * If pRec contains N fields, where N is more than one, then as well as the
-	 * samples in aSample[] (truncated to N fields), the search also has to
-	 * consider prefixes of those samples. For example, if the set of samples
-	 * in aSample is:
-	 *
-	 *     aSample[0] = (a, 5)
-	 *     aSample[1] = (a, 10)
-	 *     aSample[2] = (b, 5)
-	 *     aSample[3] = (c, 100)
-	 *     aSample[4] = (c, 105)
-	 *
-	 * Then the search space should ideally be the samples above and the
-	 * unique prefixes [a], [b] and [c]. But since that is hard to organize,
-	 * the code actually searches this set:
-	 *
-	 *     0: (a)
-	 *     1: (a, 5)
-	 *     2: (a, 10)
-	 *     3: (a, 10)
-	 *     4: (b)
-	 *     5: (b, 5)
-	 *     6: (c)
-	 *     7: (c, 100)
-	 *     8: (c, 105)
-	 *     9: (c, 105)
-	 *
-	 * For each sample in the aSample[] array, N samples are present in the
-	 * effective sample array. In the above, samples 0 and 1 are based on
-	 * sample aSample[0]. Samples 2 and 3 on aSample[1] etc.
-	 *
-	 * Often, sample i of each block of N effective samples has (i+1) fields.
-	 * Except, each sample may be extended to ensure that it is greater than or
-	 * equal to the previous sample in the array. For example, in the above,
-	 * sample 2 is the first sample of a block of N samples, so at first it
-	 * appears that it should be 1 field in size. However, that would make it
-	 * smaller than sample 1, so the binary search would not work. As a result,
-	 * it is extended to two fields. The duplicates that this creates do not
-	 * cause any problems.
-	 */
-	nField = pRec->nField;
-	iCol = 0;
-	uint32_t sample_count = idx->def->opts.stat->sample_count;
-	iSample = sample_count * nField;
-	do {
-		int iSamp;	/* Index in aSample[] of test sample */
-		int n;		/* Number of fields in test sample */
-
-		iTest = (iMin + iSample) / 2;
-		iSamp = iTest / nField;
-		if (iSamp > 0) {
-			/* The proposed effective sample is a prefix of sample aSample[iSamp].
-			 * Specifically, the shortest prefix of at least (1 + iTest%nField)
-			 * fields that is greater than the previous effective sample.
-			 */
-			for (n = (iTest % nField) + 1; n < nField; n++) {
-				if (samples[iSamp - 1].lt[n - 1] !=
-				    samples[iSamp].lt[n - 1])
-					break;
-			}
-		} else {
-			n = iTest + 1;
-		}
-
-		pRec->nField = n;
-		res =
-		    sqlVdbeRecordCompareMsgpack(samples[iSamp].sample_key,
-						    pRec);
-		if (res < 0) {
-			iLower =
-			    samples[iSamp].lt[n - 1] + samples[iSamp].eq[n - 1];
-			iMin = iTest + 1;
-		} else if (res == 0 && n < nField) {
-			iLower = samples[iSamp].lt[n - 1];
-			iMin = iTest + 1;
-			res = -1;
-		} else {
-			iSample = iTest;
-			iCol = n - 1;
-		}
-	} while (res && iMin < iSample);
-	i = iSample / nField;
-
-#ifdef SQL_DEBUG
-	/* The following assert statements check that the binary search code
-	 * above found the right answer. This block serves no purpose other
-	 * than to invoke the asserts.
-	 */
-	if (pParse->db->mallocFailed == 0) {
-		if (res == 0) {
-			/* If (res==0) is true, then pRec must be equal to sample i. */
-			assert(i < (int) sample_count);
-			assert(iCol == nField - 1);
-			pRec->nField = nField;
-			assert(0 ==
-			       sqlVdbeRecordCompareMsgpack(samples[i].sample_key,
-							       pRec)
-			       || pParse->db->mallocFailed);
-		} else {
-			/* Unless i==pIdx->nSample, indicating that pRec is larger than
-			 * all samples in the aSample[] array, pRec must be smaller than the
-			 * (iCol+1) field prefix of sample i.
-			 */
-			assert(i <= (int) sample_count && i >= 0);
-			pRec->nField = iCol + 1;
-			assert(i == (int) sample_count ||
-			       sqlVdbeRecordCompareMsgpack(samples[i].sample_key,
-							       pRec) > 0
-			       || pParse->db->mallocFailed);
-
-			/* if i==0 and iCol==0, then record pRec is smaller than all samples
-			 * in the aSample[] array. Otherwise, if (iCol>0) then pRec must
-			 * be greater than or equal to the (iCol) field prefix of sample i.
-			 * If (i>0), then pRec must also be greater than sample (i-1).
-			 */
-			if (iCol > 0) {
-				pRec->nField = iCol;
-				assert(sqlVdbeRecordCompareMsgpack
-				       (samples[i].sample_key, pRec) <= 0
-				       || pParse->db->mallocFailed);
-			}
-			if (i > 0) {
-				pRec->nField = nField;
-				assert(sqlVdbeRecordCompareMsgpack
-				       (samples[i - 1].sample_key, pRec) < 0 ||
-				       pParse->db->mallocFailed);
-			}
-		}
-	}
-#endif				/* ifdef SQL_DEBUG */
-
-	if (res == 0) {
-		/* Record pRec is equal to sample i */
-		assert(iCol == nField - 1);
-		aStat[0] = samples[i].lt[iCol];
-		aStat[1] = samples[i].eq[iCol];
-	} else {
-		/* At this point, the (iCol+1) field prefix of aSample[i] is the first
-		 * sample that is greater than pRec. Or, if i==pIdx->nSample then pRec
-		 * is larger than all samples in the array.
-		 */
-		tRowcnt iUpper, iGap;
-		if (i >= (int) sample_count) {
-			iUpper = sqlLogEstToInt(idx->def->opts.stat->tuple_log_est[0]);
-		} else {
-			iUpper = samples[i].lt[iCol];
-		}
-
-		if (iLower >= iUpper) {
-			iGap = 0;
-		} else {
-			iGap = iUpper - iLower;
-		}
-		if (roundUp) {
-			iGap = (iGap * 2) / 3;
-		} else {
-			iGap = iGap / 3;
-		}
-		aStat[0] = iLower + iGap;
-		aStat[1] = idx->def->opts.stat->avg_eq[iCol];
-	}
-
-	/* Restore the pRec->nField value before returning.  */
-	pRec->nField = nField;
-	return i;
 }
 
 /*
@@ -1191,125 +958,6 @@ whereRangeAdjust(WhereTerm * pTerm, LogEst nNew)
 		}
 	}
 	return nRet;
-}
-
-/*
- * This function is called to estimate the number of rows visited by a
- * range-scan on a skip-scan index. For example:
- *
- *   CREATE INDEX i1 ON t1(a, b, c);
- *   SELECT * FROM t1 WHERE a=? AND c BETWEEN ? AND ?;
- *
- * Value pLoop->nOut is currently set to the estimated number of rows
- * visited for scanning (a=? AND b=?). This function reduces that estimate
- * by some factor to account for the (c BETWEEN ? AND ?) expression based
- * on the stat4 data for the index. this scan will be peformed multiple
- * times (once for each (a,b) combination that matches a=?) is dealt with
- * by the caller.
- *
- * It does this by scanning through all stat4 samples, comparing values
- * extracted from pLower and pUpper with the corresponding column in each
- * sample. If L and U are the number of samples found to be less than or
- * equal to the values extracted from pLower and pUpper respectively, and
- * N is the total number of samples, the pLoop->nOut value is adjusted
- * as follows:
- *
- *   nOut = nOut * ( min(U - L, 1) / N )
- *
- * If pLower is NULL, or a value cannot be extracted from the term, L is
- * set to zero. If pUpper is NULL, or a value cannot be extracted from it,
- * U is set to N.
- *
- * Normally, this function sets *pbDone to 1 before returning. However,
- * if no value can be extracted from either pLower or pUpper (and so the
- * estimate of the number of rows delivered remains unchanged), *pbDone
- * is left as is.
- *
- * If an error occurs, an sql error code is returned. Otherwise,
- * 0.
- */
-static int
-whereRangeSkipScanEst(Parse * pParse,		/* Parsing & code generating context */
-		      WhereTerm * pLower,	/* Lower bound on the range. ex: "x>123" Might be NULL */
-		      WhereTerm * pUpper,	/* Upper bound on the range. ex: "x<455" Might be NULL */
-		      WhereLoop * pLoop,	/* Update the .nOut value of this loop */
-		      int *pbDone)		/* Set to true if at least one expr. value extracted */
-{
-	struct index_def *p = pLoop->index_def;
-	struct space *space = space_by_id(p->space_id);
-	assert(space != NULL);
-	struct index *index = space_index(space, p->iid);
-	assert(index != NULL && index->def->opts.stat != NULL);
-	int nEq = pLoop->nEq;
-	sql *db = pParse->db;
-	int nLower = -1;
-	int nUpper = index->def->opts.stat->sample_count + 1;
-	int rc = 0;
-	enum field_type type = p->key_def->parts[nEq].type;
-
-	sql_value *p1 = 0;	/* Value extracted from pLower */
-	sql_value *p2 = 0;	/* Value extracted from pUpper */
-	sql_value *pVal = 0;	/* Value extracted from record */
-
-	struct coll *coll = p->key_def->parts[nEq].coll;
-	if (pLower) {
-		rc = sqlStat4ValueFromExpr(pParse, pLower->pExpr->pRight,
-					       type, &p1);
-		nLower = 0;
-	}
-	if (pUpper != NULL && rc == 0) {
-		rc = sqlStat4ValueFromExpr(pParse, pUpper->pExpr->pRight,
-					       type, &p2);
-		nUpper = p2 ? 0 : index->def->opts.stat->sample_count;
-	}
-
-	if (p1 || p2) {
-		int i;
-		int nDiff;
-		struct index_sample *samples = index->def->opts.stat->samples;
-		uint32_t sample_count = index->def->opts.stat->sample_count;
-		for (i = 0; rc == 0 && i < (int) sample_count; i++) {
-			rc = sql_stat4_column(db, samples[i].sample_key, nEq,
-					      &pVal);
-			if (rc == 0 && p1 != NULL) {
-				if (mem_cmp_scalar(p1, pVal, coll) >= 0)
-					nLower++;
-			}
-			if (rc == 0 && p2 != NULL) {
-				if (mem_cmp_scalar(p2, pVal, coll) >= 0)
-					nUpper++;
-			}
-		}
-		nDiff = (nUpper - nLower);
-		if (nDiff <= 0)
-			nDiff = 1;
-
-		/* If there is both an upper and lower bound specified, and the
-		 * comparisons indicate that they are close together, use the fallback
-		 * method (assume that the scan visits 1/64 of the rows) for estimating
-		 * the number of rows visited. Otherwise, estimate the number of rows
-		 * using the method described in the header comment for this function.
-		 */
-		if (nDiff != 1 || pUpper == 0 || pLower == 0) {
-			int nAdjust =
-			    (sqlLogEst(sample_count) -
-			     sqlLogEst(nDiff));
-			pLoop->nOut -= nAdjust;
-			*pbDone = 1;
-			WHERETRACE(0x10,
-				   ("range skip-scan regions: %u..%u  adjust=%d est=%d\n",
-				    nLower, nUpper, nAdjust * -1, pLoop->nOut));
-		}
-
-	} else {
-		assert(*pbDone == 0);
-	}
-
-	sqlValueFree(p1);
-	sqlValueFree(p2);
-	sqlValueFree(pVal);
-
-	return rc;
 }
 
 /*
@@ -1353,177 +1001,12 @@ whereRangeSkipScanEst(Parse * pParse,		/* Parsing & code generating context */
  * rows visited by a factor of 64.
  */
 static int
-whereRangeScanEst(Parse * pParse,	/* Parsing & code generating context */
-		  WhereLoopBuilder * pBuilder, WhereTerm * pLower,	/* Lower bound on the range. ex: "x>123" Might be NULL */
-		  WhereTerm * pUpper,	/* Upper bound on the range. ex: "x<455" Might be NULL */
-		  WhereLoop * pLoop)	/* Modify the .nOut and maybe .rRun fields */
+whereRangeScanEst(struct WhereTerm *pLower, struct WhereTerm *pUpper,
+		  struct WhereLoop *pLoop)
 {
 	int rc = 0;
 	int nOut = pLoop->nOut;
 	LogEst nNew;
-
-	struct index_def *p = pLoop->index_def;
-	int nEq = pLoop->nEq;
-	struct space *space = space_by_id(p->space_id);
-	assert(space != NULL);
-	struct index *idx = space_index(space, p->iid);
-	assert(idx != NULL);
-	struct index_stat *stat = idx->def->opts.stat;
-	/*
-	 * Create surrogate stat in case ANALYZE command hasn't
-	 * been ran. Simply fill it with zeros.
-	 */
-	struct index_stat surrogate_stat;
-	memset(&surrogate_stat, 0, sizeof(surrogate_stat));
-	if (stat == NULL)
-		stat = &surrogate_stat;
-	if (stat->sample_count > 0 && nEq < (int) stat->sample_field_count) {
-		if (nEq == pBuilder->nRecValid) {
-			UnpackedRecord *pRec = pBuilder->pRec;
-			tRowcnt a[2];
-			int nBtm = pLoop->nBtm;
-			int nTop = pLoop->nTop;
-
-			/* Variable iLower will be set to the estimate of the number of rows in
-			 * the index that are less than the lower bound of the range query. The
-			 * lower bound being the concatenation of $P and $L, where $P is the
-			 * key-prefix formed by the nEq values matched against the nEq left-most
-			 * columns of the index, and $L is the value in pLower.
-			 *
-			 * Or, if pLower is NULL or $L cannot be extracted from it (because it
-			 * is not a simple variable or literal value), the lower bound of the
-			 * range is $P. Due to a quirk in the way whereKeyStats() works, even
-			 * if $L is available, whereKeyStats() is called for both ($P) and
-			 * ($P:$L) and the larger of the two returned values is used.
-			 *
-			 * Similarly, iUpper is to be set to the estimate of the number of rows
-			 * less than the upper bound of the range query. Where the upper bound
-			 * is either ($P) or ($P:$U). Again, even if $U is available, both values
-			 * of iUpper are requested of whereKeyStats() and the smaller used.
-			 *
-			 * The number of rows between the two bounds is then just iUpper-iLower.
-			 */
-			tRowcnt iLower;	/* Rows less than the lower bound */
-			tRowcnt iUpper;	/* Rows less than the upper bound */
-			int iLwrIdx = -2;	/* aSample[] for the lower bound */
-			int iUprIdx = -1;	/* aSample[] for the upper bound */
-
-			if (pRec) {
-				testcase(pRec->nField != pBuilder->nRecValid);
-				pRec->nField = pBuilder->nRecValid;
-			}
-			/* Determine iLower and iUpper using ($P) only. */
-			if (nEq == 0) {
-				/*
-				 * In this simple case, there are no any
-				 * equality constraints, so initially all rows
-				 * are in range.
-				 */
-				iLower = 0;
-				iUpper = index_size(idx);
-			} else {
-				/* Note: this call could be optimized away - since the same values must
-				 * have been requested when testing key $P in whereEqualScanEst().
-				 */
-				whereKeyStats(pParse, p, pRec, 0, a);
-				iLower = a[0];
-				iUpper = a[0] + a[1];
-			}
-
-			assert(pLower == 0
-			       || (pLower->eOperator & (WO_GT | WO_GE)) != 0);
-			assert(pUpper == 0
-			       || (pUpper->eOperator & (WO_LT | WO_LE)) != 0);
-			if (p->key_def->parts[nEq].sort_order !=
-			    SORT_ORDER_ASC) {
-				/* The roles of pLower and pUpper are swapped for a DESC index */
-				SWAP(pLower, pUpper);
-				SWAP(nBtm, nTop);
-			}
-
-			/* If possible, improve on the iLower estimate using ($P:$L). */
-			if (pLower) {
-				int n;	/* Values extracted from pExpr */
-				Expr *pExpr = pLower->pExpr->pRight;
-				rc = sqlStat4ProbeSetValue(pParse, p, &pRec,
-							       pExpr, nBtm, nEq,
-							       &n);
-				if (rc == 0 && n != 0) {
-					tRowcnt iNew;
-					u16 mask = WO_GT | WO_LE;
-					if (sqlExprVectorSize(pExpr) > n)
-						mask = (WO_LE | WO_LT);
-					iLwrIdx =
-					    whereKeyStats(pParse, p, pRec, 0,
-							  a);
-					iNew =
-					    a[0] +
-					    ((pLower->
-					      eOperator & mask) ? a[1] : 0);
-					if (iNew > iLower)
-						iLower = iNew;
-					nOut--;
-					pLower = 0;
-				}
-			}
-
-			/* If possible, improve on the iUpper estimate using ($P:$U). */
-			if (pUpper) {
-				int n;	/* Values extracted from pExpr */
-				Expr *pExpr = pUpper->pExpr->pRight;
-				rc = sqlStat4ProbeSetValue(pParse, p, &pRec,
-							       pExpr, nTop, nEq,
-							       &n);
-				if (rc == 0 && n != 0) {
-					tRowcnt iNew;
-					u16 mask = WO_GT | WO_LE;
-					if (sqlExprVectorSize(pExpr) > n)
-						mask = (WO_LE | WO_LT);
-					iUprIdx =
-					    whereKeyStats(pParse, p, pRec, 1,
-							  a);
-					iNew =
-					    a[0] +
-					    ((pUpper->
-					      eOperator & mask) ? a[1] : 0);
-					if (iNew < iUpper)
-						iUpper = iNew;
-					nOut--;
-					pUpper = 0;
-				}
-			}
-
-			pBuilder->pRec = pRec;
-			if (rc == 0) {
-				if (iUpper > iLower) {
-					nNew = sqlLogEst(iUpper - iLower);
-					/* TUNING:  If both iUpper and iLower are derived from the same
-					 * sample, then assume they are 4x more selective.  This brings
-					 * the estimated selectivity more in line with what it would be
-					 * if estimated without the use of STAT4 table.
-					 */
-					if (iLwrIdx == iUprIdx)
-						nNew -= 20;
-					assert(20 == sqlLogEst(4));
-				} else {
-					nNew = 10;
-					assert(10 == sqlLogEst(2));
-				}
-				if (nNew < nOut) {
-					nOut = nNew;
-				}
-				WHERETRACE(0x10,
-					   ("STAT4 range scan: %u..%u  est=%d\n",
-					    (u32) iLower, (u32) iUpper, nOut));
-			}
-		} else {
-			int bDone = 0;
-			rc = whereRangeSkipScanEst(pParse, pLower, pUpper,
-						   pLoop, &bDone);
-			if (bDone)
-				return rc;
-		}
-	}
 	assert(pUpper == 0 || (pUpper->wtFlags & TERM_VNULL) == 0);
 	nNew = whereRangeAdjust(pLower, nOut);
 	nNew = whereRangeAdjust(pUpper, nNew);
@@ -1551,102 +1034,6 @@ whereRangeScanEst(Parse * pParse,	/* Parsing & code generating context */
 	}
 #endif
 	pLoop->nOut = (LogEst) nOut;
-	return rc;
-}
-
-/*
- * Estimate the number of rows that will be returned based on
- * an equality constraint x=VALUE and where that VALUE occurs in
- * the histogram data.  This only works when x is the left-most
- * column of an index and sql_stat4 histogram data is available
- * for that index.  When pExpr==NULL that means the constraint is
- * "x IS NULL" instead of "x=VALUE".
- *
- * Write the estimated row count into *pnRow and return 0.
- * If unable to make an estimate, leave *pnRow unchanged and return
- * non-zero.
- *
- * This routine can fail if it is unable to load a collating sequence
- * required for string comparison, or if unable to allocate memory
- * for a UTF conversion required for comparison.  The error is stored
- * in the pParse structure.
- */
-static int
-whereEqualScanEst(Parse * pParse,	/* Parsing & code generating context */
-		  WhereLoopBuilder * pBuilder, Expr * pExpr,	/* Expression for VALUE in the x=VALUE constraint */
-		  tRowcnt * pnRow)	/* Write the revised row estimate here */
-{
-	struct index_def *p = pBuilder->pNew->index_def;
-	int nEq = pBuilder->pNew->nEq;
-	UnpackedRecord *pRec = pBuilder->pRec;
-	int rc;			/* Subfunction return code */
-	tRowcnt a[2];		/* Statistics */
-	int bOk;
-
-	assert(nEq >= 1);
-	assert(nEq <= (int) p->key_def->part_count);
-	assert(pBuilder->nRecValid == (nEq - 1));
-
-	rc = sqlStat4ProbeSetValue(pParse, p, &pRec, pExpr, 1, nEq - 1,
-				       &bOk);
-	pBuilder->pRec = pRec;
-	if (rc != 0)
-		return rc;
-	assert(bOk != 0);
-	pBuilder->nRecValid = nEq;
-
-	whereKeyStats(pParse, p, pRec, 0, a);
-	WHERETRACE(0x10, ("equality scan regions %s(%d): %d\n", p->name,
-		   nEq - 1, (int)a[1]));
-	*pnRow = a[1];
-
-	return rc;
-}
-
-/*
- * Estimate the number of rows that will be returned based on
- * an IN constraint where the right-hand side of the IN operator
- * is a list of values.  Example:
- *
- *        WHERE x IN (1,2,3,4)
- *
- * Write the estimated row count into *pnRow and return 0.
- * If unable to make an estimate, leave *pnRow unchanged and return
- * non-zero.
- *
- * This routine can fail if it is unable to load a collating sequence
- * required for string comparison, or if unable to allocate memory
- * for a UTF conversion required for comparison.  The error is stored
- * in the pParse structure.
- */
-static int
-whereInScanEst(Parse * pParse,	/* Parsing & code generating context */
-	       WhereLoopBuilder * pBuilder, ExprList * pList,	/* The value list on the RHS of "x IN (v1,v2,v3,...)" */
-	       tRowcnt * pnRow)	/* Write the revised row estimate here */
-{
-	struct index_def *p = pBuilder->pNew->index_def;
-	i64 nRow0 = sqlLogEstToInt(index_field_tuple_est(p, 0));
-	int nRecValid = pBuilder->nRecValid;
-	int rc = 0;	/* Subfunction return code */
-	tRowcnt nEst;		/* Number of rows for a single term */
-	tRowcnt nRowEst = 0;	/* New estimate of the number of rows */
-	int i;			/* Loop counter */
-
-	for (i = 0; rc == 0 && i < pList->nExpr; i++) {
-		nEst = nRow0;
-		rc = whereEqualScanEst(pParse, pBuilder, pList->a[i].pExpr,
-				       &nEst);
-		nRowEst += nEst;
-		pBuilder->nRecValid = nRecValid;
-	}
-
-	if (rc == 0) {
-		if (nRowEst > nRow0)
-			nRowEst = nRow0;
-		*pnRow = nRowEst;
-		WHERETRACE(0x10, ("IN row estimate: est=%d\n", nRowEst));
-	}
-	assert(pBuilder->nRecValid == nRecValid);
 	return rc;
 }
 
@@ -1780,49 +1167,37 @@ whereLoopClearUnion(WhereLoop * p)
  * Deallocate internal memory used by a WhereLoop object
  */
 static void
-whereLoopClear(sql * db, WhereLoop * p)
+whereLoopClear(struct WhereLoop *p)
 {
 	if (p->aLTerm != p->aLTermSpace)
-		sqlDbFree(db, p->aLTerm);
+		sql_xfree(p->aLTerm);
 	whereLoopClearUnion(p);
 	whereLoopInit(p);
 }
 
-/*
- * Increase the memory allocation for pLoop->aLTerm[] to be at least n.
- */
-static int
-whereLoopResize(sql * db, WhereLoop * p, int n)
+static void
+whereLoopResize(struct WhereLoop *p, int n)
 {
 	WhereTerm **paNew;
 	if (p->nLSlot >= n)
-		return 0;
+		return;
 	n = (n + 7) & ~7;
-	paNew = sqlDbMallocRawNN(db, sizeof(p->aLTerm[0]) * n);
-	if (paNew == 0)
-		return -1;
+	paNew = sql_xmalloc(sizeof(p->aLTerm[0]) * n);
 	memcpy(paNew, p->aLTerm, sizeof(p->aLTerm[0]) * p->nLSlot);
 	if (p->aLTerm != p->aLTermSpace)
-		sqlDbFree(db, p->aLTerm);
+		sql_xfree(p->aLTerm);
 	p->aLTerm = paNew;
 	p->nLSlot = n;
-	return 0;
 }
 
 /*
  * Transfer content from the second pLoop into the first.
  */
 static int
-whereLoopXfer(sql * db, WhereLoop * pTo, WhereLoop * pFrom)
+whereLoopXfer(struct WhereLoop *pTo, struct WhereLoop *pFrom)
 {
 	whereLoopClearUnion(pTo);
-	if (whereLoopResize(db, pTo, pFrom->nLTerm)) {
-		pTo->nEq = 0;
-		pTo->nBtm = 0;
-		pTo->nTop = 0;
-		pTo->index_def = NULL;
-		return -1;
-	}
+	whereLoopResize(pTo, pFrom->nLTerm);
 	memcpy(pTo, pFrom, WHERE_LOOP_XFER_SZ);
 	memcpy(pTo->aLTerm, pFrom->aLTerm,
 	       pTo->nLTerm * sizeof(pTo->aLTerm[0]));
@@ -1835,17 +1210,14 @@ whereLoopXfer(sql * db, WhereLoop * pTo, WhereLoop * pFrom)
  * Delete a WhereLoop object
  */
 static void
-whereLoopDelete(sql * db, WhereLoop * p)
+whereLoopDelete(struct WhereLoop *p)
 {
-	whereLoopClear(db, p);
-	sqlDbFree(db, p);
+	whereLoopClear(p);
+	sql_xfree(p);
 }
 
-/*
- * Free a WhereInfo structure
- */
-static void
-whereInfoFree(sql * db, WhereInfo * pWInfo)
+void
+whereInfoFree(struct WhereInfo *pWInfo)
 {
 	if (ALWAYS(pWInfo)) {
 		int i;
@@ -1853,16 +1225,16 @@ whereInfoFree(sql * db, WhereInfo * pWInfo)
 			WhereLevel *pLevel = &pWInfo->a[i];
 			if (pLevel->pWLoop
 			    && (pLevel->pWLoop->wsFlags & WHERE_IN_ABLE)) {
-				sqlDbFree(db, pLevel->u.in.aInLoop);
+				sql_xfree(pLevel->u.in.aInLoop);
 			}
 		}
 		sqlWhereClauseClear(&pWInfo->sWC);
 		while (pWInfo->pLoops) {
 			WhereLoop *p = pWInfo->pLoops;
 			pWInfo->pLoops = p->pNextLoop;
-			whereLoopDelete(db, p);
+			whereLoopDelete(p);
 		}
-		sqlDbFree(db, pWInfo);
+		sql_xfree(pWInfo);
 	}
 }
 
@@ -2074,7 +1446,6 @@ whereLoopInsert(WhereLoopBuilder * pBuilder, WhereLoop * pTemplate)
 {
 	WhereLoop **ppPrev, *p;
 	WhereInfo *pWInfo = pBuilder->pWInfo;
-	sql *db = pWInfo->pParse->db;
 	int rc;
 
 	/* If pBuilder->pOrSet is defined, then only keep track of the costs
@@ -2136,9 +1507,8 @@ whereLoopInsert(WhereLoopBuilder * pBuilder, WhereLoop * pTemplate)
 #endif
 	if (p == 0) {
 		/* Allocate a new WhereLoop to add to the end of the list */
-		*ppPrev = p = sqlDbMallocRawNN(db, sizeof(WhereLoop));
-		if (p == 0)
-			return -1;
+		p = sql_xmalloc(sizeof(struct WhereLoop));
+		*ppPrev = p;
 		whereLoopInit(p);
 		p->pNextLoop = 0;
 	} else {
@@ -2162,10 +1532,10 @@ whereLoopInsert(WhereLoopBuilder * pBuilder, WhereLoop * pTemplate)
 				whereLoopPrint(pToDel, pBuilder->pWC);
 			}
 #endif
-			whereLoopDelete(db, pToDel);
+			whereLoopDelete(pToDel);
 		}
 	}
-	rc = whereLoopXfer(db, p, pTemplate);
+	rc = whereLoopXfer(p, pTemplate);
 	struct index_def *idx = p->index_def;
 	if (idx != NULL && idx->space_id == 0)
 		p->index_def = NULL;
@@ -2346,7 +1716,6 @@ whereLoopAddBtreeIndex(WhereLoopBuilder * pBuilder,	/* The WhereLoop factory */
 {
 	WhereInfo *pWInfo = pBuilder->pWInfo;	/* WHERE analyse context */
 	Parse *pParse = pWInfo->pParse;	/* Parsing context */
-	sql *db = pParse->db;	/* Database connection malloc context */
 	WhereLoop *pNew;	/* Template WhereLoop under construction */
 	WhereTerm *pTerm;	/* A WhereTerm under consideration */
 	int opMask;		/* Valid operators for constraints */
@@ -2366,8 +1735,6 @@ whereLoopAddBtreeIndex(WhereLoopBuilder * pBuilder,	/* The WhereLoop factory */
 	uint32_t probe_part_count = probe->key_def->part_count;
 
 	pNew = pBuilder->pNew;
-	if (db->mallocFailed)
-		return -1;
 	WHERETRACE(0x800, ("BEGIN addBtreeIdx(%s), nEq=%d\n",
 			   probe->name, pNew->nEq));
 
@@ -2380,22 +1747,6 @@ whereLoopAddBtreeIndex(WhereLoopBuilder * pBuilder,	/* The WhereLoop factory */
 		    WO_EQ | WO_IN | WO_GT | WO_GE | WO_LT | WO_LE | WO_ISNULL;
 	}
 	struct space *space = space_by_id(probe->space_id);
-	struct index_stat *stat = NULL;
-	if (space != NULL && probe->iid != UINT32_MAX) {
-		struct index *idx = space_index(space, probe->iid);
-		assert(idx != NULL);
-		stat = idx->def->opts.stat;
-	}
-	/*
-	 * Create surrogate stat in case ANALYZE command hasn't
-	 * been ran. Simply fill it with zeros.
-	 */
-	struct index_stat surrogate_stat;
-	memset(&surrogate_stat, 0, sizeof(surrogate_stat));
-	if (stat == NULL)
-		stat = &surrogate_stat;
-	if (stat->is_unordered)
-		opMask &= ~(WO_GT | WO_GE | WO_LT | WO_LE);
 	assert(pNew->nEq < probe_part_count);
 
 	saved_nEq = pNew->nEq;
@@ -2442,7 +1793,6 @@ whereLoopAddBtreeIndex(WhereLoopBuilder * pBuilder,	/* The WhereLoop factory */
 		if ((pSrc->fg.jointype & JT_LEFT) != 0
 		    && !ExprHasProperty(pTerm->pExpr, EP_FromJoin)
 		    && (eOp & WO_ISNULL) != 0) {
-			testcase(eOp & WO_ISNULL);
 			continue;
 		}
 
@@ -2451,8 +1801,7 @@ whereLoopAddBtreeIndex(WhereLoopBuilder * pBuilder,	/* The WhereLoop factory */
 		pNew->nBtm = saved_nBtm;
 		pNew->nTop = saved_nTop;
 		pNew->nLTerm = saved_nLTerm;
-		if (whereLoopResize(db, pNew, pNew->nLTerm + 1))
-			break;	/* OOM */
+		whereLoopResize(pNew, pNew->nLTerm + 1);
 		pNew->aLTerm[pNew->nLTerm++] = pTerm;
 		pNew->prereq =
 		    (saved_prereq | pTerm->prereqRight) & ~pNew->maskSelf;
@@ -2510,8 +1859,6 @@ whereLoopAddBtreeIndex(WhereLoopBuilder * pBuilder,	/* The WhereLoop factory */
 		} else if (eOp & WO_ISNULL) {
 			pNew->wsFlags |= WHERE_COLUMN_NULL;
 		} else if (eOp & (WO_GT | WO_GE)) {
-			testcase(eOp & WO_GT);
-			testcase(eOp & WO_GE);
 			pNew->wsFlags |= WHERE_COLUMN_RANGE | WHERE_BTM_LIMIT;
 			pNew->nBtm =
 			    whereRangeVectorLen(pParse, pSrc->iCursor, probe,
@@ -2527,16 +1874,13 @@ whereLoopAddBtreeIndex(WhereLoopBuilder * pBuilder,	/* The WhereLoop factory */
 				       pTerm->pWC->nTerm);
 				assert(pTop->wtFlags & TERM_LIKEOPT);
 				assert(pTop->eOperator == WO_LT);
-				if (whereLoopResize(db, pNew, pNew->nLTerm + 1))
-					break;	/* OOM */
+				whereLoopResize(pNew, pNew->nLTerm + 1);
 				pNew->aLTerm[pNew->nLTerm++] = pTop;
 				pNew->wsFlags |= WHERE_TOP_LIMIT;
 				pNew->nTop = 1;
 			}
 		} else {
 			assert(eOp & (WO_LT | WO_LE));
-			testcase(eOp & WO_LT);
-			testcase(eOp & WO_LE);
 			pNew->wsFlags |= WHERE_COLUMN_RANGE | WHERE_TOP_LIMIT;
 			pNew->nTop =
 			    whereRangeVectorLen(pParse, pSrc->iCursor, probe,
@@ -2557,7 +1901,7 @@ whereLoopAddBtreeIndex(WhereLoopBuilder * pBuilder,	/* The WhereLoop factory */
 			/* Adjust nOut using stat4 data. Or, if there is no stat4
 			 * data, using some other estimate.
 			 */
-			whereRangeScanEst(pParse, pBuilder, pBtm, pTop, pNew);
+			whereRangeScanEst(pBtm, pTop, pNew);
 		} else {
 			int nEq = ++pNew->nEq;
 			assert(eOp & (WO_ISNULL | WO_EQ | WO_IN));
@@ -2565,54 +1909,20 @@ whereLoopAddBtreeIndex(WhereLoopBuilder * pBuilder,	/* The WhereLoop factory */
 			assert(pNew->nOut == saved_nOut);
 			if (pTerm->truthProb <= 0 && probe->space_id != 0) {
 				assert((eOp & WO_IN) || nIn == 0);
-				testcase(eOp & WO_IN);
 				pNew->nOut += pTerm->truthProb;
 				pNew->nOut -= nIn;
 			} else {
-				tRowcnt nOut = 0;
-				if (nInMul == 0
-				    && stat->sample_count
-				    && pNew->nEq <= stat->sample_field_count
-				    && ((eOp & WO_IN) == 0
-					|| !ExprHasProperty(pTerm->pExpr,
-							    EP_xIsSelect))
-				    ) {
-					Expr *pExpr = pTerm->pExpr;
-					if ((eOp & (WO_EQ | WO_ISNULL))
-					    != 0) {
-						testcase(eOp & WO_EQ);
-						testcase(eOp & WO_ISNULL);
-						rc = whereEqualScanEst(pParse,
-								       pBuilder,
-								       pExpr->pRight,
-								       &nOut);
-					} else {
-						rc = whereInScanEst(pParse,
-								    pBuilder,
-								    pExpr->x.pList,
-								    &nOut);
-					}
-					if (rc != 0)
-						break;	/* Jump out of the pTerm loop */
-					if (nOut) {
-						pNew->nOut =
-						    sqlLogEst(nOut);
-						if (pNew->nOut > saved_nOut)
-							pNew->nOut = saved_nOut;
-						pNew->nOut -= nIn;
-					}
-				}
-				if (nOut == 0) {
-					pNew->nOut +=
-						(index_field_tuple_est(probe, nEq) -
-						 index_field_tuple_est(probe, nEq -1));
-					if (eOp & WO_ISNULL) {
-						/* TUNING: If there is no likelihood() value, assume that a
-						 * "col IS NULL" expression matches twice as many rows
-						 * as (col=?).
-						 */
-						pNew->nOut += 10;
-					}
+				pNew->nOut +=
+					(index_field_tuple_est(probe, nEq) -
+					 index_field_tuple_est(probe, nEq - 1));
+				if ((eOp & WO_ISNULL) != 0) {
+					/*
+					 * TUNING: If there is no likelihood()
+					 * value, assume that a "col IS NULL"
+					 * expression matches twice as many rows
+					 * as (col=?).
+					 */
+					pNew->nOut += 10;
 				}
 			}
 		}
@@ -2686,29 +1996,6 @@ whereLoopAddBtreeIndex(WhereLoopBuilder * pBuilder,	/* The WhereLoop factory */
 	 * more expensive.
 	 */
 	assert(42 == sqlLogEst(18));
-	if (saved_nEq == saved_nSkip && saved_nEq + 1U < probe_part_count &&
-	    stat->skip_scan_enabled == true &&
-	    /* TUNING: Minimum for skip-scan */
-	    index_field_tuple_est(probe, saved_nEq + 1) >= 42 &&
-	    (rc = whereLoopResize(db, pNew, pNew->nLTerm + 1)) == 0) {
-		LogEst nIter;
-		pNew->nEq++;
-		pNew->nSkip++;
-		pNew->aLTerm[pNew->nLTerm++] = 0;
-		pNew->wsFlags |= WHERE_SKIPSCAN;
-		nIter = index_field_tuple_est(probe, saved_nEq) -
-			index_field_tuple_est(probe, saved_nEq + 1);
-		pNew->nOut -= nIter;
-		/* TUNING:  Because uncertainties in the estimates for skip-scan queries,
-		 * add a 1.375 fudge factor to make skip-scan slightly less likely.
-		 */
-		nIter += 5;
-		whereLoopAddBtreeIndex(pBuilder, pSrc, probe, nIter + nInMul);
-		pNew->nOut = saved_nOut;
-		pNew->nEq = saved_nEq;
-		pNew->nSkip = saved_nSkip;
-		pNew->wsFlags = saved_wsFlags;
-	}
 
 	WHERETRACE(0x800, ("END addBtreeIdx(%s), nEq=%d, rc=%d\n",
 			   probe->name, saved_nEq, rc));
@@ -2730,8 +2017,6 @@ indexMightHelpWithOrderBy(WhereLoopBuilder * pBuilder,
 	ExprList *pOB;
 	int ii, jj;
 	int part_count = idx_def->key_def->part_count;
-	if (idx_def->opts.stat != NULL && idx_def->opts.stat->is_unordered)
-		return 0;
 	if ((pOB = pBuilder->pWInfo->pOrderBy) == 0)
 		return 0;
 	for (ii = 0; ii < pOB->nExpr; ii++) {
@@ -2835,35 +2120,22 @@ whereLoopAddBtree(WhereLoopBuilder * pBuilder,	/* WHERE clause information */
 		part.path = NULL;
 		part.exclude_null = false;
 
-		struct key_def *key_def = key_def_new(&part, 1, false);
+		struct key_def *key_def = key_def_new(&part, 1, 0);
 		if (key_def == NULL) {
-tnt_error:
 			pWInfo->pParse->is_aborted = true;
 			return -1;
 		}
 
 		struct index_opts opts;
 		index_opts_create(&opts);
-		fake_index = index_def_new(space->def->id, 0,"fake_autoindex",
+		fake_index = index_def_new(space->def->id, 0, "fake_autoindex",
 					   sizeof("fake_autoindex") - 1,
+					   space->def->name,
+					   space->def->engine_name,
 					   TREE, &opts, key_def, NULL);
 		key_def_delete(key_def);
-		if (fake_index == NULL)
-			goto tnt_error;
 		/* Special marker for  non-existent index. */
 		fake_index->iid = UINT32_MAX;
-		int size = sizeof(struct index_stat) + sizeof(log_est_t) * 2;
-
-		struct index_stat *stat = (struct index_stat *) calloc(1, size);
-		if (stat == NULL) {
-			diag_set(OutOfMemory, size, "calloc", "stat");
-			goto tnt_error;
-		}
-		stat->tuple_log_est = (log_est_t *) ((char *) (stat + 1));
-		stat->tuple_log_est[0] = sql_space_tuple_log_count(pSrc->space);
-		stat->tuple_log_est[1] = 0;
-		fake_index->opts.stat = stat;
-
 		probe = fake_index;
 	}
 
@@ -3131,7 +2403,6 @@ whereLoopAddAll(WhereLoopBuilder * pBuilder)
 	SrcList *pTabList = pWInfo->pTabList;
 	struct SrcList_item *pItem;
 	struct SrcList_item *pEnd = &pTabList->a[pWInfo->nLevel];
-	sql *db = pWInfo->pParse->db;
 	int rc = 0;
 	WhereLoop *pNew;
 	u8 priorJointype = 0;
@@ -3158,11 +2429,11 @@ whereLoopAddAll(WhereLoopBuilder * pBuilder)
 		if (rc == 0)
 			rc = whereLoopAddOr(pBuilder, mPrereq, mUnusable);
 		mPrior |= pNew->maskSelf;
-		if (rc || db->mallocFailed)
+		if (rc != 0)
 			break;
 	}
 
-	whereLoopClear(db, pNew);
+	whereLoopClear(pNew);
 	return rc;
 }
 
@@ -3209,7 +2480,6 @@ wherePathSatisfiesOrderBy(WhereInfo * pWInfo,	/* The WHERE clause */
 	WhereTerm *pTerm;	/* A single term of the WHERE clause */
 	Expr *pOBExpr;		/* An expression from the ORDER BY clause */
 	struct index_def *idx_def;
-	sql *db = pWInfo->pParse->db;	/* Database connection */
 	Bitmask obSat = 0;	/* Mask of ORDER BY terms satisfied so far */
 	Bitmask obDone;		/* Mask of all ORDER BY terms */
 	Bitmask orderDistinctMask;	/* Mask of all well-ordered loops */
@@ -3234,11 +2504,10 @@ wherePathSatisfiesOrderBy(WhereInfo * pWInfo,	/* The WHERE clause */
 	 */
 
 	assert(pOrderBy != 0);
-	if (nLoop && OptimizationDisabled(db, SQL_OrderByIdxJoin))
+	if (nLoop && OptimizationDisabled(SQL_OrderByIdxJoin))
 		return 0;
 
 	nOrderBy = pOrderBy->nExpr;
-	testcase(nOrderBy == BMS - 1);
 	if (nOrderBy > BMS - 1)
 		return 0;	/* Cannot optimize overly large ORDER BYs */
 	isOrderDistinct = 1;
@@ -3317,11 +2586,10 @@ wherePathSatisfiesOrderBy(WhereInfo * pWInfo,	/* The WHERE clause */
 			if (pLoop->wsFlags & WHERE_IPK) {
 				idx_def = NULL;
 				nColumn = 1;
-			} else if ((idx_def = pLoop->index_def) == NULL ||
-				   (idx_def->opts.stat != NULL &&
-				    idx_def->opts.stat->is_unordered)) {
+			} else if (pLoop->index_def == NULL) {
 				return 0;
 			} else {
+				idx_def = pLoop->index_def;
 				nColumn = idx_def->key_def->part_count;
 				isOrderDistinct = idx_def->opts.is_unique;
 			}
@@ -3351,7 +2619,6 @@ wherePathSatisfiesOrderBy(WhereInfo * pWInfo,	/* The WHERE clause */
 					 */
 					if ((eOp & eqOpMask) != 0) {
 						if (eOp & WO_ISNULL) {
-							testcase(isOrderDistinct);
 							isOrderDistinct = 0;
 						}
 						continue;
@@ -3413,8 +2680,6 @@ wherePathSatisfiesOrderBy(WhereInfo * pWInfo,	/* The WHERE clause */
 						continue;
 					pOBExpr =
 					    sqlExprSkipCollate(pOrderBy-> a[i].pExpr);
-					testcase(wctrlFlags & WHERE_GROUPBY);
-					testcase(wctrlFlags & WHERE_DISTINCTBY);
 					if ((wctrlFlags & (WHERE_GROUPBY | WHERE_DISTINCTBY)) == 0)
 						bOnce = 0;
 					if (iColumn >= (-1)) {
@@ -3466,14 +2731,12 @@ wherePathSatisfiesOrderBy(WhereInfo * pWInfo,	/* The WHERE clause */
 				} else {
 					/* No match found */
 					if (j == 0 || j < nColumn) {
-						testcase(isOrderDistinct != 0);
 						isOrderDistinct = 0;
 					}
 					break;
 				}
 			}	/* end Loop over all index columns */
 			if (distinctColumns) {
-				testcase(isOrderDistinct == 0);
 				isOrderDistinct = 1;
 			}
 		}
@@ -3615,7 +2878,6 @@ wherePathSolver(WhereInfo * pWInfo, LogEst nRowEst)
 	int mxChoice;		/* Maximum number of simultaneous paths tracked */
 	int nLoop;		/* Number of terms in the join */
 	Parse *pParse;		/* Parsing context */
-	sql *db;		/* The database connection */
 	int iLoop;		/* Loop counter over the terms of the join */
 	int ii, jj;		/* Loop counters */
 	int mxI = 0;		/* Index of next entry to replace */
@@ -3634,7 +2896,6 @@ wherePathSolver(WhereInfo * pWInfo, LogEst nRowEst)
 	int nSpace;		/* Bytes of space allocated at pSpace */
 
 	pParse = pWInfo->pParse;
-	db = pParse->db;
 	nLoop = pWInfo->nLevel;
 	/* TUNING: For simple queries, only the best path is tracked.
 	 * For 2-way joins, the 5 best paths are followed.
@@ -3660,9 +2921,7 @@ wherePathSolver(WhereInfo * pWInfo, LogEst nRowEst)
 	nSpace =
 	    (sizeof(WherePath) + sizeof(WhereLoop *) * nLoop) * mxChoice * 2;
 	nSpace += sizeof(LogEst) * nOrderBy;
-	pSpace = sqlDbMallocRawNN(db, nSpace);
-	if (pSpace == 0)
-		return -1;
+	pSpace = sql_xmalloc(nSpace);
 	aTo = (WherePath *) pSpace;
 	aFrom = aTo + mxChoice;
 	memset(aFrom, 0, sizeof(aFrom[0]));
@@ -3795,7 +3054,6 @@ wherePathSolver(WhereInfo * pWInfo, LogEst nRowEst)
 					if (pTo->maskLoop == maskNew
 					    && ((pTo->isOrdered ^ isOrdered) &
 						0x80) == 0) {
-						testcase(jj == nTo - 1);
 						break;
 					}
 				}
@@ -3871,10 +3129,8 @@ wherePathSolver(WhereInfo * pWInfo, LogEst nRowEst)
 						}
 #endif
 						/* Discard the candidate path from further consideration */
-						testcase(pTo->rCost == rCost);
 						continue;
 					}
-					testcase(pTo->rCost == rCost + 1);
 					/* Control reaches here if the candidate path is better than the
 					 * pTo path.  Replace pTo with the candidate.
 					 */
@@ -4007,9 +3263,6 @@ wherePathSolver(WhereInfo * pWInfo, LogEst nRowEst)
 						     nLoop - 1,
 						     pFrom->aLoop[nLoop - 1],
 						     &m);
-						testcase(wsFlags & WHERE_IPK);
-						testcase(wsFlags &
-							 WHERE_COLUMN_IN);
 						if (rc ==
 						    pWInfo->pOrderBy->nExpr) {
 							pWInfo->
@@ -4040,7 +3293,7 @@ wherePathSolver(WhereInfo * pWInfo, LogEst nRowEst)
 	pWInfo->nRowOut = pFrom->nRow;
 
 	/* Free temporary memory and return success */
-	sqlDbFree(db, pSpace);
+	sql_xfree(pSpace);
 	return 0;
 }
 
@@ -4072,7 +3325,6 @@ where_loop_assign_terms(struct WhereLoop *loop, struct WhereClause *where,
 					       idx_def->key_def : NULL);
 		if (term == NULL)
 			break;
-		testcase(pTerm->eOperator & WO_IS);
 		loop->aLTerm[i] = term;
 	}
 	if (i != column_count)
@@ -4278,7 +3530,6 @@ sqlWhereBegin(Parse * pParse,	/* The parser context */
 	WhereLevel *pLevel;	/* A single level in pWInfo->a[] */
 	WhereLoop *pLoop;	/* Pointer to a single WhereLoop object */
 	int ii;			/* Loop counter */
-	sql *db;		/* Database connection */
 	int rc;			/* Return code */
 	u8 bFordelete = 0;	/* OPFLAG_FORDELETE or zero, as appropriate */
 
@@ -4300,11 +3551,9 @@ sqlWhereBegin(Parse * pParse,	/* The parser context */
 	       || (wctrlFlags & WHERE_USE_LIMIT) == 0);
 
 	/* Variable initialization */
-	db = pParse->db;
 	memset(&sWLB, 0, sizeof(sWLB));
 
 	/* An ORDER/GROUP BY clause of more than 63 terms cannot be optimized */
-	testcase(pOrderBy && pOrderBy->nExpr == BMS - 1);
 	if (pOrderBy && pOrderBy->nExpr >= BMS)
 		pOrderBy = 0;
 	sWLB.pOrderBy = pOrderBy;
@@ -4312,14 +3561,13 @@ sqlWhereBegin(Parse * pParse,	/* The parser context */
 	/* Disable the DISTINCT optimization if SQL_DistinctOpt is set via
 	 * sql_test_ctrl(SQL_TESTCTRL_OPTIMIZATIONS,...)
 	 */
-	if (OptimizationDisabled(db, SQL_DistinctOpt)) {
+	if (OptimizationDisabled(SQL_DistinctOpt)) {
 		wctrlFlags &= ~WHERE_WANT_DISTINCT;
 	}
 
 	/* The number of tables in the FROM clause is limited by the number of
 	 * bits in a Bitmask
 	 */
-	testcase(pTabList->nSrc == BMS);
 	if (pTabList->nSrc > BMS) {
 		diag_set(ClientError, ER_SQL_PARSER_LIMIT, "The number of "\
 			 "tables in a join", pTabList->nSrc, BMS);
@@ -4343,12 +3591,7 @@ sqlWhereBegin(Parse * pParse,	/* The parser context */
 	 */
 	nByteWInfo =
 	    ROUND8(sizeof(WhereInfo) + (nTabList - 1) * sizeof(WhereLevel));
-	pWInfo = sqlDbMallocRawNN(db, nByteWInfo + sizeof(WhereLoop));
-	if (db->mallocFailed) {
-		sqlDbFree(db, pWInfo);
-		pWInfo = 0;
-		goto whereBeginError;
-	}
+	pWInfo = sql_xmalloc(nByteWInfo + sizeof(WhereLoop));
 	pWInfo->pParse = pParse;
 	pWInfo->pTabList = pTabList;
 	pWInfo->pOrderBy = pOrderBy;
@@ -4417,10 +3660,8 @@ sqlWhereBegin(Parse * pParse,	/* The parser context */
 	 * equal to pTabList->nSrc but might be shortened to 1 if the
 	 * WHERE_OR_SUBCLAUSE flag is set.
 	 */
-	for (ii = 0; ii < pTabList->nSrc; ii++) {
+	for (ii = 0; ii < pTabList->nSrc; ii++)
 		createMask(pMaskSet, pTabList->a[ii].iCursor);
-		sqlWhereTabFuncArgs(pParse, &pTabList->a[ii], &pWInfo->sWC);
-	}
 #ifdef SQL_DEBUG
 	for (ii = 0; ii < pTabList->nSrc; ii++) {
 		Bitmask m =
@@ -4431,8 +3672,6 @@ sqlWhereBegin(Parse * pParse,	/* The parser context */
 
 	/* Analyze all of the subexpressions. */
 	sqlWhereExprAnalyze(pTabList, &pWInfo->sWC);
-	if (db->mallocFailed)
-		goto whereBeginError;
 
 	if (wctrlFlags & WHERE_WANT_DISTINCT) {
 		if (isDistinctRedundant
@@ -4482,21 +3721,15 @@ sqlWhereBegin(Parse * pParse,	/* The parser context */
 #endif
 
 		wherePathSolver(pWInfo, 0);
-		if (db->mallocFailed)
-			goto whereBeginError;
-		if (pWInfo->pOrderBy) {
+		if (pWInfo->pOrderBy != NULL)
 			wherePathSolver(pWInfo, pWInfo->nRowOut + 1);
-			if (db->mallocFailed)
-				goto whereBeginError;
-		}
 	}
 	if (pWInfo->pOrderBy == 0 &&
 	    (pParse->sql_flags & SQL_ReverseOrder) != 0) {
 		pWInfo->revMask = ALLBITS;
 	}
-	if (pParse->is_aborted || NEVER(db->mallocFailed)) {
+	if (pParse->is_aborted)
 		goto whereBeginError;
-	}
 #ifdef SQL_DEBUG
 	if (sqlWhereTrace) {
 		sqlDebugPrintf("---- Solution nRow=%d", pWInfo->nRowOut);
@@ -4525,9 +3758,8 @@ sqlWhereBegin(Parse * pParse,	/* The parser context */
 	}
 #endif
 	/* Attempt to omit tables from the join that do not effect the result */
-	if (pWInfo->nLevel >= 2
-	    && pDistinctSet != 0 && OptimizationEnabled(db, SQL_OmitNoopJoin)
-	    ) {
+	if (pWInfo->nLevel >= 2 && pDistinctSet != 0 &&
+	    OptimizationEnabled(SQL_OmitNoopJoin)) {
 		Bitmask tabUsed =
 		    sqlWhereExprListUsage(pMaskSet, pDistinctSet);
 		if (sWLB.pOrderBy) {
@@ -4635,10 +3867,10 @@ sqlWhereBegin(Parse * pParse,	/* The parser context */
 					assert(wctrlFlags &
 					       WHERE_ONEPASS_DESIRED);
 					while (pJ->def->iid != idx_def->iid) {
-						iIndexCur++;
 						iid++;
 						pJ = pTabItem->space->index[iid];
 					}
+					iIndexCur++;
 				} else {
 					for(uint32_t i = 0;
 					    i < space->index_count; ++i) {
@@ -4654,7 +3886,7 @@ sqlWhereBegin(Parse * pParse,	/* The parser context */
 			} else if (iAuxArg
 				   && (wctrlFlags & WHERE_OR_SUBCLAUSE) != 0) {
 				iIndexCur = iAuxArg;
-				op = OP_IteratorReopen;
+				assert(op == OP_IteratorOpen);
 			} else {
 				iIndexCur = pParse->nTab++;
 			}
@@ -4678,8 +3910,6 @@ sqlWhereBegin(Parse * pParse,	/* The parser context */
 		}
 	}
 	pWInfo->iTop = sqlVdbeCurrentAddr(v);
-	if (db->mallocFailed)
-		goto whereBeginError;
 
 	/* Generate the code to do the search.  Each iteration of the for
 	 * loop below generates code for a single nested loop of the VM
@@ -4692,8 +3922,6 @@ sqlWhereBegin(Parse * pParse,	/* The parser context */
 			constructAutomaticIndex(pParse, &pWInfo->sWC,
 						&pTabList->a[pLevel->iFrom],
 						notReady, pLevel);
-			if (db->mallocFailed)
-				goto whereBeginError;
 		}
 		sqlWhereExplainOneScan(pParse, pTabList, pLevel, ii,
 					       pLevel->iFrom, wctrlFlags);
@@ -4703,16 +3931,13 @@ sqlWhereBegin(Parse * pParse,	/* The parser context */
 	}
 
 	/* Done. */
-	VdbeModuleComment((v, "Begin WHERE-core"));
 	return pWInfo;
 
-	/* Jump here if malloc fails */
- whereBeginError:
-	if (pWInfo) {
-		pParse->nQueryLoop = pWInfo->savedNQueryLoop;
-		whereInfoFree(db, pWInfo);
-	}
-	return 0;
+whereBeginError:
+	assert(pWInfo != NULL);
+	pParse->nQueryLoop = pWInfo->savedNQueryLoop;
+	whereInfoFree(pWInfo);
+	return NULL;
 }
 
 /*
@@ -4728,11 +3953,9 @@ sqlWhereEnd(WhereInfo * pWInfo)
 	WhereLevel *pLevel;
 	WhereLoop *pLoop;
 	SrcList *pTabList = pWInfo->pTabList;
-	sql *db = pParse->db;
 
 	/* Generate loop termination code.
 	 */
-	VdbeModuleComment((v, "End WHERE-core"));
 	sqlExprCacheClear(pParse);
 	for (i = pWInfo->nLevel - 1; i >= 0; i--) {
 		int addr;
@@ -4743,9 +3966,6 @@ sqlWhereEnd(WhereInfo * pWInfo)
 			sqlVdbeAddOp3(v, pLevel->op, pLevel->p1, pLevel->p2,
 					  pLevel->p3);
 			sqlVdbeChangeP5(v, pLevel->p5);
-			VdbeCoverage(v);
-			VdbeCoverageIf(v, pLevel->op == OP_Next);
-			VdbeCoverageIf(v, pLevel->op == OP_Prev);
 		}
 		if (pLoop->wsFlags & WHERE_IN_ABLE && pLevel->u.in.nIn > 0) {
 			struct InLoop *pIn;
@@ -4758,9 +3978,6 @@ sqlWhereEnd(WhereInfo * pWInfo)
 					sqlVdbeAddOp2(v, pIn->eEndLoopOp,
 							  pIn->iCur,
 							  pIn->addrInTop);
-					VdbeCoverage(v);
-					VdbeCoverageIf(v, pIn->eEndLoopOp == OP_PrevIfOpen);
-					VdbeCoverageIf(v, pIn->eEndLoopOp == OP_NextIfOpen);
 				}
 				sqlVdbeJumpHere(v, pIn->addrInTop - 1);
 			}
@@ -4777,7 +3994,6 @@ sqlWhereEnd(WhereInfo * pWInfo)
 			int ws = pLoop->wsFlags;
 			addr =
 			    sqlVdbeAddOp1(v, OP_IfPos, pLevel->iLeftJoin);
-			VdbeCoverage(v);
 			assert((ws & WHERE_IDX_ONLY) == 0
 			       || (ws & WHERE_INDEXED) != 0);
 			if ((ws & WHERE_IDX_ONLY) == 0) {
@@ -4798,9 +4014,6 @@ sqlWhereEnd(WhereInfo * pWInfo)
 			}
 			sqlVdbeJumpHere(v, addr);
 		}
-		VdbeModuleComment((v, "End WHERE-loop%d: %s", i,
-				   pWInfo->pTabList->a[pLevel->iFrom].space->
-				   def->name));
 	}
 
 	/* The "break" point is here, just past the end of the outer loop.
@@ -4819,7 +4032,7 @@ sqlWhereEnd(WhereInfo * pWInfo)
 		/* For a co-routine, change all OP_Column references to the table of
 		 * the co-routine into OP_Copy of result contained in a register.
 		 */
-		if (pTabItem->fg.viaCoroutine && !db->mallocFailed) {
+		if (pTabItem->fg.viaCoroutine != 0) {
 			translateColumnToCopy(v, pLevel->addrBody,
 					      pLevel->iTabCur,
 					      pTabItem->regResult);
@@ -4843,7 +4056,7 @@ sqlWhereEnd(WhereInfo * pWInfo)
 		} else if (pLoop->wsFlags & WHERE_MULTI_OR) {
 			def = pLevel->u.pCovidx;
 		}
-		if (def != NULL && !db->mallocFailed) {
+		if (def != NULL) {
 			last = sqlVdbeCurrentAddr(v);
 			k = pLevel->addrBody;
 			pOp = sqlVdbeGetOp(v, k);
@@ -4887,6 +4100,6 @@ sqlWhereEnd(WhereInfo * pWInfo)
 	/* Final cleanup
 	 */
 	pParse->nQueryLoop = pWInfo->savedNQueryLoop;
-	whereInfoFree(db, pWInfo);
+	whereInfoFree(pWInfo);
 	return;
 }

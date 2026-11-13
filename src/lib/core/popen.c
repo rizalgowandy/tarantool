@@ -11,14 +11,21 @@
 #include <sys/wait.h>
 
 #include "popen.h"
+#include "trivia/util.h"
+#include "small/region.h"
 #include "fiber.h"
+#include "fiber_cond.h"
 #include "assoc.h"
 #include "coio.h"
+#include "iostream.h"
 #include "say.h"
+#include "tarantool_ev.h"
 
-#ifdef TARGET_OS_DARWIN
+#if TARGET_OS_DARWIN
 # include <sys/ioctl.h>
 #endif
+
+#define POPEN_WAIT_LEADERSHIP_DELAY 0.01
 
 /* A mapping to find popens by their pids in a signal handler */
 static struct mh_i32ptr_t *popen_pids_map = NULL;
@@ -171,7 +178,7 @@ handle_new(struct popen_opts *opts)
 {
 	struct popen_handle *handle;
 	size_t size = 0, i;
-	char *pos;
+	char *pos, *pos_max;
 
 	assert(opts->argv != NULL && opts->nr_argv > 0);
 
@@ -188,29 +195,41 @@ handle_new(struct popen_opts *opts)
 		return NULL;
 	}
 
+	/*
+	 * Reject empty argv earlier (it has no sense to run
+	 * anyway).
+	 *
+	 * This way we don't have to take this case into account
+	 * in size/pointer calculations below.
+	 */
+	if (opts->argv[0] == NULL) {
+		diag_set(IllegalParams, "popen: no command to run");
+		return NULL;
+	}
+
 	for (i = 0; i < opts->nr_argv; i++) {
 		if (opts->argv[i] == NULL)
 			continue;
 		size += strlen(opts->argv[i]) + 3;
 	}
 
-	handle = malloc(sizeof(*handle) + size);
-	if (!handle) {
-		diag_set(OutOfMemory, sizeof(*handle) + size,
-			 "malloc", "popen_handle");
-		return NULL;
-	}
+	handle = xmalloc(sizeof(*handle) + size);
 
 	pos = handle->command = (void *)handle + sizeof(*handle);
+	pos_max = pos + size;
+
 	for (i = 0; i < opts->nr_argv-1; i++) {
 		if (opts->argv[i] == NULL)
 			continue;
+		size_t len = strlen(opts->argv[i]);
 		bool is_multiword = strchr(opts->argv[i], ' ') != NULL;
-		if (is_multiword)
+		/* Quote empty and multiword arguments. */
+		bool use_quotes = len == 0 || is_multiword;
+		if (use_quotes)
 			*pos++ = '\'';
-		strcpy(pos, opts->argv[i]);
-		pos += strlen(opts->argv[i]);
-		if (is_multiword)
+		strlcpy(pos, opts->argv[i], pos_max - pos);
+		pos += len;
+		if (use_quotes)
 			*pos++ = '\'';
 		*pos++ = ' ';
 	}
@@ -222,12 +241,10 @@ handle_new(struct popen_opts *opts)
 
 	rlist_create(&handle->list);
 
-	/*
-	 * No need to initialize the whole ios structure,
-	 * just set fd value to mark as unused.
-	 */
 	for (i = 0; i < lengthof(handle->ios); i++)
-		handle->ios[i].fd = -1;
+		iostream_clear(&handle->ios[i]);
+
+	fiber_cond_create(&handle->completion_cond);
 
 	say_debug("popen: alloc handle %p command '%s' flags %#x",
 		  handle, handle->command, opts->flags);
@@ -236,11 +253,22 @@ handle_new(struct popen_opts *opts)
 
 /**
  * Free memory allocated for a handle. To pair with handle_new().
+ *
+ * Preconditions:
+ *
+ * - No fibers waiting for handle->completion_cond. It may be
+ *   achieved by calling fiber_cond_broadcast(). The waiting
+ *   fibers must be ready to observe a freed handle.
+ * - The handle is removed from the global hashmap of handles
+ *   (using popen_unregister()). popen_wait_timeout() leans on
+ *   this to don't access the freed memory.
  */
 static inline void
 handle_free(struct popen_handle *handle)
 {
 	say_debug("popen: handle free %p", handle);
+	fiber_cond_destroy(&handle->completion_cond);
+	TRASH(handle);
 	free(handle);
 }
 
@@ -275,7 +303,7 @@ popen_may_io(struct popen_handle *handle, unsigned int idx,
 	if (!(io_flags & handle->flags))
 		return popen_set_unsupported_io_error();
 
-	if (handle->ios[idx].fd < 0) {
+	if (!iostream_is_initialized(&handle->ios[idx])) {
 		diag_set(IllegalParams, "popen: attempt to operate "
 			 "on a closed file descriptor");
 		return -1;
@@ -397,8 +425,7 @@ popen_write_timeout(struct popen_handle *handle, const void *buf,
 		  handle->pid, stdX_str(idx), idx, buf, count,
 		  handle->ios[idx].fd, timeout);
 
-	ssize_t rc = coio_write_timeout_noxc(&handle->ios[idx], buf,
-					     count, timeout);
+	ssize_t rc = coio_write_timeout(&handle->ios[idx], buf, count, timeout);
 	assert(rc < 0 || rc == (ssize_t)count);
 	return rc;
 }
@@ -462,8 +489,8 @@ popen_read_timeout(struct popen_handle *handle, void *buf,
 		  handle->pid, stdX_str(idx), idx, buf, count,
 		  handle->ios[idx].fd, timeout);
 
-	return coio_read_ahead_timeout_noxc(&handle->ios[idx], buf, 1, count,
-					    timeout);
+	return coio_read_ahead_timeout(&handle->ios[idx], buf, 1, count,
+				       timeout);
 }
 
 /**
@@ -530,13 +557,13 @@ popen_shutdown(struct popen_handle *handle, unsigned int flags)
 			continue;
 
 		/* Skip already closed fds. */
-		if (handle->ios[idx].fd < 0)
+		if (!iostream_is_initialized(&handle->ios[idx]))
 			continue;
 
 		say_debug("popen: %d: shutdown idx [%s:%zd] fd %d",
 			  handle->pid, stdX_str(idx), idx,
 			  handle->ios[idx].fd);
-		coio_close_io(loop(), &handle->ios[idx]);
+		iostream_close(&handle->ios[idx]);
 	}
 
 	return 0;
@@ -616,6 +643,7 @@ popen_sigchld_handler(EV_P_ ev_child *w, int revents)
 			 */
 			popen_unregister(handle);
 			handle->pid = -1;
+			fiber_cond_broadcast(&handle->completion_cond);
 		}
 	}
 }
@@ -668,6 +696,44 @@ popen_state_str(unsigned int state)
 	};
 
 	return state < POPEN_STATE_MAX ? state_str[state] : "unknown";
+}
+
+int
+popen_wait_timeout(struct popen_handle *handle, ev_tstamp timeout)
+{
+	ev_tstamp deadline = ev_monotonic_now(loop()) + timeout;
+
+	/*
+	 * popen_delete() may be called in another fiber, so the
+	 * handle's memory will be freed. Use pid as the primary
+	 * identifier and access the handle's memory only if there
+	 * is a handle registered with this pid.
+	 *
+	 * This way we don't differentiate a completed process
+	 * with a valid handle from a process with a deleted
+	 * handle. We don't need it though.
+	 */
+	pid_t pid = handle->pid;
+	if (pid == -1)
+		return 0;
+
+	/*
+	 * Handle spurious wakeups as suggested by
+	 * fiber_cond_wait_timeout() description.
+	 *
+	 * fiber_wakeup() unblocks fiber_cond_wait_deadline() with
+	 * zero return value despite that fiber_cond_signal() or
+	 * fiber_cond_broadcast() is not called.
+	 */
+	int rc = 0;
+	while (rc == 0) {
+		handle = popen_find(pid);
+		if (handle == NULL || handle->pid == -1)
+			break;
+		rc = fiber_cond_wait_deadline(&handle->completion_cond,
+					      deadline);
+	}
+	return rc;
 }
 
 /**
@@ -824,8 +890,8 @@ popen_delete(struct popen_handle *handle)
 	}
 
 	for (i = 0; i < lengthof(handle->ios); i++) {
-		if (handle->ios[i].fd != -1)
-			coio_close_io(loop(), &handle->ios[i]);
+		if (iostream_is_initialized(&handle->ios[i]))
+			iostream_close(&handle->ios[i]);
 	}
 
 	/*
@@ -840,6 +906,9 @@ popen_delete(struct popen_handle *handle)
 		ev_child_stop(EV_DEFAULT_ &handle->ev_sigchld);
 		popen_unregister(handle);
 	}
+
+	/* Unblock fibers waiting in popen_wait_timeout(). */
+	fiber_cond_broadcast(&handle->completion_cond);
 
 	rlist_del(&handle->list);
 	handle_free(handle);
@@ -859,7 +928,7 @@ popen_delete(struct popen_handle *handle)
 static int
 make_pipe(int pfd[2])
 {
-#ifdef TARGET_OS_LINUX
+#if TARGET_OS_LINUX
 	if (pipe2(pfd, O_CLOEXEC)) {
 		diag_set(SystemError, "Can't create pipe2");
 		return -1;
@@ -893,7 +962,7 @@ make_pipe(int pfd[2])
 static int
 close_inherited_fds(int *skip_fds, size_t nr_skip_fds)
 {
-# if defined(TARGET_OS_LINUX)
+# if TARGET_OS_LINUX
 	static const char path[] = "/proc/self/fd";
 # else
 	static const char path[] = "/dev/fd";
@@ -996,11 +1065,94 @@ signal_reset(void)
 
 	/* Unblock any signals blocked by libev */
 	sigfillset(&sigset);
-	if (sigprocmask(SIG_UNBLOCK, &sigset, NULL) == -1) {
+	if (pthread_sigmask(SIG_UNBLOCK, &sigset, NULL) == -1) {
 		say_error("child: SIG_UNBLOCK failed");
 		_exit(errno);
 	}
 }
+
+#if TARGET_OS_DARWIN
+/**
+ * Wait until a child process will become a group leader or will
+ * complete.
+ *
+ * Normally vfork() suspends a parent process until a call to
+ * execve() in the child process or termination of the child.
+ * However Mac OS 12 (and newer) implements vfork() as usual
+ * fork(): the only difference is that it does not call
+ * pthread_atfork() handlers.
+ *
+ * So the parent process is not suspended on Mac OS and may
+ * observe an intermediate state of the child: before execve()
+ * call. It may be a problem, when ..._SETSID and ..._GROUP_SIGNAL
+ * parameters are set: if we'll call killpg() before the child
+ * will actually become the group leader, we'll get ESRCH.
+ *
+ * This function offers a simple solution: wait until such process
+ * will become a group leader or will be completed (what will occur
+ * first). The child process can't overrun the setsid()/setpgrp()
+ * call when the ..._SETSID parameter is set.
+ *
+ * The function does not yield, but may block the thread for a
+ * short time.
+ *
+ * Returns 0 at success or -1 at failure (and sets a diag).
+ *
+ * Possible errors:
+ *
+ * - SystemError: getpgid() failed due to a reason other than
+ *                the process completion.
+ */
+static int
+popen_wait_group_leadership(pid_t pid)
+{
+	assert(pid > 0);
+
+	while (true) {
+		pid_t gid = getpgid(pid);
+		assert(gid != 0);
+
+		/* The process is completed. */
+		if (gid < 0 && errno == ESRCH)
+			break;
+
+		/*
+		 * It is unclear from a man 2 getpgid, whether it
+		 * can return other errors aside of ESRCH. Let's
+		 * handle it accurately just in case.
+		 */
+		if (gid < 0) {
+			diag_set(SystemError, "getpgid failed");
+			return -1;
+		}
+
+		/* The process is the group leader! */
+		assert(gid > 0);
+		if (gid == pid)
+			break;
+
+		/*
+		 * The process is not completed and not a group
+		 * leader at the time being. Let's wait for a
+		 * short time and check again.
+		 */
+		assert(gid != pid);
+		thread_sleep(POPEN_WAIT_LEADERSHIP_DELAY);
+	}
+
+	return 0;
+}
+#else
+/**
+ * No-op.
+ */
+static int
+popen_wait_group_leadership(pid_t pid)
+{
+	(void)pid;
+	return 0;
+}
+#endif
 
 /**
  * Create new popen handle.
@@ -1045,11 +1197,10 @@ signal_reset(void)
  *
  * - IllegalParams: a parameter check fails:
  *   - group signal is set, while setsid is not.
- * - SystemError: dup(), fcntl(), pipe(), vfork() or close() fails
- *   in the parent process.
+ * - SystemError: dup(), fcntl(), pipe(), vfork(), close() or
+ *   getpgid() fails in the parent process.
  * - SystemError: (temporary restriction) one of std{in,out,err}
  *   is closed in the parent process.
- * - OutOfMemory: unable to allocate handle.
  */
 struct popen_handle *
 popen_new(struct popen_opts *opts)
@@ -1068,13 +1219,6 @@ popen_new(struct popen_opts *opts)
 	char **envp = get_envp(opts);
 	int saved_errno;
 	size_t i;
-
-	/*
-	 * At max we could be skipping each pipe end
-	 * plus dev/null variants and logfd
-	 */
-	int skip_fds[POPEN_FLAG_FD_STDEND_BIT * 2 + 2 + 1];
-	size_t nr_skip_fds = 0;
 
 	/*
 	 * We must decouple log file descriptor from stderr in order to
@@ -1130,11 +1274,27 @@ popen_new(struct popen_opts *opts)
 		return NULL;
 	}
 
+	struct region *region = &fiber()->gc;
+	size_t region_svp = region_used(region);
+	/*
+	 * Beside the fds configured to be inherited by the caller,
+	 * at max we could be skipping each pipe end plus dev/null
+	 * variants and logfd.
+	 */
+	const size_t nr_skip_fds_max = opts->nr_inherit_fds +
+				       POPEN_FLAG_FD_STDEND_BIT * 2 + 2 + 1;
+	int *skip_fds = xregion_alloc_array(region, typeof(skip_fds[0]),
+					    nr_skip_fds_max);
+	size_t nr_skip_fds = opts->nr_inherit_fds;
+	if (nr_skip_fds > 0)
+		memcpy(skip_fds, opts->inherit_fds,
+		       nr_skip_fds * sizeof(*skip_fds));
+
 	if (log_fd >= 0)
 		skip_fds[nr_skip_fds++] = log_fd;
 	skip_fds[nr_skip_fds++] = dev_null_fd_ro;
 	skip_fds[nr_skip_fds++] = dev_null_fd_wr;
-	assert(nr_skip_fds <= lengthof(skip_fds));
+	assert(nr_skip_fds <= nr_skip_fds_max);
 
 	for (i = 0; i < lengthof(pfd_map); i++) {
 		if (opts->flags & pfd_map[i].mask) {
@@ -1158,7 +1318,7 @@ popen_new(struct popen_opts *opts)
 
 			skip_fds[nr_skip_fds++] = pfd[i][0];
 			skip_fds[nr_skip_fds++] = pfd[i][1];
-			assert(nr_skip_fds <= lengthof(skip_fds));
+			assert(nr_skip_fds <= nr_skip_fds_max);
 
 			say_debug("popen: created pipe [%s:%d:%d]",
 				  stdX_str(i), pfd[i][0], pfd[i][1]);
@@ -1181,7 +1341,15 @@ popen_new(struct popen_opts *opts)
 	 * vfork to complete. Also we try to do as minimum
 	 * operations before the exec() as possible.
 	 */
+#pragma GCC diagnostic push
+	/*
+	 * TODO(gh-6674): we need to review popen's design and refactor this
+	 * part, completely getting rid of vfork, or change vfork to
+	 * posix_spawn here, but only on macOS.
+	 */
+#pragma GCC diagnostic warning "-Wdeprecated-declarations"
 	handle->pid = vfork();
+#pragma GCC diagnostic pop
 	if (handle->pid < 0) {
 		diag_set(SystemError, "vfork() fails");
 		goto out_err;
@@ -1219,7 +1387,7 @@ popen_new(struct popen_opts *opts)
 			signal_reset();
 
 		if (opts->flags & POPEN_FLAG_SETSID) {
-#ifndef TARGET_OS_DARWIN
+#if !TARGET_OS_DARWIN
 			if (setsid() == -1) {
 				say_syserror("child: setsid failed");
 				goto exit_child;
@@ -1335,13 +1503,29 @@ exit_child:
 		unreachable();
 	}
 
+	/*
+	 * Suspend the parent process (tx thread) execution until
+	 * setsid()/setpgrp() will be called in the child process
+	 * if vfork() doesn't suspend the parent on its own on
+	 * given platform.
+	 *
+	 * Otherwise killpg() in popen_send_signal() may get
+	 * ESRCH due to the race.
+	 */
+	if (handle->flags & POPEN_FLAG_SETSID) {
+		int rc = popen_wait_group_leadership(handle->pid);
+		if (rc < 0)
+			goto out_err;
+	}
+
 	for (i = 0; i < lengthof(pfd_map); i++) {
 		if (opts->flags & pfd_map[i].mask) {
 			int parent_idx = pfd_map[i].parent_idx;
 			int child_idx = pfd_map[i].child_idx;
 			int parent_fd = pfd[i][parent_idx];
 
-			coio_create(&handle->ios[i], parent_fd);
+			assert(!iostream_is_initialized(&handle->ios[i]));
+			plain_iostream_create(&handle->ios[i], parent_fd);
 			if (fcntl(parent_fd, F_SETFL, O_NONBLOCK)) {
 				diag_set(SystemError, "Can't set O_NONBLOCK [%s:%d]",
 					 stdX_str(i), parent_fd);
@@ -1367,6 +1551,7 @@ exit_child:
 		log_fd = -1;
 		goto out_err;
 	}
+	region_truncate(region, region_svp);
 
 	/*
 	 * Link it into global list for force
@@ -1411,6 +1596,7 @@ out_err:
 	}
 	if (log_fd >= 0)
 		close(log_fd);
+	region_truncate(region, region_svp);
 
 	/* Restore the diagnostics area entry. */
 	diag_set_error(diag, e);

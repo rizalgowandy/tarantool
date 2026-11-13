@@ -242,7 +242,7 @@ resp_len = c:call('do_pushes', {300}, {on_push = table.insert, on_push_ctx = mes
 ...
 resp_len
 ---
-- 10
+- 12
 ...
 messages
 ---
@@ -274,7 +274,7 @@ r, _ = msgpack.decode_unchecked(ibuf.rpos)
 ...
 r
 ---
-- {48: [300]}
+- {96: {}, 48: [300]}
 ...
 --
 -- Test error in __serialize.
@@ -592,7 +592,6 @@ c:call('function1.test_push',   \
        {on_push = table.insert, \
         on_push_ctx = messages})
 ---
-- []
 ...
 messages
 ---
@@ -637,13 +636,10 @@ _ = client:write("box.func['function1.test_push']:call({1, 2, 3, s})\n")
 ...
 client:read("\n...\n")
 ---
-- '%TAG !push! tag:tarantool.io/push,2018
-
+- |
+  %TAG !push! tag:tarantool.io/push,2018
   --- [1, 2, 3, "A\0C"]
-
   ...
-
-  '
 ...
 _ = client:read("\n...\n")
 ---
@@ -660,9 +656,9 @@ _ = client:write("box.func['function1.test_push']:call({1, 2, 3, s})\n")
 ...
 client:read(";")
 ---
-- '-- Push
-
-  {1, 2, 3, "A\0C"};'
+- |-
+  -- Push
+  {1, 2, 3, "A\0C"};
 ...
 _ = client:read(";")
 ---

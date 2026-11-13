@@ -3,6 +3,19 @@ local bit = require('bit')
 local json = require('json')
 local fio = require('fio')
 local xlog = require('xlog')
+local ffi = require('ffi')
+local fun = require('fun')
+local utils = require('internal.utils')
+local tarantool = require('tarantool')
+local mkversion = require('version')
+
+ffi.cdef([[
+    void box_init_latest_dd_version_id(uint32_t version_id);
+    bool box_schema_needs_upgrade(void);
+    int box_schema_upgrade_begin(void);
+    void box_schema_upgrade_end(void);
+]])
+local builtin = ffi.C
 
 -- Guest user id - the default user
 local GUEST = 0
@@ -20,35 +33,6 @@ local SUPER = 31
 --------------------------------------------------------------------------------
 -- Utils
 --------------------------------------------------------------------------------
-
-local function setmap(tab)
-    return setmetatable(tab, { __serialize = 'map' })
-end
-
-local mkversion = {}
-mkversion.__index = mkversion
-setmetatable(mkversion, {__call = function(c, ...) return c.new(...) end})
-
-function mkversion.new(major, minor, patch)
-    local self = setmetatable({}, mkversion)
-    self.major = major
-    self.minor = minor
-    self.patch = patch
-    self.id = bit.bor(bit.lshift(bit.bor(bit.lshift(major, 8), minor), 8), patch)
-    return self
-end
-
-function mkversion.__tostring(self)
-    return string.format('%s.%s.%s', self.major, self.minor, self.patch)
-end
-
-function mkversion.__eq(lhs, rhs)
-    return lhs.id == rhs.id
-end
-
-function mkversion.__lt(lhs, rhs)
-    return lhs.id < rhs.id
-end
 
 -- space:truncate() doesn't work with disabled triggers on __index
 local function truncate(space)
@@ -88,14 +72,30 @@ local function set_system_triggers(val)
     foreach_system_space(function(s) s:run_triggers(val) end)
 end
 
-local function version_from_tuple(tuple)
-    local major, minor, patch = tuple:unpack(2, 4)
-    patch = patch or 0
-    if major and minor and type(major) == 'number' and
-       type(minor) == 'number' and type(patch) == 'number' then
-        return mkversion(major, minor, patch)
+local function with_disabled_system_triggers(func)
+    set_system_triggers(false)
+    local status, err = pcall(func)
+    set_system_triggers(true)
+    if not status then
+        error(err)
     end
-    return nil
+end
+
+-- Clears formats of all system spaces. It is used to disable system space
+-- format checking before creation of a bootstrap snapshot.
+local function clear_system_formats()
+    foreach_system_space(function(s)
+        box.space._space:update({s.id}, {{'=', 7, {}}})
+    end)
+end
+
+-- Applies no-op update to all system space records to run system triggers.
+-- It is used to re-enable system space format checking after creation of
+-- a bootstrap snapshot.
+local function reset_system_formats()
+    foreach_system_space(function(s)
+        box.space._space:update({s.id}, {})
+    end)
 end
 
 -- Get schema version, stored in _schema system space, by reading the latest
@@ -117,7 +117,7 @@ local function get_snapshot_version(snap_dir)
         if sid == box.schema.SCHEMA_ID then
             local tuple = row.BODY.tuple
             if tuple and tuple[1] == 'version' then
-                version = version_from_tuple(tuple)
+                version = box.internal.version_from_tuple(tuple)
                 if not version then
                     log.error("Corrupted version tuple in space '_schema' "..
                               "in snapshot '%s': %s ", snap, tuple)
@@ -228,7 +228,7 @@ local function create_truncate_space()
 
     log.info("create space _truncate")
     box.space._space:insert{
-        _truncate.id, ADMIN, '_truncate', 'memtx', 0, setmap({}),
+        _truncate.id, ADMIN, '_truncate', 'memtx', 0, utils.setmap({}),
         {{name = 'id', type = 'unsigned'}, {name = 'count', type = 'unsigned'}}
     }
 
@@ -246,8 +246,8 @@ local function upgrade_to_1_7_5()
 end
 
 local function user_trig_1_7_5(_, tuple)
-    if tuple and not tuple[5] then
-        tuple = tuple:update{{'=', 5, setmap({})}}
+    if tuple and (type(tuple[5]) ~= 'table' or next(tuple[5]) == nil) then
+        tuple = tuple:update{{'=', 5, utils.setmap({})}}
         log.info("Set empty password to %s '%s'", tuple[4], tuple[3])
     end
     return tuple
@@ -332,8 +332,7 @@ local function initial_1_7_5()
     local _priv = box.space[box.schema.PRIV_ID]
     local _cluster = box.space[box.schema.CLUSTER_ID]
     local _truncate = box.space[box.schema.TRUNCATE_ID]
-    local MAP = setmap({})
-    local datetime = os.date("%Y-%m-%d %H:%M:%S")
+    local MAP = utils.setmap({})
 
     --
     -- _schema
@@ -478,8 +477,8 @@ local function initial_1_7_5()
     -- Create users
     --
     log.info("create user guest")
-    _user:insert{GUEST, ADMIN, 'guest', 'user', MAP}
-    box.schema.user.passwd('guest', '')
+    _user:insert{GUEST, ADMIN, 'guest', 'user',
+                 {['chap-sha1'] = 'vhvewKp0tNyweZQ+cFKAlsyphfg='}}
     log.info("create user admin")
     _user:insert{ADMIN, ADMIN, 'admin', 'user', MAP}
     log.info("create role public")
@@ -508,9 +507,7 @@ local function initial_1_7_5()
 
     -- create "box.schema.user.info" function
     log.info('create function "box.schema.user.info" with setuid')
-    _func:replace({1, ADMIN, 'box.schema.user.info', 1, 'LUA', '', 'function',
-                  {}, 'any', 'none', 'none', false, false, true, {'LUA'},
-                  MAP, '', datetime, datetime})
+    _func:replace{1, ADMIN, 'box.schema.user.info', 1, 'LUA'}
 
     -- grant 'public' role access to 'box.schema.user.info' function
     log.info('grant execute on function "box.schema.user.info" to public')
@@ -536,13 +533,65 @@ local sequence_format = {{name = 'id', type = 'unsigned'},
 -- Tarantool 1.7.6
 --------------------------------------------------------------------------------
 
+--
+-- Update format of user spaces. Format of system spaces have been updated
+-- during upgrade to 1.7.5. However commit 519bc82e ("Parse and validate
+-- space formats") introduced strict checking of format field. Now tarantool
+-- requires, that format is written as map with explicit 'name' and 'type'
+-- keys: {name = 'a', type = 'number'}. Previously, it wasn't a case,
+-- anything could be written in the space format.
+--
+local function space_trig_1_7_6(_, tuple)
+    -- Do nothing for system spaces.
+    if tuple == nil or tuple[1] <= box.schema.SYSTEM_ID_MAX then
+        return tuple
+    end
+
+    -- If it's a complete garbage or tuple[7] is missing, use empty format.
+    -- Also, overwrite the table, if it's empty to be sure, that it's
+    -- encoded as array and not as map.
+    local new_format = {}
+    if type(tuple[7]) == 'table' and next(tuple[7]) ~= nil then
+        -- Non empty format. Check format and change if it's possible.
+        for i, f in ipairs(tuple[7]) do
+            -- Create the fields from ground up. Better not to use existing
+            -- ones, anything can be there, we must be sure, that every field
+            -- is encoded as map and has 'name' and 'type' keys.
+            local field = utils.setmap({
+                name = f['name'],
+                type = f['type'],
+            })
+
+            if field['name'] == nil then
+                if type(f[1]) ~= 'string' then
+                    local err = "Cannot find name for field %d in space %s"
+                    error(err:format(i, tuple[3]))
+                end
+                field['name'] = f[1]
+            end
+            if field['type'] == nil then
+                field['type'] = type(f[2]) == 'string' and f[2] or 'any'
+            end
+            table.insert(new_format, field)
+        end
+    end
+    if not table.equals(tuple[7], new_format) then
+        -- Better to be as verbose as it's possible. So that user can
+        -- restore the previous format if smth goes wrong.
+        log.info("Update space '%s' format: old format %s, new format %s",
+                 tuple[3], json.encode(tuple[7]), json.encode(new_format))
+        tuple = tuple:update{{'=', 7, new_format}}
+    end
+    return tuple
+end
+
 local function create_sequence_space()
     local _space = box.space[box.schema.SPACE_ID]
     local _index = box.space[box.schema.INDEX_ID]
     local _sequence = box.space[box.schema.SEQUENCE_ID]
     local _sequence_data = box.space[box.schema.SEQUENCE_DATA_ID]
     local _space_sequence = box.space[box.schema.SPACE_SEQUENCE_ID]
-    local MAP = setmap({})
+    local MAP = utils.setmap({})
 
     log.info("create space _sequence")
     _space:insert{_sequence.id, ADMIN, '_sequence', 'memtx', 0, MAP, sequence_format}
@@ -574,7 +623,8 @@ local function create_collation_space()
     local _collation = box.space[box.schema.COLLATION_ID]
 
     log.info("create space _collation")
-    box.space._space:insert{_collation.id, ADMIN, '_collation', 'memtx', 0, setmap({}),
+    box.space._space:insert{_collation.id, ADMIN, '_collation', 'memtx', 0,
+        utils.setmap({}),
         { { name = 'id', type = 'unsigned' }, { name = 'name', type = 'string' },
           { name = 'owner', type = 'unsigned' }, { name = 'type', type = 'string' },
           { name = 'locale', type = 'string' }, { name = 'opts', type = 'map' } } }
@@ -586,7 +636,7 @@ local function create_collation_space()
     box.space._index:insert{_collation.id, 1, 'name', 'tree', {unique = true}, {{1, 'string'}}}
 
     log.info("create predefined collations")
-    box.space._collation:replace{1, "unicode", ADMIN, "ICU", "", setmap{}}
+    box.space._collation:replace{1, "unicode", ADMIN, "ICU", "", utils.setmap{}}
     box.space._collation:replace{2, "unicode_ci", ADMIN, "ICU", "", {strength='primary'}}
 
     local _priv = box.space[box.schema.PRIV_ID]
@@ -633,7 +683,7 @@ local function upgrade_to_1_7_7()
     --
     -- create role 'super' and grant it all privileges on universe
     --
-    _user:replace{SUPER, ADMIN, 'super', 'role', setmap({})}
+    _user:replace{SUPER, ADMIN, 'super', 'role', utils.setmap({})}
     _priv:replace({ADMIN, SUPER, 'universe', 0, 4294967295})
 end
 
@@ -651,7 +701,8 @@ end
 --------------------------------------------------------------------------------
 local function create_vsequence_space()
     create_sysview(box.schema.SEQUENCE_ID, box.schema.VSEQUENCE_ID)
-    box.space._vsequence:format(sequence_format)
+    box.space._space:update({box.schema.VSEQUENCE_ID},
+                            {{'=', 7, sequence_format}})
 end
 
 local function upgrade_to_1_10_0()
@@ -664,17 +715,18 @@ end
 local function upgrade_priv_to_1_10_2()
     local _priv = box.space._priv
     local _vpriv = box.space._vpriv
-    local format = _priv:format()
-
-    format[4].type = 'scalar'
-    _priv:format(format)
-    format = _vpriv:format()
-    format[4].type = 'scalar'
-    _vpriv:format(format)
-    _priv.index.primary:alter{parts={2, 'unsigned', 3, 'string', 4, 'scalar'}}
-    _vpriv.index.primary:alter{parts={2, 'unsigned', 3, 'string', 4, 'scalar'}}
-    _priv.index.object:alter{parts={3, 'string', 4, 'scalar'}}
-    _vpriv.index.object:alter{parts={3, 'string', 4, 'scalar'}}
+    local _space = box.space._space
+    local _index = box.space._index
+    _space:update({_priv.id}, {{'=', '[7][4].type', 'scalar'}})
+    _space:update({_vpriv.id}, {{'=', '[7][4].type', 'scalar'}})
+    _index:update({_priv.id, _priv.index.primary.id},
+                  {{'=', 6, {{1, 'unsigned'}, {2, 'string'}, {3, 'scalar'}}}})
+    _index:update({_vpriv.id, _vpriv.index.primary.id},
+                  {{'=', 6, {{1, 'unsigned'}, {2, 'string'}, {3, 'scalar'}}}})
+    _index:update({_priv.id, _priv.index.object.id},
+                  {{'=', 6, {{2, 'string'}, {3, 'scalar'}}}})
+    _index:update({_vpriv.id, _priv.index.object.id},
+                  {{'=', 6, {{2, 'string'}, {3, 'scalar'}}}})
 end
 
 local function create_vinyl_deferred_delete_space()
@@ -733,7 +785,7 @@ local function upgrade_to_2_1_0()
     local _space = box.space[box.schema.SPACE_ID]
     local _index = box.space[box.schema.INDEX_ID]
     local _trigger = box.space[box.schema.TRIGGER_ID]
-    local MAP = setmap({})
+    local MAP = utils.setmap({})
 
     log.info("create space _trigger")
     local format = {{name='name', type='string'},
@@ -759,7 +811,7 @@ local function upgrade_to_2_1_0()
                           {name='parent_cols', type='array'}}
     log.info("create space _fk_constraint")
     _space:insert{box.schema.FK_CONSTRAINT_ID, ADMIN, '_fk_constraint', 'memtx',
-                  0, setmap({}), fk_constr_ft}
+                  0, utils.setmap({}), fk_constr_ft}
 
     log.info("create index primary on _fk_constraint")
     _index:insert{box.schema.FK_CONSTRAINT_ID, 0, 'primary', 'tree',
@@ -776,10 +828,12 @@ local function upgrade_to_2_1_0()
     local format = {}
     format[1] = {type='string', name='key'}
     format[2] = {type='any', name='value', is_nullable=true}
-    box.space._schema:format(format)
+    _space:update({box.schema.SCHEMA_ID}, {{'=', 7, format}})
 
-    box.space._collation:replace{0, "none", ADMIN, "BINARY", "", setmap{}}
-    box.space._collation:replace{3, "binary", ADMIN, "BINARY", "", setmap{}}
+    box.space._collation:replace{0, "none", ADMIN, "BINARY", "",
+                                 utils.setmap{}}
+    box.space._collation:replace{3, "binary", ADMIN, "BINARY", "",
+                                 utils.setmap{}}
 
     upgrade_priv_to_2_1_0()
 end
@@ -791,7 +845,7 @@ end
 local function upgrade_to_2_1_1()
     local _index = box.space[box.schema.INDEX_ID]
     for _, index in _index:pairs() do
-        local opts = index.opts
+        local opts = index[5]
         if opts['sql'] ~= nil then
             opts['sql'] = nil
             _index:replace(box.tuple.new({index.id, index.iid, index.name,
@@ -807,10 +861,10 @@ end
 local function update_collation_strength_field()
     local _collation = box.space[box.schema.COLLATION_ID]
     for _, collation in _collation:pairs() do
-        if collation.type == 'ICU' and collation.opts.strength == nil then
+        if collation[4] == 'ICU' and collation[6].strength == nil then
             local new_collation = collation:totable()
             new_collation[6].strength = 'tertiary'
-            _collation:delete{collation.id}
+            _collation:delete{collation[1]}
             _collation:insert(new_collation)
         end
     end
@@ -947,6 +1001,7 @@ end
 -- Add sequence field to _space_sequence table
 local function upgrade_sequence_to_2_2_1()
     log.info("add sequence field to space _space_sequence")
+    local _space = box.space[box.schema.SPACE_ID]
     local _index = box.space[box.schema.INDEX_ID]
     local _space_sequence = box.space[box.schema.SPACE_SEQUENCE_ID]
     for _, v in _space_sequence:pairs() do
@@ -968,10 +1023,10 @@ local function upgrade_sequence_to_2_2_1()
         _space_sequence:insert(t)
         ::continue::
     end
-    local format = _space_sequence:format()
-    format[4] = {name = 'field', type = 'unsigned'}
-    format[5] = {name = 'path', type = 'string'}
-    _space_sequence:format(format)
+    _space:update({_space_sequence.id}, {
+        {'=', '[7][4]', {name = 'field', type = 'unsigned'}},
+        {'=', '[7][5]', {name = 'path', type = 'string'}},
+    })
 end
 
 local function upgrade_ck_constraint_to_2_2_1()
@@ -979,7 +1034,7 @@ local function upgrade_ck_constraint_to_2_2_1()
     -- stored in space opts. Now we use separate space
     -- _ck_constraint for this purpose. Perform legacy data
     -- migration.
-    local MAP = setmap({})
+    local MAP = utils.setmap({})
     local _space = box.space._space
     local _index = box.space._index
     local _ck_constraint = box.space._ck_constraint
@@ -995,27 +1050,27 @@ local function upgrade_ck_constraint_to_2_2_1()
                   {unique = true}, {{0, 'unsigned'}, {1, 'string'}}}
 
     for _, space in _space:pairs() do
-        local flags = space.flags
+        local id = space[1]
+        local name = space[3]
+        local flags = space[6]
         if flags.checks then
             for i, check in pairs(flags.checks) do
                 local expr_str = check.expr
                 local check_name = check.name or
-                                   "CK_CONSTRAINT_"..i.."_"..space.name
-                _ck_constraint:insert({space.id, check_name, false,
-                                       'SQL', expr_str})
+                                   "CK_CONSTRAINT_" .. i .. "_" .. name
+                _ck_constraint:insert({id, check_name, false, 'SQL', expr_str})
             end
             flags.checks = nil
-            _space:replace({space.id, space.owner, space.name, space.engine,
-                            space.field_count, flags, space.format})
+            _space:update({id}, {{'=', 6, flags}})
         end
     end
 end
 
 local function create_vcollation_space()
-    local _collation = box.space._collation
-    local format = _collation:format()
+    local _space = box.space._space
+    local format = _space:get({box.schema.COLLATION_ID})[7]
     create_sysview(box.schema.COLLATION_ID, box.schema.VCOLLATION_ID)
-    box.space[box.schema.VCOLLATION_ID]:format(format)
+    _space:update({box.schema.VCOLLATION_ID}, {{'=', 7, format}})
 end
 
 local function upgrade_func_to_2_2_1()
@@ -1024,10 +1079,10 @@ local function upgrade_func_to_2_2_1()
     local _priv = box.space[box.schema.PRIV_ID]
     local datetime = os.date("%Y-%m-%d %H:%M:%S")
     for _, v in box.space._func:pairs() do
-        box.space._func:replace({v.id, v.owner, v.name, v.setuid, v[5] or 'LUA',
-                                 '', 'function', {}, 'any', 'none', 'none',
-                                 false, false, true, v[15] or {'LUA'},
-                                 setmap({}), '', datetime, datetime})
+        _func:replace({v[1], v[2], v[3], v[4], v[5] or 'LUA', '', 'function',
+                      {}, 'any', 'none', 'none', false, false, true,
+                      v[15] or {'LUA'}, utils.setmap({}), '',
+                      datetime, datetime})
     end
     local sql_builtin_list = {
         "TRIM", "TYPEOF", "PRINTF", "UNICODE", "CHAR", "HEX", "VERSION",
@@ -1045,16 +1100,17 @@ local function upgrade_func_to_2_2_1()
     for _, v in pairs(sql_builtin_list) do
         local t = _func:auto_increment({ADMIN, v, 1, 'SQL_BUILTIN', '',
                                        'function', {}, 'any', 'none', 'none',
-                                        false, false, true, {}, setmap({}), '',
+                                        false, false, true, {},
+                                        utils.setmap({}), '',
                                         datetime, datetime})
-        _priv:replace{ADMIN, PUBLIC, 'function', t.id, box.priv.X}
+        _priv:replace{ADMIN, PUBLIC, 'function', t[1], box.priv.X}
     end
     local t = _func:auto_increment({ADMIN, 'LUA', 1, 'LUA',
                         'function(code) return assert(loadstring(code))() end',
                         'function', {'string'}, 'any', 'none', 'none',
                         false, false, true, {'LUA', 'SQL'},
-                        setmap({}), '', datetime, datetime})
-    _priv:replace{ADMIN, PUBLIC, 'function', t.id, box.priv.X}
+                        utils.setmap({}), '', datetime, datetime})
+    _priv:replace{ADMIN, PUBLIC, 'function', t[1], box.priv.X}
     local format = {}
     format[1] = {name='id', type='unsigned'}
     format[2] = {name='owner', type='unsigned'}
@@ -1075,9 +1131,10 @@ local function upgrade_func_to_2_2_1()
     format[17] = {name='comment', type='string'}
     format[18] = {name='created', type='string'}
     format[19] = {name='last_altered', type='string'}
-    _func:format(format)
-    _func.index.name:alter({parts = {{'name', 'string',
-                                      collation = 'unicode_ci'}}})
+    box.space._space:update({_func.id}, {{'=', 7, format}})
+    box.space._index:update(
+        {_func.id, _func.index.name.id},
+        {{'=', 6, {{field = 2, type = 'string', collation = 2}}}})
 end
 
 local function create_func_index()
@@ -1089,7 +1146,7 @@ local function create_func_index()
                     {name='index_id', type='unsigned'},
                     {name='func_id',  type='unsigned'}}
     _space:insert{_func_index.id, ADMIN, '_func_index', 'memtx', 0,
-                  setmap({}), format}
+                  utils.setmap({}), format}
     _index:insert{_func_index.id, 0, 'primary', 'tree', {unique = true},
                   {{0, 'unsigned'}, {1, 'unsigned'}}}
     _index:insert{_func_index.id, 1, 'fid', 'tree', {unique = false},
@@ -1111,6 +1168,7 @@ end
 
 local function upgrade_to_2_3_0()
     log.info("Create GREATEST and LEAST SQL Builtins")
+    local _space = box.space[box.schema.SPACE_ID]
     local _func = box.space[box.schema.FUNC_ID]
     local _priv = box.space[box.schema.PRIV_ID]
     local datetime = os.date("%Y-%m-%d %H:%M:%S")
@@ -1118,9 +1176,10 @@ local function upgrade_to_2_3_0()
     for _, v in pairs(new_builtins) do
         local t = _func:auto_increment({ADMIN, v, 1, 'SQL_BUILTIN', '',
                                        'function', {}, 'any', 'none', 'none',
-                                        false, false, true, {}, setmap({}), '',
+                                        false, false, true, {},
+                                        utils.setmap({}), '',
                                         datetime, datetime})
-        _priv:replace{ADMIN, PUBLIC, 'function', t.id, box.priv.X}
+        _priv:replace{ADMIN, PUBLIC, 'function', t[1], box.priv.X}
     end
 
     log.info("Extend _ck_constraint space format with is_enabled field")
@@ -1134,7 +1193,7 @@ local function upgrade_to_2_3_0()
                     {name='language', type='str'},
                     {name='code', type='str'},
                     {name='is_enabled', type='boolean'}}
-    _ck_constraint:format(format)
+    _space:update({_ck_constraint.id}, {{'=', 7, format}})
 end
 
 --------------------------------------------------------------------------------
@@ -1143,7 +1202,8 @@ end
 
 local function drop_func_collation()
     local _func = box.space[box.schema.FUNC_ID]
-    _func.index.name:alter({parts = {{'name', 'string'}}})
+    box.space._index:update({_func.id, _func.index.name.id},
+                            {{'=', 6, {{2, 'string'}}}})
 end
 
 local function create_session_settings_space()
@@ -1176,7 +1236,7 @@ local function function_access()
     for _, name in pairs(funcs_to_change) do
         local func = _func.index['name']:get(name)
         if func ~= nil and func.setuid ~= 0 then
-            local id = func.id
+            local id = func[1]
             log.info('remove old function "'..name..'"')
             _priv:delete({2, 'function', id})
             _func:delete({id})
@@ -1201,9 +1261,11 @@ local function remove_sql_builtin_functions_from_func()
     local _func = box.space._func
     local _priv = box.space._priv
     for _, v in _func:pairs() do
-        if v.language == "SQL_BUILTIN" then
-            _priv:delete({2, 'function', v.id})
-            _func:delete({v.id})
+        local id = v[1]
+        local language = v[5]
+        if language == "SQL_BUILTIN" then
+            _priv:delete({2, 'function', id})
+            _func:delete({id})
         end
     end
 end
@@ -1213,48 +1275,302 @@ local function upgrade_to_2_9_1()
 end
 
 --------------------------------------------------------------------------------
+-- Tarantool 2.10.1
+--------------------------------------------------------------------------------
+local function grant_rw_access_on__session_settings_to_role_public()
+    local _priv = box.space[box.schema.PRIV_ID]
+    log.info("grant read,write access on _session_settings space to public role")
+    _priv:replace({ADMIN, PUBLIC, 'space', box.schema.SESSION_SETTINGS_ID,
+                   box.priv.R + box.priv.W})
+end
+
+local function upgrade_to_2_10_1()
+    grant_rw_access_on__session_settings_to_role_public()
+end
+
+--------------------------------------------------------------------------------
+-- Tarantool 2.10.4
+--------------------------------------------------------------------------------
+local function revoke_execute_access_to_lua_function_from_role_public()
+    local _priv = box.space[box.schema.PRIV_ID]
+    if box.func.LUA then
+        local row = _priv:get{PUBLIC, 'function', box.func.LUA.id}
+        local privilege = row and row[5] or nil
+        if privilege and bit.band(privilege, box.priv.X) ~= 0 then
+            local privilege = bit.bxor(privilege, box.priv.X)
+            -- Note that X privilege sometimes implies R privilege,
+            -- for example executable functions are visible in _vfunc.
+            -- Let's make minimal changes, leaving R privilege instead of X.
+            privilege = bit.bor(privilege, box.priv.R)
+            log.info("revoke execute access to 'LUA' function from public role")
+            _priv:update({PUBLIC, 'function', box.func.LUA.id},
+                         {{'=', 5, privilege}})
+        end
+    end
+end
+
+local function make_vfunc_same_format_as_func()
+    log.info("Make format of _vfunc the same as the format of _func")
+    local format = box.space._space:get({box.schema.FUNC_ID})[7]
+    box.space._space:update({box.schema.VFUNC_ID}, {{'=', 7, format}})
+end
+
+local function upgrade_to_2_10_4()
+    revoke_execute_access_to_lua_function_from_role_public()
+    make_vfunc_same_format_as_func()
+end
+
+--------------------------------------------------------------------------------
+-- Tarantool 2.10.5
+--------------------------------------------------------------------------------
+local function create_vspace_sequence_space()
+    create_sysview(box.schema.SPACE_SEQUENCE_ID, box.schema.VSPACE_SEQUENCE_ID)
+end
+
+local function upgrade_to_2_10_5()
+    create_vspace_sequence_space()
+end
+
+--------------------------------------------------------------------------------
+-- Tarantool 2.11.0
+--------------------------------------------------------------------------------
+local function revoke_write_access_on__collation_from_role_public()
+    local _priv = box.space[box.schema.PRIV_ID]
+    log.info("revoke write access on _collation space from public role")
+    _priv:delete{PUBLIC, 'space', box.schema.COLLATION_ID}
+end
+
+local function convert_sql_constraints_to_tuple_constraints()
+    local _space = box.space._space
+    local _fk = box.space[box.schema.FK_CONSTRAINT_ID]
+    local _ck = box.space[box.schema.CK_CONSTRAINT_ID]
+    log.info("convert constraints from _ck_constraint and _fk_constraint")
+    for _, v in _fk:pairs() do
+        local name = v[1]
+        local child_id = v[2]
+        local parent_id = v[3]
+        local child_cols = v[8]
+        local parent_cols = v[9]
+        local def = _space:get{child_id}
+        local mapping = utils.setmap({})
+        for i, id in pairs(child_cols) do
+            mapping[id] = parent_cols[i]
+        end
+        local fk = def[6].foreign_key or {}
+        fk[name] = {space = parent_id, field = mapping}
+        _space:update({child_id}, {{'=', '[6].foreign_key', fk}})
+        _fk:delete({name, child_id})
+    end
+    for _, v in _ck:pairs() do
+        local space_id = v[1]
+        local name = v[2]
+        local code = v[5]
+        local _func = box.space._func
+        local def = _space:get{space_id}
+        local datetime = os.date("%Y-%m-%d %H:%M:%S")
+        local func_name = 'check_' .. def[3] .. '_' .. name
+        local t = _func:auto_increment({ADMIN, func_name, 1, 'SQL_EXPR', code,
+                                       'function', {}, 'any', 'none', 'none',
+                                        true, true, true, {'LUA'},
+                                        utils.setmap({}), '',
+                                        datetime, datetime})
+        local ck = def.flags.constraint or {}
+        ck[name] = t[1]
+        _space:update({space_id}, {{'=', '[6].constraint', ck}})
+        _ck:delete({space_id, name})
+    end
+end
+
+local function add_user_auth_history_and_last_modified()
+    log.info("add auth_history and last_modified fields to space _user")
+    local _space = box.space[box.schema.SPACE_ID]
+    local _user = box.space[box.schema.USER_ID]
+    local _vuser = box.space[box.schema.VUSER_ID]
+    for _, v in _user:pairs() do
+        if #v == 5 then
+            _user:update(v[1], {{'=', 6, {}}, {'=', 7, 0}})
+        end
+    end
+    local ops = {
+        {'=', '[7][6]', {name = 'auth_history', type = 'array'}},
+        {'=', '[7][7]', {name = 'last_modified', type = 'unsigned'}},
+    }
+    _space:update({_user.id}, ops)
+    _space:update({_vuser.id}, ops)
+end
+
+local function upgrade_to_2_11_0()
+    revoke_write_access_on__collation_from_role_public()
+    convert_sql_constraints_to_tuple_constraints()
+    add_user_auth_history_and_last_modified()
+end
+
+--------------------------------------------------------------------------------
+-- Tarantool 2.11.1
+--------------------------------------------------------------------------------
+local function drop_schema_max_id()
+    log.info("drop field max_id in space _schema")
+    box.space._schema:delete("max_id")
+end
+
+local function upgrade_to_2_11_1()
+    drop_schema_max_id()
+end
+
+--------------------------------------------------------------------------------
+-- Tarantool 2.11.5
+--------------------------------------------------------------------------------
+local function upgrade_to_2_11_5()
+    -- NoOp. We need to bump schema version to distinguish which versions of
+    -- 2.11 release series correctly handle persistent names.
+    return
+end
+
+--------------------------------------------------------------------------------
+-- Tarantool 3.0.0
+--------------------------------------------------------------------------------
+local function change_replicaset_uuid_key(old_key, new_key)
+    local _schema = box.space._schema
+    local old = _schema:get{old_key}
+    -- 'replicaset_uuid' can be not found during bootstrap.snap generation when
+    -- the entire _schema is cleared.
+    if old ~= nil then
+        _schema:insert{new_key, old[2]}
+        _schema:delete{old_key}
+    end
+end
+
+local function store_replicaset_uuid_in_new_way()
+    log.info('update replicaset uuid key')
+    change_replicaset_uuid_key('cluster', 'replicaset_uuid')
+end
+
+local function add_instance_names()
+    log.info('add instance names to _cluster')
+    local format = {
+        {name = 'id', type = 'unsigned'},
+        {name = 'uuid', type = 'string'},
+        {name = 'name', type = 'string', is_nullable = true}
+    }
+    box.space._space:update({box.schema.CLUSTER_ID}, {{'=', 7, format}})
+end
+
+local function upgrade_to_3_0_0()
+    store_replicaset_uuid_in_new_way()
+    add_instance_names()
+end
+
+--------------------------------------------------------------------------------
+-- Tarantool 3.1.0
+--------------------------------------------------------------------------------
+
+local function add_trigger_to_func()
+    log.info('add trigger to _func')
+    local _space = box.space[box.schema.SPACE_ID]
+    local _func = box.space[box.schema.FUNC_ID]
+    local _vfunc = box.space[box.schema.VFUNC_ID]
+    for _, v in _func:pairs() do
+        _func:update(v[1], {{'=', 20, {}}})
+    end
+    local ops = {{'=', '[7][20]', {name = 'trigger', type = 'array'}}}
+    _space:update({_func.id}, ops)
+    _space:update({_vfunc.id}, ops)
+end
+
+local function upgrade_to_3_1_0()
+    add_trigger_to_func()
+end
+
+--------------------------------------------------------------------------------
+-- Tarantool 3.3.0
+--------------------------------------------------------------------------------
+
+local function create_gc_consumers()
+    local _space = box.space[box.schema.SPACE_ID]
+    local _index = box.space[box.schema.INDEX_ID]
+    local _priv = box.space[box.schema.PRIV_ID]
+    local space_id = box.schema.GC_CONSUMERS_ID
+    local opts = {group_id = 1}
+
+    log.info("create space _gc_consumers")
+    local format = {{name = 'uuid', type = 'string'},
+                    {name = 'vclock', type = 'map'},
+                    {name = 'opts', type = 'map'}}
+    _space:insert{space_id, ADMIN, '_gc_consumers', 'memtx', 0, opts,
+                  format}
+
+    -- replication can create and update persistent gc consumers
+    log.info("grant write on space _gc_consumers to replication")
+    _priv:replace{ADMIN, REPLICATION, 'space', box.schema.GC_CONSUMERS_ID,
+                  box.priv.W}
+
+    log.info("create primary index for space _gc_consumers")
+    _index:insert{space_id, 0, 'primary', 'tree', { unique = true },
+                  {{0, 'string'}}}
+end
+local function upgrade_to_3_3_0()
+    create_gc_consumers()
+end
+
+local function create_recovery_point()
+    local _space = box.space[box.schema.SPACE_ID]
+    local _index = box.space[box.schema.INDEX_ID]
+    local space_id = box.schema.RECOVERY_POINT_ID
+
+    log.info("create space _recovery_point")
+    local format = {
+        {name = 'timestamp', type = 'unsigned'},
+        {name = 'replica_id', type = 'unsigned'},
+        {name = 'lsn', type = 'unsigned'},
+        {name = 'opts', type = 'map'},
+    }
+    _space:insert{space_id, ADMIN, '_recovery_point', 'memtx', 0,
+                  utils.setmap({}), format}
+
+    log.info("create primary index for space _recovery_point")
+    local parts = {
+        {field = 0, type = 'unsigned'},
+        {field = 1, type = 'unsigned'},
+        {field = 2, type = 'unsigned'},
+     }
+    _index:insert{space_id, 0, 'primary', 'tree', {unique = true}, parts}
+end
+
+local function upgrade_to_3_8_0()
+    create_recovery_point()
+end
+
+--------------------------------------------------------------------------------
 
 local handlers = {
-    {version = mkversion(1, 7, 5), func = upgrade_to_1_7_5, auto=true},
-    {version = mkversion(1, 7, 6), func = upgrade_to_1_7_6, auto = true},
-    {version = mkversion(1, 7, 7), func = upgrade_to_1_7_7, auto = true},
-    {version = mkversion(1, 10, 0), func = upgrade_to_1_10_0, auto = true},
-    {version = mkversion(1, 10, 2), func = upgrade_to_1_10_2, auto = true},
-    {version = mkversion(2, 1, 0), func = upgrade_to_2_1_0, auto = true},
-    {version = mkversion(2, 1, 1), func = upgrade_to_2_1_1, auto = true},
-    {version = mkversion(2, 1, 2), func = upgrade_to_2_1_2, auto = true},
-    {version = mkversion(2, 1, 3), func = upgrade_to_2_1_3, auto = true},
-    {version = mkversion(2, 2, 1), func = upgrade_to_2_2_1, auto = true},
-    {version = mkversion(2, 3, 0), func = upgrade_to_2_3_0, auto = true},
-    {version = mkversion(2, 3, 1), func = upgrade_to_2_3_1, auto = true},
-    {version = mkversion(2, 7, 1), func = upgrade_to_2_7_1, auto = true},
-    {version = mkversion(2, 9, 1), func = upgrade_to_2_9_1, auto = true},
+    {version = mkversion.new(1, 7, 5), func = upgrade_to_1_7_5},
+    {version = mkversion.new(1, 7, 6), func = upgrade_to_1_7_6},
+    {version = mkversion.new(1, 7, 7), func = upgrade_to_1_7_7},
+    {version = mkversion.new(1, 10, 0), func = upgrade_to_1_10_0},
+    {version = mkversion.new(1, 10, 2), func = upgrade_to_1_10_2},
+    {version = mkversion.new(2, 1, 0), func = upgrade_to_2_1_0},
+    {version = mkversion.new(2, 1, 1), func = upgrade_to_2_1_1},
+    {version = mkversion.new(2, 1, 2), func = upgrade_to_2_1_2},
+    {version = mkversion.new(2, 1, 3), func = upgrade_to_2_1_3},
+    {version = mkversion.new(2, 2, 1), func = upgrade_to_2_2_1},
+    {version = mkversion.new(2, 3, 0), func = upgrade_to_2_3_0},
+    {version = mkversion.new(2, 3, 1), func = upgrade_to_2_3_1},
+    {version = mkversion.new(2, 7, 1), func = upgrade_to_2_7_1},
+    {version = mkversion.new(2, 9, 1), func = upgrade_to_2_9_1},
+    {version = mkversion.new(2, 10, 1), func = upgrade_to_2_10_1},
+    {version = mkversion.new(2, 10, 4), func = upgrade_to_2_10_4},
+    {version = mkversion.new(2, 10, 5), func = upgrade_to_2_10_5},
+    {version = mkversion.new(2, 11, 0), func = upgrade_to_2_11_0},
+    {version = mkversion.new(2, 11, 1), func = upgrade_to_2_11_1},
+    {version = mkversion.new(2, 11, 5), func = upgrade_to_2_11_5},
+    {version = mkversion.new(3, 0, 0), func = upgrade_to_3_0_0},
+    {version = mkversion.new(3, 1, 0), func = upgrade_to_3_1_0},
+    {version = mkversion.new(3, 3, 0), func = upgrade_to_3_3_0},
+    {version = mkversion.new(3, 8, 0), func = upgrade_to_3_8_0},
 }
 
--- Schema version of the snapshot.
-local function get_version()
-    local version = box.space._schema:get{'version'}
-    if version == nil then
-        error('Missing "version" in box.space._schema')
-    end
-    local major = version[2]
-    local minor = version[3]
-    local patch = version[4] or 0
-
-    return mkversion(major, minor, patch),
-           string.format("%s.%s.%s", major, minor, patch)
-end
-
-local function schema_needs_upgrade()
-    -- Schema needs upgrade if current schema version is greater
-    -- than schema version of the snapshot.
-    local schema_version, schema_version_str = get_version()
-    if schema_version ~= nil and
-        handlers[#handlers].version > schema_version then
-        return true, schema_version_str
-    end
-    return false
-end
+builtin.box_init_latest_dd_version_id(
+    box.internal.version_to_id(handlers[#handlers].version))
 
 local trig_oldest_version = nil
 
@@ -1276,17 +1592,20 @@ local trig_oldest_version = nil
 -- * then usual upgrade_to_X_X_X() handlers may be fired to turn schema into the
 --   latest one.
 local recovery_triggers = {
-    {version = mkversion(1, 7, 1), tbl = {
+    {version = mkversion.new(1, 7, 1), tbl = {
         _user   = user_trig_1_7_1,
     }},
-    {version = mkversion(1, 7, 2), tbl = {
+    {version = mkversion.new(1, 7, 2), tbl = {
         _index = index_trig_1_7_2,
     }},
-    {version = mkversion(1, 7, 5), tbl = {
+    {version = mkversion.new(1, 7, 5), tbl = {
         _space = space_trig_1_7_5,
         _user  = user_trig_1_7_5,
     }},
-    {version = mkversion(1, 7, 7), tbl = {
+    {version = mkversion.new(1, 7, 6), tbl = {
+        _space = space_trig_1_7_6,
+    }},
+    {version = mkversion.new(1, 7, 7), tbl = {
         _priv   = priv_trig_1_7_7,
     }},
 }
@@ -1295,7 +1614,7 @@ local recovery_triggers = {
 -- snapshot), the triggers helping recover the old schema should be removed.
 local function schema_trig_last(_, tuple)
     if tuple and tuple[1] == 'version' then
-        local version = version_from_tuple(tuple)
+        local version = box.internal.version_from_tuple(tuple)
         if version then
             log.info("Recovery trigger: recovered schema version %s. "..
                      "Removing outdated recovery triggers.", version)
@@ -1339,12 +1658,8 @@ local function clear_recovery_triggers(version)
     end
 end
 
-local function upgrade(options)
-    options = options or {}
-    setmetatable(options, {__index = {auto = false}})
-
-    local version = get_version()
-    if version < mkversion(1, 6, 8) then
+local function upgrade_from(version)
+    if version < mkversion.new(1, 6, 8) then
         log.warn('can upgrade from 1.6.8 only')
         return
     end
@@ -1352,12 +1667,6 @@ local function upgrade(options)
     for _, handler in ipairs(handlers) do
         if version >= handler.version then
             goto continue
-        end
-        if options.auto and not handler.auto then
-            log.warn("cannot auto upgrade schema version to %s, " ..
-                     "please call box.schema.upgrade() manually",
-                     handler.version)
-            return
         end
         handler.func()
         log.info("set schema version to %s", handler.version)
@@ -1369,25 +1678,745 @@ local function upgrade(options)
     end
 end
 
+-- Runs the given function with the permission to execute DDL operations
+-- with an old schema. Used by upgrade/downgrade scripts.
+local function run_upgrade(func, ...)
+    utils.box_check_configured()
+    if builtin.box_schema_upgrade_begin() ~= 0 then
+        box.error()
+    end
+    local ok, err = pcall(func, ...)
+    builtin.box_schema_upgrade_end()
+    if not ok then
+        error(err)
+    end
+end
+
+local function upgrade()
+    local version = box.internal.dd_version()
+    run_upgrade(upgrade_from, version)
+end
+
+--------------------------------------------------------------------------------
+-- Downgrade part
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+-- Tarantool 2.9.1
+--------------------------------------------------------------------------------
+
+-- See remove_sql_builtin_functions_from_func and upgrades adding
+-- SQL_BUILTIN functions.
+local function restore_sql_builtin_functions(issue_handler)
+    if issue_handler.dry_run then
+        return
+    end
+    local sql_builtin_list = {
+        "TRIM", "TYPEOF", "PRINTF", "UNICODE", "CHAR", "HEX", "VERSION",
+        "QUOTE", "REPLACE", "SUBSTR", "GROUP_CONCAT", "JULIANDAY", "DATE",
+        "TIME", "DATETIME", "STRFTIME", "CURRENT_TIME", "CURRENT_TIMESTAMP",
+        "CURRENT_DATE", "LENGTH", "POSITION", "ROUND", "UPPER", "LOWER",
+        "IFNULL", "RANDOM", "CEIL", "CEILING", "CHARACTER_LENGTH",
+        "CHAR_LENGTH", "FLOOR", "MOD", "OCTET_LENGTH", "ROW_COUNT", "COUNT",
+        "LIKE", "ABS", "EXP", "LN", "POWER", "SQRT", "SUM", "TOTAL", "AVG",
+        "RANDOMBLOB", "NULLIF", "ZEROBLOB", "MIN", "MAX", "COALESCE", "EVERY",
+        "EXISTS", "EXTRACT", "SOME", "GREATER", "LESSER", "SOUNDEX",
+        "LIKELIHOOD", "LIKELY", "UNLIKELY", "_sql_stat_get", "_sql_stat_push",
+        "_sql_stat_init", "GREATEST", "LEAST",
+    }
+    local datetime = os.date("%Y-%m-%d %H:%M:%S")
+    local _func = box.space._func
+    for _, func in ipairs(sql_builtin_list) do
+        if _func.index.name:get(func) == nil then
+            local t = _func:auto_increment{
+                ADMIN, func, 1, 'SQL_BUILTIN', '', 'function', {}, 'any',
+                'none', 'none', false, false, true, {}, utils.setmap({}), '',
+                datetime, datetime}
+            box.space._priv:replace{ADMIN, PUBLIC, 'function', t.id, box.priv.X}
+        end
+    end
+end
+
+local function downgrade_from_2_9_1(issue_handler)
+    restore_sql_builtin_functions(issue_handler)
+end
+
+--------------------------------------------------------------------------------
+-- Tarantool 2.10.0
+--------------------------------------------------------------------------------
+
+-- See tarantool 2.10.0-beta2-169-gb9f6d3858.
+local function remove_deferred_deletes(issue_handler)
+    if issue_handler.dry_run then
+        return
+    end
+    log.info("remove defer_deletes from space options")
+    for _, space in box.space._space:pairs() do
+        local new_flags = table.copy(space.flags)
+        if new_flags.defer_deletes ~= nil then
+            new_flags.defer_deletes = nil
+            utils.setmap(new_flags)
+            box.space._space:update(space.id, {{'=', 'flags', new_flags}})
+        end
+    end
+end
+
+-- See tarantool-ee 2.10.0-beta2-97-g042a213.
+local function disable_background_space_upgrade(issue_handler)
+    for _, space in box.space._space:pairs() do
+        if space.flags.upgrade then
+            issue_handler(
+                "Background update is active in space '%s'. " ..
+                "It is supported starting from version 2.10.0.",
+                space.name)
+        end
+    end
+end
+
+-- See tarantool 2.10.0-beta2-140-ga51313a45.
+local function disable_tuple_compression(issue_handler)
+    for _, space in box.space._space:pairs() do
+        for _, format in pairs(space.format) do
+            if format.compression then
+                issue_handler(
+                    "Tuple compression is found in space '%s', field '%s'. " ..
+                    "It is supported starting from version 2.10.0.",
+                    space.name, format.name)
+            end
+        end
+    end
+end
+
+-- See tarantool 2.10.0-beta2-200-gd950fdde4.
+local function disable_core_field_foreign_key_constraints(issue_handler)
+    for _, space in box.space._space:pairs() do
+        for _, format in pairs(space.format) do
+            if format.foreign_key then
+                issue_handler(
+                    "Foreign key constraint is found in space '%s'," ..
+                    " field '%s'. It is supported starting from" ..
+                    " version 2.10.0.",
+                    space.name, format.name)
+            end
+        end
+    end
+end
+
+--
+-- Since we cannot distinguish between manually created core tuple foreign keys
+-- and core tuple foreign keys generated by SQL foreign key conversion, we must
+-- convert all core tuple foreign keys to SQL foreign keys. SQL foreign key were
+-- converted to core foreign keys in tarantool 2.11.0-entrypoint-740-g930674810.
+--
+local function convert_tuple_foreing_keys_to_sql_foreing_keys(issue_handler)
+    if issue_handler.dry_run then
+        return
+    end
+
+    log.info("convert tuple foreign keys to SQL foreign keys")
+    local _fk = box.space._fk_constraint
+    for _, space in box.space._space:pairs() do
+        local new_space = space:totable()
+        local is_space_changed = false
+        if space.flags.foreign_key then
+            for name, value in pairs(space.flags.foreign_key) do
+                local parent_id = value.space or space.id
+                local child_cols = {}
+                local parent_cols = {}
+                for k, v in pairs(value.field) do
+                    table.insert(child_cols, k)
+                    table.insert(parent_cols, v)
+                end
+                _fk:replace{name, space.id, parent_id, false, "full",
+                            "no_action", "no_action", child_cols, parent_cols}
+                new_space[6].foreign_key[name] = nil
+                is_space_changed = true
+            end
+            new_space[6].foreign_key = nil
+        end
+        if is_space_changed then
+            box.space._space:replace(new_space)
+        end
+    end
+end
+
+-- See tarantool 2.10.0-beta2-194-ged9b982d3.
+local function disable_core_field_constraints(issue_handler)
+    for _, space in box.space._space:pairs() do
+        for _, format in pairs(space.format) do
+            if format.constraint then
+                issue_handler(
+                    "Field constraint is found in space '%s', field '%s'. " ..
+                    "It is supported starting from version 2.10.0.",
+                    space.name, format.name)
+            end
+        end
+    end
+end
+
+-- See tarantool 2.10.0-beta2-196-g53f5d4e79.
+local function disable_core_tuple_constraints(issue_handler)
+    for _, space in box.space._space:pairs() do
+        if space.flags.constraint then
+            for name, _ in pairs(space.flags.constraint) do
+                if issue_handler.constraints[name] == nil then
+                    issue_handler(
+                        "Tuple constraint is found in space '%s'. " ..
+                        "It is supported starting from version 2.10.0.",
+                        space.name)
+                end
+            end
+        end
+    end
+end
+
+-- See tarantool 2.10.0-beta1-376-gd2a012455
+local function disable_takes_raw_args(issue_handler)
+    for _, func in box.space._func:pairs() do
+        if func.opts.takes_raw_args then
+            issue_handler(
+                "takes_raw_args option is set for function '%s'" ..
+                " It is supported starting from version 2.10.0.",
+                func.name)
+        end
+    end
+end
+
+local function downgrade_from_2_10_0(issue_handler)
+    remove_deferred_deletes(issue_handler)
+    disable_background_space_upgrade(issue_handler)
+    disable_tuple_compression(issue_handler)
+    disable_core_field_foreign_key_constraints(issue_handler)
+    convert_tuple_foreing_keys_to_sql_foreing_keys(issue_handler)
+    disable_core_field_constraints(issue_handler)
+    disable_core_tuple_constraints(issue_handler)
+    disable_takes_raw_args(issue_handler)
+end
+
+--------------------------------------------------------------------------------
+-- Tarantool 2.10.5
+--------------------------------------------------------------------------------
+
+-- See create_vspace_sequence_space.
+local function drop_vspace_sequence_space(issue_handler)
+    if issue_handler.dry_run then
+        return
+    end
+    log.info("revoke grants for 'public' role for _vspace_sequence")
+    box.space._priv:delete{PUBLIC, 'space', box.schema.VSPACE_SEQUENCE_ID}
+    for _, index in box.space._index:pairs(box.schema.VSPACE_SEQUENCE_ID,
+                                           {iterator = 'REQ'}) do
+        log.info("drop index %s on _vspace_sequence", index[3])
+        box.space._index:delete{index[1], index[2]}
+    end
+    log.info("drop view _vspace_sequence")
+    box.space._space:delete{box.schema.VSPACE_SEQUENCE_ID}
+end
+
+local function downgrade_from_2_10_5(issue_handler)
+    drop_vspace_sequence_space(issue_handler)
+end
+
+--------------------------------------------------------------------------------
+-- Tarantool 2.11.0
+--------------------------------------------------------------------------------
+
+-- See tarantool-ee 2.11.0-entrypoint-97-g67fccd4.
+local function disable_zlib_tuple_compression(issue_handler)
+    for _, space in box.space._space:pairs() do
+        for _, format in pairs(space.format) do
+            if format.compression and format.compression == 'zlib' then
+                issue_handler(
+                    "Tuple compression with 'zlib' algo is found in" ..
+                    " space '%s', field '%s'. " ..
+                    "It is supported starting from version 2.11.0.",
+                    space.name, format.name)
+            end
+        end
+    end
+end
+
+--
+-- See tarantool 2.11.0-entrypoint-740-g930674810 and
+-- tarantool 2.11.0-entrypoint-409-g0dea6493f.
+--
+local function convert_tuple_constraints_to_sql_check_constraints(issue_handler)
+    if not issue_handler.dry_run then
+        log.info("convert tuple constraints to SQL check constraints")
+    end
+    local funcs = {}
+    local _ck = box.space._ck_constraint
+    for _, space in box.space._space:pairs() do
+        local new_space = space:totable()
+        local is_space_changed = false
+        if space.flags.constraint then
+            for name, func_id in pairs(space.flags.constraint) do
+                local func = box.space._func:get{func_id}
+                if func ~= nil and func.language == 'SQL_EXPR' then
+                    funcs[func_id] = true
+                    if not issue_handler.dry_run then
+                        _ck:replace{space.id, name, false, "SQL", func.body,
+                                    true}
+                        new_space[6].constraint[name] = nil
+                        is_space_changed = true
+                    else
+                        issue_handler.constraints[name] = true
+                    end
+                end
+            end
+            if not issue_handler.dry_run and
+               next(new_space[6].constraint) == nil then
+                new_space[6].constraint = nil
+            end
+        end
+        if is_space_changed then
+            box.space._space:replace(new_space)
+            for id, _ in pairs(funcs) do
+                box.space._func:delete(id)
+                funcs[id] = nil
+            end
+        end
+    end
+    for _, func in box.space._func:pairs() do
+        if func.language == 'SQL_EXPR' and funcs[func.id] == nil then
+            issue_handler(
+                "Function '%s' has language type SQL_EXPR. " ..
+                "It is supported starting from version 2.11.0.",
+                func.name)
+        end
+    end
+end
+
+-- See tarantool-ee 2.11.0-entrypoint-104-ga005915.
+local function disable_pap_sha256_auth_method(issue_handler)
+    for _, user in box.space._user:pairs() do
+        for k in pairs(user.auth) do
+            if k == "pap-sha256" then
+                issue_handler(
+                    "Auth type 'pap-sha256' is found for user '%s'. " ..
+                    "It is supported starting from version 2.11.0.",
+                    user.name)
+            end
+        end
+    end
+end
+
+-- Check corresponding upgrade's add_user_auth_history_and_last_modified.
+-- See also tarantool 2.11.0-entrypoint-821-g1c33484d5.
+local function remove_user_auth_history_and_last_modified(issue_handler)
+    if issue_handler.dry_run then
+        return
+    end
+    log.info("remove auth_history and last_modified fields from space _user")
+    local ops = {{'#', '[7][6]', 2}}
+    if box.space._space:get(box.space._user.id)[7][6] ~= nil then
+        box.space._space:update(box.space._user.id, ops)
+    end
+    if box.space._space:get(box.space._vuser.id)[7][6] ~= nil then
+        box.space._space:update(box.space._vuser.id, ops)
+    end
+    for _, user in box.space._user:pairs() do
+        if #user == 7 then
+            box.space._user:update(user[1], {{'#', 6, 2}})
+        end
+    end
+end
+
+local function downgrade_from_2_11_0(issue_handler)
+    disable_zlib_tuple_compression(issue_handler)
+    convert_tuple_constraints_to_sql_check_constraints(issue_handler)
+    disable_pap_sha256_auth_method(issue_handler)
+    remove_user_auth_history_and_last_modified(issue_handler)
+end
+
+--------------------------------------------------------------------------------
+-- Tarantool 2.11.1
+--------------------------------------------------------------------------------
+
+-- See drop_schema_max_id.
+local function add_schema_max_id(issue_handler)
+    if issue_handler.dry_run then
+        return
+    end
+    log.info("add field max_id to space _schema")
+    local max_id = box.space._space.index.primary:max()[1]
+    if max_id < box.schema.SYSTEM_ID_MAX then
+        max_id = box.schema.SYSTEM_ID_MAX
+    end
+    box.space._schema:replace({"max_id", max_id})
+end
+
+local function downgrade_from_2_11_1(issue_handler)
+    add_schema_max_id(issue_handler)
+end
+
+--------------------------------------------------------------------------------
+-- Tarantool 3.0.0
+--------------------------------------------------------------------------------
+
+-- Revert store_replicaset_uuid_in_new_way().
+local function store_replicaset_uuid_in_old_way(issue_handler)
+    if issue_handler.dry_run then
+        return
+    end
+    log.info('drop replicaset uuid key')
+    change_replicaset_uuid_key('replicaset_uuid', 'cluster')
+end
+
+local function drop_instance_names(issue_handler)
+    if issue_handler.dry_run then
+        return
+    end
+    log.info('drop instance names from _cluster format')
+    local format = {
+        {name = 'id', type = 'unsigned'},
+        {name = 'uuid', type = 'string'},
+    }
+    box.space._space:update({box.schema.CLUSTER_ID}, {{'=', 7, format}})
+end
+
+local function downgrade_from_3_0_0(issue_handler)
+    store_replicaset_uuid_in_old_way(issue_handler)
+    -- It's allowed to downgrade with names set in order to simlify the
+    -- downgrade process. Names will properly work on schema 2.11, since
+    -- the DDL is allowed, even though they they're not in the format.
+    drop_instance_names(issue_handler)
+end
+
+--------------------------------------------------------------------------------
+-- Tarantool 3.1.0
+--------------------------------------------------------------------------------
+
+local function drop_trigger_from_func(issue_handler)
+    local _space = box.space[box.schema.SPACE_ID]
+    local _func = box.space[box.schema.FUNC_ID]
+    local _vfunc = box.space[box.schema.VFUNC_ID]
+    local fmt = 'Function %s is registered as event trigger. ' ..
+                'It is supported starting from version 3.1.0'
+    if #_func:format() == 19 then
+        return
+    end
+    if not issue_handler.dry_run then
+        log.info('drop trigger from _func')
+        local ops = {{'#', '[7][20]', 1}}
+        _space:update({_func.id}, ops)
+        _space:update({_vfunc.id}, ops)
+    end
+    for _, v in _func:pairs() do
+        if #v > 19 and not table.equals(v[20], {}) then
+            issue_handler(fmt, v.name)
+        end
+        if not issue_handler.dry_run then
+            _func:update(v[1], {{'#', 20, 1}})
+        end
+    end
+end
+
+local function downgrade_from_3_1_0(issue_handler)
+    drop_trigger_from_func(issue_handler)
+end
+
+--------------------------------------------------------------------------------
+-- Tarantool 3.3.0
+--------------------------------------------------------------------------------
+
+local function drop_gc_consumers(issue_handler)
+    -- GC consumers are created by Tarantool, not users, so the space
+    -- can be dropped even if some persistent consumers are left
+    if issue_handler.dry_run then
+        return
+    end
+
+    local _space = box.space[box.schema.SPACE_ID]
+    local _index = box.space[box.schema.INDEX_ID]
+    local _priv = box.space[box.schema.PRIV_ID]
+    local space_id = box.schema.GC_CONSUMERS_ID
+
+    log.info("drop primary index of _gc_consumers")
+    _index:delete{space_id, 0}
+
+    log.info("drop replication privilege for _gc_consumers")
+    _priv:delete{REPLICATION, 'space', space_id}
+
+    log.info("drop space _gc_consumers")
+    _space:delete{space_id}
+end
+
+local function downgrade_from_3_3_0(issue_handler)
+    drop_gc_consumers(issue_handler)
+end
+
+local function drop_recovery_point(issue_handler)
+    if issue_handler.dry_run then
+        return
+    end
+
+    local _space = box.space[box.schema.SPACE_ID]
+    local _index = box.space[box.schema.INDEX_ID]
+    local space_id = box.schema.RECOVERY_POINT_ID
+
+    log.info("drop primary index of _recovery_point")
+    _index:delete{space_id, 0}
+
+    log.info("drop space _recovery_point")
+    _space:delete{space_id}
+end
+
+local function downgrade_from_3_8_0(issue_handler)
+    drop_recovery_point(issue_handler)
+end
+
+-- Versions should be ordered from newer to older.
+--
+-- Every step can be called in 2 modes. In dry_run mode (issue_handler.dry_run
+-- is set) step should only check for downgrade issues that cannot be handled
+-- without client help. In this mode step should NOT apply any changes.
+-- In regular mode (issue_handler.dry_run is not set) step should actually
+-- apply the required changes.
+--
+-- NOTICE: all downgrade steps SHOULD be idempotent.
+--
+-- We require steps to be idempotent because downgrade steps are run not
+-- considering current schema version. For example when downgrade('2.10.0') is
+-- run on Tarantool version 2.11.0 then step for 2.10.5 will be applied.
+-- It will be applied if schema version is 2.11.0 and it will be applied
+-- if schema version is 2.10.0.
+--
+local downgrade_handlers = {
+    {version = mkversion.new(3, 8, 0), func = downgrade_from_3_8_0},
+    {version = mkversion.new(3, 3, 0), func = downgrade_from_3_3_0},
+    {version = mkversion.new(3, 1, 0), func = downgrade_from_3_1_0},
+    {version = mkversion.new(3, 0, 0), func = downgrade_from_3_0_0},
+    {version = mkversion.new(2, 11, 1), func = downgrade_from_2_11_1},
+    {version = mkversion.new(2, 11, 0), func = downgrade_from_2_11_0},
+    {version = mkversion.new(2, 10, 5), func = downgrade_from_2_10_5},
+    {version = mkversion.new(2, 10, 0), func = downgrade_from_2_10_0},
+    {version = mkversion.new(2, 9, 1), func = downgrade_from_2_9_1},
+}
+
+-- This downgrade issue handler is used to raise an error when issue is
+-- encountered.
+local downgrade_raise_error = {}
+
+local downgrade_raise_error_mt = {
+    __call = function(self, fmt, ...)
+        error(string.format(fmt, ...))
+    end
+}
+
+downgrade_raise_error.new = function()
+    local handler = {}
+    return setmetatable(handler, downgrade_raise_error_mt)
+end
+
+-- This downgrade issue handler is used to collect all downgrade issues.
+local downgrade_list_issue = {}
+
+local downgrade_list_issue_mt = {
+    __call = function(self, fmt, ...)
+        table.insert(self.list, string.format(fmt, ...))
+    end
+}
+
+downgrade_list_issue.new = function()
+    local handler = {}
+    handler.list = {}
+    handler.dry_run = true
+    handler.constraints = {}
+    return setmetatable(handler, downgrade_list_issue_mt)
+end
+
+-- Find schema version which does not require upgrade for given application
+-- version. For example:
+--
+-- app2schema_version(mkversion.new('2.10.3')) == mkversion.new('2.10.1')
+-- app2schema_version(mkversion.new('2.10.0')) == mkversion.new('2.9.1')
+local function app2schema_version(app_version)
+    local schema_version
+    for _, handler in ipairs(handlers) do
+        if handler.version > app_version then
+            break
+        end
+        schema_version = handler.version
+    end
+    return schema_version
+end
+
+-- Call required downgrade step given application version we downgrade to.
+-- Version should have mkversion type.
+local function downgrade_steps(version, issue_handler)
+    for _, handler in ipairs(downgrade_handlers) do
+        if handler.version < version then
+            break
+        end
+        if handler.version ~= version then
+            handler.func(issue_handler)
+        end
+    end
+end
+
+-- List of all Tarantool releases we can downgrade to.
+local downgrade_versions = {
+    -- DOWNGRADE VERSIONS BEGIN
+    "2.8.2",
+    "2.8.3",
+    "2.8.4",
+    "2.10.0",
+    "2.10.1",
+    "2.10.2",
+    "2.10.3",
+    "2.10.4",
+    "2.10.5",
+    "2.10.6",
+    "2.10.7",
+    "2.10.8",
+    "2.11.0",
+    "2.11.1",
+    "2.11.2",
+    "2.11.3",
+    "2.11.4",
+    "2.11.5",
+    "2.11.6",
+    "2.11.7",
+    "2.11.8",
+    "2.11.9",
+    "2.11.10",
+    "3.0.0",
+    "3.0.1",
+    "3.0.2",
+    "3.1.0",
+    "3.1.1",
+    "3.1.2",
+    "3.2.0",
+    "3.2.1",
+    "3.2.2",
+    "3.2.3",
+    "3.2.4",
+    "3.3.0",
+    "3.3.1",
+    "3.3.2",
+    "3.3.3",
+    "3.3.4",
+    "3.3.5",
+    "3.4.0",
+    "3.4.1",
+    "3.4.2",
+    "3.5.0",
+    "3.5.1",
+    "3.5.2",
+    "3.6.0",
+    "3.6.1",
+    "3.6.2",
+    "3.6.3",
+    "3.6.4",
+    "3.7.0",
+    "3.7.1",
+    "3.7.2",
+    "3.8.0",
+    "3.8.1",
+    "3.8.2",
+    "3.9.0",
+    -- DOWNGRADE VERSIONS END
+}
+
+-- Downgrade or list downgrade issues depending of dry_run argument value.
+--
+-- If dry_run is true then list downgrade issues.  if dry_run is false then
+-- downgrade.
+--
+-- In case of downgrade check for issues is done before making any changes.
+-- If any issue is found then downgrade is failed and no any changes are done.
+local function downgrade_impl(version_str, dry_run)
+    utils.box_check_configured()
+    utils.check_param(version_str, 'version_str', 'string')
+    local version = mkversion.fromstr(version_str)
+    if fun.index(version_str, downgrade_versions) == nil then
+        error("Downgrade is only possible to version listed in" ..
+              " box.schema.downgrade_versions().")
+    end
+
+    local schema_version_cur = box.internal.dd_version()
+    local app_version = tarantool.version:match('^%d+%.%d+%.%d+')
+    if schema_version_cur > mkversion.fromstr(app_version) then
+        local err = "Cannot downgrade as current schema version %s is newer" ..
+                    " than Tarantool version %s"
+        error(err:format(schema_version_cur, app_version))
+    end
+    local schema_version_dst = app2schema_version(version)
+    if schema_version_cur < schema_version_dst then
+        local err = "Cannot downgrade as current schema version %s is older" ..
+                    " then schema version %s for Tarantool %s"
+        error(err:format(schema_version_cur, schema_version_dst, version))
+    end
+
+    local issue_handler = downgrade_list_issue.new()
+    downgrade_steps(version, issue_handler)
+    if dry_run then
+        return issue_handler.list
+    end
+
+    if #issue_handler.list > 0 then
+        local err = issue_handler.list[1]
+        if #issue_handler.list > 1 then
+            local more = " There are more downgrade issues. To list them" ..
+                         " all call box.schema.downgrade_issues."
+            err = err .. more
+        end
+        error(err)
+    end
+
+    downgrade_steps(version, downgrade_raise_error.new())
+
+    log.info("set schema version to %s", version)
+    box.space._schema:replace{'version',
+                              schema_version_dst.major,
+                              schema_version_dst.minor,
+                              schema_version_dst.patch}
+end
+
 local function bootstrap()
-    set_system_triggers(false)
+    -- Disabling system triggers doesn't turn off space format checks.
+    -- Since a system space format may be updated during the bootstrap
+    -- sequence, we clear all formats so that we can insert any data
+    -- into system spaces and reset them back after we're done.
+    clear_system_formats()
 
-    -- erase current schema
-    erase()
-    -- insert initial schema
-    initial_1_7_5()
-    -- upgrade schema to the latest version
-    upgrade()
+    with_disabled_system_triggers(function()
+        -- erase current schema
+        erase()
+        -- insert initial schema
+        initial_1_7_5()
+        -- upgrade schema to the latest version
+        upgrade_from(mkversion.new(1, 7, 5))
+    end)
 
-    set_system_triggers(true)
+    reset_system_formats()
 
     -- save new bootstrap.snap
     box.snapshot()
 end
 
-box.schema.upgrade = upgrade;
-box.internal.bootstrap = bootstrap;
-box.internal.schema_needs_upgrade = schema_needs_upgrade;
+box.schema.needs_upgrade = function()
+    utils.box_check_configured()
+    return builtin.box_schema_needs_upgrade()
+end
+box.schema.upgrade = upgrade
+box.schema.downgrade_versions = function()
+    return table.copy(downgrade_versions)
+end
+box.schema.downgrade = function(version)
+    run_upgrade(downgrade_impl, version, false)
+end
+box.schema.downgrade_issues = function(version)
+    return downgrade_impl(version, true)
+end
+box.internal.bootstrap = function()
+    run_upgrade(bootstrap)
+end
 box.internal.get_snapshot_version = get_snapshot_version;
 box.internal.set_recovery_triggers = set_recovery_triggers;
 box.internal.clear_recovery_triggers = clear_recovery_triggers;
+
+-- Export the run_upgrade() helper to let users perform schema upgrade
+-- manually in case box.schema.upgrade() failed.
+box.internal.run_schema_upgrade = run_upgrade

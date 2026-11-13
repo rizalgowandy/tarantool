@@ -42,6 +42,8 @@
 #include "session.h"
 #include "coio_file.h"
 #include "error.h"
+#include "iproto_constants.h"
+#include "tweaks.h"
 
 /*
  * Recovery subsystem
@@ -76,11 +78,14 @@
 
 /* {{{ Initial recovery */
 
+uint64_t xlog_row_bytes_per_yield = 1 << 19;
+TWEAK_UINT(xlog_row_bytes_per_yield);
+
 /**
  * Throws an exception in  case of error.
  */
 struct recovery *
-recovery_new(const char *wal_dirname, bool force_recovery,
+recovery_new(const char *wal_dirname, unsigned flags,
 	     const struct vclock *vclock)
 {
 	struct recovery *r = (struct recovery *)
@@ -95,11 +100,13 @@ recovery_new(const char *wal_dirname, bool force_recovery,
 		free(r);
 	});
 
-	xdir_create(&r->wal_dir, wal_dirname, XLOG, &INSTANCE_UUID,
+	xdir_create(&r->wal_dir, wal_dirname, "XLOG", &INSTANCE_UUID,
 		    &xlog_opts_default);
-	r->wal_dir.force_recovery = force_recovery;
+	if (flags & RECOVERY_IGNORE_ERRORS)
+		r->wal_dir.force_recovery = true;
 
 	vclock_copy(&r->vclock, vclock);
+	r->flags = flags;
 
 	/**
 	 * Avoid scanning WAL dir before we recovered
@@ -141,7 +148,9 @@ recovery_scan(struct recovery *r, struct vclock *end_vclock,
 	struct xrow_header row;
 	while (xlog_cursor_next(&cursor, &row, true) == 0) {
 		vclock_follow_xrow(end_vclock, &row);
-		if (++stream->row_count % WAL_ROWS_PER_YIELD == 0)
+		++stream->row_count;
+		stream->row_bytes_since_yield += xrow_approx_len(&row);
+		if (stream->row_bytes_since_yield > xlog_row_bytes_per_yield)
 			xstream_yield(stream);
 	}
 	xlog_cursor_close(&cursor, false);
@@ -155,7 +164,8 @@ recovery_close_log(struct recovery *r)
 	if (!xlog_cursor_is_open(&r->cursor))
 		return;
 	if (xlog_cursor_is_eof(&r->cursor)) {
-		say_info("done `%s'", r->cursor.name);
+		if (!(r->flags & RECOVERY_SUPPRESS_LOGGING))
+			say_info("done `%s'", r->cursor.name);
 	} else {
 		say_warn("file `%s` wasn't correctly closed",
 			 r->cursor.name);
@@ -167,7 +177,6 @@ recovery_close_log(struct recovery *r)
 static void
 recovery_open_log(struct recovery *r, const struct vclock *vclock)
 {
-	XlogGapError *e;
 	struct xlog_meta meta = r->cursor.meta;
 	enum xlog_cursor_state state = r->cursor.state;
 
@@ -209,11 +218,10 @@ out:
 	return;
 
 gap_error:
-	e = tnt_error(XlogGapError, &r->vclock, vclock);
-	if (!r->wal_dir.force_recovery)
-		throw e;
-	/* Ignore missing WALs if force_recovery is set. */
-	e->log();
+	diag_set(XlogGapError, &r->vclock, vclock);
+	if (!(r->flags & RECOVERY_IGNORE_ERRORS))
+		diag_raise();
+	diag_log();
 	say_warn("ignoring a gap in LSN");
 	goto out;
 }
@@ -247,14 +255,19 @@ recover_xlog(struct recovery *r, struct xstream *stream,
 	     const struct vclock *stop_vclock)
 {
 	struct xrow_header row;
+	bool is_sending_tx = false;
 	while (xlog_cursor_next_xc(&r->cursor, &row,
-				   r->wal_dir.force_recovery) == 0) {
-		if (++stream->row_count % WAL_ROWS_PER_YIELD == 0) {
+				   (r->flags & RECOVERY_IGNORE_ERRORS)) == 0) {
+		++stream->row_count;
+		stream->row_bytes_since_yield += xrow_approx_len(&row);
+		if (stream->row_bytes_since_yield > xlog_row_bytes_per_yield) {
 			xstream_yield(stream);
 		}
-		if (stream->row_count % 100000 == 0)
-			say_info("%.1fM rows processed",
-				 stream->row_count / 1000000.);
+		if (stream->row_count % 100000 == 0 &&
+		    !(r->flags & RECOVERY_SUPPRESS_LOGGING)) {
+			say_info_ratelimited("%.1fM rows processed",
+					     stream->row_count / 1e6);
+		}
 		/*
 		 * Read the next row from xlog file.
 		 *
@@ -266,9 +279,6 @@ recover_xlog(struct recovery *r, struct xstream *stream,
 		if (stop_vclock != NULL &&
 		    r->vclock.signature >= stop_vclock->signature)
 			return;
-		int64_t current_lsn = vclock_get(&r->vclock, row.replica_id);
-		if (row.lsn <= current_lsn)
-			continue; /* already applied, skip */
 
 		/*
 		 * All rows in xlog files have an assigned replica
@@ -276,15 +286,34 @@ recover_xlog(struct recovery *r, struct xstream *stream,
 		 * are signed with a zero replica id.
 		 */
 		assert(row.replica_id != 0 || row.group_id == GROUP_LOCAL);
-		/*
-		 * We can promote the vclock either before or
-		 * after xstream_write(): it only makes any impact
-		 * in case of forced recovery, when we skip the
-		 * failed row anyway.
-		 */
-		vclock_follow_xrow(&r->vclock, &row);
+		int64_t current_lsn = vclock_get(&r->vclock, row.replica_id);
+		if (row.lsn <= current_lsn) {
+			/*
+			 * Skip the already applied row, if it is not needed to
+			 * preserve transaction boundaries (is not the last row
+			 * of a currently recovered transaction). Otherwise,
+			 * replace it with a NOP, so that the transaction end
+			 * flag reaches the receiver, but the data isn't
+			 * recovered twice.
+			 */
+			if (!is_sending_tx || !row.is_commit)
+				continue; /* already applied, skip */
+			row.type = IPROTO_NOP;
+			row.bodycnt = 0;
+			row.body[0].iov_base = NULL;
+			row.body[0].iov_len = 0;
+		} else {
+			/*
+			 * We can promote the vclock either before or
+			 * after xstream_write(): it only makes any impact
+			 * in case of forced recovery, when we skip the
+			 * failed row anyway.
+			 */
+			vclock_follow_xrow(&r->vclock, &row);
+		}
+		is_sending_tx = !row.is_commit;
 		if (xstream_write(stream, &row) != 0) {
-			if (!r->wal_dir.force_recovery)
+			if (!(r->flags & RECOVERY_IGNORE_ERRORS))
 				diag_raise();
 
 			say_error("skipping row {%u: %lld}",
@@ -348,8 +377,8 @@ recover_remaining_wals(struct recovery *r, struct xstream *stream,
 
 		recovery_open_log(r, clock);
 
-		say_info("recover from `%s'", r->cursor.name);
-
+		if (!(r->flags & RECOVERY_SUPPRESS_LOGGING))
+			say_info("recover from `%s'", r->cursor.name);
 recover_current_wal:
 		recover_xlog(r, stream, stop_vclock);
 	}
@@ -359,8 +388,6 @@ recover_current_wal:
 
 	if (stop_vclock != NULL && vclock_compare(&r->vclock, stop_vclock) != 0)
 		tnt_raise(XlogGapError, &r->vclock, stop_vclock);
-
-	region_free(&fiber()->gc);
 }
 
 void
@@ -402,8 +429,7 @@ public:
 	void wakeup(unsigned events)
 	{
 		this->events |= events;
-		if (f->flags & FIBER_IS_CANCELLABLE)
-			fiber_wakeup(f);
+		fiber_wakeup(f);
 	}
 
 	WalSubscription(const char *wal_dir)
@@ -471,7 +497,7 @@ hot_standby_f(va_list ap)
 	WalSubscription subscription(r->wal_dir.dirname);
 
 	while (! fiber_is_cancelled()) {
-
+		FiberGCChecker gc_check;
 		/*
 		 * Recover until there is no new stuff which appeared in
 		 * the log dir while recovery was running.
@@ -483,9 +509,12 @@ hot_standby_f(va_list ap)
 		int64_t start, end;
 		do {
 			start = vclock_sum(&r->vclock);
-
-			recover_remaining_wals(r, stream, NULL, scan_dir);
-
+			try {
+				recover_remaining_wals(r, stream, NULL,
+						       scan_dir);
+			} catch (Exception *e) {
+				error_log(e);
+			}
 			end = vclock_sum(&r->vclock);
 			/*
 			 * Continue, given there's been progress *and* there is a
@@ -499,14 +528,12 @@ hot_standby_f(va_list ap)
 					  r->cursor.name : NULL);
 
 		bool timed_out = false;
-		if (subscription.events == 0) {
-			/**
-			 * Allow an immediate wakeup/break loop
-			 * from recovery_stop_local().
-			 */
-			fiber_set_cancellable(true);
-			timed_out = fiber_yield_timeout(wal_dir_rescan_delay);
-			fiber_set_cancellable(false);
+		ev_tstamp deadline = ev_monotonic_now(loop())
+				     + wal_dir_rescan_delay;
+		while (r->watcher != NULL &&
+		       !timed_out &&
+		       subscription.events == 0) {
+			timed_out = fiber_yield_deadline(deadline);
 		}
 
 		scan_dir = timed_out ||
@@ -527,7 +554,7 @@ recovery_follow_local(struct recovery *r, struct xstream *stream,
 	 * xlog.
 	 */
 	assert(r->watcher == NULL);
-	r->watcher = fiber_new_xc(name, hot_standby_f);
+	r->watcher = fiber_new_system(name, hot_standby_f);
 	fiber_set_joinable(r->watcher, true);
 	fiber_start(r->watcher, r, stream, wal_dir_rescan_delay);
 }
@@ -537,6 +564,7 @@ recovery_stop_local(struct recovery *r)
 {
 	if (r->watcher) {
 		struct fiber *f = r->watcher;
+		/* Break the loop in hot_standby_f(). */
 		r->watcher = NULL;
 		fiber_cancel(f);
 		if (fiber_join(f) != 0)

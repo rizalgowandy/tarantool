@@ -85,11 +85,12 @@ sequence_data_equal_key(struct sequence_data data, uint32_t id)
 
 static struct light_sequence_core sequence_data_index;
 static struct mempool sequence_data_extent_pool;
+static struct matras_allocator sequence_data_extent_allocator;
 
 static void *
-sequence_data_extent_alloc(void *ctx)
+sequence_data_extent_alloc(struct matras_allocator *allocator)
 {
-	(void)ctx;
+	(void)allocator;
 	void *ret = mempool_alloc(&sequence_data_extent_pool);
 	if (ret == NULL)
 		diag_set(OutOfMemory, SEQUENCE_DATA_EXTENT_SIZE,
@@ -98,9 +99,9 @@ sequence_data_extent_alloc(void *ctx)
 }
 
 static void
-sequence_data_extent_free(void *ctx, void *extent)
+sequence_data_extent_free(struct matras_allocator *allocator, void *extent)
 {
-	(void)ctx;
+	(void)allocator;
 	mempool_free(&sequence_data_extent_pool, extent);
 }
 
@@ -115,26 +116,26 @@ sequence_init(void)
 {
 	mempool_create(&sequence_data_extent_pool, &cord()->slabc,
 		       SEQUENCE_DATA_EXTENT_SIZE);
-	light_sequence_create(&sequence_data_index, SEQUENCE_DATA_EXTENT_SIZE,
-			      sequence_data_extent_alloc,
-			      sequence_data_extent_free, NULL, 0);
+	matras_allocator_create(&sequence_data_extent_allocator,
+				SEQUENCE_DATA_EXTENT_SIZE,
+				sequence_data_extent_alloc,
+				sequence_data_extent_free);
+	light_sequence_create(&sequence_data_index, 0,
+			      &sequence_data_extent_allocator, NULL);
 }
 
 void
 sequence_free(void)
 {
 	light_sequence_destroy(&sequence_data_index);
+	matras_allocator_destroy(&sequence_data_extent_allocator);
 	mempool_destroy(&sequence_data_extent_pool);
 }
 
 struct sequence *
 sequence_new(struct sequence_def *def)
 {
-	struct sequence *seq = calloc(1, sizeof(*seq));
-	if (seq == NULL) {
-		diag_set(OutOfMemory, sizeof(*seq), "malloc", "sequence");
-		return NULL;
-	}
+	struct sequence *seq = xcalloc(1, sizeof(*seq));
 	seq->def = def;
 	return seq;
 }
@@ -300,71 +301,133 @@ access_check_sequence(struct sequence *seq)
 	return 0;
 }
 
-struct sequence_data_iterator {
-	struct snapshot_iterator base;
-	/** Iterator over the data index. */
-	struct light_sequence_iterator iter;
-	/** Last tuple returned by the iterator. */
-	char tuple[0];
+/** Read view implementation. */
+struct sequence_data_read_view {
+	/** Base class. */
+	struct index_read_view base;
+	/** Frozen view of the data index. */
+	struct light_sequence_view view;
 };
 
-#define SEQUENCE_TUPLE_BUF_SIZE		(mp_sizeof_array(2) + \
-					 2 * mp_sizeof_uint(UINT64_MAX))
+/** Read view iterator implementation. */
+struct sequence_data_iterator {
+	/** Base class. */
+	struct index_read_view_iterator_base base;
+	/** Iterator over the data index. */
+	struct light_sequence_iterator iter;
+};
 
+static_assert(sizeof(struct sequence_data_iterator) <=
+	      INDEX_READ_VIEW_ITERATOR_SIZE,
+	      "sizeof(struct sequence_data_iterator) must be less than or "
+	      "equal to INDEX_READ_VIEW_ITERATOR_SIZE");
+
+/** Implementation of next_raw index_read_view_iterator callback. */
 static int
-sequence_data_iterator_next(struct snapshot_iterator *base,
-			    const char **data, uint32_t *size)
+sequence_data_iterator_next_raw(struct index_read_view_iterator *iterator,
+				struct read_view_tuple *result)
 {
 	struct sequence_data_iterator *iter =
-		(struct sequence_data_iterator *)base;
+		(struct sequence_data_iterator *)iterator;
+	struct sequence_data_read_view *rv =
+		(struct sequence_data_read_view *)iter->base.index;
 
-	struct sequence_data *sd =
-		light_sequence_iterator_get_and_next(&sequence_data_index,
-						     &iter->iter);
+	struct sequence_data *sd = light_sequence_view_iterator_get_and_next(
+		&rv->view, &iter->iter);
 	if (sd == NULL) {
-		*data = NULL;
+		*result = read_view_tuple_none();
 		return 0;
 	}
 
-	char *buf_end = iter->tuple;
+	const size_t buf_size = mp_sizeof_array(2) +
+				2 * mp_sizeof_uint(UINT64_MAX);
+	char *buf = xregion_alloc(&fiber()->gc, buf_size);
+	char *buf_end = buf;
 	buf_end = mp_encode_array(buf_end, 2);
 	buf_end = mp_encode_uint(buf_end, sd->id);
 	buf_end = (sd->value >= 0 ?
 		   mp_encode_uint(buf_end, sd->value) :
 		   mp_encode_int(buf_end, sd->value));
-	assert(buf_end <= iter->tuple + SEQUENCE_TUPLE_BUF_SIZE);
-	*data = iter->tuple;
-	*size = buf_end - iter->tuple;
+	assert(buf_end <= buf + buf_size);
+	result->data = buf;
+	result->size = buf_end - buf;
+	result->ptr = NULL; /* Invalid, should not be used. */
+	return 0;
+}
+
+static inline int
+sequence_data_read_view_get_raw(struct index_read_view *rv,
+				const char *key, uint32_t part_count,
+				struct read_view_tuple *result)
+{
+	(void)rv;
+	(void)key;
+	(void)part_count;
+	(void)result;
+	diag_set(ClientError, ER_UNSUPPORTED,
+		 "_sequence_data read view", "get()");
+	return -1;
+}
+
+/** Implementation of create_iterator index_read_view callback. */
+static int
+sequence_data_iterator_create(struct index_read_view *base,
+			      enum iterator_type type,
+			      const char *key, uint32_t part_count,
+			      const char *pos,
+			      struct index_read_view_iterator *iterator)
+{
+	if (pos != NULL) {
+		diag_set(UnsupportedIndexFeature, base->def, "pagination");
+		return -1;
+	}
+	if (type != ITER_ALL) {
+		diag_set(ClientError, ER_UNSUPPORTED,
+			 "_sequence_data read view", "requested iterator type");
+		return -1;
+	}
+	(void)key;
+	(void)part_count;
+	struct sequence_data_read_view *rv =
+		(struct sequence_data_read_view *)base;
+	struct sequence_data_iterator *iter =
+		(struct sequence_data_iterator *)iterator;
+	iter->base.index = base;
+	iter->base.destroy = generic_index_read_view_iterator_destroy;
+	iter->base.next_raw = sequence_data_iterator_next_raw;
+	iter->base.position = generic_index_read_view_iterator_position;
+	light_sequence_view_iterator_begin(&rv->view, &iter->iter);
 	return 0;
 }
 
 static void
-sequence_data_iterator_free(struct snapshot_iterator *base)
+sequence_data_read_view_free(struct index_read_view *base)
 {
-	struct sequence_data_iterator *iter =
-		(struct sequence_data_iterator *)base;
-	light_sequence_iterator_destroy(&sequence_data_index, &iter->iter);
-	TRASH(iter);
-	free(iter);
+	struct sequence_data_read_view *rv =
+		(struct sequence_data_read_view *)base;
+	light_sequence_view_destroy(&rv->view);
+	TRASH(rv);
+	free(rv);
 }
 
-struct snapshot_iterator *
-sequence_data_iterator_create(void)
+struct index_read_view *
+sequence_data_read_view_create(struct index *index)
 {
-	struct sequence_data_iterator *iter = calloc(1, sizeof(*iter) +
-						     SEQUENCE_TUPLE_BUF_SIZE);
-	if (iter == NULL) {
-		diag_set(OutOfMemory, sizeof(*iter) + SEQUENCE_TUPLE_BUF_SIZE,
-			 "malloc", "sequence_data_iterator");
-		return NULL;
-	}
-
-	iter->base.free = sequence_data_iterator_free;
-	iter->base.next = sequence_data_iterator_next;
-
-	light_sequence_iterator_begin(&sequence_data_index, &iter->iter);
-	light_sequence_iterator_freeze(&sequence_data_index, &iter->iter);
-	return &iter->base;
+	static const struct index_read_view_vtab vtab = {
+		.free = sequence_data_read_view_free,
+		.count = generic_index_read_view_count,
+		.quantile = generic_index_read_view_quantile,
+		.get_raw = sequence_data_read_view_get_raw,
+		.create_iterator = sequence_data_iterator_create,
+		.create_iterator_with_offset =
+			generic_index_read_view_create_iterator_with_offset,
+		.create_arrow_stream =
+			generic_index_read_view_create_arrow_stream,
+	};
+	struct sequence_data_read_view *rv = xmalloc(sizeof(*rv));
+	index_read_view_create(&rv->base, &vtab, index->def);
+	light_sequence_view_create(&rv->view, &sequence_data_index);
+	return (struct index_read_view *)rv;
 }
 
 int

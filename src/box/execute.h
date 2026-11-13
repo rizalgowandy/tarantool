@@ -46,21 +46,12 @@ enum sql_info_key {
 	sql_info_key_MAX,
 };
 
-/**
- * One of possible formats used to dump msgpack/Lua.
- * For details see port_sql_dump_msgpack() and port_sql_dump_lua().
- */
-enum sql_serialization_format {
-	DQL_EXECUTE = 0,
-	DML_EXECUTE = 1,
-	DQL_PREPARE = 2,
-	DML_PREPARE = 3,
-};
-
 extern const char *sql_info_key_strs[];
 
+struct Vdbe;
 struct region;
 struct sql_bind;
+struct sql_request;
 
 int
 sql_unprepare(uint32_t stmt_id);
@@ -89,36 +80,11 @@ sql_prepare_and_execute(const char *sql, int len, const struct sql_bind *bind,
 			struct region *region);
 
 /**
- * Port implementation that is used to store SQL responses and
- * output them to obuf or Lua. This port implementation is
- * inherited from the port_c structure. This allows us to use
- * this structure in the port_c methods instead of port_c itself.
- *
- * The methods of port_c are called via explicit access to
- * port_c_vtab just like C++ does with BaseClass::method, when
- * it is called in a child method.
+ * The following routine destroys a virtual machine that is created by the
+ * sql_stmt_compile() routine.
  */
-struct port_sql {
-	/** Base port struct. To be able to use port_c methods. */
-	struct port_c base;
-	/* Prepared SQL statement. */
-	struct sql_stmt *stmt;
-	/**
-	 * Serialization format depends on type of SQL query: DML or
-	 * DQL; and on type of SQL request: execute or prepare.
-	 */
-	uint8_t serialization_format;
-	/**
-	 * There's no need in clean-up in case of PREPARE request:
-	 * statement remains in cache and will be deleted later.
-	 */
-	bool do_finalize;
-};
-
-extern const struct port_vtab port_sql_vtab;
-
 int
-sql_stmt_finalize(struct sql_stmt *stmt);
+sql_stmt_finalize(struct Vdbe *stmt);
 
 /**
  * Calculate estimated size of memory occupied by VM.
@@ -126,17 +92,25 @@ sql_stmt_finalize(struct sql_stmt *stmt);
  * memory.
  */
 size_t
-sql_stmt_est_size(const struct sql_stmt *stmt);
+sql_stmt_est_size(const struct Vdbe *stmt);
 
 /**
  * Return string of SQL query.
  */
 const char *
-sql_stmt_query_str(const struct sql_stmt *stmt);
+sql_stmt_query_str(const struct Vdbe *stmt);
+
+/** Store the ID in the prepared statement cache within the statement itself. */
+int
+sql_stmt_set_id(struct Vdbe *stmt, uint32_t id);
+
+/** Get the ID in the prepared statement cache from the statement. */
+uint32_t
+sql_stmt_get_id(const struct Vdbe *stmt);
 
 /** Return true if statement executes right now. */
 int
-sql_stmt_busy(const struct sql_stmt *stmt);
+sql_stmt_busy(const struct Vdbe *stmt);
 
 /**
  * Prepare (compile into VDBE byte-code) statement.
@@ -146,7 +120,23 @@ sql_stmt_busy(const struct sql_stmt *stmt);
  * @param port Port to store request response.
  */
 int
-sql_prepare(const char *sql, int len, struct port *port);
+sql_prepare(const char *sql, size_t len, struct port *port);
+
+/**
+ * Process an SQL request received over IPROTO.
+ *
+ * @param request SQL request.
+ * @param port Port to store request response.
+ *
+ * @retval  0 Success.
+ * @retval -1 Error, see diag.
+ *
+ * NOTE: The port may refer to data allocated from the fiber region.
+ * The caller is responsible for truncating the region after using
+ * the port.
+ */
+int
+box_process_sql(const struct sql_request *request, struct port *port);
 
 #if defined(__cplusplus)
 } /* extern "C" { */

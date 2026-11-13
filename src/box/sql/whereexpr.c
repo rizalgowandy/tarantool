@@ -50,29 +50,26 @@ static void exprAnalyze(SrcList *, WhereClause *, int);
  * Deallocate all memory associated with a WhereOrInfo object.
  */
 static void
-whereOrInfoDelete(sql * db, WhereOrInfo * p)
+whereOrInfoDelete(struct WhereOrInfo *p)
 {
 	sqlWhereClauseClear(&p->wc);
-	sqlDbFree(db, p);
+	sql_xfree(p);
 }
 
 /*
  * Deallocate all memory associated with a WhereAndInfo object.
  */
 static void
-whereAndInfoDelete(sql * db, WhereAndInfo * p)
+whereAndInfoDelete(struct WhereAndInfo *p)
 {
 	sqlWhereClauseClear(&p->wc);
-	sqlDbFree(db, p);
+	sql_xfree(p);
 }
 
 /*
  * Add a single new WhereTerm entry to the WhereClause object pWC.
  * The new WhereTerm object is constructed from Expr p and with wtFlags.
- * The index in pWC->a[] of the new WhereTerm is returned on success.
- * 0 is returned if the new WhereTerm could not be added due to a memory
- * allocation error.  The memory allocation failure will be recorded in
- * the db->mallocFailed flag so that higher-level functions can detect it.
+ * The index in pWC->a[] of the new WhereTerm is returned.
  *
  * This routine will increase the size of the pWC->a[] array as necessary.
  *
@@ -90,25 +87,16 @@ whereClauseInsert(WhereClause * pWC, Expr * p, u16 wtFlags)
 {
 	WhereTerm *pTerm;
 	int idx;
-	testcase(wtFlags & TERM_VIRTUAL);
 	if (pWC->nTerm >= pWC->nSlot) {
 		WhereTerm *pOld = pWC->a;
-		sql *db = pWC->pWInfo->pParse->db;
-		pWC->a =
-		    sqlDbMallocRawNN(db,
-					 sizeof(pWC->a[0]) * pWC->nSlot * 2);
-		if (pWC->a == 0) {
-			if (wtFlags & TERM_DYNAMIC) {
-				sql_expr_delete(db, p, false);
-			}
-			pWC->a = pOld;
-			return 0;
-		}
+		size_t size = sizeof(pWC->a[0]) * pWC->nSlot * 2;
+		pWC->a = sql_xmalloc(size);
 		memcpy(pWC->a, pOld, sizeof(pWC->a[0]) * pWC->nTerm);
 		if (pOld != pWC->aStatic) {
-			sqlDbFree(db, pOld);
+			sql_xfree(pOld);
 		}
-		pWC->nSlot = sqlDbMallocSize(db, pWC->a) / sizeof(pWC->a[0]);
+		assert(size / sizeof(pWC->a[0]) == (size_t)pWC->nSlot * 2);
+		pWC->nSlot *= 2;
 	}
 	pTerm = &pWC->a[idx = pWC->nTerm++];
 	if (p && ExprHasProperty(p, EP_Unlikely)) {
@@ -244,7 +232,6 @@ operatorMask(int op)
  * bound) should be found using weight table that is not such
  * trivial case.
  *
- * @param pParse      Parsing and code generating context.
  * @param pExpr       Test this expression.
  * @param ppPrefix    Pointer to expression with pattern prefix.
  * @param pisComplete True if the only wildcard is '%' in the
@@ -253,8 +240,7 @@ operatorMask(int op)
  *         optimizable using inequality constraints.
  */
 static int
-like_optimization_is_valid(Parse *pParse, Expr *pExpr, Expr **ppPrefix,
-			   int *pisComplete)
+like_optimization_is_valid(Expr *pExpr, Expr **ppPrefix, int *pisComplete)
 {
 	/* String on RHS of LIKE operator. */
 	const char *z = 0;
@@ -266,9 +252,6 @@ like_optimization_is_valid(Parse *pParse, Expr *pExpr, Expr **ppPrefix,
 	int c;
 	/* Number of non-wildcard prefix characters. */
 	int cnt;
-	/* Database connection. */
-	sql *db = pParse->db;
-	sql_value *pVal = 0;
 	/* Opcode of pRight. */
 	int op;
 	/* Result code to return. */
@@ -306,18 +289,8 @@ like_optimization_is_valid(Parse *pParse, Expr *pExpr, Expr **ppPrefix,
 		return 0;
 
 	op = pRight->op;
-	if (op == TK_VARIABLE) {
-		Vdbe *pReprepare = pParse->pReprepare;
-		int iCol = pRight->iColumn;
-		pVal = sqlVdbeGetBoundValue(pReprepare, iCol);
-		if (pVal != NULL && mem_is_str(pVal)) {
-			if (mem_as_str0(pVal) == NULL)
-				return -1;
-		}
-		assert(pRight->op == TK_VARIABLE || pRight->op == TK_REGISTER);
-	} else if (op == TK_STRING) {
+	if (op == TK_STRING)
 		z = pRight->u.zToken;
-	}
 	if (z) {
 		cnt = 0;
 		while ((c = z[cnt]) != 0 && c != MATCH_ONE_WILDCARD &&
@@ -327,37 +300,15 @@ like_optimization_is_valid(Parse *pParse, Expr *pExpr, Expr **ppPrefix,
 			Expr *pPrefix;
 			*pisComplete = c == MATCH_ALL_WILDCARD &&
 				       z[cnt + 1] == 0;
-			pPrefix = sql_expr_new_named(db, TK_STRING, z);
-			if (pPrefix == NULL)
-				pParse->is_aborted = true;
-			else
-				pPrefix->u.zToken[cnt] = 0;
+			pPrefix = sql_expr_new_named(TK_STRING, z);
+			pPrefix->u.zToken[cnt] = 0;
 			*ppPrefix = pPrefix;
-			if (op == TK_VARIABLE) {
-				Vdbe *v = pParse->pVdbe;
-				if (*pisComplete && pRight->u.zToken[1]) {
-					/* If the rhs of the LIKE expression is a variable, and the current
-					 * value of the variable means there is no need to invoke the LIKE
-					 * function, then no OP_Variable will be added to the program.
-					 * This causes problems for the sql_bind_parameter_name()
-					 * API. To work around them, add a dummy OP_Variable here.
-					 */
-					int r1 = sqlGetTempReg(pParse);
-					sqlExprCodeTarget(pParse, pRight,
-							      r1);
-					sqlVdbeChangeP3(v,
-							    sqlVdbeCurrentAddr
-							    (v) - 1, 0);
-					sqlReleaseTempReg(pParse, r1);
-				}
-			}
 		} else {
 			z = 0;
 		}
 	}
 
 	rc = (z != 0);
-	sqlValueFree(pVal);
 	return rc;
 }
 
@@ -430,7 +381,6 @@ whereCombineDisjuncts(SrcList * pSrc,	/* the FROM clause */
     )
 {
 	u16 eOp = pOne->eOperator | pTwo->eOperator;
-	sql *db;		/* Database connection (for malloc) */
 	Expr *pNew;		/* New virtual expression */
 	int op;			/* Operator for the combined expression */
 	int idxNew;		/* Index in pWC of the next virtual term */
@@ -457,8 +407,7 @@ whereCombineDisjuncts(SrcList * pSrc,	/* the FROM clause */
 			eOp = WO_GE;
 		}
 	}
-	db = pWC->pWInfo->pParse->db;
-	pNew = sqlExprDup(db, pOne->pExpr, 0);
+	pNew = sqlExprDup(pOne->pExpr, 0);
 	if (pNew == 0)
 		return;
 	for (op = TK_EQ; eOp != (WO_EQ << (op - TK_EQ)); op++) {
@@ -559,7 +508,6 @@ exprAnalyzeOrTerm(SrcList * pSrc,	/* the FROM clause */
 {
 	WhereInfo *pWInfo = pWC->pWInfo;	/* WHERE clause processing context */
 	Parse *pParse = pWInfo->pParse;	/* Parser context */
-	sql *db = pParse->db;	/* Database connection */
 	WhereTerm *pTerm = &pWC->a[idxTerm];	/* The term to be analyzed */
 	Expr *pExpr = pTerm->pExpr;	/* The expression of the term */
 	int i;			/* Loop counters */
@@ -577,17 +525,14 @@ exprAnalyzeOrTerm(SrcList * pSrc,	/* the FROM clause */
 	assert((pTerm->wtFlags & (TERM_DYNAMIC | TERM_ORINFO | TERM_ANDINFO)) ==
 	       0);
 	assert(pExpr->op == TK_OR);
-	pTerm->u.pOrInfo = pOrInfo = sqlDbMallocZero(db, sizeof(*pOrInfo));
-	if (pOrInfo == 0)
-		return;
+	pOrInfo = sql_xmalloc0(sizeof(*pOrInfo));
+	pTerm->u.pOrInfo = pOrInfo;
 	pTerm->wtFlags |= TERM_ORINFO;
 	pOrWc = &pOrInfo->wc;
 	memset(pOrWc->aStatic, 0, sizeof(pOrWc->aStatic));
 	sqlWhereClauseInit(pOrWc, pWInfo);
 	sqlWhereSplit(pOrWc, pExpr, TK_OR);
 	sqlWhereExprAnalyze(pSrc, pOrWc);
-	if (db->mallocFailed)
-		return;
 	assert(pOrWc->nTerm >= 2);
 
 	/*
@@ -602,41 +547,31 @@ exprAnalyzeOrTerm(SrcList * pSrc,	/* the FROM clause */
 			assert((pOrTerm->
 				wtFlags & (TERM_ANDINFO | TERM_ORINFO)) == 0);
 			chngToIN = 0;
-			pAndInfo = sqlDbMallocRawNN(db, sizeof(*pAndInfo));
-			if (pAndInfo) {
-				WhereClause *pAndWC;
-				WhereTerm *pAndTerm;
-				int j;
-				Bitmask b = 0;
-				pOrTerm->u.pAndInfo = pAndInfo;
-				pOrTerm->wtFlags |= TERM_ANDINFO;
-				pOrTerm->eOperator = WO_AND;
-				pAndWC = &pAndInfo->wc;
-				memset(pAndWC->aStatic, 0,
-				       sizeof(pAndWC->aStatic));
-				sqlWhereClauseInit(pAndWC, pWC->pWInfo);
-				sqlWhereSplit(pAndWC, pOrTerm->pExpr,
-						  TK_AND);
-				sqlWhereExprAnalyze(pSrc, pAndWC);
-				pAndWC->pOuter = pWC;
-				if (!db->mallocFailed) {
-					for (j = 0, pAndTerm = pAndWC->a;
-					     j < pAndWC->nTerm;
-					     j++, pAndTerm++) {
-						assert(pAndTerm->pExpr);
-						if (allowedOp
-						    (pAndTerm->pExpr->op)
-						    || pAndTerm->eOperator ==
-						    WO_MATCH) {
-							b |= sqlWhereGetMask
-							    (&pWInfo->sMaskSet,
-							     pAndTerm->
-							     leftCursor);
-						}
-					}
+			pAndInfo = sql_xmalloc(sizeof(*pAndInfo));
+			struct WhereClause *pAndWC;
+			struct WhereTerm *pAndTerm;
+			int j;
+			Bitmask b = 0;
+			pOrTerm->u.pAndInfo = pAndInfo;
+			pOrTerm->wtFlags |= TERM_ANDINFO;
+			pOrTerm->eOperator = WO_AND;
+			pAndWC = &pAndInfo->wc;
+			memset(pAndWC->aStatic, 0,
+			       sizeof(pAndWC->aStatic));
+			sqlWhereClauseInit(pAndWC, pWC->pWInfo);
+			sqlWhereSplit(pAndWC, pOrTerm->pExpr, TK_AND);
+			sqlWhereExprAnalyze(pSrc, pAndWC);
+			pAndWC->pOuter = pWC;
+			for (j = 0, pAndTerm = pAndWC->a; j < pAndWC->nTerm;
+			     j++, pAndTerm++) {
+				assert(pAndTerm->pExpr != NULL);
+				if (allowedOp(pAndTerm->pExpr->op) ||
+				    pAndTerm->eOperator == WO_MATCH) {
+					b |= sqlWhereGetMask(&pWInfo->sMaskSet,
+						pAndTerm->leftCursor);
 				}
-				indexable &= b;
 			}
+			indexable &= b;
 		} else if (pOrTerm->wtFlags & TERM_COPIED) {
 			/* Skip this term for now.  We revisit it when we process the
 			 * corresponding TERM_VIRTUAL term
@@ -735,10 +670,6 @@ exprAnalyzeOrTerm(SrcList * pSrc,	/* the FROM clause */
 					 * or follwed by an inverted copy (t2.b==t1.a).  Skip this term
 					 * and use its inversion.
 					 */
-					testcase(pOrTerm->
-						 wtFlags & TERM_COPIED);
-					testcase(pOrTerm->
-						 wtFlags & TERM_VIRTUAL);
 					assert(pOrTerm->
 					       wtFlags & (TERM_COPIED |
 							  TERM_VIRTUAL));
@@ -759,7 +690,6 @@ exprAnalyzeOrTerm(SrcList * pSrc,	/* the FROM clause */
 							   iCursor));
 				break;
 			}
-			testcase(j == 1);
 
 			/* We have found a candidate table and column.  Check to see if that
 			 * table and column is common to every term in the OR clause
@@ -809,15 +739,12 @@ exprAnalyzeOrTerm(SrcList * pSrc,	/* the FROM clause */
 				assert(pOrTerm->eOperator & WO_EQ);
 				assert(pOrTerm->leftCursor == iCursor);
 				assert(pOrTerm->u.leftColumn == iColumn);
-				pDup =
-				    sqlExprDup(db, pOrTerm->pExpr->pRight,
-						   0);
-				pList = sql_expr_list_append(pWInfo->pParse->db,
-							     pList, pDup);
+				pDup = sqlExprDup(pOrTerm->pExpr->pRight, 0);
+				pList = sql_expr_list_append(pList, pDup);
 				pLeft = pOrTerm->pExpr->pLeft;
 			}
 			assert(pLeft != 0);
-			pDup = sqlExprDup(db, pLeft, 0);
+			pDup = sqlExprDup(pLeft, 0);
 			pNew = sqlPExpr(pParse, TK_IN, pDup, 0);
 			if (pNew) {
 				int idxNew;
@@ -828,12 +755,11 @@ exprAnalyzeOrTerm(SrcList * pSrc,	/* the FROM clause */
 				    whereClauseInsert(pWC, pNew,
 						      TERM_VIRTUAL |
 						      TERM_DYNAMIC);
-				testcase(idxNew == 0);
 				exprAnalyze(pSrc, pWC, idxNew);
 				pTerm = &pWC->a[idxTerm];
 				markTermAsChild(pWC, idxNew, idxTerm);
 			} else {
-				sql_expr_list_delete(db, pList);
+				sql_expr_list_delete(pList);
 			}
 			pTerm->eOperator = WO_NOOP;	/* case 1 trumps case 3 */
 		}
@@ -858,7 +784,7 @@ exprAnalyzeOrTerm(SrcList * pSrc,	/* the FROM clause */
 static int
 termIsEquivalence(Parse * pParse, Expr * pExpr)
 {
-	if (!OptimizationEnabled(pParse->db, SQL_Transitive))
+	if (!OptimizationEnabled(SQL_Transitive))
 		return 0;
 	if (pExpr->op != TK_EQ)
 		return 0;
@@ -1004,12 +930,7 @@ exprAnalyze(SrcList * pSrc,	/* the FROM clause */
 	int op;
 	/* Parsing context. */
 	Parse *pParse = pWInfo->pParse;
-	/* Database connection. */
-	sql *db = pParse->db;
 
-	if (db->mallocFailed) {
-		return;
-	}
 	pTerm = &pWC->a[idxTerm];
 	pMaskSet = &pWInfo->sMaskSet;
 	pExpr = pTerm->pExpr;
@@ -1072,11 +993,7 @@ exprAnalyze(SrcList * pSrc,	/* the FROM clause */
 			assert(pTerm->iField == 0);
 			if (pTerm->leftCursor >= 0) {
 				int idxNew;
-				pDup = sqlExprDup(db, pExpr, 0);
-				if (db->mallocFailed) {
-					sql_expr_delete(db, pDup, false);
-					return;
-				}
+				pDup = sqlExprDup(pExpr, 0);
 				idxNew =
 				    whereClauseInsert(pWC, pDup,
 						      TERM_VIRTUAL |
@@ -1099,7 +1016,6 @@ exprAnalyze(SrcList * pSrc,	/* the FROM clause */
 			exprCommute(pParse, pDup);
 			pNew->leftCursor = iCur;
 			pNew->u.leftColumn = iColumn;
-			testcase((prereqLeft | extraRight) != prereqLeft);
 			pNew->prereqRight = prereqLeft | extraRight;
 			pNew->prereqAll = prereqAll;
 			pNew->eOperator =
@@ -1132,16 +1048,12 @@ exprAnalyze(SrcList * pSrc,	/* the FROM clause */
 			Expr *pNewExpr;
 			int idxNew;
 			pNewExpr = sqlPExpr(pParse, ops[i],
-						sqlExprDup(db, pExpr->pLeft,
-							       0),
-						sqlExprDup(db,
-							       pList->a[i].
-							       pExpr, 0));
+					    sqlExprDup(pExpr->pLeft, 0),
+					    sqlExprDup(pList->a[i].pExpr, 0));
 			transferJoinMarkings(pNewExpr, pExpr);
 			idxNew =
 			    whereClauseInsert(pWC, pNewExpr,
 					      TERM_VIRTUAL | TERM_DYNAMIC);
-			testcase(idxNew == 0);
 			exprAnalyze(pSrc, pWC, idxNew);
 			pTerm = &pWC->a[idxTerm];
 			markTermAsChild(pWC, idxNew, idxTerm);
@@ -1172,8 +1084,7 @@ exprAnalyze(SrcList * pSrc,	/* the FROM clause */
 	 * amount of scanned entries.
 	 */
 	if (pWC->op == TK_AND &&
-	    like_optimization_is_valid(pParse, pExpr, &pStr1,
-				       &isComplete)) {
+	    like_optimization_is_valid(pExpr, &pStr1, &isComplete)) {
 		Expr *pLeft;
 		/* Copy of pStr1 - RHS of LIKE operator. */
 		Expr *pStr2;
@@ -1184,26 +1095,22 @@ exprAnalyze(SrcList * pSrc,	/* the FROM clause */
 		const u16 wtFlags = TERM_LIKEOPT | TERM_VIRTUAL | TERM_DYNAMIC;
 
 		pLeft = pExpr->x.pList->a[1].pExpr;
-		pStr2 = sqlExprDup(db, pStr1, 0);
+		pStr2 = sqlExprDup(pStr1, 0);
 
-		if (!db->mallocFailed) {
-			u8 c, *pC;	/* Last character before the first wildcard */
-			pC = (u8 *) & pStr2->u.
-			    zToken[sqlStrlen30(pStr2->u.zToken) - 1];
-			c = *pC;
-			*pC = c + 1;
-		}
-		pNewExpr1 = sqlExprDup(db, pLeft, 0);
+		/* Last character before the first wildcard */
+		u8 c, *pC;
+		pC = (u8 *)&pStr2->u.zToken[sqlStrlen30(pStr2->u.zToken) - 1];
+		c = *pC;
+		*pC = c + 1;
+		pNewExpr1 = sqlExprDup(pLeft, 0);
 		pNewExpr1 = sqlPExpr(pParse, TK_GE, pNewExpr1, pStr1);
 		transferJoinMarkings(pNewExpr1, pExpr);
 		idxNew1 = whereClauseInsert(pWC, pNewExpr1, wtFlags);
-		testcase(idxNew1 == 0);
 		exprAnalyze(pSrc, pWC, idxNew1);
-		pNewExpr2 = sqlExprDup(db, pLeft, 0);
+		pNewExpr2 = sqlExprDup(pLeft, 0);
 		pNewExpr2 = sqlPExpr(pParse, TK_LT, pNewExpr2, pStr2);
 		transferJoinMarkings(pNewExpr2, pExpr);
 		idxNew2 = whereClauseInsert(pWC, pNewExpr2, wtFlags);
-		testcase(idxNew2 == 0);
 		exprAnalyze(pSrc, pWC, idxNew2);
 		pTerm = &pWC->a[idxTerm];
 		if (isComplete) {
@@ -1278,11 +1185,8 @@ exprAnalyze(SrcList * pSrc,	/* the FROM clause */
 		Expr *pLeft = pExpr->pLeft;
 		int idxNew;
 		WhereTerm *pNewTerm;
-		struct Expr *expr = sql_expr_new_anon(db, TK_NULL);
-		if (expr == NULL)
-			pParse->is_aborted = true;
-		pNewExpr = sqlPExpr(pParse, TK_GT, sqlExprDup(db, pLeft, 0),
-				    expr);
+		struct Expr *expr = sql_expr_new_anon(TK_NULL);
+		pNewExpr = sqlPExpr(pParse, TK_GT, sqlExprDup(pLeft, 0), expr);
 
 		idxNew = whereClauseInsert(pWC, pNewExpr,
 					   TERM_VIRTUAL | TERM_DYNAMIC |
@@ -1303,7 +1207,6 @@ exprAnalyze(SrcList * pSrc,	/* the FROM clause */
 	/* Prevent ON clause terms of a LEFT JOIN from being used to drive
 	 * an index for tables to the left of the join.
 	 */
-	testcase(pTerm != &pWC->a[idxTerm]);
 	pTerm = &pWC->a[idxTerm];
 	pTerm->prereqRight |= extraRight;
 }
@@ -1370,19 +1273,17 @@ sqlWhereClauseClear(WhereClause * pWC)
 {
 	int i;
 	WhereTerm *a;
-	sql *db = pWC->pWInfo->pParse->db;
 	for (i = pWC->nTerm - 1, a = pWC->a; i >= 0; i--, a++) {
-		if (a->wtFlags & TERM_DYNAMIC) {
-			sql_expr_delete(db, a->pExpr, false);
-		}
+		if (a->wtFlags & TERM_DYNAMIC)
+			sql_expr_delete(a->pExpr);
 		if (a->wtFlags & TERM_ORINFO) {
-			whereOrInfoDelete(db, a->u.pOrInfo);
+			whereOrInfoDelete(a->u.pOrInfo);
 		} else if (a->wtFlags & TERM_ANDINFO) {
-			whereAndInfoDelete(db, a->u.pAndInfo);
+			whereAndInfoDelete(a->u.pAndInfo);
 		}
 	}
 	if (pWC->a != pWC->aStatic) {
-		sqlDbFree(db, pWC->a);
+		sql_xfree(pWC->a);
 	}
 }
 
@@ -1443,49 +1344,5 @@ sqlWhereExprAnalyze(SrcList * pTabList,	/* the FROM clause */
 	int i;
 	for (i = pWC->nTerm - 1; i >= 0; i--) {
 		exprAnalyze(pTabList, pWC, i);
-	}
-}
-
-/*
- * For table-valued-functions, transform the function arguments into
- * new WHERE clause terms.
- */
-void
-sqlWhereTabFuncArgs(Parse * pParse,	/* Parsing context */
-			struct SrcList_item *pItem,	/* The FROM clause term to process */
-			WhereClause * pWC	/* Xfer function arguments to here */
-    )
-{
-	int j, k;
-	ExprList *pArgs;
-	Expr *pColRef;
-	Expr *pTerm;
-	if (pItem->fg.isTabFunc == 0)
-		return;
-	struct space_def *space_def = pItem->space->def;
-	pArgs = pItem->u1.pFuncArg;
-	if (pArgs == 0)
-		return;
-	for (j = k = 0; j < pArgs->nExpr; j++) {
-		while (k < (int)space_def->field_count)
-			k++;
-		/*
-		 * This assert replaces error. At the moment, this
-		 * error cannot appear due to this function being
-		 * unused.
-		 */
-		assert(k < (int)space_def->field_count);
-		pColRef = sql_expr_new_anon(pParse->db, TK_COLUMN_REF);
-		if (pColRef == NULL) {
-			pParse->is_aborted = true;
-			return;
-		}
-		pColRef->iTable = pItem->iCursor;
-		pColRef->iColumn = k++;
-		pColRef->space_def = space_def;
-		pTerm = sqlPExpr(pParse, TK_EQ, pColRef,
-				     sqlExprDup(pParse->db,
-						    pArgs->a[j].pExpr, 0));
-		whereClauseInsert(pWC, pTerm, TERM_DYNAMIC);
 	}
 }

@@ -33,29 +33,97 @@
 #include "string.h"
 #include "diag.h"
 #include "error.h"
+#include "salad/grp_alloc.h"
+#include "trivia/util.h"
 
-const char *func_language_strs[] = {"LUA", "C", "SQL", "SQL_BUILTIN"};
+#include <assert.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdlib.h>
+
+const char *func_language_strs[] = {
+	"LUA", "C", "SQL", "SQL_BUILTIN", "SQL_EXPR"
+};
 
 const char *func_aggregate_strs[] = {"none", "group"};
 
 const struct func_opts func_opts_default = {
 	/* .is_multikey = */ false,
+	/* .takes_raw_args = */ false,
 };
 
 const struct opt_def func_opts_reg[] = {
 	OPT_DEF("is_multikey", OPT_BOOL, struct func_opts, is_multikey),
+	OPT_DEF("takes_raw_args", OPT_BOOL, struct func_opts, takes_raw_args),
+	OPT_END,
 };
 
-int
-func_opts_cmp(struct func_opts *o1, struct func_opts *o2)
+struct func_def *
+func_def_new(uint32_t fid, uint32_t uid, const char *name, uint32_t name_len,
+	     enum func_language language, const char *body, uint32_t body_len,
+	     const char *comment, uint32_t comment_len, const char *triggers)
+{
+	struct func_def *def;
+	struct grp_alloc all = grp_alloc_initializer();
+	grp_alloc_reserve_data(&all, sizeof(*def));
+	grp_alloc_reserve_str(&all, name_len);
+	if (body_len != 0)
+		grp_alloc_reserve_str(&all, body_len);
+	if (comment_len != 0)
+		grp_alloc_reserve_str(&all, comment_len);
+	size_t triggers_len = 0;
+	if (triggers != NULL) {
+		const char *triggers_end = triggers;
+		mp_next(&triggers_end);
+		triggers_len = triggers_end - triggers;
+		grp_alloc_reserve_data(&all, triggers_len);
+	}
+	grp_alloc_use(&all, xmalloc(grp_alloc_size(&all)));
+	def = grp_alloc_create_data(&all, sizeof(*def));
+	def->name = grp_alloc_create_str(&all, name, name_len);
+	def->name_len = name_len;
+	def->body = body_len == 0 ? NULL :
+		    grp_alloc_create_str(&all, body, body_len);
+	def->comment = comment_len == 0 ? NULL :
+		       grp_alloc_create_str(&all, comment, comment_len);
+	def->triggers = NULL;
+	if (triggers != NULL) {
+		def->triggers = grp_alloc_create_data(&all, triggers_len);
+		memcpy(def->triggers, triggers, triggers_len);
+	}
+	assert(grp_alloc_size(&all) == 0);
+	def->fid = fid;
+	def->uid = uid;
+	def->setuid = false;
+	def->is_deterministic = false;
+	def->is_sandboxed = false;
+	def->param_count = 0;
+	def->returns = FIELD_TYPE_ANY;
+	def->aggregate = FUNC_AGGREGATE_NONE;
+	def->language = language;
+	def->exports.all = 0;
+	func_opts_create(&def->opts);
+	return def;
+}
+
+void
+func_def_delete(struct func_def *def)
+{
+	free(def);
+}
+
+static int
+func_opts_cmp(const struct func_opts *o1, const struct func_opts *o2)
 {
 	if (o1->is_multikey != o2->is_multikey)
 		return o1->is_multikey - o2->is_multikey;
+	if (o1->takes_raw_args != o2->takes_raw_args)
+		return o1->takes_raw_args - o2->takes_raw_args;
 	return 0;
 }
 
 int
-func_def_cmp(struct func_def *def1, struct func_def *def2)
+func_def_cmp(const struct func_def *def1, const struct func_def *def2)
 {
 	if (def1->fid != def2->fid)
 		return def1->fid - def2->fid;
@@ -87,7 +155,42 @@ func_def_cmp(struct func_def *def1, struct func_def *def2)
 		return def1->comment - def2->comment;
 	if (def1->comment != NULL && strcmp(def1->comment, def2->comment) != 0)
 		return strcmp(def1->comment, def2->comment);
+	if ((def1->triggers != NULL) != (def2->triggers != NULL))
+		return def1->triggers - def2->triggers;
+	if (def1->triggers != NULL) {
+		const char *triggers1_end = def1->triggers;
+		mp_next(&triggers1_end);
+		const char *triggers2_end = def2->triggers;
+		mp_next(&triggers2_end);
+		size_t triggers1_len = triggers1_end - def1->triggers;
+		size_t triggers2_len = triggers2_end - def2->triggers;
+		if (triggers1_len != triggers2_len)
+			return triggers1_len - triggers2_len;
+		int cmp_res = memcmp(def1->triggers, def2->triggers,
+				     triggers1_len);
+		if (cmp_res != 0)
+			return cmp_res;
+	}
 	return func_opts_cmp(&def1->opts, &def2->opts);
+}
+
+struct func_def *
+func_def_dup(const struct func_def *def)
+{
+	struct func_def *copy = func_def_new(
+		def->fid, def->uid, def->name, def->name_len, def->language,
+		def->body, def->body != NULL ? strlen(def->body) : 0,
+		def->comment, def->comment != NULL ? strlen(def->comment) : 0,
+		def->triggers);
+	copy->setuid = def->setuid;
+	copy->is_deterministic = def->is_deterministic;
+	copy->is_sandboxed = def->is_sandboxed;
+	copy->param_count = def->param_count;
+	copy->returns = def->returns;
+	copy->aggregate = def->aggregate;
+	copy->exports.all = def->exports.all;
+	copy->opts = def->opts;
+	return copy;
 }
 
 /**
@@ -97,7 +200,7 @@ func_def_cmp(struct func_def *def1, struct func_def *def2)
  *            diagnostics message is provided
  */
 int
-func_def_check(struct func_def *def)
+func_def_check(const struct func_def *def)
 {
 	switch (def->language) {
 	case FUNC_LANGUAGE_C:

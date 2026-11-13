@@ -1,5 +1,12 @@
 std = "luajit"
-globals = {"box", "_TARANTOOL", "tonumber64", "utf8"}
+globals = {
+    "box",
+    "misc",
+    "package",
+    "tonumber64",
+    "utf8",
+    "_TARANTOOL",
+}
 ignore = {
     -- Accessing an undefined field of a global variable <debug>.
     "143/debug",
@@ -21,29 +28,35 @@ ignore = {
     "431",
     -- Shadowing an upvalue argument.
     "432",
+    -- Unused variable with `_` prefix.
+    "212/_.*",
+    -- Unused loop variable with `_` prefix.
+    "213/_.*",
 }
 
 include_files = {
     "**/*.lua",
-    "extra/dist/tarantoolctl.in",
 }
 
 exclude_files = {
     "build/**/*.lua",
-    "test-run/test/test-tarantool/*.test.lua",
-    "test-run/lib/checks/*",
-    "test-run/lib/luatest/*",
+    "luatest/**/*.lua",
+    "test-run/**/*.lua",
     "test/app/*.test.lua",
+    "test/app-luatest/emmylua/**/*.lua",
     "test/box/*.test.lua",
     "test/engine/*.test.lua",
     "test/engine_long/*.test.lua",
     "test/replication/*.test.lua",
+    "test/metrics-luatest/test/*.lua",
+    "test/metrics-luatest/test/**/*.lua",
     "test/sql/**/*.lua",
     "test/swim/*.test.lua",
     "test/var/**/*.lua",
     "test/vinyl/*.test.lua",
     "test/wal_off/*.test.lua",
     "test/xlog/*.test.lua",
+    "test/static/corpus/luaL_loadbuffer/*.lua",
     "third_party/**/*.lua",
     ".rocks/**/*.lua",
     ".git/**/*.lua",
@@ -64,12 +77,6 @@ files["src/lua/help.lua"] = {
 files["src/lua/init.lua"] = {
     -- Miscellaneous global function definition.
     globals = {"dostring"},
-}
-files["src/box/lua/console.lua"] = {
-    ignore = {
-        -- https://github.com/tarantool/tarantool/issues/5032
-        "212",
-    }
 }
 files["test/box/box.lua"] = {
     globals = {
@@ -109,5 +116,13 @@ files["test/replication/replica_quorum.lua"] = {
     globals = {
         "INSTANCE_URI",
         "nonexistent_uri",
+    },
+}
+
+-- Defined functions is unused in preamble,
+-- but could be used by generated Lua programs.
+files["test/fuzz/luaL_loadbuffer/preamble.lua"] = {
+    ignore = {
+        "211",
     },
 }

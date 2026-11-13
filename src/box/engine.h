@@ -40,15 +40,59 @@
 extern "C" {
 #endif /* defined(__cplusplus) */
 
+enum {
+	/**
+	 * For simplicity, assume that the total engine count can't exceed
+	 * the value of this constant.
+	 */
+	MAX_ENGINE_COUNT = 7,
+	/**
+	 * Max number of engines involved in a multi-statement transaction.
+	 * This value must be greater than any `engine::id' of an engine
+	 * without `ENGINE_BYPASS_TX' flag.
+	 */
+	MAX_TX_ENGINE_COUNT = 4,
+};
+
+struct box_checkpoint;
 struct engine;
+struct engine_read_view;
 struct txn;
 struct txn_stmt;
+struct read_view_opts;
 struct space;
 struct space_def;
 struct vclock;
 struct xstream;
+struct engine_join_ctx;
 
-extern struct rlist engines;
+/**
+ * All registered engines stored in a null-terminated array indexed by
+ * engine id.
+ */
+extern struct engine *engines[];
+
+/**
+ * Recovery state of entire tarantool. Apart from memtx recovery state,
+ * which is internal recovery optimization status, this enum describers
+ * real sequence of recovery actions.
+ */
+enum recovery_state {
+	/** Recovery have not been started yet. */
+	RECOVERY_NOT_STARTED,
+	/** Recovery from snapshot file. */
+	INITIAL_RECOVERY,
+	/** Recovery from WAL file(s). */
+	FINAL_RECOVERY,
+	/** Recovery from WAL file(s). */
+	FINISHED_RECOVERY,
+};
+
+/**
+ * The one and only recovery status of entire tarantool.
+ * See enum recovery_state description.
+ */
+extern enum recovery_state recovery_state;
 
 /**
  * Aggregated memory statistics. Used by box.info.memory().
@@ -64,31 +108,58 @@ struct engine_memory_stat {
 	size_t tx;
 };
 
+/** Parameters passed to the engines on checkpoint start. */
+struct engine_checkpoint_params {
+	/** Global engine-agnostic control states of the instance. */
+	const struct box_checkpoint *box;
+};
+
 typedef int
 engine_backup_cb(const char *path, void *arg);
 
 struct engine_vtab {
 	/** Destroy an engine instance. */
+	void (*free)(struct engine *);
+	/**
+	 * Shutdown an engine instance. Shutdown stops all internal
+	 * fibers/threads. It may yield.
+	 */
 	void (*shutdown)(struct engine *);
 	/** Allocate a new space instance. */
 	struct space *(*create_space)(struct engine *engine,
 			struct space_def *def, struct rlist *key_list);
 	/**
+	 * Create a read view of the data stored in the engine.
+	 *
+	 * This function is supposed to do the engine-wide work necessary for
+	 * creation of a read view, e.g. disable garbage collection. An index
+	 * read view is created by index_vtab::create_read_view. The caller
+	 * must not yield between calling this function and creation of the
+	 * corresponding index read views.
+	 *
+	 * May be called only if the engine has the ENGINE_SUPPORTS_READ_VIEW
+	 * flag set.
+	 */
+	struct engine_read_view *(*create_read_view)(
+		struct engine *engine, const struct read_view_opts *opts);
+	/**
 	 * Freeze a read view to feed to a new replica.
 	 * Setup and return a context that will be used
 	 * on further steps.
 	 */
-	int (*prepare_join)(struct engine *engine, void **ctx);
+	int (*prepare_join)(struct engine *engine, struct engine_join_ctx *ctx);
 	/**
 	 * Feed the read view frozen on the previous step to
 	 * the given stream.
 	 */
-	int (*join)(struct engine *engine, void *ctx, struct xstream *stream);
+	int (*join)(struct engine *engine, struct engine_join_ctx *ctx,
+		    struct xstream *stream);
 	/**
 	 * Release the read view and free the context prepared
 	 * on the first step.
 	 */
-	void (*complete_join)(struct engine *engine, void *ctx);
+	void (*complete_join)(struct engine *engine,
+			      struct engine_join_ctx *ctx);
 	/**
 	 * Begin a new single or multi-statement transaction.
 	 * Called on first statement in a transaction, not when
@@ -96,7 +167,7 @@ struct engine_vtab {
 	 * transaction in the engine begins with the first
 	 * statement.
 	 */
-	int (*begin)(struct engine *, struct txn *);
+	void (*begin)(struct engine *engine, struct txn *txn);
 	/**
 	 * Begine one statement in existing transaction.
 	 */
@@ -124,11 +195,19 @@ struct engine_vtab {
 	 */
 	void (*rollback)(struct engine *, struct txn *);
 	/**
-	 * Notify the engine that the instance is about to switch
-	 * to read-only mode. The engine is supposed to abort all
-	 * active rw transactions when this method is called.
+	 * Free the resources held by the engine_savepoint.
 	 */
-	void (*switch_to_ro)(struct engine *);
+	void (*destroy_savepoint)(void *engine_savepoint);
+	/**
+	 * Send the transaction to a read view in which it can't see changes
+	 * done with the given PSN or newer.
+	 */
+	void (*send_to_read_view)(struct engine *engine, struct txn *txn,
+				  int64_t psn);
+	/**
+	 * Abort the transaction as conflicted.
+	 */
+	void (*abort_with_conflict)(struct engine *engine, struct txn *txn);
 	/**
 	 * Bootstrap an empty data directory
 	 */
@@ -162,7 +241,8 @@ struct engine_vtab {
 	 * engine (snapshot is a memtx idea of a checkpoint).
 	 * Must not yield.
 	 */
-	int (*begin_checkpoint)(struct engine *, bool is_scheduled);
+	int (*begin_checkpoint)(struct engine *e,
+				const struct engine_checkpoint_params *p);
 	/**
 	 * Wait for a checkpoint to complete.
 	 */
@@ -207,8 +287,8 @@ struct engine_vtab {
 	void (*reset_stat)(struct engine *);
 	/**
 	 * Check definition of a new space for engine-specific
-	 * limitations. E.g. not all engines support temporary
-	 * tables.
+	 * limitations. E.g. not all engines support data-temporary
+	 * spaces.
 	 */
 	int (*check_space_def)(struct space_def *);
 };
@@ -216,11 +296,30 @@ struct engine_vtab {
 enum {
 	/**
 	 * If set, the engine will not participate in transaction
-	 * control. In particular, this means that any operations
-	 * done on this engine's spaces can mix in other engine's
-	 * transactions w/o throwing ER_CROSS_ENGINE_TRANSACTION.
+	 * control.
 	 */
 	ENGINE_BYPASS_TX = 1 << 0,
+	/**
+	 * Set if the engine supports creation of a read view.
+	 */
+	ENGINE_SUPPORTS_READ_VIEW = 1 << 1,
+	/**
+	 * Set if checkpointing is implemented by the memtx engine.
+	 * Engine setting this flag must support read views.
+	 */
+	ENGINE_CHECKPOINT_BY_MEMTX = 1 << 2,
+	/**
+	 * Set if replica join is implemented by the memtx engine.
+	 * Engine setting this flag must support read views.
+	 */
+	ENGINE_JOIN_BY_MEMTX = 1 << 3,
+	/**
+	 * Set if the engine supports multiversion concurrency control,
+	 * i.e. it can send a transaction to a consistent read view.
+	 * Engines that set this flag must implement send_to_read_view
+	 * and abort_with_conflict callbacks.
+	 */
+	ENGINE_SUPPORTS_MVCC = 1 << 4,
 };
 
 struct engine {
@@ -232,20 +331,56 @@ struct engine {
 	uint32_t id;
 	/** Engine flags. */
 	uint32_t flags;
-	/** Used for search for engine by name. */
+};
+
+/** Engine read view virtual function table. */
+struct engine_read_view_vtab {
+	/** Free an engine read view instance. */
+	void
+	(*free)(struct engine_read_view *rv);
+};
+
+/**
+ * Engine read view.
+ *
+ * Must not be freed until all corresponding index read views are closed.
+ */
+struct engine_read_view {
+	/** Virtual function table. */
+	const struct engine_read_view_vtab *vtab;
+	/** Link in read_view::engines. */
 	struct rlist link;
 };
 
-struct engine_join_ctx {
-	/** Array of engine join contexts, one per each engine. */
-	void **array;
+/**
+ * Cursor used during checkpoint initial join. Shared between engines.
+ */
+struct checkpoint_cursor {
+	/** Signature of the checkpoint to take data from. */
+	struct vclock *vclock;
+	/** Checkpoint lsn to start from. */
+	int64_t start_lsn;
+	/** Counter, shared between engines */
+	int64_t lsn_counter;
 };
 
-/** Register engine engine instance. */
-void engine_register(struct engine *engine);
+struct engine_join_ctx {
+	/** Journal vclock. */
+	const struct vclock *vclock;
+	/** Checkpoint join cursor. */
+	struct checkpoint_cursor *cursor;
+	/** Array of engine join contexts, one per each engine. */
+	void **data;
+};
 
-/** Call a visitor function on every registered engine. */
-#define engine_foreach(engine) rlist_foreach_entry(engine, &engines, link)
+/** Register engine instance. */
+void
+engine_register(struct engine *engine);
+
+/** Loop over all registered engines. */
+#define engine_foreach(engine) \
+	for (engine = engines[0]; engine != NULL; \
+	     engine = engines[engine->id + 1])
 
 /** Find engine engine by name. */
 struct engine *
@@ -268,10 +403,17 @@ engine_create_space(struct engine *engine, struct space_def *def,
 	return engine->vtab->create_space(engine, def, key_list);
 }
 
-static inline int
+static inline struct engine_read_view *
+engine_create_read_view(struct engine *engine,
+			const struct read_view_opts *opts)
+{
+	return engine->vtab->create_read_view(engine, opts);
+}
+
+static inline void
 engine_begin(struct engine *engine, struct txn *txn)
 {
-	return engine->vtab->begin(engine, txn);
+	engine->vtab->begin(engine, txn);
 }
 
 static inline int
@@ -305,23 +447,48 @@ engine_rollback(struct engine *engine, struct txn *txn)
 	engine->vtab->rollback(engine, txn);
 }
 
+static inline void
+engine_destroy_savepoint(struct engine *engine, void *engine_savepoint)
+{
+	engine->vtab->destroy_savepoint(engine_savepoint);
+}
+
+static inline void
+engine_send_to_read_view(struct engine *engine, struct txn *txn, int64_t psn)
+{
+	engine->vtab->send_to_read_view(engine, txn, psn);
+}
+
+static inline void
+engine_abort_with_conflict(struct engine *engine, struct txn *txn)
+{
+	engine->vtab->abort_with_conflict(engine, txn);
+}
+
 static inline int
 engine_check_space_def(struct engine *engine, struct space_def *def)
 {
 	return engine->vtab->check_space_def(def);
 }
 
+static inline void
+engine_read_view_delete(struct engine_read_view *rv)
+{
+	rv->vtab->free(rv);
+}
+
 /**
- * Shutdown all engine factories.
+ * Shutdown all engines. Shutdown stops all internal fibers/threads.
+ * It may yield.
  */
 void
 engine_shutdown(void);
 
 /**
- * Called before switching the instance to read-only mode.
+ * Free all engines.
  */
 void
-engine_switch_to_ro(void);
+engine_free(void);
 
 /**
  * Initialize an empty data directory
@@ -363,8 +530,9 @@ engine_join(struct engine_join_ctx *ctx, struct xstream *stream);
 void
 engine_complete_join(struct engine_join_ctx *ctx);
 
+/** Begin checkpoint in all engines. */
 int
-engine_begin_checkpoint(bool is_scheduled);
+engine_begin_checkpoint(const struct engine_checkpoint_params *params);
 
 /**
  * Create a checkpoint.
@@ -390,24 +558,31 @@ engine_reset_stat(void);
 /*
  * Virtual method stubs.
  */
-int generic_engine_prepare_join(struct engine *, void **);
-int generic_engine_join(struct engine *, void *, struct xstream *);
-void generic_engine_complete_join(struct engine *, void *);
-int generic_engine_begin(struct engine *, struct txn *);
+struct engine_read_view *
+generic_engine_create_read_view(struct engine *engine,
+				const struct read_view_opts *opts);
+int generic_engine_prepare_join(struct engine *, struct engine_join_ctx *);
+int generic_engine_join(struct engine *, struct engine_join_ctx *,
+			struct xstream *);
+void generic_engine_complete_join(struct engine *, struct engine_join_ctx *);
+void generic_engine_begin(struct engine *, struct txn *);
 int generic_engine_begin_statement(struct engine *, struct txn *);
 int generic_engine_prepare(struct engine *, struct txn *);
 void generic_engine_commit(struct engine *, struct txn *);
 void generic_engine_rollback_statement(struct engine *, struct txn *,
 				       struct txn_stmt *);
 void generic_engine_rollback(struct engine *, struct txn *);
-void generic_engine_switch_to_ro(struct engine *);
+void generic_engine_destroy_savepoint(void *);
+void generic_engine_send_to_read_view(struct engine *, struct txn *, int64_t);
+void generic_engine_abort_with_conflict(struct engine *, struct txn *);
 int generic_engine_bootstrap(struct engine *);
 int generic_engine_begin_initial_recovery(struct engine *,
 					  const struct vclock *);
 int generic_engine_begin_final_recovery(struct engine *);
 int generic_engine_begin_hot_standby(struct engine *);
 int generic_engine_end_recovery(struct engine *);
-int generic_engine_begin_checkpoint(struct engine *, bool);
+int generic_engine_begin_checkpoint(
+	struct engine *, const struct engine_checkpoint_params *params);
 int generic_engine_wait_checkpoint(struct engine *, const struct vclock *);
 void generic_engine_commit_checkpoint(struct engine *, const struct vclock *);
 void generic_engine_abort_checkpoint(struct engine *);
@@ -417,56 +592,10 @@ int generic_engine_backup(struct engine *, const struct vclock *,
 void generic_engine_memory_stat(struct engine *, struct engine_memory_stat *);
 void generic_engine_reset_stat(struct engine *);
 int generic_engine_check_space_def(struct space_def *);
+void generic_engine_shutdown(struct engine *engine);
 
 #if defined(__cplusplus)
 } /* extern "C" */
-
-static inline struct engine *
-engine_find_xc(const char *name)
-{
-	struct engine *engine = engine_find(name);
-	if (engine == NULL)
-		diag_raise();
-	return engine;
-}
-
-static inline struct space *
-engine_create_space_xc(struct engine *engine, struct space_def *def,
-		    struct rlist *key_list)
-{
-	struct space *space = engine_create_space(engine, def, key_list);
-	if (space == NULL)
-		diag_raise();
-	return space;
-}
-
-static inline void
-engine_begin_xc(struct engine *engine, struct txn *txn)
-{
-	if (engine_begin(engine, txn) != 0)
-		diag_raise();
-}
-
-static inline void
-engine_begin_statement_xc(struct engine *engine, struct txn *txn)
-{
-	if (engine_begin_statement(engine, txn) != 0)
-		diag_raise();
-}
-
-static inline void
-engine_prepare_xc(struct engine *engine, struct txn *txn)
-{
-	if (engine_prepare(engine, txn) != 0)
-		diag_raise();
-}
-
-static inline void
-engine_check_space_def_xc(struct engine *engine, struct space_def *def)
-{
-	if (engine_check_space_def(engine, def) != 0)
-		diag_raise();
-}
 
 static inline void
 engine_bootstrap_xc(void)

@@ -103,7 +103,9 @@ static void
 lbox_watcher_destroy_f(struct watcher *base)
 {
 	struct lbox_watcher *watcher = (struct lbox_watcher *)base;
-	luaL_unref(tarantool_L, LUA_REGISTRYINDEX, watcher->func_ref);
+	/* tarantool_L is freed on Tarantool shutdown. */
+	if (tarantool_L != NULL)
+		luaL_unref(tarantool_L, LUA_REGISTRYINDEX, watcher->func_ref);
 	free(watcher);
 }
 
@@ -165,6 +167,27 @@ lbox_watch(struct lua_State *L)
 }
 
 /**
+ * Lua wrapper around box_watch_once().
+ */
+static int
+lbox_watch_once(struct lua_State *L)
+{
+	if (lua_gettop(L) != 1)
+		return luaL_error(L, "Usage: box.watch_once(key)");
+	size_t key_len;
+	const char *key = luaL_checklstring(L, 1, &key_len);
+	const char *data_end;
+	const char *data = box_watch_once(key, key_len, &data_end);
+	if (data == NULL) {
+		assert(data_end == NULL);
+		return 0;
+	}
+	luamp_decode(L, luaL_msgpack_default, &data);
+	assert(data == data_end);
+	return 1;
+}
+
+/**
  * Lua wrapper around box_broadcast().
  */
 static int
@@ -175,21 +198,27 @@ lbox_broadcast(struct lua_State *L)
 		return luaL_error(L, "Usage: box.broadcast(key[, value])");
 	size_t key_len;
 	const char *key = luaL_checklstring(L, 1, &key_len);
+	if (strncmp(key, "box.", 4) == 0)
+		return luaL_error(L, "System event can't be override");
 	struct ibuf *ibuf = cord_ibuf_take();
 	const char *data = NULL;
 	const char *data_end = NULL;
+	int rc = -1;
 	if (!lua_isnoneornil(L, 2)) {
 		struct mpstream stream;
 		mpstream_init(&stream, ibuf, ibuf_reserve_cb, ibuf_alloc_cb,
 			      luamp_error, L);
-		luamp_encode(L, luaL_msgpack_default, &stream, 2);
+		if (luamp_encode(L, luaL_msgpack_default, &stream, 2) != 0)
+			goto cleanup;
 		mpstream_flush(&stream);
 		data = ibuf->rpos;
 		data_end = data + ibuf_used(ibuf);
 	}
 	box_broadcast(key, key_len, data, data_end);
+	rc = 0;
+cleanup:
 	cord_ibuf_put(ibuf);
-	return 0;
+	return rc == 0 ? 0 : luaT_error(L);
 }
 
 void
@@ -208,6 +237,9 @@ box_lua_watcher_init(struct lua_State *L)
 	lua_getfield(L, LUA_GLOBALSINDEX, "box");
 	lua_pushstring(L, "watch");
 	lua_pushcfunction(L, lbox_watch);
+	lua_settable(L, -3);
+	lua_pushstring(L, "watch_once");
+	lua_pushcfunction(L, lbox_watch_once);
 	lua_settable(L, -3);
 	lua_pushstring(L, "broadcast");
 	lua_pushcfunction(L, lbox_broadcast);

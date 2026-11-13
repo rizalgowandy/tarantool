@@ -32,6 +32,7 @@
 #include "raft/raft_ev.h"
 #include "raft_test_utils.h"
 #include "random.h"
+#include "tt_static.h"
 
 #include <fcntl.h>
 
@@ -53,6 +54,13 @@ raft_ev_timer_stop(struct ev_loop *loop, struct ev_timer *watcher)
 	fakeev_timer_stop(loop, watcher);
 }
 
+double
+raft_ev_monotonic_now(struct ev_loop *loop)
+{
+	(void)loop;
+	return raft_time();
+}
+
 struct ev_loop *
 raft_loop(void)
 {
@@ -68,10 +76,14 @@ raft_node_write_f(struct raft *raft, const struct raft_msg *msg);
 static void
 raft_node_schedule_async_f(struct raft *raft);
 
+static const char *
+raft_node_to_string_f(uint32_t node_id);
+
 static struct raft_vtab raft_vtab = {
 	.broadcast = raft_node_broadcast_f,
 	.write = raft_node_write_f,
 	.schedule_async = raft_node_schedule_async_f,
+	.node_to_string = raft_node_to_string_f,
 };
 
 static int
@@ -193,7 +205,9 @@ raft_node_create(struct raft_node *node)
 	node->cfg_election_timeout = 5;
 	node->cfg_election_quorum = 3;
 	node->cfg_death_timeout = 5;
+	node->cfg_max_shift = 0.1;
 	node->cfg_instance_id = 1;
+	node->cfg_cluster_size = VCLOCK_MAX;
 	node->cfg_vclock = &node->journal.vclock;
 	raft_journal_create(&node->journal, node->cfg_instance_id);
 	raft_node_start(node);
@@ -224,13 +238,18 @@ raft_node_check_full_state(const struct raft_node *node, enum raft_state state,
 {
 	assert(raft_node_is_started(node));
 	const struct raft *raft = &node->raft;
-	struct vclock v;
-	raft_vclock_from_string(&v, vclock);
+	if (vclock != NULL) {
+		struct vclock v;
+		raft_vclock_from_string(&v, vclock);
+		if (vclock_compare(&v, raft->vclock) != 0)
+			return false;
+	} else if (raft->vclock != NULL) {
+		return false;
+	}
 	return raft->state == state && raft->leader == leader &&
 	       raft->term == term && raft->vote == vote &&
 	       raft->volatile_term == volatile_term &&
-	       raft->volatile_vote == volatile_vote &&
-	       vclock_compare(&v, raft->vclock) == 0;
+	       raft->volatile_vote == volatile_vote;
 }
 
 bool
@@ -319,6 +338,17 @@ raft_node_send_heartbeat(struct raft_node *node, uint32_t source)
 	raft_process_heartbeat(&node->raft, source);
 }
 
+int
+raft_node_send_is_leader_seen(struct raft_node *node, uint64_t term,
+			      bool is_seen, uint32_t source)
+{
+	struct raft_msg msg = {
+		.state = RAFT_STATE_FOLLOWER,
+		.term = term,
+		.is_leader_seen = is_seen,
+	};
+	return raft_node_process_msg(node, &msg, source);
+}
 void
 raft_node_restart(struct raft_node *node)
 {
@@ -343,6 +373,13 @@ raft_node_stop(struct raft_node *node)
 void
 raft_node_start(struct raft_node *node)
 {
+	raft_node_recover(node);
+	raft_node_cfg(node);
+}
+
+void
+raft_node_recover(struct raft_node *node)
+{
 	assert(!raft_node_is_started(node));
 
 	raft_net_create(&node->net);
@@ -358,13 +395,22 @@ raft_node_start(struct raft_node *node)
 
 	for (int i = 0; i < node->journal.size; ++i)
 		raft_process_recovery(&node->raft, &node->journal.rows[i]);
+	raft_run_async_work();
+}
+
+void
+raft_node_cfg(struct raft_node *node)
+{
+	assert(raft_node_is_started(node));
 
 	raft_cfg_is_enabled(&node->raft, node->cfg_is_enabled);
 	raft_cfg_is_candidate(&node->raft, node->cfg_is_candidate);
 	raft_cfg_election_timeout(&node->raft, node->cfg_election_timeout);
 	raft_cfg_election_quorum(&node->raft, node->cfg_election_quorum);
 	raft_cfg_death_timeout(&node->raft, node->cfg_death_timeout);
+	raft_cfg_max_shift(&node->raft, node->cfg_max_shift);
 	raft_cfg_instance_id(&node->raft, node->cfg_instance_id);
+	raft_cfg_cluster_size(&node->raft, node->cfg_cluster_size);
 	raft_cfg_vclock(&node->raft, node->cfg_vclock);
 	raft_run_async_work();
 }
@@ -392,6 +438,14 @@ raft_node_promote(struct raft_node *node)
 {
 	assert(raft_node_is_started(node));
 	raft_promote(&node->raft);
+	raft_run_async_work();
+}
+
+void
+raft_node_resign(struct raft_node *node)
+{
+	assert(raft_node_is_started(node));
+	raft_resign(&node->raft);
 	raft_run_async_work();
 }
 
@@ -424,6 +478,16 @@ raft_node_cfg_is_candidate(struct raft_node *node, bool value)
 }
 
 void
+raft_node_cfg_cluster_size(struct raft_node *node, int value)
+{
+	node->cfg_cluster_size = value;
+	if (raft_node_is_started(node)) {
+		raft_cfg_cluster_size(&node->raft, value);
+		raft_run_async_work();
+	}
+}
+
+void
 raft_node_cfg_election_timeout(struct raft_node *node, double value)
 {
 	node->cfg_election_timeout = value;
@@ -449,6 +513,16 @@ raft_node_cfg_death_timeout(struct raft_node *node, double value)
 	node->cfg_death_timeout = value;
 	if (raft_node_is_started(node)) {
 		raft_cfg_death_timeout(&node->raft, value);
+		raft_run_async_work();
+	}
+}
+
+void
+raft_node_cfg_max_shift(struct raft_node *node, double value)
+{
+	node->cfg_max_shift = value;
+	if (raft_node_is_started(node)) {
+		raft_cfg_max_shift(&node->raft, value);
 		raft_run_async_work();
 	}
 }
@@ -523,6 +597,12 @@ raft_node_schedule_async_f(struct raft *raft)
 	fiber_wakeup(node->worker);
 }
 
+static const char *
+raft_node_to_string_f(uint32_t node_id)
+{
+	return tt_sprintf("%u", node_id);
+}
+
 static int
 raft_node_worker_f(va_list va)
 {
@@ -558,7 +638,7 @@ raft_run_test(const char *log_file, fiber_func test)
 	int fd = open(log_file, O_TRUNC);
 	if (fd != -1)
 		close(fd);
-	say_logger_init(log_file, 5, 1, "plain", 0);
+	say_logger_init(log_file, 5, 1, "plain");
 	/* Print the seed to be able to reproduce a bug with the same seed. */
 	say_info("Random seed = %llu", (unsigned long long) seed);
 

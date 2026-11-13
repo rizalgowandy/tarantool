@@ -41,6 +41,12 @@ struct fiber;
 struct wal_writer;
 struct tt_uuid;
 
+/**
+ * Callback called by wal_backup().
+ */
+typedef int
+(*wal_backup_cb)(const char *path, void *arg);
+
 enum wal_mode {
 	/**
 	 * Do not write data at all.
@@ -62,19 +68,16 @@ enum wal_mode {
 	WAL_MODE_MAX
 };
 
-enum {
-	/**
-	 * Recovery yields once per that number of rows read and
-	 * applied from WAL. It allows not to block the event
-	 * loop for the whole recovery stage.
-	 */
-	WAL_ROWS_PER_YIELD = 1 << 15,
-};
-
 /** String constants for the supported modes. */
 extern const char *wal_mode_STRS[];
 
 extern int wal_dir_lock;
+
+/**
+ * Triggers ivoked by tx thread's sched fiber upon WAL write confirmation
+ * arrival.
+ */
+extern struct rlist wal_on_write;
 
 #if defined(__cplusplus)
 extern "C" {
@@ -101,7 +104,10 @@ typedef void (*wal_on_checkpoint_threshold_f)(void);
  */
 int
 wal_init(enum wal_mode wal_mode, const char *wal_dirname,
-	 int64_t wal_max_size, const struct tt_uuid *instance_uuid,
+	 int64_t wal_max_size, double wal_retention_period,
+	 const struct tt_uuid *instance_uuid,
+	 struct vclock *instance_vclock,
+	 struct vclock *checkpoint_vclock,
 	 wal_on_garbage_collection_f on_garbage_collection,
 	 wal_on_checkpoint_threshold_f on_checkpoint_threshold);
 
@@ -199,55 +205,8 @@ void
 wal_clear_watcher(struct wal_watcher *watcher,
 		  void (*process_cb)(struct cbus_endpoint *));
 
-void
-wal_atfork(void);
-
 enum wal_mode
 wal_mode(void);
-
-/**
- * Wait until all submitted writes are successfully flushed
- * to disk. Returns 0 on success, -1 if write failed.
- * Corresponding vclock is returned in @a vclock unless it is
- * NULL.
- */
-int
-wal_sync(struct vclock *vclock);
-
-struct wal_checkpoint {
-	struct cbus_call_msg base;
-	/**
-	 * VClock of the last record written to the rotated WAL.
-	 * This is the vclock that is supposed to be used to
-	 * identify the new checkpoint.
-	 */
-	struct vclock vclock;
-	/**
-	 * Size of WAL files written since the last checkpoint.
-	 * Used to reset the corresponding WAL counter upon
-	 * successful checkpoint creation.
-	 */
-	int64_t wal_size;
-};
-
-/**
- * Prepare WAL for checkpointing.
- *
- * This function flushes all pending changes and rotates the
- * current WAL. Checkpoint info is returned in @checkpoint.
- * It is supposed to be passed to wal_commit_checkpoint()
- * upon successful checkpoint creation.
- */
-int
-wal_begin_checkpoint(struct wal_checkpoint *checkpoint);
-
-/**
- * This function is called upon successful checkpoint creation.
- * It updates the WAL thread's version of the last checkpoint
- * vclock.
- */
-void
-wal_commit_checkpoint(struct wal_checkpoint *checkpoint);
 
 /**
  * Set the WAL size threshold exceeding which will trigger
@@ -264,11 +223,36 @@ void
 wal_set_queue_max_size(int64_t size);
 
 /**
+ * Set new value for wal_retention_period, update expiration time
+ * of all xlog files.
+ */
+void
+wal_set_retention_period(double period);
+
+/**
+ * Return vclock (unless @vclock is NULL) of the oldest file,
+ * which is protected from garbage collection.
+ */
+void
+wal_get_retention_vclock(struct vclock *vclock);
+
+/**
  * Remove WAL files that are not needed by consumers reading
  * rows at @vclock or newer.
  */
 void
 wal_collect_garbage(const struct vclock *vclock);
+
+/**
+ * Backup up WAL. Calls @cb on every xlog from @begin_vclock to @end_vclock.
+ *
+ * It is error @begin_vclock does not point to some xlog.
+ *
+ * Return 0 on success, -1 on error (diag is set).
+ */
+int
+wal_backup(const struct vclock *begin_vclock, const struct vclock *end_vclock,
+	   wal_backup_cb cb, void *cb_arg);
 
 void
 wal_init_vy_log(void);

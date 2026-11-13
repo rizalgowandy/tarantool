@@ -293,7 +293,7 @@ save_type
 s:drop()
 
 --
--- gh-4266 triggers on temporary space fail
+-- gh-4266 triggers on data-temporary space fail
 --
 s = box.schema.space.create('test', {temporary = true})
 
@@ -314,6 +314,7 @@ s:drop()
 test_run:cmd('create server test with script="box/on_schema_init.lua"')
 test_run:cmd('start server test')
 test_run:cmd('switch test')
+require('fiber').set_max_slice(15)
 s = box.schema.space.create('test_on_schema_init')
 _ = s:create_index('pk')
 test_run:cmd('setopt delimiter ";"')

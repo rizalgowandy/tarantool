@@ -1,15 +1,15 @@
 local ffi = require('ffi')
-local errno_list = require('errno')
+local errno_list = require('errno.lib')
 
 ffi.cdef[[
-    char *strerror(int errnum);
+    const char *tt_strerror(int errnum);
 ]]
 
 local function strerror(errno)
     if errno == nil then
         errno = ffi.errno()
     end
-    return ffi.string(ffi.C.strerror(tonumber(errno)))
+    return ffi.string(ffi.C.tt_strerror(tonumber(errno)))
 end
 
 return setmetatable({

@@ -8,6 +8,9 @@
 #include "box/bind.h"
 #include "box/sql_stmt_cache.h"
 #include "box/schema.h"
+#include "mpstream/mpstream.h"
+#include "box/sql/vdbeInt.h"
+#include "box/sql/port.h"
 
 /**
  * Serialize a description of the prepared statement.
@@ -17,8 +20,7 @@
  * @param column_count Statement's column count.
  */
 static inline void
-lua_sql_get_metadata(struct sql_stmt *stmt, struct lua_State *L,
-		     int column_count)
+lua_sql_get_metadata(struct Vdbe *stmt, struct lua_State *L, int column_count)
 {
 	assert(column_count > 0);
 	lua_createtable(L, column_count, 0);
@@ -68,7 +70,7 @@ lua_sql_get_metadata(struct sql_stmt *stmt, struct lua_State *L,
 }
 
 static inline void
-lua_sql_get_params_metadata(struct sql_stmt *stmt, struct lua_State *L)
+lua_sql_get_params_metadata(struct Vdbe *stmt, struct lua_State *L)
 {
 	int bind_count = sql_bind_parameter_count(stmt);
 	lua_createtable(L, bind_count, 0);
@@ -163,20 +165,20 @@ lbox_unprepare(struct lua_State *L)
 }
 
 void
-port_sql_dump_lua(struct port *port, struct lua_State *L, bool is_flat)
+port_sql_dump_lua(struct port *port, struct lua_State *L,
+		  enum port_dump_lua_mode mode)
 {
-	(void) is_flat;
-	assert(is_flat == false);
+	(void)mode;
+	assert(mode == PORT_DUMP_LUA_MODE_TABLE);
 	assert(port->vtab == &port_sql_vtab);
-	struct sql *db = sql_get();
 	struct port_sql *port_sql = (struct port_sql *)port;
-	struct sql_stmt *stmt = port_sql->stmt;
+	struct Vdbe *stmt = port_sql->stmt;
 	switch (port_sql->serialization_format) {
 	case DQL_EXECUTE: {
 		lua_createtable(L, 0, 2);
 		lua_sql_get_metadata(stmt, L, sql_column_count(stmt));
 		lua_setfield(L, -2, "metadata");
-		port_c_vtab.dump_lua(port, L, false);
+		port_c_vtab.dump_lua(port, L, PORT_DUMP_LUA_MODE_TABLE);
 		lua_setfield(L, -2, "rows");
 		break;
 	}
@@ -186,7 +188,7 @@ port_sql_dump_lua(struct port *port, struct lua_State *L, bool is_flat)
 			vdbe_autoinc_id_list((struct Vdbe *) stmt);
 		lua_createtable(L, 0, stailq_empty(autoinc_id_list) ? 1 : 2);
 
-		luaL_pushuint64(L, db->nChange);
+		luaL_pushuint64(L, sql_get()->nChange);
 		lua_setfield(L, -2, sql_info_key_strs[SQL_INFO_ROW_COUNT]);
 
 		if (!stailq_empty(autoinc_id_list)) {
@@ -216,9 +218,7 @@ port_sql_dump_lua(struct port *port, struct lua_State *L, bool is_flat)
 		 */
 		lua_createtable(L, 0, 6);
 		/* query_id */
-		const char *sql_str = sql_stmt_query_str(port_sql->stmt);
-		luaL_pushuint64(L, sql_stmt_calculate_id(sql_str,
-							 strlen(sql_str)));
+		luaL_pushuint64(L, sql_stmt_get_id(port_sql->stmt));
 		lua_setfield(L, -2, "stmt_id");
 		/* param_count */
 		luaL_pushuint64(L, sql_bind_parameter_count(stmt));
@@ -247,9 +247,7 @@ port_sql_dump_lua(struct port *port, struct lua_State *L, bool is_flat)
 		 */
 		lua_createtable(L, 0, 5);
 		/* query_id */
-		const char *sql_str = sql_stmt_query_str(port_sql->stmt);
-		luaL_pushuint64(L, sql_stmt_calculate_id(sql_str,
-							 strlen(sql_str)));
+		luaL_pushuint64(L, sql_stmt_get_id(port_sql->stmt));
 		lua_setfield(L, -2, "stmt_id");
 		/* param_count */
 		luaL_pushuint64(L, sql_bind_parameter_count(stmt));
@@ -298,15 +296,15 @@ lua_sql_bind_decode(struct lua_State *L, struct sql_bind *bind, int idx, int i)
 		lua_pushnil(L);
 		lua_next(L, -2);
 		if (! lua_isstring(L, -2)) {
-			diag_set(ClientError, ER_ILLEGAL_PARAMS, "name of the "\
+			diag_set(IllegalParams, "name of the "
 				 "parameter should be a string.");
 			return -1;
 		}
 		/* Check that the table is one-row sized. */
 		lua_pushvalue(L, -2);
 		if (lua_next(L, -4) != 0) {
-			diag_set(ClientError, ER_ILLEGAL_PARAMS, "SQL bind "\
-				 "named parameter should be a table with "\
+			diag_set(IllegalParams, "SQL bind "
+				 "named parameter should be a table with "
 				 "one key - {name = value}");
 			return -1;
 		}
@@ -316,12 +314,7 @@ lua_sql_bind_decode(struct lua_State *L, struct sql_bind *bind, int idx, int i)
 		 * Name should be saved in allocated memory as it
 		 * will be poped from Lua stack.
 		 */
-		buf = region_alloc(region, name_len + 1);
-		if (buf == NULL) {
-			diag_set(OutOfMemory, name_len + 1, "region_alloc",
-				 "buf");
-			return -1;
-		}
+		buf = xregion_alloc(region, name_len + 1);
 		memcpy(buf, bind->name, name_len + 1);
 		bind->name = buf;
 		bind->name_len = name_len;
@@ -331,6 +324,8 @@ lua_sql_bind_decode(struct lua_State *L, struct sql_bind *bind, int idx, int i)
 	}
 	if (luaL_tofield(L, luaL_msgpack_default, -1, &field) < 0)
 		return -1;
+	bind->type = field.type;
+	bind->ext_type = field.ext_type;
 	switch (field.type) {
 	case MP_UINT:
 		bind->u64 = field.ival;
@@ -340,18 +335,14 @@ lua_sql_bind_decode(struct lua_State *L, struct sql_bind *bind, int idx, int i)
 		bind->i64 = field.ival;
 		bind->bytes = sizeof(bind->i64);
 		break;
+	case MP_BIN:
 	case MP_STR:
 		/*
 		 * Data should be saved in allocated memory as it
 		 * will be poped from Lua stack.
 		 */
-		buf = region_alloc(region, field.sval.len + 1);
-		if (buf == NULL) {
-			diag_set(OutOfMemory, field.sval.len + 1,
-				 "region_alloc", "buf");
-			return -1;
-		}
-		memcpy(buf, field.sval.data, field.sval.len + 1);
+		buf = xregion_alloc(region, field.sval.len);
+		memcpy(buf, field.sval.data, field.sval.len);
 		bind->s = buf;
 		bind->bytes = field.sval.len;
 		break;
@@ -367,9 +358,6 @@ lua_sql_bind_decode(struct lua_State *L, struct sql_bind *bind, int idx, int i)
 		bind->b = field.bval;
 		bind->bytes = sizeof(bind->b);
 		break;
-	case MP_BIN:
-		bind->s = mp_decode_bin(&field.sval.data, &bind->bytes);
-		break;
 	case MP_EXT:
 		if (field.ext_type == MP_UUID) {
 			bind->uuid = *field.uuidval;
@@ -379,22 +367,43 @@ lua_sql_bind_decode(struct lua_State *L, struct sql_bind *bind, int idx, int i)
 			bind->dec = *field.decval;
 			break;
 		}
+		if (field.ext_type == MP_DATETIME) {
+			bind->dt = *field.dateval;
+			break;
+		}
+		if (field.ext_type == MP_INTERVAL) {
+			bind->itv = *field.interval;
+			break;
+		}
 		diag_set(ClientError, ER_SQL_BIND_TYPE, "USERDATA",
 			 sql_bind_name(bind));
 		return -1;
-	case MP_ARRAY:
-		diag_set(ClientError, ER_SQL_BIND_TYPE, "ARRAY",
-			 sql_bind_name(bind));
-		return -1;
 	case MP_MAP:
-		diag_set(ClientError, ER_SQL_BIND_TYPE, "MAP",
-			 sql_bind_name(bind));
-		return -1;
+	case MP_ARRAY: {
+		size_t used = region_used(region);
+		struct mpstream stream;
+		bool is_error = false;
+		mpstream_init(&stream, region, region_reserve_cb,
+			      region_alloc_cb, set_encode_error, &is_error);
+		if (luamp_encode_r(L, luaL_msgpack_default, &stream,
+				   &field, 0) != 0) {
+			region_truncate(region, used);
+			return -1;
+		}
+		mpstream_flush(&stream);
+		if (is_error) {
+			region_truncate(region, used);
+			diag_set(OutOfMemory, stream.pos - stream.buf,
+				 "mpstream_flush", "stream");
+			return -1;
+		}
+		bind->bytes = region_used(region) - used;
+		bind->s = xregion_join(region, bind->bytes);
+		break;
+	}
 	default:
 		unreachable();
 	}
-	bind->type = field.type;
-	bind->ext_type = field.ext_type;
 	lua_pop(L, lua_gettop(L) - idx);
 	return 0;
 }
@@ -414,18 +423,13 @@ lua_sql_bind_list_decode(struct lua_State *L, struct sql_bind **out_bind,
 	}
 	struct region *region = &fiber()->gc;
 	uint32_t used = region_used(region);
-	size_t size;
 	/*
 	 * Memory allocated here will be freed in
 	 * sql_stmt_finalize() or in txn_commit()/txn_rollback() if
 	 * there is an active transaction.
 	 */
-	struct sql_bind *bind = region_alloc_array(region, typeof(bind[0]),
-						   bind_count, &size);
-	if (bind == NULL) {
-		diag_set(OutOfMemory, size, "region_alloc_array", "bind");
-		return -1;
-	}
+	struct sql_bind *bind = xregion_alloc_array(region, typeof(bind[0]),
+						    bind_count);
 	for (uint32_t i = 0; i < bind_count; ++i) {
 		if (lua_sql_bind_decode(L, &bind[i], idx, i) != 0) {
 			region_truncate(region, used);
@@ -449,6 +453,10 @@ lbox_execute(struct lua_State *L)
 		return luaL_error(L, "Usage: box.execute(sqlstring[, params]) "
 				  "or box.execute(stmt_id[, params])");
 
+	if (lua_type(L, 1) != LUA_TSTRING && lua_tointeger(L, 1) < 0)
+		return luaL_error(L, "Statement id can't be negative");
+
+	size_t region_svp = region_used(&fiber()->gc);
 	if (top == 2) {
 		if (! lua_istable(L, 2))
 			return luaL_error(L, "Second argument must be a table");
@@ -464,19 +472,22 @@ lbox_execute(struct lua_State *L)
 		const char *sql = lua_tolstring(L, 1, &length);
 		if (sql_prepare_and_execute(sql, length, bind, bind_count, &port,
 					    &fiber()->gc) != 0)
-			return luaT_push_nil_and_error(L);
+			goto error;
 	} else {
 		assert(lua_type(L, 1) == LUA_TNUMBER);
 		lua_Integer query_id = lua_tointeger(L, 1);
-		if (query_id < 0)
-			return luaL_error(L, "Statement id can't be negative");
 		if (sql_execute_prepared(query_id, bind, bind_count, &port,
 					 &fiber()->gc) != 0)
-			return luaT_push_nil_and_error(L);
+			goto error;
 	}
-	port_dump_lua(&port, L, false);
+	port_dump_lua(&port, L, PORT_DUMP_LUA_MODE_TABLE);
 	port_destroy(&port);
+	region_truncate(&fiber()->gc, region_svp);
 	return 1;
+
+error:
+	region_truncate(&fiber()->gc, region_svp);
+	return luaT_push_nil_and_error(L);
 }
 
 /**
@@ -495,7 +506,7 @@ lbox_prepare(struct lua_State *L)
 	const char *sql = lua_tolstring(L, 1, &length);
 	if (sql_prepare(sql, length, &port) != 0)
 		return luaT_push_nil_and_error(L);
-	port_dump_lua(&port, L, false);
+	port_dump_lua(&port, L, PORT_DUMP_LUA_MODE_TABLE);
 	port_destroy(&port);
 	return 1;
 }

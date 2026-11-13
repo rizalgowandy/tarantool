@@ -45,6 +45,37 @@ static void exprCodeBetween(Parse *, Expr *, int,
 			    void (*)(Parse *, Expr *, int, int), int);
 static int exprCodeVector(Parse * pParse, Expr * p, int *piToFree);
 
+/**
+ * Determine the highest type between the given type and the type of the given
+ * expression.
+ */
+static enum field_type
+sql_highest_type(enum field_type a, struct Expr *expr)
+{
+	if (a == FIELD_TYPE_ANY || sql_token_is_variable(expr->op))
+		return FIELD_TYPE_ANY;
+	if (expr->op == TK_NULL)
+		return a;
+	enum field_type b = sql_expr_type(expr);
+	if (a == b)
+		return a;
+	if (b == FIELD_TYPE_ANY || a == FIELD_TYPE_MAP || b == FIELD_TYPE_MAP ||
+	    a == FIELD_TYPE_ARRAY || b == FIELD_TYPE_ARRAY ||
+	    a == FIELD_TYPE_INTERVAL || b == FIELD_TYPE_INTERVAL)
+		return FIELD_TYPE_ANY;
+	if (!sql_type_is_numeric(a) || !sql_type_is_numeric(b))
+		return FIELD_TYPE_SCALAR;
+	if (a == FIELD_TYPE_NUMBER || b == FIELD_TYPE_NUMBER)
+		return FIELD_TYPE_NUMBER;
+	if (a == FIELD_TYPE_DECIMAL || b == FIELD_TYPE_DECIMAL)
+		return FIELD_TYPE_DECIMAL;
+	if (a == FIELD_TYPE_DOUBLE || b == FIELD_TYPE_DOUBLE)
+		return FIELD_TYPE_DOUBLE;
+	assert((a == FIELD_TYPE_INTEGER || a == FIELD_TYPE_UNSIGNED));
+	assert((b == FIELD_TYPE_INTEGER || b == FIELD_TYPE_UNSIGNED));
+	return FIELD_TYPE_INTEGER;
+}
+
 enum field_type
 sql_expr_type(struct Expr *pExpr)
 {
@@ -83,6 +114,8 @@ sql_expr_type(struct Expr *pExpr)
 		enum field_type lhs_type = sql_expr_type(pExpr->pLeft);
 		enum field_type rhs_type = sql_expr_type(pExpr->pRight);
 		return sql_type_result(rhs_type, lhs_type);
+	case TK_GETITEM:
+		return FIELD_TYPE_ANY;
 	case TK_CONCAT:
 		return FIELD_TYPE_STRING;
 	case TK_CASE: {
@@ -93,24 +126,25 @@ sql_expr_type(struct Expr *pExpr)
 		 * WHEN and one THEN clauses. So, first
 		 * expression always represents WHEN
 		 * argument, and the second one - THEN.
-		 * In case at least one type of THEN argument
-		 * is different from others then we can't
-		 * determine type of returning value at compiling
-		 * stage and set SCALAR (i.e. most general) type.
 		 */
-		enum field_type ref_type = sql_expr_type(cs->a[1].pExpr);
-		for (int i = 3; i < cs->nExpr; i += 2) {
-			if (ref_type != sql_expr_type(cs->a[i].pExpr))
-				return FIELD_TYPE_SCALAR;
-		}
+		uint32_t i = 1;
+		uint32_t count = cs->nExpr;
+		while (i < count && cs->a[i].pExpr->op == TK_NULL)
+			i += 2;
+		if (i >= count)
+			return FIELD_TYPE_ANY;
+		enum field_type res_type = sql_expr_type(cs->a[i].pExpr);
+		if (sql_token_is_variable(cs->a[i].pExpr->op))
+			res_type = FIELD_TYPE_ANY;
+		for (i += 2; i < count; i += 2)
+			res_type = sql_highest_type(res_type, cs->a[i].pExpr);
 		/*
 		 * ELSE clause is optional but we should check
 		 * its type as well.
 		 */
-		if (cs->nExpr % 2 == 1 &&
-		    ref_type != sql_expr_type(cs->a[cs->nExpr - 1].pExpr))
-			return FIELD_TYPE_SCALAR;
-		return ref_type;
+		if (count % 2 == 0)
+			return res_type;
+		return sql_highest_type(res_type, cs->a[count - 1].pExpr);
 	}
 	case TK_LT:
 	case TK_GT:
@@ -133,6 +167,10 @@ sql_expr_type(struct Expr *pExpr)
 	case TK_BITNOT:
 		assert(pExpr->pRight == NULL);
 		return sql_expr_type(pExpr->pLeft);
+	case TK_LEADING:
+	case TK_TRAILING:
+	case TK_BOTH:
+		return FIELD_TYPE_INTEGER;
 	}
 	return pExpr->type;
 }
@@ -150,9 +188,7 @@ sql_emit_args_types(struct Vdbe *v, int reg, struct func *base, uint32_t argc)
 	}
 	assert(func->base.def->param_count == -1);
 	uint32_t size = argc * sizeof(enum field_type);
-	enum field_type *types = sqlDbMallocRawNN(sql_get(), size);
-	if (types == NULL)
-		return -1;
+	enum field_type *types = sql_xmalloc(size);
 	enum field_type type = func->param_list[0];
 	for (uint32_t i = 0; i < argc; ++i)
 		types[i] = type;
@@ -161,57 +197,37 @@ sql_emit_args_types(struct Vdbe *v, int reg, struct func *base, uint32_t argc)
 }
 
 enum field_type *
-field_type_sequence_dup(struct Parse *parse, enum field_type *types,
-			uint32_t len)
+field_type_sequence_dup(enum field_type *types, uint32_t len)
 {
 	uint32_t sz = (len + 1) * sizeof(enum field_type);
-	enum field_type *ret_types = sqlDbMallocRaw(parse->db, sz);
-	if (ret_types == NULL)
-		return NULL;
+	enum field_type *ret_types = sql_xmalloc(sz);
 	memcpy(ret_types, types, sz);
 	ret_types[len] = field_type_MAX;
 	return ret_types;
 }
 
-/*
- * Set the collating sequence for expression pExpr to be the collating
- * sequence named by pToken.   Return a pointer to a new Expr node that
- * implements the COLLATE operator.
- *
- * If a memory allocation error occurs, that fact is recorded in pParse->db
- * and the pExpr parameter is returned unchanged.
- */
-Expr *
-sqlExprAddCollateToken(Parse * pParse,	/* Parsing context */
-			   Expr * pExpr,	/* Add the "COLLATE" clause to this expression */
-			   const Token * pCollName,	/* Name of collating sequence */
-			   int dequote	/* True to dequote pCollName */
-    )
+struct Expr *
+sqlExprAddCollateToken(struct Expr *pExpr, const Token *pCollName, int dequote)
 {
 	if (pCollName->n == 0)
 		return pExpr;
 	struct Expr *new_expr;
-	struct sql *db = pParse->db;
 	if (dequote)
-		new_expr = sql_expr_new_dequoted(db, TK_COLLATE, pCollName);
+		new_expr = sql_expr_new_dequoted(TK_COLLATE, pCollName);
 	else
-		new_expr = sql_expr_new(db, TK_COLLATE, pCollName);
-	if (new_expr == NULL) {
-		pParse->is_aborted = true;
-		return pExpr;
-	}
+		new_expr = sql_expr_new(TK_COLLATE, pCollName);
 	new_expr->pLeft = pExpr;
 	new_expr->flags |= EP_Collate | EP_Skip;
 	return new_expr;
 }
 
-Expr *
-sqlExprAddCollateString(Parse * pParse, Expr * pExpr, const char *zC)
+struct Expr *
+sqlExprAddCollateString(struct Expr *pExpr, const char *zC)
 {
 	Token s;
 	assert(zC != 0);
 	sqlTokenInit(&s, (char *)zC);
-	return sqlExprAddCollateToken(pParse, pExpr, &s, 0);
+	return sqlExprAddCollateToken(pExpr, &s, 0);
 }
 
 /*
@@ -253,7 +269,7 @@ check_collate_arg(struct Parse *parse, struct Expr *expr)
 	while (left->op == TK_COLLATE)
 		left = left->pLeft;
 	enum field_type type = sql_expr_type(left);
-	if (type != FIELD_TYPE_STRING && type != FIELD_TYPE_SCALAR) {
+	if (!field_type1_contains_type2(type, NULL, FIELD_TYPE_STRING, NULL)) {
 		diag_set(ClientError, ER_SQL_PARSER_GENERIC,
 			 "COLLATE clause can't be used with non-string "
 			 "arguments");
@@ -279,9 +295,15 @@ sql_expr_coll(Parse *parse, Expr *p, bool *is_explicit_coll, uint32_t *coll_id,
 		}
 		if (op == TK_COLLATE ||
 		    (op == TK_REGISTER && p->op2 == TK_COLLATE)) {
-			*coll = sql_get_coll_seq(parse, p->u.zToken, coll_id);
-			if (coll == NULL)
+			uint32_t id = sql_coll_id_by_expr(p);
+			if (id == UINT32_MAX) {
+				diag_set(ClientError, ER_NO_SUCH_COLLATION,
+					 p->u.zToken);
+				parse->is_aborted = true;
 				return -1;
+			}
+			*coll_id = id;
+			*coll = coll_by_id(id)->coll;
 			*is_explicit_coll = true;
 			break;
 		}
@@ -351,7 +373,7 @@ sql_expr_coll(Parse *parse, Expr *p, bool *is_explicit_coll, uint32_t *coll_id,
 		if (op == TK_FUNCTION) {
 			uint32_t arg_count = p->x.pList == NULL ? 0 :
 					     p->x.pList->nExpr;
-			uint32_t flags = sql_func_flags(p->u.zToken);
+			uint32_t flags = sql_func_flags(p);
 			if (((flags & SQL_FUNC_DERIVEDCOLL) != 0) &&
 			    arg_count > 0 && p->type == FIELD_TYPE_STRING) {
 				/*
@@ -411,12 +433,17 @@ sql_type_result(enum field_type lhs, enum field_type rhs)
 			return FIELD_TYPE_DOUBLE;
 		if (lhs == FIELD_TYPE_DECIMAL || rhs == FIELD_TYPE_DECIMAL)
 			return FIELD_TYPE_DECIMAL;
-		if (lhs == FIELD_TYPE_INTEGER || rhs == FIELD_TYPE_INTEGER)
-			return FIELD_TYPE_INTEGER;
 		assert(lhs == FIELD_TYPE_UNSIGNED ||
-		       rhs == FIELD_TYPE_UNSIGNED);
-		return FIELD_TYPE_UNSIGNED;
+		       lhs == FIELD_TYPE_INTEGER ||
+		       rhs == FIELD_TYPE_UNSIGNED || rhs == FIELD_TYPE_INTEGER);
+		return FIELD_TYPE_INTEGER;
 	}
+	if ((lhs == FIELD_TYPE_DATETIME && rhs == FIELD_TYPE_DATETIME) ||
+	    (lhs == FIELD_TYPE_INTERVAL && rhs == FIELD_TYPE_INTERVAL))
+		return FIELD_TYPE_INTERVAL;
+	if ((lhs == FIELD_TYPE_INTERVAL && rhs == FIELD_TYPE_DATETIME) ||
+	    (lhs == FIELD_TYPE_DATETIME && rhs == FIELD_TYPE_INTERVAL))
+		return FIELD_TYPE_DATETIME;
 	return FIELD_TYPE_SCALAR;
 }
 
@@ -529,6 +556,9 @@ codeCompare(Parse * pParse,	/* The parsing (and code generating) context */
 	    int jumpIfNull	/* If true, jump if either operand is NULL */
     )
 {
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+	return -1;
+#endif /* FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION */
 	uint32_t id;
 	if (sql_binary_compare_coll_seq(pParse, pLeft, pRight, &id) != 0)
 		return -1;
@@ -661,7 +691,7 @@ sqlExprForVectorField(Parse * pParse,	/* Parsing context */
 	} else {
 		if (pVector->op == TK_VECTOR)
 			pVector = pVector->x.pList->a[iField].pExpr;
-		pRet = sqlExprDup(pParse->db, pVector, 0);
+		pRet = sqlExprDup(pVector, 0);
 	}
 	return pRet;
 }
@@ -779,18 +809,6 @@ codeVectorCompare(Parse * pParse,	/* Code generator context */
 		r2 = exprVectorRegister(pParse, pRight, i, regRight, &pR,
 					&regFree2);
 		codeCompare(pParse, pL, pR, opx, r1, r2, dest, p5);
-		testcase(op == OP_Lt);
-		VdbeCoverageIf(v, op == OP_Lt);
-		testcase(op == OP_Le);
-		VdbeCoverageIf(v, op == OP_Le);
-		testcase(op == OP_Gt);
-		VdbeCoverageIf(v, op == OP_Gt);
-		testcase(op == OP_Ge);
-		VdbeCoverageIf(v, op == OP_Ge);
-		testcase(op == OP_Eq);
-		VdbeCoverageIf(v, op == OP_Eq);
-		testcase(op == OP_Ne);
-		VdbeCoverageIf(v, op == OP_Ne);
 		sqlReleaseTempReg(pParse, regFree1);
 		sqlReleaseTempReg(pParse, regFree2);
 		if (i > 0)
@@ -800,20 +818,14 @@ codeVectorCompare(Parse * pParse,	/* Code generator context */
 		}
 		if (opx == TK_EQ) {
 			sqlVdbeAddOp2(v, OP_IfNot, dest, addrDone);
-			VdbeCoverage(v);
 			p5 |= SQL_KEEPNULL;
 		} else if (opx == TK_NE) {
 			sqlVdbeAddOp2(v, OP_If, dest, addrDone);
-			VdbeCoverage(v);
 			p5 |= SQL_KEEPNULL;
 		} else {
 			assert(op == TK_LT || op == TK_GT || op == TK_LE
 			       || op == TK_GE);
 			sqlVdbeAddOp2(v, OP_ElseNotEq, 0, addrDone);
-			VdbeCoverageIf(v, op == TK_LT);
-			VdbeCoverageIf(v, op == TK_GT);
-			VdbeCoverageIf(v, op == TK_LE);
-			VdbeCoverageIf(v, op == TK_GE);
 			if (i == nLeft - 2)
 				opx = op;
 		}
@@ -821,7 +833,6 @@ codeVectorCompare(Parse * pParse,	/* Code generator context */
 	sqlVdbeResolveLabel(v, addrDone);
 }
 
-#if SQL_MAX_EXPR_DEPTH>0
 /*
  * Check that argument nHeight is less than or equal to the maximum
  * expression depth allowed. If it is not, leave an error message in
@@ -836,10 +847,9 @@ codeVectorCompare(Parse * pParse,	/* Code generator context */
 int
 sqlExprCheckHeight(Parse * pParse, int nHeight)
 {
-	int mxHeight = pParse->db->aLimit[SQL_LIMIT_EXPR_DEPTH];
-	if (nHeight > mxHeight) {
+	if (nHeight > SQL_MAX_EXPR_DEPTH) {
 		diag_set(ClientError, ER_SQL_PARSER_LIMIT, "Number of nodes "\
-			 "in expression tree", nHeight, mxHeight);
+			 "in expression tree", nHeight, SQL_MAX_EXPR_DEPTH);
 		pParse->is_aborted = true;
 		return -1;
 	}
@@ -897,9 +907,6 @@ heightOfSelect(Select * p, int *pnHeight)
  * Expr.pSelect member has a height of 1. Any other expression
  * has a height equal to the maximum height of any other
  * referenced Expr plus one.
- *
- * Also propagate EP_Propagate flags up from Expr.x.pList to Expr.flags,
- * if appropriate.
  */
 static void
 exprSetHeight(Expr * p)
@@ -911,26 +918,8 @@ exprSetHeight(Expr * p)
 		heightOfSelect(p->x.pSelect, &nHeight);
 	} else if (p->x.pList) {
 		heightOfExprList(p->x.pList, &nHeight);
-		p->flags |= EP_Propagate & sqlExprListFlags(p->x.pList);
 	}
 	p->nHeight = nHeight + 1;
-}
-
-/*
- * Set the Expr.nHeight variable using the exprSetHeight() function. If
- * the height is greater than the maximum allowed expression depth,
- * leave an error in pParse.
- *
- * Also propagate all EP_Propagate flags from the Expr.x.pList into
- * Expr.flags.
- */
-void
-sqlExprSetHeightAndFlags(Parse * pParse, Expr * p)
-{
-	if (pParse->is_aborted)
-		return;
-	exprSetHeight(p);
-	sqlExprCheckHeight(pParse, p->nHeight);
 }
 
 /*
@@ -944,26 +933,11 @@ sqlSelectExprHeight(Select * p)
 	heightOfSelect(p, &nHeight);
 	return nHeight;
 }
-#else				/* ABOVE:  Height enforcement enabled.  BELOW: Height enforcement off */
-/*
- * Propagate all EP_Propagate flags from the Expr.x.pList into
- * Expr.flags.
- */
-void
-sqlExprSetHeightAndFlags(Parse * pParse, Expr * p)
-{
-	if (p && p->x.pList && !ExprHasProperty(p, EP_xIsSelect)) {
-		p->flags |= EP_Propagate & sqlExprListFlags(p->x.pList);
-	}
-}
-
-#define exprSetHeight(y)
-#endif				/* SQL_MAX_EXPR_DEPTH>0 */
 
 /**
  * Allocate a new empty expression object with reserved extra
  * memory.
- * @param db SQL context.
+ *
  * @param op Expression value type.
  * @param extra_size Extra size, needed to be allocated together
  *        with the expression.
@@ -971,19 +945,13 @@ sqlExprSetHeightAndFlags(Parse * pParse, Expr * p)
  * @retval NULL Error. A diag message is set.
  */
 static struct Expr *
-sql_expr_new_empty(struct sql *db, int op, int extra_size)
+sql_expr_new_empty(int op, int extra_size)
 {
-	struct Expr *e = sqlDbMallocRawNN(db, sizeof(*e) + extra_size);
-	if (e == NULL) {
-		diag_set(OutOfMemory, sizeof(*e), "sqlDbMallocRawNN", "e");
-		return NULL;
-	}
+	struct Expr *e = sql_xmalloc(sizeof(*e) + extra_size);
 	memset(e, 0, sizeof(*e));
 	e->op = (u8)op;
 	e->iAgg = -1;
-#if SQL_MAX_EXPR_DEPTH > 0
 	e->nHeight = 1;
-#endif
 	return e;
 }
 
@@ -1006,28 +974,27 @@ sql_expr_token_to_int(int op, const struct Token *token, int *res)
 
 /** Create an expression of a constant integer. */
 static inline struct Expr *
-sql_expr_new_int(struct sql *db, int value)
+sql_expr_new_int(int value)
 {
-	struct Expr *e = sql_expr_new_empty(db, TK_INTEGER, 0);
-	if (e != NULL) {
-		e->flags |= EP_IntValue;
-		e->u.iValue = value;
-	}
+	struct Expr *e = sql_expr_new_empty(TK_INTEGER, 0);
+	e->type = FIELD_TYPE_INTEGER;
+	e->flags |= EP_IntValue;
+	e->u.iValue = value;
 	return e;
 }
 
 struct Expr *
-sql_expr_new(struct sql *db, int op, const struct Token *token)
+sql_expr_new(int op, const struct Token *token)
 {
 	int extra_sz = 0;
 	if (token != NULL) {
 		int val;
 		if (sql_expr_token_to_int(op, token, &val) == 0)
-			return sql_expr_new_int(db, val);
+			return sql_expr_new_int(val);
 		extra_sz = token->n + 1;
 	}
-	struct Expr *e = sql_expr_new_empty(db, op, extra_sz);
-	if (e == NULL || token == NULL)
+	struct Expr *e = sql_expr_new_empty(op, extra_sz);
+	if (token == NULL)
 		return e;
 	e->u.zToken = (char *) &e[1];
 	assert(token->z != NULL || token->n == 0);
@@ -1037,73 +1004,49 @@ sql_expr_new(struct sql *db, int op, const struct Token *token)
 }
 
 struct Expr *
-sql_expr_new_dequoted(struct sql *db, int op, const struct Token *token)
+sql_expr_new_dequoted(int op, const struct Token *token)
 {
-	int extra_size = 0, rc;
+	int extra_size = 0;
 	if (token != NULL) {
 		int val;
 		assert(token->z != NULL || token->n == 0);
 		if (sql_expr_token_to_int(op, token, &val) == 0)
-			return sql_expr_new_int(db, val);
+			return sql_expr_new_int(val);
 		extra_size = token->n + 1;
 	}
-	struct Expr *e = sql_expr_new_empty(db, op, extra_size);
-	if (e == NULL || token == NULL || token->n == 0)
+	struct Expr *e = sql_expr_new_empty(op, extra_size);
+	if (token == NULL || token->n == 0)
 		return e;
 	e->u.zToken = (char *) &e[1];
-	if (token->z[0] == '"')
-		e->flags |= EP_DblQuoted;
-	if (op != TK_ID && op != TK_COLLATE && op != TK_FUNCTION) {
-		memcpy(e->u.zToken, token->z, token->n);
-		e->u.zToken[token->n] = '\0';
-		sqlDequote(e->u.zToken);
-	} else if ((rc = sql_normalize_name(e->u.zToken, extra_size, token->z,
-					    token->n)) > extra_size) {
-		extra_size = rc;
-		e = sqlDbReallocOrFree(db, e, sizeof(*e) + extra_size);
-		if (e == NULL)
-			return NULL;
-		e->u.zToken = (char *) &e[1];
-		if (sql_normalize_name(e->u.zToken, extra_size, token->z,
-				       token->n) > extra_size)
-			unreachable();
-	}
+	memcpy(e->u.zToken, token->z, token->n);
+	e->u.zToken[token->n] = '\0';
+	sqlDequote(e->u.zToken);
+	if (op == TK_ID || op == TK_COLLATE || op == TK_FUNCTION)
+		e->flags |= token->z[0] != '"' ? EP_Lookup2 : 0;
 	return e;
 }
 
-/*
- * Attach subtrees pLeft and pRight to the Expr node pRoot.
- *
- * If pRoot==NULL that means that a memory allocation error has occurred.
- * In that case, delete the subtrees pLeft and pRight.
- */
 void
-sqlExprAttachSubtrees(sql * db,
-			  Expr * pRoot, Expr * pLeft, Expr * pRight)
+sqlExprAttachSubtrees(struct Expr *pRoot, struct Expr *pLeft,
+		      struct Expr *pRight)
 {
-	if (pRoot == 0) {
-		assert(db->mallocFailed);
-		sql_expr_delete(db, pLeft, false);
-		sql_expr_delete(db, pRight, false);
-	} else {
-		if (pRight) {
-			pRoot->pRight = pRight;
-			pRoot->flags |= EP_Propagate & pRight->flags;
-		}
-		if (pLeft) {
-			pRoot->pLeft = pLeft;
-			pRoot->flags |= EP_Propagate & pLeft->flags;
-		}
-		exprSetHeight(pRoot);
+	assert(pRoot != NULL);
+	if (pRight != NULL) {
+		pRoot->pRight = pRight;
+		pRoot->flags |= EP_Propagate & pRight->flags;
 	}
+	if (pLeft != NULL) {
+		pRoot->pLeft = pLeft;
+		pRoot->flags |= EP_Propagate & pLeft->flags;
+	}
+	exprSetHeight(pRoot);
 }
 
 /*
  * Allocate an Expr node which joins as many as two subtrees.
  *
  * One or both of the subtrees can be NULL.  Return a pointer to the new
- * Expr node.  Or, if an OOM error occurs, set pParse->db->mallocFailed,
- * free the subtrees and return NULL.
+ * Expr node.
  */
 Expr *
 sqlPExpr(Parse * pParse,	/* Parsing context */
@@ -1118,39 +1061,23 @@ sqlPExpr(Parse * pParse,	/* Parsing context */
 		 * Take advantage of short-circuit false
 		 * optimization for AND.
 		 */
-		p = sql_and_expr_new(pParse->db, pLeft, pRight);
-		if (p == NULL)
-			pParse->is_aborted = true;
+		p = sql_and_expr_new(pLeft, pRight);
 	} else {
-		p = sqlDbMallocRawNN(pParse->db, sizeof(Expr));
-		if (p) {
-			memset(p, 0, sizeof(Expr));
-			p->op = op & TKFLG_MASK;
-			p->iAgg = -1;
-		}
-		sqlExprAttachSubtrees(pParse->db, p, pLeft, pRight);
-	}
-	if (p) {
-		sqlExprCheckHeight(pParse, p->nHeight);
+		p = sql_xmalloc(sizeof(Expr));
+		memset(p, 0, sizeof(Expr));
+		p->op = op & TKFLG_MASK;
+		p->iAgg = -1;
+		sqlExprAttachSubtrees(p, pLeft, pRight);
 	}
 	return p;
 }
 
-/*
- * Add pSelect to the Expr.x.pSelect field.  Or, if pExpr is NULL (due
- * do a memory allocation failure) then delete the pSelect object.
- */
 void
-sqlPExprAddSelect(Parse * pParse, Expr * pExpr, Select * pSelect)
+sqlPExprAddSelect(struct Expr *expr, struct Select *select)
 {
-	if (pExpr) {
-		pExpr->x.pSelect = pSelect;
-		ExprSetProperty(pExpr, EP_xIsSelect | EP_Subquery);
-		sqlExprSetHeightAndFlags(pParse, pExpr);
-	} else {
-		assert(pParse->db->mallocFailed);
-		sql_select_delete(pParse->db, pSelect);
-	}
+	assert(expr != NULL);
+	expr->x.pSelect = select;
+	ExprSetProperty(expr, EP_xIsSelect | EP_Subquery);
 }
 
 /**
@@ -1175,70 +1102,48 @@ exprAlwaysFalse(Expr * p)
 }
 
 struct Expr *
-sql_and_expr_new(struct sql *db, struct Expr *left_expr,
-		 struct Expr *right_expr)
+sql_and_expr_new(struct Expr *left_expr, struct Expr *right_expr)
 {
+	assert(left_expr != NULL || right_expr != NULL);
 	if (left_expr == NULL) {
 		return right_expr;
 	} else if (right_expr == NULL) {
 		return left_expr;
 	} else if (exprAlwaysFalse(left_expr) || exprAlwaysFalse(right_expr)) {
-		sql_expr_delete(db, left_expr, false);
-		sql_expr_delete(db, right_expr, false);
-		struct Expr *f = sql_expr_new_anon(db, TK_FALSE);
-		if (f != NULL)
-			f->type = FIELD_TYPE_BOOLEAN;
+		sql_expr_delete(left_expr);
+		sql_expr_delete(right_expr);
+		struct Expr *f = sql_expr_new_anon(TK_FALSE);
+		f->type = FIELD_TYPE_BOOLEAN;
 		return f;
 	} else {
-		struct Expr *new_expr = sql_expr_new_anon(db, TK_AND);
-		sqlExprAttachSubtrees(db, new_expr, left_expr, right_expr);
+		struct Expr *new_expr = sql_expr_new_anon(TK_AND);
+		sqlExprAttachSubtrees(new_expr, left_expr, right_expr);
 		return new_expr;
 	}
-}
-
-/*
- * Construct a new expression node for a function with multiple
- * arguments.
- */
-Expr *
-sqlExprFunction(Parse * pParse, ExprList * pList, Token * pToken)
-{
-	struct sql *db = pParse->db;
-	assert(pToken != NULL);
-	struct Expr *new_expr = sql_expr_new_dequoted(db, TK_FUNCTION, pToken);
-	if (new_expr == NULL) {
-		sql_expr_list_delete(db, pList);
-		pParse->is_aborted = true;
-		return NULL;
-	}
-	new_expr->x.pList = pList;
-	assert(!ExprHasProperty(new_expr, EP_xIsSelect));
-	sqlExprSetHeightAndFlags(pParse, new_expr);
-	return new_expr;
 }
 
 /*
  * Assign a variable number to an expression that encodes a
  * wildcard in the original SQL statement.
  *
- * Wildcards consisting of a single "?" are assigned the next
- * sequential variable number.
+ * Wildcards consisting of a single "?" character are assigned
+ * an offset from the preceding named variable; if no named variables
+ * have appeared yet, the next sequential variable number is assigned.
  *
  * Wildcards of the form "$nnn" are assigned the number "nnn".
  * We make sure "nnn" is not too big to avoid a denial of service
  * attack when the SQL statement comes from an external source.
  *
- * Wildcards of the form ":aaa", "@aaa", are assigned the same
- * number as the previous instance of the same wildcard.  Or if
- * this is the first instance of the wildcard, the next sequential variable
- * number is assigned.
+ * Patterns of the form ":aaa" or "@aaa" are assigned the number 0.
+ * Their actual position is calculated at runtime as the position
+ * of the actual parameter with the matching name.
  */
 void
 sqlExprAssignVarNumber(Parse * pParse, Expr * pExpr, u32 n)
 {
-	sql *db = pParse->db;
 	const char *z;
 	ynVar x;
+	ynVar num;
 
 	if (pExpr == 0)
 		return;
@@ -1251,7 +1156,17 @@ sqlExprAssignVarNumber(Parse * pParse, Expr * pExpr, u32 n)
 	if (z[1] == 0) {
 		/* Wildcard of the form "?".  Assign the next variable number */
 		assert(z[0] == '?');
-		x = (ynVar) (++pParse->nVar);
+		x = pParse->var.offset;
+		int nVar = x;
+		if (pParse->var.pos != 0) {
+			nVar += pParse->var.pos;
+			pExpr->var_base = pParse->var.pos;
+		} else {
+			pExpr->var_base = 0;
+		}
+		if (nVar > pParse->nVar)
+			pParse->nVar = nVar;
+		pParse->var.offset++;
 	} else {
 		int doAdd = 0;
 		assert(z[0] != '?');
@@ -1265,10 +1180,6 @@ sqlExprAssignVarNumber(Parse * pParse, Expr * pExpr, u32 n)
 			bool is_neg;
 			bool is_ok = 0 == sql_atoi64(&z[1], &i, &is_neg, n - 1);
 			x = (ynVar) i;
-			testcase(i == 0);
-			testcase(i == 1);
-			testcase(i == SQL_BIND_PARAMETER_MAX - 1);
-			testcase(i == SQL_BIND_PARAMETER_MAX);
 			if (is_neg || i < 1) {
 				diag_set(ClientError, ER_SQL_PARSER_GENERIC,
 					 "Index of binding slots must start "\
@@ -1282,27 +1193,34 @@ sqlExprAssignVarNumber(Parse * pParse, Expr * pExpr, u32 n)
 				pParse->is_aborted = true;
 				return;
 			}
-			if (x > pParse->nVar) {
-				pParse->nVar = (int)x;
+			pParse->var.pos = 0;
+			pParse->var.offset = x + 1;
+			if (x > pParse->nVar)
+				pParse->nVar = x;
+			num = sqlVListNameToNum(pParse->pVList, z, n);
+			if (num == 0) {
 				doAdd = 1;
-			} else if (sqlVListNumToName(pParse->pVList, x) ==
-				   0) {
-				doAdd = 1;
+				num = x;
 			}
 		} else {
 			/* Wildcards like ":aaa", or "@aaa".  Reuse the same variable
 			 * number as the prior appearance of the same name, or if the name
 			 * has never appeared before, reuse the same variable number
 			 */
-			x = (ynVar) sqlVListNameToNum(pParse->pVList, z, n);
-			if (x == 0) {
-				x = (ynVar) (++pParse->nVar);
+			num = sqlVListNameToNum(pParse->pVList, z, n);
+			if (num == 0) {
+				pParse->nVar++;
+				num = pParse->nVar;
 				doAdd = 1;
 			}
+			x = (ynVar)0;
+			pParse->var.offset = 1;
+			pParse->var.pos = num;
+			pExpr->var_base = num;
 		}
 		if (doAdd) {
-			pParse->pVList =
-			    sqlVListAdd(db, pParse->pVList, z, n, x);
+			pParse->pVList = sqlVListAdd(pParse->pVList,
+						     z, n, num);
 		}
 	}
 	pExpr->iColumn = x;
@@ -1317,7 +1235,7 @@ sqlExprAssignVarNumber(Parse * pParse, Expr * pExpr, u32 n)
  * Recursively delete an expression tree.
  */
 static SQL_NOINLINE void
-sqlExprDeleteNN(sql * db, Expr * p, bool extern_alloc)
+sqlExprDeleteNN(struct Expr *p)
 {
 	assert(p != 0);
 	/* Sanity check: Assert that the IntValue is non-negative if it exists */
@@ -1332,28 +1250,27 @@ sqlExprDeleteNN(sql * db, Expr * p, bool extern_alloc)
 	if (!ExprHasProperty(p, (EP_TokenOnly | EP_Leaf))) {
 		/* The Expr.x union is never used at the same time as Expr.pRight */
 		assert(p->x.pList == 0 || p->pRight == 0);
-		if (p->pLeft && p->op != TK_SELECT_COLUMN && !extern_alloc)
-			sqlExprDeleteNN(db, p->pLeft, extern_alloc);
-		if (!extern_alloc)
-			sql_expr_delete(db, p->pRight, extern_alloc);
+		if (p->pLeft && p->op != TK_SELECT_COLUMN)
+			sqlExprDeleteNN(p->pLeft);
+		sql_expr_delete(p->pRight);
 		if (ExprHasProperty(p, EP_xIsSelect)) {
-			sql_select_delete(db, p->x.pSelect);
+			sql_select_delete(p->x.pSelect);
 		} else {
-			sql_expr_list_delete(db, p->x.pList);
+			sql_expr_list_delete(p->x.pList);
 		}
 	}
 	if (ExprHasProperty(p, EP_MemToken))
-		sqlDbFree(db, p->u.zToken);
+		sql_xfree(p->u.zToken);
 	if (!ExprHasProperty(p, EP_Static)) {
-		sqlDbFree(db, p);
+		sql_xfree(p);
 	}
 }
 
 void
-sql_expr_delete(sql *db, Expr *expr, bool extern_alloc)
+sql_expr_delete(Expr *expr)
 {
 	if (expr != NULL)
-		sqlExprDeleteNN(db, expr, extern_alloc);
+		sqlExprDeleteNN(expr);
 }
 
 /*
@@ -1459,14 +1376,25 @@ sql_expr_sizeof(struct Expr *p, int flags)
 	return size;
 }
 
-struct Expr *
-sql_expr_dup(struct sql *db, struct Expr *p, int flags, char **buffer)
+/**
+ * This function is similar to sqlExprDup(), except that if pzBuffer
+ * is not NULL then *pzBuffer is assumed to point to a buffer large enough
+ * to store the copy of expression p, the copies of p->u.zToken
+ * (if applicable), and the copies of the p->pLeft and p->pRight expressions,
+ * if any. Before returning, *pzBuffer is set to the first byte past the
+ * portion of the buffer copied into by this function.
+ *
+ * @param p Root of expression's AST.
+ * @param dupFlags EXPRDUP_REDUCE or 0.
+ * @param pzBuffer If not NULL, then buffer to store duplicate.
+ */
+static struct Expr *
+sql_expr_dup(struct Expr *p, int flags, char **buffer)
 {
 	Expr *pNew;		/* Value to return */
 	u32 staticFlag;         /* EP_Static if space not obtained from malloc */
 	char *zAlloc;		/* Memory space from which to build Expr object */
 
-	assert(db != 0);
 	assert(p);
 	assert(flags == 0 || flags == EXPRDUP_REDUCE);
 
@@ -1475,90 +1403,79 @@ sql_expr_dup(struct sql *db, struct Expr *p, int flags, char **buffer)
 		zAlloc = *buffer;
 		staticFlag = EP_Static;
 	} else {
-		zAlloc = sqlDbMallocRawNN(db,
-					      sql_expr_sizeof(p, flags));
+		zAlloc = sql_xmalloc(sql_expr_sizeof(p, flags));
 		staticFlag = 0;
 	}
+	assert(zAlloc != NULL);
 	pNew = (Expr *) zAlloc;
 
-	if (pNew) {
-		/* Set nNewSize to the size allocated for the structure pointed to
-		 * by pNew. This is either EXPR_FULLSIZE, EXPR_REDUCEDSIZE or
-		 * EXPR_TOKENONLYSIZE. nToken is set to the number of bytes consumed
-		 * by the copy of the p->u.zToken string (if any).
-		 */
-		const unsigned nStructSize = dupedExprStructSize(p, flags);
-		const int nNewSize = nStructSize & 0xfff;
-		int nToken;
-		if (!ExprHasProperty(p, EP_IntValue) && p->u.zToken)
-			nToken = sqlStrlen30(p->u.zToken) + 1;
+	/*
+	 * Set nNewSize to the size allocated for the structure pointed to
+	 * by pNew. This is either EXPR_FULLSIZE, EXPR_REDUCEDSIZE or
+	 * EXPR_TOKENONLYSIZE. nToken is set to the number of bytes consumed
+	 * by the copy of the p->u.zToken string (if any).
+	 */
+	const unsigned nStructSize = dupedExprStructSize(p, flags);
+	const int nNewSize = nStructSize & 0xfff;
+	int nToken;
+	if (!ExprHasProperty(p, EP_IntValue) && p->u.zToken)
+		nToken = sqlStrlen30(p->u.zToken) + 1;
+	else
+		nToken = 0;
+	if (flags != 0) {
+		assert(ExprHasProperty(p, EP_Reduced) == 0);
+		memcpy(zAlloc, p, nNewSize);
+	} else {
+		size_t nSize = exprStructSize(p);
+		memcpy(zAlloc, p, nSize);
+		if (nSize < EXPR_FULLSIZE)
+			memset(&zAlloc[nSize], 0, EXPR_FULLSIZE - nSize);
+	}
+
+	/*
+	 * Set the EP_Reduced, EP_TokenOnly, and EP_Static flags appropriately.
+	 */
+	pNew->flags &= ~(EP_Reduced | EP_TokenOnly | EP_Static | EP_MemToken);
+	pNew->flags |= nStructSize & (EP_Reduced | EP_TokenOnly);
+	pNew->flags |= staticFlag;
+
+	/* Copy the p->u.zToken string, if any. */
+	if (nToken != 0) {
+		pNew->u.zToken = &zAlloc[nNewSize];
+		memcpy(pNew->u.zToken, p->u.zToken, nToken);
+	}
+
+	if (((p->flags | pNew->flags) & (EP_TokenOnly | EP_Leaf)) == 0) {
+		/* Fill in the pNew->x.pSelect or pNew->x.pList member. */
+		if (ExprHasProperty(p, EP_xIsSelect))
+			pNew->x.pSelect = sqlSelectDup(p->x.pSelect, flags);
 		else
-			nToken = 0;
-		if (flags) {
-			assert(ExprHasProperty(p, EP_Reduced) == 0);
-			memcpy(zAlloc, p, nNewSize);
-		} else {
-			u32 nSize = (u32) exprStructSize(p);
-			memcpy(zAlloc, p, nSize);
-			if (nSize < EXPR_FULLSIZE) {
-				memset(&zAlloc[nSize], 0,
-				       EXPR_FULLSIZE - nSize);
-			}
+			pNew->x.pList = sql_expr_list_dup(p->x.pList, flags);
+	}
+
+	/* Fill in pNew->pLeft and pNew->pRight. */
+	if (ExprHasProperty(pNew, EP_Reduced | EP_TokenOnly)) {
+		zAlloc += dupedExprNodeSize(p, flags);
+		if (!ExprHasProperty(pNew, EP_TokenOnly | EP_Leaf)) {
+			pNew->pLeft = p->pLeft != NULL ?
+				      sql_expr_dup(p->pLeft, EXPRDUP_REDUCE,
+						   &zAlloc) : NULL;
+			pNew->pRight = p->pRight != NULL ?
+				       sql_expr_dup(p->pRight, EXPRDUP_REDUCE,
+						    &zAlloc) : NULL;
 		}
-
-		/* Set the EP_Reduced, EP_TokenOnly, and EP_Static flags appropriately. */
-		pNew->flags &=
-		    ~(EP_Reduced | EP_TokenOnly | EP_Static | EP_MemToken);
-		pNew->flags |= nStructSize & (EP_Reduced | EP_TokenOnly);
-		pNew->flags |= staticFlag;
-
-		/* Copy the p->u.zToken string, if any. */
-		if (nToken) {
-			char *zToken = pNew->u.zToken =
-			    (char *)&zAlloc[nNewSize];
-			memcpy(zToken, p->u.zToken, nToken);
-		}
-
-		if (0 == ((p->flags | pNew->flags) & (EP_TokenOnly | EP_Leaf))) {
-			/* Fill in the pNew->x.pSelect or pNew->x.pList member. */
-			if (ExprHasProperty(p, EP_xIsSelect)) {
-				pNew->x.pSelect =
-				    sqlSelectDup(db, p->x.pSelect,
-						     flags);
+		if (buffer != NULL)
+			*buffer = zAlloc;
+	} else {
+		if (!ExprHasProperty(p, EP_TokenOnly | EP_Leaf)) {
+			if (pNew->op == TK_SELECT_COLUMN) {
+				pNew->pLeft = p->pLeft;
+				assert(p->iColumn == 0 || p->pRight == 0);
+				assert(p->pRight == 0 || p->pRight == p->pLeft);
 			} else {
-				pNew->x.pList =
-					sql_expr_list_dup(db, p->x.pList, flags);
+				pNew->pLeft = sqlExprDup(p->pLeft, 0);
 			}
-		}
-
-		/* Fill in pNew->pLeft and pNew->pRight. */
-		if (ExprHasProperty(pNew, EP_Reduced | EP_TokenOnly)) {
-			zAlloc += dupedExprNodeSize(p, flags);
-			if (!ExprHasProperty(pNew, EP_TokenOnly | EP_Leaf)) {
-				pNew->pLeft = p->pLeft ?
-				    sql_expr_dup(db, p->pLeft, EXPRDUP_REDUCE,
-						 &zAlloc) : 0;
-				pNew->pRight =
-				    p->pRight ? sql_expr_dup(db, p->pRight,
-							     EXPRDUP_REDUCE,
-							     &zAlloc) : 0;
-			}
-			if (buffer)
-				*buffer = zAlloc;
-		} else {
-			if (!ExprHasProperty(p, EP_TokenOnly | EP_Leaf)) {
-				if (pNew->op == TK_SELECT_COLUMN) {
-					pNew->pLeft = p->pLeft;
-					assert(p->iColumn == 0
-					       || p->pRight == 0);
-					assert(p->pRight == 0
-					       || p->pRight == p->pLeft);
-				} else {
-					pNew->pLeft =
-					    sqlExprDup(db, p->pLeft, 0);
-				}
-				pNew->pRight = sqlExprDup(db, p->pRight, 0);
-			}
+			pNew->pRight = sqlExprDup(p->pRight, 0);
 		}
 	}
 	return pNew;
@@ -1566,83 +1483,52 @@ sql_expr_dup(struct sql *db, struct Expr *p, int flags, char **buffer)
 
 /*
  * Create and return a deep copy of the object passed as the second
- * argument. If an OOM condition is encountered, NULL is returned
- * and the db->mallocFailed flag set.
+ * argument.
  */
-static With *
-withDup(sql * db, With * p)
+static struct With *
+withDup(struct With *p)
 {
-	With *pRet = 0;
-	if (p) {
-		int nByte = sizeof(*p) + sizeof(p->a[0]) * (p->nCte - 1);
-		pRet = sqlDbMallocZero(db, nByte);
-		if (pRet) {
-			int i;
-			pRet->nCte = p->nCte;
-			for (i = 0; i < p->nCte; i++) {
-				pRet->a[i].pSelect =
-				    sqlSelectDup(db, p->a[i].pSelect, 0);
-				pRet->a[i].pCols =
-				    sql_expr_list_dup(db, p->a[i].pCols, 0);
-				pRet->a[i].zName =
-				    sqlDbStrDup(db, p->a[i].zName);
-			}
-		}
+	if (p == NULL)
+		return NULL;
+	int nByte = sizeof(*p) + sizeof(p->a[0]) * (p->nCte - 1);
+	With *pRet = sql_xmalloc0(nByte);
+	pRet->nCte = p->nCte;
+	for (int i = 0; i < p->nCte; i++) {
+		pRet->a[i].pSelect = sqlSelectDup(p->a[i].pSelect, 0);
+		pRet->a[i].pCols = sql_expr_list_dup(p->a[i].pCols, 0);
+		pRet->a[i].zName = sql_xstrdup(p->a[i].zName);
 	}
 	return pRet;
 }
 
-/*
- * The following group of routines make deep copies of expressions,
- * expression lists, ID lists, and select statements.  The copies can
- * be deleted (by being passed to their respective ...Delete() routines)
- * without effecting the originals.
- *
- * The expression list, ID, and source lists return by sql_expr_list_dup(),
- * sqlIdListDup(), and sqlSrcListDup() can not be further expanded
- * by subsequent calls to sql*ListAppend() routines.
- *
- * Any tables that the SrcList might point to are not duplicated.
- *
- * The flags parameter contains a combination of the EXPRDUP_XXX flags.
- * If the EXPRDUP_REDUCE flag is set, then the structure returned is a
- * truncated version of the usual Expr structure that will be stored as
- * part of the in-memory representation of the database schema.
- */
-Expr *
-sqlExprDup(sql * db, Expr * p, int flags)
+struct Expr *
+sqlExprDup(struct Expr *p, int flags)
 {
 	assert(flags == 0 || flags == EXPRDUP_REDUCE);
-	return p ? sql_expr_dup(db, p, flags, 0) : 0;
+	return p != NULL ? sql_expr_dup(p, flags, 0) : NULL;
 }
 
 struct ExprList *
-sql_expr_list_dup(struct sql *db, struct ExprList *p, int flags)
+sql_expr_list_dup(struct ExprList *p, int flags)
 {
 	struct ExprList_item *pItem, *pOldItem;
 	int i;
 	Expr *pPriorSelectCol = NULL;
-	assert(db != NULL);
 	if (p == NULL)
 		return NULL;
-	ExprList *pNew = sqlDbMallocRawNN(db, sizeof(*pNew));
-	if (pNew == NULL)
-		return NULL;
+	ExprList *pNew = sql_xmalloc(sizeof(*pNew));
 	pNew->nExpr = i = p->nExpr;
 	if ((flags & EXPRDUP_REDUCE) == 0) {
 		for (i = 1; i < p->nExpr; i += i) {
 		}
 	}
-	pNew->a = pItem = sqlDbMallocRawNN(db, i * sizeof(p->a[0]));
-	if (pItem == NULL) {
-		sqlDbFree(db, pNew);
-		return NULL;
-	}
+	pItem = sql_xmalloc(i * sizeof(p->a[0]));
+	pNew->a = pItem;
 	pOldItem = p->a;
 	for (i = 0; i < p->nExpr; i++, pItem++, pOldItem++) {
 		Expr *pOldExpr = pOldItem->pExpr;
 		Expr *pNewExpr;
-		pItem->pExpr = sqlExprDup(db, pOldExpr, flags);
+		pItem->pExpr = sqlExprDup(pOldExpr, flags);
 		if (pOldExpr != NULL && pOldExpr->op == TK_SELECT_COLUMN &&
 		    (pNewExpr = pItem->pExpr) != NULL) {
 			assert(pNewExpr->iColumn == 0 || i > 0);
@@ -1660,8 +1546,9 @@ sql_expr_list_dup(struct sql *db, struct ExprList *p, int flags)
 				pNewExpr->pLeft = pPriorSelectCol;
 			}
 		}
-		pItem->zName = sqlDbStrDup(db, pOldItem->zName);
-		pItem->zSpan = sqlDbStrDup(db, pOldItem->zSpan);
+		pItem->zName = sql_xstrdup(pOldItem->zName);
+		pItem->zSpan = sql_xstrdup(pOldItem->zSpan);
+		pItem->legacy_name = sql_xstrdup(pOldItem->legacy_name);
 		pItem->sort_order = pOldItem->sort_order;
 		pItem->done = 0;
 		pItem->bSpanIsTab = pOldItem->bSpanIsTab;
@@ -1676,66 +1563,54 @@ sql_expr_list_dup(struct sql *db, struct ExprList *p, int flags)
  * sqlSelectDup(), can be called. sqlSelectDup() is sometimes
  * called with a NULL argument.
  */
-SrcList *
-sqlSrcListDup(sql * db, SrcList * p, int flags)
+static struct SrcList *
+sqlSrcListDup(struct SrcList *p, int flags)
 {
 	SrcList *pNew;
 	int i;
 	int nByte;
-	assert(db != 0);
 	if (p == 0)
 		return 0;
 	nByte =
 	    sizeof(*p) + (p->nSrc > 0 ? sizeof(p->a[0]) * (p->nSrc - 1) : 0);
-	pNew = sqlDbMallocRawNN(db, nByte);
-	if (pNew == 0)
-		return 0;
+	pNew = sql_xmalloc(nByte);
 	pNew->nSrc = pNew->nAlloc = p->nSrc;
 	for (i = 0; i < p->nSrc; i++) {
 		struct SrcList_item *pNewItem = &pNew->a[i];
 		struct SrcList_item *pOldItem = &p->a[i];
-		pNewItem->zName = sqlDbStrDup(db, pOldItem->zName);
-		pNewItem->zAlias = sqlDbStrDup(db, pOldItem->zAlias);
+		pNewItem->zName = sql_xstrdup(pOldItem->zName);
+		pNewItem->zAlias = sql_xstrdup(pOldItem->zAlias);
+		pNewItem->legacy_name = sql_xstrdup(pOldItem->legacy_name);
 		pNewItem->fg = pOldItem->fg;
 		pNewItem->iCursor = pOldItem->iCursor;
 		pNewItem->addrFillSub = pOldItem->addrFillSub;
 		pNewItem->regReturn = pOldItem->regReturn;
 		if (pNewItem->fg.isIndexedBy) {
-			pNewItem->u1.zIndexedBy =
-			    sqlDbStrDup(db, pOldItem->u1.zIndexedBy);
+			pNewItem->indexed_by =
+				sql_xstrdup(pOldItem->indexed_by);
+			pNewItem->legacy_index_name =
+				sql_xstrdup(pOldItem->legacy_index_name);
 		}
 		pNewItem->pIBIndex = pOldItem->pIBIndex;
-		if (pNewItem->fg.isTabFunc) {
-			pNewItem->u1.pFuncArg =
-			    sql_expr_list_dup(db, pOldItem->u1.pFuncArg, flags);
-		}
 		pNewItem->space = pOldItem->space;
-		pNewItem->pSelect =
-		    sqlSelectDup(db, pOldItem->pSelect, flags);
-		pNewItem->pOn = sqlExprDup(db, pOldItem->pOn, flags);
-		pNewItem->pUsing = sqlIdListDup(db, pOldItem->pUsing);
+		pNewItem->pSelect = sqlSelectDup(pOldItem->pSelect, flags);
+		pNewItem->pOn = sqlExprDup(pOldItem->pOn, flags);
+		pNewItem->pUsing = sqlIdListDup(pOldItem->pUsing);
 		pNewItem->colUsed = pOldItem->colUsed;
 	}
 	return pNew;
 }
 
-IdList *
-sqlIdListDup(sql * db, IdList * p)
+struct IdList *
+sqlIdListDup(struct IdList *p)
 {
 	IdList *pNew;
 	int i;
-	assert(db != 0);
 	if (p == 0)
 		return 0;
-	pNew = sqlDbMallocRawNN(db, sizeof(*pNew));
-	if (pNew == 0)
-		return 0;
+	pNew = sql_xmalloc(sizeof(*pNew));
 	pNew->nId = p->nId;
-	pNew->a = sqlDbMallocRawNN(db, p->nId * sizeof(p->a[0]));
-	if (pNew->a == 0) {
-		sqlDbFree(db, pNew);
-		return 0;
-	}
+	pNew->a = sql_xmalloc(p->nId * sizeof(p->a[0]));
 	/*
 	 * Note that because the size of the allocation for p->a[]
 	 * is not necessarily a power of two, sql_id_list_append()
@@ -1745,67 +1620,57 @@ sqlIdListDup(sql * db, IdList * p)
 	for (i = 0; i < p->nId; i++) {
 		struct IdList_item *pNewItem = &pNew->a[i];
 		struct IdList_item *pOldItem = &p->a[i];
-		pNewItem->zName = sqlDbStrDup(db, pOldItem->zName);
+		pNewItem->zName = sql_xstrdup(pOldItem->zName);
+		pNewItem->legacy_name = sql_xstrdup(pOldItem->legacy_name);
 		pNewItem->idx = pOldItem->idx;
 	}
 	return pNew;
 }
 
-Select *
-sqlSelectDup(sql * db, Select * p, int flags)
+struct Select *
+sqlSelectDup(struct Select *p, int flags)
 {
 	Select *pNew, *pPrior;
-	assert(db != 0);
 	if (p == 0)
 		return 0;
-	pNew = sqlDbMallocRawNN(db, sizeof(*p));
-	if (pNew == 0)
-		return 0;
-	pNew->pEList = sql_expr_list_dup(db, p->pEList, flags);
-	pNew->pSrc = sqlSrcListDup(db, p->pSrc, flags);
-	pNew->pWhere = sqlExprDup(db, p->pWhere, flags);
-	pNew->pGroupBy = sql_expr_list_dup(db, p->pGroupBy, flags);
-	pNew->pHaving = sqlExprDup(db, p->pHaving, flags);
-	pNew->pOrderBy = sql_expr_list_dup(db, p->pOrderBy, flags);
+	pNew = sql_xmalloc(sizeof(*p));
+	pNew->pEList = sql_expr_list_dup(p->pEList, flags);
+	pNew->pSrc = sqlSrcListDup(p->pSrc, flags);
+	pNew->pWhere = sqlExprDup(p->pWhere, flags);
+	pNew->pGroupBy = sql_expr_list_dup(p->pGroupBy, flags);
+	pNew->pHaving = sqlExprDup(p->pHaving, flags);
+	pNew->pOrderBy = sql_expr_list_dup(p->pOrderBy, flags);
 	pNew->op = p->op;
-	pNew->pPrior = pPrior = sqlSelectDup(db, p->pPrior, flags);
+	pPrior = sqlSelectDup(p->pPrior, flags);
+	pNew->pPrior = pPrior;
 	if (pPrior)
 		pPrior->pNext = pNew;
 	pNew->pNext = 0;
-	pNew->pLimit = sqlExprDup(db, p->pLimit, flags);
-	pNew->pOffset = sqlExprDup(db, p->pOffset, flags);
+	pNew->pLimit = sqlExprDup(p->pLimit, flags);
+	pNew->pOffset = sqlExprDup(p->pOffset, flags);
 	pNew->iLimit = 0;
 	pNew->iOffset = 0;
 	pNew->selFlags = p->selFlags & ~SF_UsesEphemeral;
 	pNew->addrOpenEphm[0] = -1;
 	pNew->addrOpenEphm[1] = -1;
 	pNew->nSelectRow = p->nSelectRow;
-	pNew->pWith = withDup(db, p->pWith);
+	pNew->pWith = withDup(p->pWith);
 	sqlSelectSetName(pNew, p->zSelName);
 	return pNew;
 }
 
 struct ExprList *
-sql_expr_list_append(struct sql *db, struct ExprList *expr_list,
-		     struct Expr *expr)
+sql_expr_list_append(struct ExprList *expr_list, struct Expr *expr)
 {
-	assert(db != NULL);
 	if (expr_list == NULL) {
-		expr_list = sqlDbMallocRawNN(db, sizeof(ExprList));
-		if (expr_list == NULL)
-			goto no_mem;
+		expr_list = sql_xmalloc(sizeof(ExprList));
 		expr_list->nExpr = 0;
-		expr_list->a =
-			sqlDbMallocRawNN(db, sizeof(expr_list->a[0]));
-		if (expr_list->a == NULL)
-			goto no_mem;
+		expr_list->a = sql_xmalloc(sizeof(expr_list->a[0]));
 	} else if ((expr_list->nExpr & (expr_list->nExpr - 1)) == 0) {
 		struct ExprList_item *a;
 		assert(expr_list->nExpr > 0);
-		a = sqlDbRealloc(db, expr_list->a, expr_list->nExpr * 2 *
-				     sizeof(expr_list->a[0]));
-		if (a == NULL)
-			goto no_mem;
+		a = sql_xrealloc(expr_list->a, expr_list->nExpr * 2 *
+				 sizeof(expr_list->a[0]));
 		expr_list->a = a;
 	}
 	assert(expr_list->a != NULL);
@@ -1813,41 +1678,15 @@ sql_expr_list_append(struct sql *db, struct ExprList *expr_list,
 	memset(pItem, 0, sizeof(*pItem));
 	pItem->pExpr = expr;
 	return expr_list;
-
- no_mem:
-	/* Avoid leaking memory if malloc has failed. */
-	sql_expr_delete(db, expr, false);
-	sql_expr_list_delete(db, expr_list);
-	return NULL;
 }
 
-/*
- * pColumns and pExpr form a vector assignment which is part of the SET
- * clause of an UPDATE statement.  Like this:
- *
- *        (a,b,c) = (expr1,expr2,expr3)
- * Or:    (a,b,c) = (SELECT x,y,z FROM ....)
- *
- * For each term of the vector assignment, append new entries to the
- * expression list pList.  In the case of a subquery on the LHS, append
- * TK_SELECT_COLUMN expressions.
- */
-ExprList *
-sqlExprListAppendVector(Parse * pParse,	/* Parsing context */
-			    ExprList * pList,	/* List to which to append. Might be NULL */
-			    IdList * pColumns,	/* List of names of LHS of the assignment */
-			    Expr * pExpr	/* Vector expression to be appended. Might be NULL */
-    )
+struct ExprList *
+sqlExprListAppendVector(struct Parse *pParse, struct ExprList *pList,
+			struct IdList *pColumns, struct Expr *pExpr)
 {
-	sql *db = pParse->db;
 	int n;
 	int i;
 	int iFirst = pList ? pList->nExpr : 0;
-	/* pColumns can only be NULL due to an OOM but an OOM will cause an
-	 * exit prior to this routine being invoked
-	 */
-	if (NEVER(pColumns == 0))
-		goto vector_append_error;
 	if (pExpr == 0)
 		goto vector_append_error;
 
@@ -1867,12 +1706,13 @@ sqlExprListAppendVector(Parse * pParse,	/* Parsing context */
 
 	for (i = 0; i < pColumns->nId; i++) {
 		Expr *pSubExpr = sqlExprForVectorField(pParse, pExpr, i);
-		pList = sql_expr_list_append(pParse->db, pList, pSubExpr);
-		if (pList) {
-			assert(pList->nExpr == iFirst + i + 1);
-			pList->a[pList->nExpr - 1].zName = pColumns->a[i].zName;
-			pColumns->a[i].zName = 0;
-		}
+		pList = sql_expr_list_append(pList, pSubExpr);
+		assert(pList->nExpr == iFirst + i + 1);
+		pList->a[pList->nExpr - 1].zName = pColumns->a[i].zName;
+		pList->a[pList->nExpr - 1].legacy_name =
+			pColumns->a[i].legacy_name;
+		pColumns->a[i].zName = 0;
+		pColumns->a[i].legacy_name = NULL;
 	}
 
 	if (pExpr->op == TK_SELECT) {
@@ -1894,8 +1734,8 @@ sqlExprListAppendVector(Parse * pParse,	/* Parsing context */
 	}
 
  vector_append_error:
-	sql_expr_delete(db, pExpr, false);
-	sqlIdListDelete(db, pColumns);
+	sql_expr_delete(pExpr);
+	sqlIdListDelete(pColumns);
 	return pList;
 }
 
@@ -1912,32 +1752,12 @@ sqlExprListSetSortOrder(struct ExprList *p, enum sort_order sort_order)
 	p->a[p->nExpr - 1].sort_order = sort_order;
 }
 
-void
-sql_expr_check_sort_orders(struct Parse *parse,
-			   const struct ExprList *expr_list)
-{
-	if(expr_list == NULL)
-		return;
-	enum sort_order reference_order = expr_list->a[0].sort_order;
-	for (int i = 1; i < expr_list->nExpr; i++) {
-		assert(expr_list->a[i].sort_order != SORT_ORDER_UNDEF);
-		if (expr_list->a[i].sort_order != reference_order) {
-			diag_set(ClientError, ER_UNSUPPORTED,
-				 "ORDER BY with LIMIT",
-				 "different sorting orders");
-			parse->is_aborted = true;
-			return;
-		}
-	}
-}
-
 /*
  * Set the ExprList.a[].zName element of the most recently added item
  * on the expression list.
  *
  * pList might be NULL following an OOM error.  But pName should never be
- * NULL.  If a memory allocation fails, the pParse->db->mallocFailed flag
- * is set.
+ * NULL.
  */
 void
 sqlExprListSetName(Parse * pParse,	/* Parsing context */
@@ -1946,74 +1766,55 @@ sqlExprListSetName(Parse * pParse,	/* Parsing context */
 		       int dequote	/* True to cause the name to be dequoted */
     )
 {
-	struct sql *db = pParse->db;
-	assert(pList != NULL || db->mallocFailed != 0);
+	assert(pList != NULL);
 	if (pList == NULL || pName->n == 0)
 		return;
 	assert(pList->nExpr > 0);
 	struct ExprList_item *item = &pList->a[pList->nExpr - 1];
 	assert(item->zName == NULL);
 	if (dequote) {
-		item->zName = sql_normalized_name_db_new(db, pName->z, pName->n);
-		if (item->zName == NULL)
-			pParse->is_aborted = true;
+		item->zName = sql_name_new(pName->z, pName->n);
+		item->legacy_name = sql_legacy_name_new(pName->z, pName->n);
 	} else {
-		item->zName = sqlDbStrNDup(db, pName->z, pName->n);
+		item->zName = sql_xstrndup(pName->z, pName->n);
 	}
-	if (item->zName != NULL)
-		sqlCheckIdentifierName(pParse, item->zName);
+	sqlCheckIdentifierName(pParse, item->zName);
 }
 
-/*
- * Set the ExprList.a[].zSpan element of the most recently added item
- * on the expression list.
- *
- * pList might be NULL following an OOM error.  But pSpan should never be
- * NULL.  If a memory allocation fails, the pParse->db->mallocFailed flag
- * is set.
- */
 void
-sqlExprListSetSpan(Parse * pParse,	/* Parsing context */
-		       ExprList * pList,	/* List to which to add the span. */
-		       ExprSpan * pSpan	/* The span to be added */
-    )
+sqlExprListSetSpan(struct ExprList *pList, const char *str, uint32_t len)
 {
-	sql *db = pParse->db;
-	assert(pList != 0 || db->mallocFailed != 0);
-	if (pList) {
-		struct ExprList_item *pItem = &pList->a[pList->nExpr - 1];
-		assert(pList->nExpr > 0);
-		assert(db->mallocFailed || pItem->pExpr == pSpan->pExpr);
-		sqlDbFree(db, pItem->zSpan);
-		pItem->zSpan = sqlDbStrNDup(db, (char *)pSpan->zStart,
-						(int)(pSpan->zEnd -
-						      pSpan->zStart));
-	}
+	assert(pList != NULL);
+	struct ExprList_item *pItem = &pList->a[pList->nExpr - 1];
+	assert(pList->nExpr > 0);
+	sql_xfree(pItem->zSpan);
+	pItem->zSpan = sql_xstrndup(str, len);
 }
 
 /*
  * Delete an entire expression list.
  */
 static SQL_NOINLINE void
-exprListDeleteNN(sql * db, ExprList * pList)
+exprListDeleteNN(struct ExprList *pList)
 {
 	int i;
 	struct ExprList_item *pItem;
 	assert(pList->a != 0 || pList->nExpr == 0);
 	for (pItem = pList->a, i = 0; i < pList->nExpr; i++, pItem++) {
-		sql_expr_delete(db, pItem->pExpr, false);
-		sqlDbFree(db, pItem->zName);
-		sqlDbFree(db, pItem->zSpan);
+		sql_expr_delete(pItem->pExpr);
+		sql_xfree(pItem->zName);
+		sql_xfree(pItem->zSpan);
+		sql_xfree(pItem->legacy_name);
 	}
-	sqlDbFree(db, pList->a);
-	sqlDbFree(db, pList);
+	sql_xfree(pList->a);
+	sql_xfree(pList);
 }
 
 void
-sql_expr_list_delete(sql *db, ExprList *expr_list)
+sql_expr_list_delete(struct ExprList *expr_list)
 {
 	if (expr_list != NULL)
-		exprListDeleteNN(db, expr_list);
+		exprListDeleteNN(expr_list);
 }
 
 /*
@@ -2085,17 +1886,15 @@ exprNodeIsConstant(Walker * pWalker, Expr * pExpr)
 	case TK_COLUMN_REF:
 	case TK_AGG_FUNCTION:
 	case TK_AGG_COLUMN:
-		testcase(pExpr->op == TK_ID);
-		testcase(pExpr->op == TK_COLUMN_REF);
-		testcase(pExpr->op == TK_AGG_FUNCTION);
-		testcase(pExpr->op == TK_AGG_COLUMN);
 		if (pWalker->eCode == 3 && pExpr->iTable == pWalker->u.iCur) {
 			return WRC_Continue;
 		} else {
 			pWalker->eCode = 0;
 			return WRC_Abort;
 		}
-	case TK_VARIABLE:
+	case TK_VAR_NUM:
+	case TK_VAR_ANON:
+	case TK_VAR_NAME:
 		if (pWalker->eCode == 4) {
 			/* A bound parameter in a CREATE statement that originates from
 			 * sql_prepare() causes an error
@@ -2105,8 +1904,6 @@ exprNodeIsConstant(Walker * pWalker, Expr * pExpr)
 		}
 		/* Fall through */
 	default:
-		testcase(pExpr->op == TK_SELECT);	/* selectNodeIsConstant will disallow */
-		testcase(pExpr->op == TK_EXISTS);	/* selectNodeIsConstant will disallow */
 		return WRC_Continue;
 	}
 }
@@ -2170,20 +1967,10 @@ sqlExprIsTableConstant(Expr * p, int iCur)
 	return exprIsConst(p, 3, iCur);
 }
 
-/*
- * Walk an expression tree.  Return non-zero if the expression is constant
- * or a function call with constant arguments.  Return and 0 if there
- * are any variables.
- *
- * For the purposes of this function, a double-quoted string (ex: "abc")
- * is considered a variable but a single-quoted string (ex: 'abc') is
- * a constant.
- */
 int
-sqlExprIsConstantOrFunction(Expr * p, u8 isInit)
+sqlExprIsConstantOrFunction(struct Expr *p)
 {
-	assert(isInit == 0 || isInit == 1);
-	return exprIsConst(p, 4 + isInit, 0);
+	return exprIsConst(p, 4, 0);
 }
 
 /*
@@ -2290,10 +2077,6 @@ isCandidateForInOpt(Expr * pX)
 	if (p->pPrior)
 		return 0;	/* Not a compound SELECT */
 	if (p->selFlags & (SF_Distinct | SF_Aggregate)) {
-		testcase((p->selFlags & (SF_Distinct | SF_Aggregate)) ==
-			 SF_Distinct);
-		testcase((p->selFlags & (SF_Distinct | SF_Aggregate)) ==
-			 SF_Aggregate);
 		return 0;	/* No DISTINCT keyword and no aggregate functions */
 	}
 	assert(p->pGroupBy == 0);	/* Has no GROUP BY clause */
@@ -2339,7 +2122,6 @@ sqlSetHasNullFlag(Vdbe * v, int iCur, int iCol, int regHasNull)
 	int addr1;
 	sqlVdbeAddOp2(v, OP_Integer, 0, regHasNull);
 	addr1 = sqlVdbeAddOp1(v, OP_Rewind, iCur);
-	VdbeCoverage(v);
 	sqlVdbeAddOp3(v, OP_Column, iCur, iCol, regHasNull);
 	sqlVdbeChangeP5(v, OPFLAG_TYPEOFARG);
 	VdbeComment((v, "first_entry_in(%d)", iCur));
@@ -2488,7 +2270,6 @@ sqlFindInIndex(Parse * pParse,	/* Parsing context */
 	 * ephemeral table.
 	 */
 	if (!pParse->is_aborted && (p = isCandidateForInOpt(pX)) != 0) {
-		sql *db = pParse->db;	/* Database connection */
 		ExprList *pEList = p->pEList;
 		int nExpr = pEList->nExpr;
 
@@ -2542,8 +2323,6 @@ sqlFindInIndex(Parse * pParse,	/* Parsing context */
 				/* Maximum nColumn is BMS-2, not BMS-1, so that we can compute
 				 * BITMASK(nExpr) without overflowing
 				 */
-				testcase(part_count == BMS - 2);
-				testcase(part_count == BMS - 1);
 				if (part_count >= BMS - 1)
 					continue;
 				if (mustBeUnique &&
@@ -2591,13 +2370,11 @@ sqlFindInIndex(Parse * pParse,	/* Parsing context */
 				if (colUsed == (MASKBIT(nExpr) - 1)) {
 					/* If we reach this point, that means the index pIdx is usable */
 					int iAddr = sqlVdbeAddOp0(v, OP_Once);
-					VdbeCoverage(v);
-					sqlVdbeAddOp4(v, OP_Explain,
-							  0, 0, 0,
-							  sqlMPrintf(db,
-							  "USING INDEX %s FOR IN-OPERATOR",
-							  idx->def->name),
-							  P4_DYNAMIC);
+					char *str = sqlMPrintf("USING INDEX %s "
+						"FOR IN-OPERATOR",
+						idx->def->name);
+					sqlVdbeAddOp4(v, OP_Explain, 0, 0, 0,
+						      str, P4_DYNAMIC);
 					vdbe_emit_open_cursor(pParse, iTab,
 							      idx->def->iid,
 							      space);
@@ -2673,10 +2450,10 @@ sqlFindInIndex(Parse * pParse,	/* Parsing context */
  * the types to be used for each column of the comparison.
  *
  * It is the responsibility of the caller to ensure that the returned
- * string is eventually freed using sqlDbFree().
+ * string is eventually freed using sql_xfree().
  */
 static enum field_type *
-expr_in_type(Parse *pParse, Expr *pExpr)
+expr_in_type(struct Expr *pExpr)
 {
 	Expr *pLeft = pExpr->pLeft;
 	int nVal = sqlExprVectorSize(pLeft);
@@ -2684,22 +2461,19 @@ expr_in_type(Parse *pParse, Expr *pExpr)
 
 	assert(pExpr->op == TK_IN);
 	uint32_t sz = (nVal + 1) * sizeof(enum field_type);
-	enum field_type *zRet = sqlDbMallocZero(pParse->db, sz);
-	if (zRet) {
-		int i;
-		for (i = 0; i < nVal; i++) {
-			Expr *pA = sqlVectorFieldSubexpr(pLeft, i);
-			enum field_type lhs = sql_expr_type(pA);
-			if (pSelect) {
-				struct Expr *e = pSelect->pEList->a[i].pExpr;
-				enum field_type rhs = sql_expr_type(e);
-				zRet[i] = sql_type_result(rhs, lhs);
-			} else {
-				zRet[i] = lhs;
-			}
+	enum field_type *zRet = sql_xmalloc0(sz);
+	for (int i = 0; i < nVal; i++) {
+		Expr *pA = sqlVectorFieldSubexpr(pLeft, i);
+		enum field_type lhs = sql_expr_type(pA);
+		if (pSelect != NULL) {
+			struct Expr *e = pSelect->pEList->a[i].pExpr;
+			enum field_type rhs = sql_expr_type(e);
+			zRet[i] = sql_type_result(rhs, lhs);
+		} else {
+			zRet[i] = lhs;
 		}
-		zRet[nVal] = field_type_MAX;
 	}
+	zRet[nVal] = field_type_MAX;
 	return zRet;
 }
 
@@ -2735,8 +2509,6 @@ sqlCodeSubselect(Parse * pParse,	/* Parsing context */
 	int jmpIfDynamic = -1;	/* One-time test address */
 	int rReg = 0;		/* Register storing resulting */
 	Vdbe *v = sqlGetVdbe(pParse);
-	if (NEVER(v == 0))
-		return 0;
 	sqlExprCachePush(pParse);
 
 	/* The evaluation of the IN/EXISTS/SELECT must be repeated every time it
@@ -2749,16 +2521,13 @@ sqlCodeSubselect(Parse * pParse,	/* Parsing context */
 	 * If all of the above are false, then we can run this code just once
 	 * save the results, and reuse the same result on subsequent invocations.
 	 */
-	if (!ExprHasProperty(pExpr, EP_VarSelect)) {
+	if (!ExprHasProperty(pExpr, EP_VarSelect))
 		jmpIfDynamic = sqlVdbeAddOp0(v, OP_Once);
-		VdbeCoverage(v);
-	}
 	if (pParse->explain == 2) {
-		char *zMsg =
-		    sqlMPrintf(pParse->db, "EXECUTE %s%s SUBQUERY %d",
-				   jmpIfDynamic >= 0 ? "" : "CORRELATED ",
-				   pExpr->op == TK_IN ? "LIST" : "SCALAR",
-				   pParse->iNextSelectId);
+		char *zMsg = sqlMPrintf("EXECUTE %s%s SUBQUERY %d",
+					jmpIfDynamic >= 0 ? "" : "CORRELATED ",
+					pExpr->op == TK_IN ? "LIST" : "SCALAR",
+					pParse->iNextSelectId);
 		sqlVdbeAddOp4(v, OP_Explain, pParse->iSelectId, 0, 0, zMsg,
 				  P4_DYNAMIC);
 	}
@@ -2787,8 +2556,6 @@ sqlCodeSubselect(Parse * pParse,	/* Parsing context */
 			int reg_eph = ++pParse->nMem;
 			struct sql_space_info *info =
 				sql_space_info_new(nVal, 0);
-			if (info == NULL)
-				return 0;
 			sqlVdbeAddOp4(v, OP_OpenTEphemeral, reg_eph, 0, 0,
 				      (char *)info, P4_DYNAMIC);
 			sqlVdbeAddOp3(v, OP_IteratorOpen, pExpr->iTable, 0,
@@ -2811,21 +2578,16 @@ sqlCodeSubselect(Parse * pParse,	/* Parsing context */
 					int i;
 					sqlSelectDestInit(&dest, SRT_Set,
 							      pExpr->iTable, reg_eph);
-					dest.dest_type =
-						expr_in_type(pParse, pExpr);
+					dest.dest_type = expr_in_type(pExpr);
 					assert((pExpr->iTable & 0x0000FFFF) ==
 					       pExpr->iTable);
 					pSelect->iLimit = 0;
-					testcase(pSelect->
-						 selFlags & SF_Distinct);
 					if (sqlSelect
 					    (pParse, pSelect, &dest)) {
-						sqlDbFree(pParse->db,
-							      dest.dest_type);
+						sql_xfree(dest.dest_type);
 						return 0;
 					}
-					sqlDbFree(pParse->db,
-						      dest.dest_type);
+					sql_xfree(dest.dest_type);
 					assert(pEList != 0);
 					assert(pEList->nExpr > 0);
 					for (i = 0; i < nVal; i++) {
@@ -2900,16 +2662,11 @@ sqlCodeSubselect(Parse * pParse,	/* Parsing context */
 			 *
 			 * If this is an EXISTS, write an integer 0 (not exists) or 1 (exists)
 			 * into a register and return that register number.
-			 *
-			 * In both cases, the query is augmented with "LIMIT 1".  Any
-			 * preexisting limit is discarded in place of the new LIMIT 1.
 			 */
 			Select *pSel;	/* SELECT statement to encode */
 			SelectDest dest;	/* How to deal with SELECT result */
 			int nReg;	/* Registers to allocate */
 
-			testcase(pExpr->op == TK_EXISTS);
-			testcase(pExpr->op == TK_SELECT);
 			assert(pExpr->op == TK_EXISTS
 			       || pExpr->op == TK_SELECT);
 			assert(ExprHasProperty(pExpr, EP_xIsSelect));
@@ -2930,18 +2687,22 @@ sqlCodeSubselect(Parse * pParse,	/* Parsing context */
 				sqlVdbeAddOp2(v, OP_Bool, false, dest.iSDParm);
 				VdbeComment((v, "Init EXISTS result"));
 			}
-			if (pSel->pLimit == NULL) {
-				pSel->pLimit =
-					sql_expr_new(pParse->db, TK_INTEGER,
-						     &sqlIntTokens[1]);
+			if (pExpr->op == TK_SELECT) {
 				if (pSel->pLimit == NULL) {
-					pParse->is_aborted = true;
-				} else {
+					pSel->pLimit = sql_expr_new_int(1);
 					ExprSetProperty(pSel->pLimit,
 							EP_System);
 				}
+				pSel->selFlags |= SF_SingleRow;
+			} else {
+				/*
+				 * For EXISTS it doesn't matter whether we
+				 * return one or more results, so just replace
+				 * limit with 1.
+				 */
+				sql_expr_delete(pSel->pLimit);
+				pSel->pLimit = sql_expr_new_int(1);
 			}
-			pSel->selFlags |= SF_SingleRow;
 			pSel->iLimit = 0;
 			pSel->selFlags &= ~SF_MultiValue;
 			if (sqlSelect(pParse, pSel, &dest)) {
@@ -3043,14 +2804,9 @@ sqlExprCodeIN(Parse * pParse,	/* Parsing and code generating context */
 	if (sqlExprCheckIN(pParse, pExpr))
 		return;
 	/* Type sequence for comparisons. */
-	enum field_type *zAff = expr_in_type(pParse, pExpr);
+	enum field_type *zAff = expr_in_type(pExpr);
 	nVector = sqlExprVectorSize(pExpr->pLeft);
-	aiMap =
-	    (int *)sqlDbMallocZero(pParse->db,
-				       nVector * (sizeof(int) + sizeof(char)) +
-				       1);
-	if (pParse->db->mallocFailed)
-		goto sqlExprCodeIN_oom_error;
+	aiMap = sql_xmalloc0(nVector * (sizeof(int) + sizeof(char)) + 1);
 
 	/* Attempt to compute the RHS. After this step, if anything other than
 	 * IN_INDEX_NOOP is returned, the table opened ith cursor pExpr->iTable
@@ -3122,15 +2878,12 @@ sqlExprCodeIN(Parse * pParse,	/* Parsing and code generating context */
 			if (ii < pList->nExpr - 1 || destIfNull != destIfFalse) {
 				sqlVdbeAddOp4(v, OP_Eq, rLhs, labelOk, r2,
 						  (void *)coll, P4_COLLSEQ);
-				VdbeCoverageIf(v, ii < pList->nExpr - 1);
-				VdbeCoverageIf(v, ii == pList->nExpr - 1);
 				sqlVdbeChangeP5(v, zAff[0]);
 			} else {
 				assert(destIfNull == destIfFalse);
 				sqlVdbeAddOp4(v, OP_Ne, rLhs, destIfFalse,
 						  r2, (void *)coll,
 						  P4_COLLSEQ);
-				VdbeCoverage(v);
 				sqlVdbeChangeP5(v,
 						    zAff[0] |
 						    SQL_JUMPIFNULL);
@@ -3139,7 +2892,6 @@ sqlExprCodeIN(Parse * pParse,	/* Parsing and code generating context */
 		}
 		if (regCkNull) {
 			sqlVdbeAddOp2(v, OP_IsNull, regCkNull, destIfNull);
-			VdbeCoverage(v);
 			sqlVdbeGoto(v, destIfFalse);
 		}
 		sqlVdbeResolveLabel(v, labelOk);
@@ -3158,10 +2910,8 @@ sqlExprCodeIN(Parse * pParse,	/* Parsing and code generating context */
 	}
 	for (i = 0; i < nVector; i++) {
 		Expr *p = sqlVectorFieldSubexpr(pExpr->pLeft, i);
-		if (sqlExprCanBeNull(p)) {
+		if (sqlExprCanBeNull(p))
 			sqlVdbeAddOp2(v, OP_IsNull, rLhs + i, destStep2);
-			VdbeCoverage(v);
-		}
 	}
 
 	/* Step 3.  The LHS is now known to be non-NULL.  Do the binary search
@@ -3180,22 +2930,18 @@ sqlExprCodeIN(Parse * pParse,	/* Parsing and code generating context */
 		/* Combine Step 3 and Step 5 into a single opcode */
 		sqlVdbeAddOp4Int(v, OP_NotFound, pExpr->iTable,
 				     destIfFalse, rLhs, nVector);
-		VdbeCoverage(v);
 		goto sqlExprCodeIN_finished;
 	}
 	/* Ordinary Step 3, for the case where FALSE and NULL are distinct */
 	addrTruthOp =
 		sqlVdbeAddOp4Int(v, OP_Found, pExpr->iTable, 0, rLhs,
 				     nVector);
-	VdbeCoverage(v);
 
 	/* Step 4.  If the RHS is known to be non-NULL and we did not find
 	 * an match on the search above, then the result must be FALSE.
 	 */
-	if (rRhsHasNull && nVector == 1) {
+	if (rRhsHasNull && nVector == 1)
 		sqlVdbeAddOp2(v, OP_NotNull, rRhsHasNull, destIfFalse);
-		VdbeCoverage(v);
-	}
 
 	/* Step 5.  If we do not care about the difference between NULL and
 	 * FALSE, then just return false.
@@ -3213,7 +2959,6 @@ sqlExprCodeIN(Parse * pParse,	/* Parsing and code generating context */
 	if (destStep6)
 		sqlVdbeResolveLabel(v, destStep6);
 	addrTop = sqlVdbeAddOp2(v, OP_Rewind, pExpr->iTable, destIfFalse);
-	VdbeCoverage(v);
 	if (nVector > 1) {
 		destNotNull = sqlVdbeMakeLabel(v);
 	} else {
@@ -3236,14 +2981,12 @@ sqlExprCodeIN(Parse * pParse,	/* Parsing and code generating context */
 		sqlVdbeAddOp3(v, OP_Column, pExpr->iTable, aiMap[i], r3);
 		sqlVdbeAddOp4(v, OP_Ne, rLhs + i, destNotNull, r3,
 				  (void *)pColl, P4_COLLSEQ);
-		VdbeCoverage(v);
 		sqlReleaseTempReg(pParse, r3);
 	}
 	sqlVdbeAddOp2(v, OP_Goto, 0, destIfNull);
 	if (nVector > 1) {
 		sqlVdbeResolveLabel(v, destNotNull);
 		sqlVdbeAddOp2(v, OP_Next, pExpr->iTable, addrTop + 1);
-		VdbeCoverage(v);
 
 		/* Step 7:  If we reach this point, we know that the result must
 		 * be false.
@@ -3259,9 +3002,8 @@ sqlExprCodeIN(Parse * pParse,	/* Parsing and code generating context */
 		sqlReleaseTempReg(pParse, rLhs);
 	sqlExprCachePop(pParse);
 	VdbeComment((v, "end IN expr"));
- sqlExprCodeIN_oom_error:
-	sqlDbFree(pParse->db, aiMap);
-	sqlDbFree(pParse->db, zAff);
+	sql_xfree(aiMap);
+	sql_xfree(zAff);
 }
 
 /*
@@ -3281,8 +3023,7 @@ codeReal(Vdbe * v, const char *z, int negateFlag, int iMem)
 		assert(!sqlIsNaN(value));	/* The new AtoF never returns NaN */
 		if (negateFlag)
 			value = -value;
-		sqlVdbeAddOp4Dup8(v, OP_Real, 0, iMem, 0, (u8 *) & value,
-				      P4_REAL);
+		sql_vdbe_add_op4_real(v, 0, iMem, 0, value);
 	}
 }
 
@@ -3291,9 +3032,7 @@ expr_code_dec(struct Parse *parser, struct Expr *expr, bool is_neg, int reg)
 {
 	const char *str = expr->u.zToken;
 	assert(str != NULL);
-	decimal_t *value = sqlDbMallocRawNN(sql_get(), sizeof(*value));
-	if (value == NULL)
-		goto error;
+	decimal_t *value = sql_xmalloc(sizeof(*value));
 	if (is_neg) {
 		decimal_t dec;
 		if (decimal_from_string(&dec, str) == NULL)
@@ -3306,7 +3045,8 @@ expr_code_dec(struct Parse *parser, struct Expr *expr, bool is_neg, int reg)
 		      P4_DEC);
 	return;
 error:
-	sqlDbFree(sql_get(), value);
+	sql_xfree(value);
+	diag_set(ClientError, ER_INVALID_DEC, str);
 	parser->is_aborted = true;
 }
 
@@ -3339,15 +3079,13 @@ expr_code_int(struct Parse *parse, struct Expr *expr, bool is_neg,
 	const char *sign = is_neg ? "-" : "";
 	if (z[0] == '0' && (z[1] == 'x' || z[1] == 'X')) {
 		errno = 0;
-		if (is_neg) {
+		if (is_neg)
 			value = strtoll(z, NULL, 16);
-		} else {
+		else
 			value = strtoull(z, NULL, 16);
-			if (value > INT64_MAX)
-				goto int_overflow;
-		}
 		if (errno != 0) {
-			diag_set(ClientError, ER_HEX_LITERAL_MAX, sign, z,
+			diag_set(ClientError, ER_HEX_LITERAL_MAX,
+				 tt_sprintf("%s%s", sign, z),
 				 strlen(z) - 2, 16);
 			parse->is_aborted = true;
 			return;
@@ -3357,16 +3095,123 @@ expr_code_int(struct Parse *parse, struct Expr *expr, bool is_neg,
 		bool unused;
 		if (sql_atoi64(z, &value, &unused, len) != 0 ||
 		    (is_neg && (uint64_t) value > (uint64_t) INT64_MAX + 1)) {
-int_overflow:
-			diag_set(ClientError, ER_INT_LITERAL_MAX, sign, z);
+			diag_set(ClientError, ER_INT_LITERAL_MAX,
+				 tt_sprintf("%s%s", sign, z));
 			parse->is_aborted = true;
 			return;
 		}
 	}
-	if (is_neg)
+
+	/*
+	 * We don't need to negate INT64_MIN value because it's negation is
+	 * equal to it.
+	 */
+	if (is_neg && value != INT64_MIN)
 		value = -value;
-	sqlVdbeAddOp4Dup8(v, OP_Int64, 0, mem, 0, (u8 *) &value,
-			  is_neg ? P4_INT64 : P4_UINT64);
+	if (is_neg)
+		sql_vdbe_add_op4_int64(v, 0, mem, 0, value);
+	else
+		sql_vdbe_add_op4_uint64(v, 0, mem, 0, value);
+}
+
+static void
+expr_code_array(struct Parse *parser, struct Expr *expr, int reg)
+{
+	struct Vdbe *vdbe = parser->pVdbe;
+	struct ExprList *list = expr->x.pList;
+	if (list == NULL) {
+		sqlVdbeAddOp3(vdbe, OP_Array, 0, reg, 0);
+		return;
+	}
+	int count = list->nExpr;
+	int values_reg = parser->nMem + 1;
+	parser->nMem += count;
+	sqlExprCodeExprList(parser, list, values_reg, 0, SQL_ECEL_FACTOR);
+	sqlVdbeAddOp3(vdbe, OP_Array, count, reg, values_reg);
+}
+
+/** Generate opcodes that will create a MAP from an expression. */
+static void
+expr_code_map(struct Parse *parser, struct Expr *expr, int reg)
+{
+	struct Vdbe *vdbe = parser->pVdbe;
+	struct ExprList *list = expr->x.pList;
+	if (list == NULL) {
+		sqlVdbeAddOp3(vdbe, OP_Map, 0, reg, 0);
+		return;
+	}
+	assert(list->nExpr % 2 == 0);
+	int count = list->nExpr / 2;
+	for (int i = 0; i < count; ++i) {
+		struct Expr *expr = list->a[2 * i].pExpr;
+		enum field_type type = sql_expr_type(expr);
+		if (!sql_token_is_variable(expr->op) &&
+		    type != FIELD_TYPE_INTEGER &&
+		    type != FIELD_TYPE_UNSIGNED &&
+		    type != FIELD_TYPE_STRING &&
+		    type != FIELD_TYPE_UUID) {
+			diag_set(ClientError, ER_SQL_PARSER_GENERIC, "Only "
+				 "integer, string and uuid can be keys in map");
+			parser->is_aborted = true;
+			return;
+		}
+	}
+	int len = 0;
+	int result_reg = parser->nMem + 1;
+	for (int i = 0; i < count; ++i) {
+		struct Expr *key = list->a[2 * i].pExpr;
+		int j;
+		for (j = i + 1; j < count; ++j) {
+			struct Expr *tmp_key = list->a[2 * j].pExpr;
+			if (sqlExprCompare(key, tmp_key, -1) == 0)
+				break;
+		}
+		if (j < count)
+			continue;
+
+		++len;
+		struct Expr *value = list->a[2 * i + 1].pExpr;
+		sqlExprCodeFactorable(parser, key, ++parser->nMem);
+		sqlExprCodeFactorable(parser, value, ++parser->nMem);
+	}
+	sqlVdbeAddOp3(vdbe, OP_Map, len, reg, result_reg);
+}
+
+/** Generate opcodes for operator []. */
+static void
+expr_code_getitem(struct Parse *parser, struct Expr *expr, int reg)
+{
+	struct Vdbe *vdbe = parser->pVdbe;
+	struct ExprList *list = expr->x.pList;
+	assert(list != NULL);
+	/* The last expr is the value to which the operator is applied. */
+	int count = list->nExpr - 1;
+	struct Expr *value = list->a[count].pExpr;
+
+	enum field_type type = value->op != TK_NULL ? sql_expr_type(value) :
+			       field_type_MAX;
+	if (!sql_token_is_variable(value->op) &&
+	    type != FIELD_TYPE_MAP && type != FIELD_TYPE_ARRAY) {
+		diag_set(ClientError, ER_SQL_PARSER_GENERIC, "Selecting is "
+			 "only possible from map and array values");
+		parser->is_aborted = true;
+		return;
+	}
+	for (int i = 0; i < count; ++i) {
+		struct Expr *arg = list->a[i].pExpr;
+		enum field_type type = arg->op != TK_NULL ? sql_expr_type(arg) :
+				       field_type_MAX;
+		if (type == FIELD_TYPE_MAP || type == FIELD_TYPE_ARRAY) {
+			diag_set(ClientError, ER_SQL_PARSER_GENERIC, "Map and "
+				 "array values cannot be keys");
+			parser->is_aborted = true;
+			return;
+		}
+	}
+	int reg_operands = parser->nMem + 1;
+	parser->nMem += count + 1;
+	sqlExprCodeExprList(parser, list, reg_operands, 0, SQL_ECEL_FACTOR);
+	sqlVdbeAddOp3(vdbe, OP_Getitem, count, reg, reg_operands);
 }
 
 /*
@@ -3400,14 +3245,14 @@ sqlExprCacheStore(Parse * pParse, int iTab, int iCol, int iReg)
 	struct yColCache *p;
 
 	/* Unless an error has occurred, register numbers are always positive. */
-	assert(iReg > 0 || pParse->is_aborted || pParse->db->mallocFailed);
+	assert(iReg > 0 || pParse->is_aborted);
 	assert(iCol >= -1 && iCol < 32768);	/* Finite column numbers */
 
 	/* The SQL_ColumnCache flag disables the column cache.  This is used
 	 * for testing only - to verify that sql always gets the same answer
 	 * with and without the column cache.
 	 */
-	if (OptimizationDisabled(pParse->db, SQL_ColumnCache))
+	if (OptimizationDisabled(SQL_ColumnCache))
 		return;
 
 	/* First replace any existing entry.
@@ -3472,7 +3317,6 @@ sqlExprCacheRemove(Parse * pParse, int iReg, int nReg)
 void
 sqlExprCachePush(Parse * pParse)
 {
-	struct session MAYBE_UNUSED *user_session;
 	pParse->iCacheLevel++;
 }
 
@@ -3485,8 +3329,6 @@ void
 sqlExprCachePop(Parse * pParse)
 {
 	int i = 0;
-	struct session *user_session MAYBE_UNUSED;
-	user_session = current_session();
 	assert(pParse->iCacheLevel >= 1);
 	pParse->iCacheLevel--;
 	while (i < pParse->nColCache) {
@@ -3557,9 +3399,6 @@ void
 sqlExprCacheClear(Parse * pParse)
 {
 	int i;
-	struct session MAYBE_UNUSED *user_session;
-	user_session = current_session();
-
 	for (i = 0; i < pParse->nColCache; i++) {
 		if (pParse->aColCache[i].tempReg
 		    && pParse->nTempReg < ArraySize(pParse->aTempReg)
@@ -3598,7 +3437,7 @@ sqlExprCodeMove(Parse * pParse, int iFrom, int iTo, int nReg)
  * Return true if any register in the range iFrom..iTo (inclusive)
  * is used as part of the column cache.
  *
- * This routine is used within assert() and testcase() macros only
+ * This routine is used within assert() only
  * and does not appear in a normal build.
  */
 static int
@@ -3687,10 +3526,7 @@ sqlExprCodeTarget(Parse * pParse, Expr * pExpr, int target)
 	Expr tempX;		/* Temporary expression node */
 
 	assert(target > 0 && target <= pParse->nMem);
-	if (v == 0) {
-		assert(pParse->db->mallocFailed);
-		return 0;
-	}
+	assert(v != NULL);
 
 	if (pExpr == 0) {
 		op = TK_NULL;
@@ -3740,6 +3576,18 @@ sqlExprCodeTarget(Parse * pParse, Expr * pExpr, int target)
 			return sqlExprCodeGetColumn(pParse, col, iTab, target,
 						    pExpr->op2);
 		}
+	case TK_ID:
+		assert(pParse->vdbe_field_ref_reg > 0);
+		int reg = pParse->vdbe_field_ref_reg;
+		sqlVdbeAddOp4(v, OP_FetchByName, reg, 0, target,
+			      sql_xstrdup(pExpr->u.zToken), P4_DYNAMIC);
+		return target;
+	case TK_DOT:
+		assert(pParse->vdbe_field_ref_reg > 0);
+		diag_set(ClientError, ER_UNSUPPORTED, "SQL expressions",
+			 "reference to spaces");
+		pParse->is_aborted = true;
+		return target;
 	case TK_INTEGER:{
 			expr_code_int(pParse, pExpr, false, target);
 			return target;
@@ -3760,14 +3608,14 @@ sqlExprCodeTarget(Parse * pParse, Expr * pExpr, int target)
 		}
 	case TK_STRING:{
 			assert(!ExprHasProperty(pExpr, EP_IntValue));
-			sqlVdbeLoadString(v, target, pExpr->u.zToken);
+			sqlVdbeAddOp4(v, OP_String8, 0, target, 0,
+				      sql_xstrdup(pExpr->u.zToken), P4_DYNAMIC);
 			return target;
 		}
 	case TK_NULL:{
 			sqlVdbeAddOp2(v, OP_Null, 0, target);
 			return target;
 		}
-#ifndef SQL_OMIT_BLOB_LITERAL
 	case TK_BLOB:{
 			int n;
 			const char *z;
@@ -3779,29 +3627,29 @@ sqlExprCodeTarget(Parse * pParse, Expr * pExpr, int target)
 			z = &pExpr->u.zToken[2];
 			n = sqlStrlen30(z) - 1;
 			assert(z[n] == '\'');
-			zBlob = sqlHexToBlob(sqlVdbeDb(v), z, n);
+			zBlob = sqlHexToBlob(z, n);
 			sqlVdbeAddOp4(v, OP_Blob, n / 2, target, 0, zBlob,
 					  P4_DYNAMIC);
 			return target;
 		}
-#endif
-	case TK_VARIABLE:{
+	case TK_VAR_NUM:
+	case TK_VAR_NAME:
+	case TK_VAR_ANON:
 			assert(!ExprHasProperty(pExpr, EP_IntValue));
 			assert(pExpr->u.zToken != 0);
 			assert(pExpr->u.zToken[0] != 0);
-			sqlVdbeAddOp2(v, OP_Variable, pExpr->iColumn,
-					  target);
-			if (pExpr->u.zToken[1] != 0) {
+			sqlVdbeAddOp2(v, OP_Variable, pExpr->iColumn, target);
+			assert(pExpr->u.zToken[1] != 0 || op == TK_VAR_ANON);
+			if (pExpr->var_base != 0) {
 				const char *z =
-				    sqlVListNumToName(pParse->pVList,
-							  pExpr->iColumn);
-				assert(pExpr->u.zToken[0] == '$'
-				       || strcmp(pExpr->u.zToken, z) == 0);
-				pParse->pVList[0] = 0;	/* Indicate VList may no longer be enlarged */
+					sqlVListNumToName(pParse->pVList,
+							  pExpr->var_base);
+				assert(z != NULL);
+				/* Indicate VList may no longer be enlarged */
+				pParse->pVList[0] = 0;
 				sqlVdbeAppendP4(v, (char *)z, P4_STATIC);
 			}
 			return target;
-		}
 	case TK_REGISTER:{
 			return pExpr->iTable;
 		}
@@ -3815,10 +3663,21 @@ sqlExprCodeTarget(Parse * pParse, Expr * pExpr, int target)
 				inReg = target;
 			}
 			sqlVdbeAddOp2(v, OP_Cast, target, pExpr->type);
-			testcase(usedAsColumnCache(pParse, inReg, inReg));
 			sql_expr_type_cache_change(pParse, inReg, 1);
 			return inReg;
 		}
+
+	case TK_ARRAY:
+		expr_code_array(pParse, pExpr, target);
+		break;
+
+	case TK_MAP:
+		expr_code_map(pParse, pExpr, target);
+		return target;
+
+	case TK_GETITEM:
+		expr_code_getitem(pParse, pExpr, target);
+		return target;
 
 	case TK_LT:
 	case TK_LE:
@@ -3837,25 +3696,11 @@ sqlExprCodeTarget(Parse * pParse, Expr * pExpr, int target)
 				codeCompare(pParse, pLeft, pExpr->pRight, op,
 					    r1, r2, inReg, SQL_STOREP2);
 				assert(TK_LT == OP_Lt);
-				testcase(op == OP_Lt);
-				VdbeCoverageIf(v, op == OP_Lt);
 				assert(TK_LE == OP_Le);
-				testcase(op == OP_Le);
-				VdbeCoverageIf(v, op == OP_Le);
 				assert(TK_GT == OP_Gt);
-				testcase(op == OP_Gt);
-				VdbeCoverageIf(v, op == OP_Gt);
 				assert(TK_GE == OP_Ge);
-				testcase(op == OP_Ge);
-				VdbeCoverageIf(v, op == OP_Ge);
 				assert(TK_EQ == OP_Eq);
-				testcase(op == OP_Eq);
-				VdbeCoverageIf(v, op == OP_Eq);
 				assert(TK_NE == OP_Ne);
-				testcase(op == OP_Ne);
-				VdbeCoverageIf(v, op == OP_Ne);
-				testcase(regFree1 == 0);
-				testcase(regFree2 == 0);
 			}
 			break;
 		}
@@ -3872,34 +3717,21 @@ sqlExprCodeTarget(Parse * pParse, Expr * pExpr, int target)
 	case TK_RSHIFT:
 	case TK_CONCAT:{
 			assert(TK_AND == OP_And);
-			testcase(op == TK_AND);
 			assert(TK_OR == OP_Or);
-			testcase(op == TK_OR);
 			assert(TK_PLUS == OP_Add);
-			testcase(op == TK_PLUS);
 			assert(TK_MINUS == OP_Subtract);
-			testcase(op == TK_MINUS);
 			assert(TK_REM == OP_Remainder);
-			testcase(op == TK_REM);
 			assert(TK_BITAND == OP_BitAnd);
-			testcase(op == TK_BITAND);
 			assert(TK_BITOR == OP_BitOr);
-			testcase(op == TK_BITOR);
 			assert(TK_SLASH == OP_Divide);
-			testcase(op == TK_SLASH);
 			assert(TK_LSHIFT == OP_ShiftLeft);
-			testcase(op == TK_LSHIFT);
 			assert(TK_RSHIFT == OP_ShiftRight);
-			testcase(op == TK_RSHIFT);
 			assert(TK_CONCAT == OP_Concat);
-			testcase(op == TK_CONCAT);
 			r1 = sqlExprCodeTemp(pParse, pExpr->pLeft,
 						 &regFree1);
 			r2 = sqlExprCodeTemp(pParse, pExpr->pRight,
 						 &regFree2);
 			sqlVdbeAddOp3(v, op, r2, r1, target);
-			testcase(regFree1 == 0);
-			testcase(regFree2 == 0);
 			break;
 		}
 	case TK_UMINUS:{
@@ -3917,6 +3749,7 @@ sqlExprCodeTarget(Parse * pParse, Expr * pExpr, int target)
 				return target;
 			} else {
 				tempX.op = TK_INTEGER;
+				tempX.type = FIELD_TYPE_INTEGER;
 				tempX.flags = EP_IntValue | EP_TokenOnly;
 				tempX.u.iValue = 0;
 				r1 = sqlExprCodeTemp(pParse, &tempX,
@@ -3925,19 +3758,15 @@ sqlExprCodeTarget(Parse * pParse, Expr * pExpr, int target)
 							 &regFree2);
 				sqlVdbeAddOp3(v, OP_Subtract, r2, r1,
 						  target);
-				testcase(regFree2 == 0);
 			}
 			break;
 		}
 	case TK_BITNOT:
 	case TK_NOT:{
 			assert(TK_BITNOT == OP_BitNot);
-			testcase(op == TK_BITNOT);
 			assert(TK_NOT == OP_Not);
-			testcase(op == TK_NOT);
 			r1 = sqlExprCodeTemp(pParse, pExpr->pLeft,
 						 &regFree1);
-			testcase(regFree1 == 0);
 			sqlVdbeAddOp2(v, op, r1, inReg);
 			break;
 		}
@@ -3945,16 +3774,11 @@ sqlExprCodeTarget(Parse * pParse, Expr * pExpr, int target)
 	case TK_NOTNULL:{
 			int addr;
 			assert(TK_ISNULL == OP_IsNull);
-			testcase(op == TK_ISNULL);
 			assert(TK_NOTNULL == OP_NotNull);
-			testcase(op == TK_NOTNULL);
 			sqlVdbeAddOp2(v, OP_Bool, true, target);
 			r1 = sqlExprCodeTemp(pParse, pExpr->pLeft,
 						 &regFree1);
-			testcase(regFree1 == 0);
 			addr = sqlVdbeAddOp1(v, op, r1);
-			VdbeCoverageIf(v, op == TK_ISNULL);
-			VdbeCoverageIf(v, op == TK_NOTNULL);
 			sqlVdbeAddOp2(v, OP_Bool, false, target);
 			sqlVdbeJumpHere(v, addr);
 			break;
@@ -4002,7 +3826,8 @@ sqlExprCodeTarget(Parse * pParse, Expr * pExpr, int target)
 					diag_set(ClientError,
 						 ER_FUNC_WRONG_ARG_COUNT,
 						 func->def->name,
-						 "at least two", nFarg);
+						 "at least two", nFarg, 2,
+						 SQL_MAX_FUNCTION_ARG);
 					pParse->is_aborted = true;
 					break;
 				}
@@ -4011,7 +3836,6 @@ sqlExprCodeTarget(Parse * pParse, Expr * pExpr, int target)
 				for (i = 1; i < nFarg; i++) {
 					sqlVdbeAddOp2(v, OP_NotNull, target,
 							  endCoalesce);
-					VdbeCoverage(v);
 					sqlExprCacheRemove(pParse, target,
 							       1);
 					sqlExprCachePush(pParse);
@@ -4032,7 +3856,8 @@ sqlExprCodeTarget(Parse * pParse, Expr * pExpr, int target)
 					diag_set(ClientError,
 						 ER_FUNC_WRONG_ARG_COUNT,
 						 func->def->name,
-						 "at least one", nFarg);
+						 "at least one", nFarg, 1,
+						 SQL_MAX_FUNCTION_ARG);
 					pParse->is_aborted = true;
 					break;
 				}
@@ -4045,7 +3870,6 @@ sqlExprCodeTarget(Parse * pParse, Expr * pExpr, int target)
 				if (i < 32
 				    && sqlExprIsConstant(pFarg->a[i].
 							     pExpr)) {
-					testcase(i == 31);
 					constMask |= MASKBIT32(i);
 				}
 			}
@@ -4136,18 +3960,13 @@ sqlExprCodeTarget(Parse * pParse, Expr * pExpr, int target)
 			if (func->def->language == FUNC_LANGUAGE_SQL_BUILTIN) {
 				struct sql_context *ctx =
 					sql_context_new(func, coll);
-				if (ctx == NULL) {
-					pParse->is_aborted = true;
-					return -1;
-				}
 				sqlVdbeAddOp4(v, OP_BuiltinFunction, nFarg,
 					      r1, target, (char *)ctx,
 					      P4_FUNCCTX);
 			} else {
 				sqlVdbeAddOp4(v, OP_FunctionByName, nFarg,
 					      r1, target,
-					      sqlDbStrNDup(pParse->db,
-							   func->def->name,
+					      sql_xstrndup(func->def->name,
 							   func->def->name_len),
 					      P4_DYNAMIC);
 			}
@@ -4156,11 +3975,24 @@ sqlExprCodeTarget(Parse * pParse, Expr * pExpr, int target)
 			}
 			return target;
 		}
+	case TK_LEADING:
+		sqlVdbeAddOp2(v, OP_Integer, TRIM_LEADING, target);
+		break;
+	case TK_TRAILING:
+		sqlVdbeAddOp2(v, OP_Integer, TRIM_TRAILING, target);
+		break;
+	case TK_BOTH:
+		sqlVdbeAddOp2(v, OP_Integer, TRIM_BOTH, target);
+		break;
 	case TK_EXISTS:
 	case TK_SELECT:{
+			if (pParse->vdbe_field_ref_reg > 0) {
+				diag_set(ClientError, ER_UNSUPPORTED,
+					 "SQL expressions", "subselects");
+				pParse->is_aborted = true;
+				return target;
+			}
 			int nCol;
-			testcase(op == TK_EXISTS);
-			testcase(op == TK_SELECT);
 			if (op == TK_SELECT
 			    && (nCol = pExpr->x.pSelect->pEList->nExpr) != 1) {
 				diag_set(ClientError, ER_SQL_COLUMN_COUNT,
@@ -4325,11 +4157,9 @@ sqlExprCodeTarget(Parse * pParse, Expr * pExpr, int target)
 			endLabel = sqlVdbeMakeLabel(v);
 			if ((pX = pExpr->pLeft) != 0) {
 				tempX = *pX;
-				testcase(pX->op == TK_COLUMN_REF);
 				exprToRegister(&tempX,
 					       exprCodeVector(pParse, &tempX,
 							      &regFree1));
-				testcase(regFree1 == 0);
 				memset(&opCompare, 0, sizeof(opCompare));
 				opCompare.op = TK_EQ;
 				opCompare.pLeft = &tempX;
@@ -4350,11 +4180,8 @@ sqlExprCodeTarget(Parse * pParse, Expr * pExpr, int target)
 					pTest = aListelem[i].pExpr;
 				}
 				nextCase = sqlVdbeMakeLabel(v);
-				testcase(pTest->op == TK_COLUMN_REF);
 				sqlExprIfFalse(pParse, pTest, nextCase,
 						   SQL_JUMPIFNULL);
-				testcase(aListelem[i + 1].pExpr->op ==
-					 TK_COLUMN_REF);
 				sqlExprCode(pParse, aListelem[i + 1].pExpr,
 						target);
 				sqlVdbeGoto(v, endLabel);
@@ -4370,9 +4197,13 @@ sqlExprCodeTarget(Parse * pParse, Expr * pExpr, int target)
 			} else {
 				sqlVdbeAddOp2(v, OP_Null, 0, target);
 			}
-			assert(pParse->db->mallocFailed || pParse->is_aborted
+			assert(pParse->is_aborted
 			       || pParse->iCacheLevel == iCacheLevel);
 			sqlVdbeResolveLabel(v, endLabel);
+			enum field_type *type = sql_xmalloc0(sizeof(*type));
+			type[0] = sql_expr_type(pExpr);
+			sqlVdbeAddOp4(v, OP_ApplyType, target, 1, 0,
+				      (char *)type, P4_DYNAMIC);
 			break;
 		}
 	case TK_RAISE:
@@ -4384,15 +4215,10 @@ sqlExprCodeTarget(Parse * pParse, Expr * pExpr, int target)
 		}
 		assert(!ExprHasProperty(pExpr, EP_IntValue));
 		if (pExpr->on_conflict_action == ON_CONFLICT_ACTION_IGNORE) {
-			sqlVdbeAddOp4(v, OP_Halt, 0,
-					  ON_CONFLICT_ACTION_IGNORE, 0,
-					  pExpr->u.zToken, 0);
+			sqlVdbeAddOp2(v, OP_Halt, 0, ON_CONFLICT_ACTION_IGNORE);
 		} else {
-			const char *err =
-				tt_sprintf(tnt_errcode_desc(ER_SQL_EXECUTE),
-					   pExpr->u.zToken);
-			sqlVdbeAddOp4(v, OP_SetDiag, ER_SQL_EXECUTE, 0, 0, err,
-				      P4_STATIC);
+			sqlVdbeAddOp4(v, OP_SetDiag, ER_SQL_EXECUTE, 0, 0,
+				      sql_xstrdup(pExpr->u.zToken), P4_DYNAMIC);
 			sqlVdbeAddOp2(v, OP_Halt, -1,
 				      pExpr->on_conflict_action);
 		}
@@ -4416,13 +4242,10 @@ sqlExprCodeAtInit(Parse * pParse,	/* Parsing context */
 	ExprList *p;
 	assert(ConstFactorOk(pParse));
 	p = pParse->pConstExpr;
-	pExpr = sqlExprDup(pParse->db, pExpr, 0);
-	p = sql_expr_list_append(pParse->db, p, pExpr);
-	if (p) {
-		struct ExprList_item *pItem = &p->a[p->nExpr - 1];
-		pItem->u.iConstExprReg = regDest;
-		pItem->reusable = reusable;
-	}
+	p = sql_expr_list_append(p, sqlExprDup(pExpr, 0));
+	struct ExprList_item *pItem = &p->a[p->nExpr - 1];
+	pItem->u.iConstExprReg = regDest;
+	pItem->reusable = reusable;
 	pParse->pConstExpr = p;
 }
 
@@ -4490,7 +4313,7 @@ sqlExprCode(Parse * pParse, Expr * pExpr, int target)
 				  target);
 	} else {
 		inReg = sqlExprCodeTarget(pParse, pExpr, target);
-		assert(pParse->pVdbe != 0 || pParse->db->mallocFailed);
+		assert(pParse->pVdbe != 0);
 		if (inReg != target && pParse->pVdbe) {
 			sqlVdbeAddOp2(pParse->pVdbe, OP_SCopy, inReg,
 					  target);
@@ -4673,25 +4496,6 @@ exprCodeBetween(Parse * pParse,	/* Parsing and code generating context */
 		sqlExprCodeTarget(pParse, &exprAnd, dest);
 	}
 	sqlReleaseTempReg(pParse, regFree1);
-
-	/* Ensure adequate test coverage */
-	testcase(xJump == sqlExprIfTrue && jumpIfNull == 0
-		 && regFree1 == 0);
-	testcase(xJump == sqlExprIfTrue && jumpIfNull == 0
-		 && regFree1 != 0);
-	testcase(xJump == sqlExprIfTrue && jumpIfNull != 0
-		 && regFree1 == 0);
-	testcase(xJump == sqlExprIfTrue && jumpIfNull != 0
-		 && regFree1 != 0);
-	testcase(xJump == sqlExprIfFalse && jumpIfNull == 0
-		 && regFree1 == 0);
-	testcase(xJump == sqlExprIfFalse && jumpIfNull == 0
-		 && regFree1 != 0);
-	testcase(xJump == sqlExprIfFalse && jumpIfNull != 0
-		 && regFree1 == 0);
-	testcase(xJump == sqlExprIfFalse && jumpIfNull != 0
-		 && regFree1 != 0);
-	testcase(xJump == 0);
 }
 
 /*
@@ -4726,7 +4530,6 @@ sqlExprIfTrue(Parse * pParse, Expr * pExpr, int dest, int jumpIfNull)
 	switch (op) {
 	case TK_AND:{
 			int d2 = sqlVdbeMakeLabel(v);
-			testcase(jumpIfNull == 0);
 			sqlExprIfFalse(pParse, pExpr->pLeft, d2,
 					   jumpIfNull ^ SQL_JUMPIFNULL);
 			sqlExprCachePush(pParse);
@@ -4737,7 +4540,6 @@ sqlExprIfTrue(Parse * pParse, Expr * pExpr, int dest, int jumpIfNull)
 			break;
 		}
 	case TK_OR:{
-			testcase(jumpIfNull == 0);
 			sqlExprIfTrue(pParse, pExpr->pLeft, dest,
 					  jumpIfNull);
 			sqlExprCachePush(pParse);
@@ -4747,7 +4549,6 @@ sqlExprIfTrue(Parse * pParse, Expr * pExpr, int dest, int jumpIfNull)
 			break;
 		}
 	case TK_NOT:{
-			testcase(jumpIfNull == 0);
 			sqlExprIfFalse(pParse, pExpr->pLeft, dest,
 					   jumpIfNull);
 			break;
@@ -4760,7 +4561,6 @@ sqlExprIfTrue(Parse * pParse, Expr * pExpr, int dest, int jumpIfNull)
 	case TK_EQ:{
 			if (sqlExprIsVector(pExpr->pLeft))
 				goto default_expr;
-			testcase(jumpIfNull == 0);
 			r1 = sqlExprCodeTemp(pParse, pExpr->pLeft,
 						 &regFree1);
 			r2 = sqlExprCodeTemp(pParse, pExpr->pRight,
@@ -4768,49 +4568,23 @@ sqlExprIfTrue(Parse * pParse, Expr * pExpr, int dest, int jumpIfNull)
 			codeCompare(pParse, pExpr->pLeft, pExpr->pRight, op, r1,
 				    r2, dest, jumpIfNull);
 			assert(TK_LT == OP_Lt);
-			testcase(op == OP_Lt);
-			VdbeCoverageIf(v, op == OP_Lt);
 			assert(TK_LE == OP_Le);
-			testcase(op == OP_Le);
-			VdbeCoverageIf(v, op == OP_Le);
 			assert(TK_GT == OP_Gt);
-			testcase(op == OP_Gt);
-			VdbeCoverageIf(v, op == OP_Gt);
 			assert(TK_GE == OP_Ge);
-			testcase(op == OP_Ge);
-			VdbeCoverageIf(v, op == OP_Ge);
 			assert(TK_EQ == OP_Eq);
-			testcase(op == OP_Eq);
-			VdbeCoverageIf(v, op == OP_Eq
-				       && jumpIfNull == SQL_NULLEQ);
-			VdbeCoverageIf(v, op == OP_Eq
-				       && jumpIfNull != SQL_NULLEQ);
 			assert(TK_NE == OP_Ne);
-			testcase(op == OP_Ne);
-			VdbeCoverageIf(v, op == OP_Ne
-				       && jumpIfNull == SQL_NULLEQ);
-			VdbeCoverageIf(v, op == OP_Ne
-				       && jumpIfNull != SQL_NULLEQ);
-			testcase(regFree1 == 0);
-			testcase(regFree2 == 0);
 			break;
 		}
 	case TK_ISNULL:
 	case TK_NOTNULL:{
 			assert(TK_ISNULL == OP_IsNull);
-			testcase(op == TK_ISNULL);
 			assert(TK_NOTNULL == OP_NotNull);
-			testcase(op == TK_NOTNULL);
 			r1 = sqlExprCodeTemp(pParse, pExpr->pLeft,
 						 &regFree1);
 			sqlVdbeAddOp2(v, op, r1, dest);
-			VdbeCoverageIf(v, op == TK_ISNULL);
-			VdbeCoverageIf(v, op == TK_NOTNULL);
-			testcase(regFree1 == 0);
 			break;
 		}
 	case TK_BETWEEN:{
-			testcase(jumpIfNull == 0);
 			exprCodeBetween(pParse, pExpr, dest, sqlExprIfTrue,
 					jumpIfNull);
 			break;
@@ -4835,9 +4609,6 @@ sqlExprIfTrue(Parse * pParse, Expr * pExpr, int dest, int jumpIfNull)
 							 &regFree1);
 				sqlVdbeAddOp3(v, OP_If, r1, dest,
 						  jumpIfNull != 0);
-				VdbeCoverage(v);
-				testcase(regFree1 == 0);
-				testcase(jumpIfNull == 0);
 			}
 			break;
 		}
@@ -4918,7 +4689,6 @@ sqlExprIfFalse(Parse * pParse, Expr * pExpr, int dest, int jumpIfNull)
 
 	switch (pExpr->op) {
 	case TK_AND:{
-			testcase(jumpIfNull == 0);
 			sqlExprIfFalse(pParse, pExpr->pLeft, dest,
 					   jumpIfNull);
 			sqlExprCachePush(pParse);
@@ -4929,7 +4699,6 @@ sqlExprIfFalse(Parse * pParse, Expr * pExpr, int dest, int jumpIfNull)
 		}
 	case TK_OR:{
 			int d2 = sqlVdbeMakeLabel(v);
-			testcase(jumpIfNull == 0);
 			sqlExprIfTrue(pParse, pExpr->pLeft, d2,
 					  jumpIfNull ^ SQL_JUMPIFNULL);
 			sqlExprCachePush(pParse);
@@ -4940,7 +4709,6 @@ sqlExprIfFalse(Parse * pParse, Expr * pExpr, int dest, int jumpIfNull)
 			break;
 		}
 	case TK_NOT:{
-			testcase(jumpIfNull == 0);
 			sqlExprIfTrue(pParse, pExpr->pLeft, dest,
 					  jumpIfNull);
 			break;
@@ -4953,7 +4721,6 @@ sqlExprIfFalse(Parse * pParse, Expr * pExpr, int dest, int jumpIfNull)
 	case TK_EQ:{
 			if (sqlExprIsVector(pExpr->pLeft))
 				goto default_expr;
-			testcase(jumpIfNull == 0);
 			r1 = sqlExprCodeTemp(pParse, pExpr->pLeft,
 						 &regFree1);
 			r2 = sqlExprCodeTemp(pParse, pExpr->pRight,
@@ -4961,31 +4728,11 @@ sqlExprIfFalse(Parse * pParse, Expr * pExpr, int dest, int jumpIfNull)
 			codeCompare(pParse, pExpr->pLeft, pExpr->pRight, op, r1,
 				    r2, dest, jumpIfNull);
 			assert(TK_LT == OP_Lt);
-			testcase(op == OP_Lt);
-			VdbeCoverageIf(v, op == OP_Lt);
 			assert(TK_LE == OP_Le);
-			testcase(op == OP_Le);
-			VdbeCoverageIf(v, op == OP_Le);
 			assert(TK_GT == OP_Gt);
-			testcase(op == OP_Gt);
-			VdbeCoverageIf(v, op == OP_Gt);
 			assert(TK_GE == OP_Ge);
-			testcase(op == OP_Ge);
-			VdbeCoverageIf(v, op == OP_Ge);
 			assert(TK_EQ == OP_Eq);
-			testcase(op == OP_Eq);
-			VdbeCoverageIf(v, op == OP_Eq
-				       && jumpIfNull != SQL_NULLEQ);
-			VdbeCoverageIf(v, op == OP_Eq
-				       && jumpIfNull == SQL_NULLEQ);
 			assert(TK_NE == OP_Ne);
-			testcase(op == OP_Ne);
-			VdbeCoverageIf(v, op == OP_Ne
-				       && jumpIfNull != SQL_NULLEQ);
-			VdbeCoverageIf(v, op == OP_Ne
-				       && jumpIfNull == SQL_NULLEQ);
-			testcase(regFree1 == 0);
-			testcase(regFree2 == 0);
 			break;
 		}
 	case TK_ISNULL:
@@ -4993,15 +4740,9 @@ sqlExprIfFalse(Parse * pParse, Expr * pExpr, int dest, int jumpIfNull)
 			r1 = sqlExprCodeTemp(pParse, pExpr->pLeft,
 						 &regFree1);
 			sqlVdbeAddOp2(v, op, r1, dest);
-			testcase(op == TK_ISNULL);
-			VdbeCoverageIf(v, op == TK_ISNULL);
-			testcase(op == TK_NOTNULL);
-			VdbeCoverageIf(v, op == TK_NOTNULL);
-			testcase(regFree1 == 0);
 			break;
 		}
 	case TK_BETWEEN:{
-			testcase(jumpIfNull == 0);
 			exprCodeBetween(pParse, pExpr, dest, sqlExprIfFalse,
 					jumpIfNull);
 			break;
@@ -5028,9 +4769,6 @@ sqlExprIfFalse(Parse * pParse, Expr * pExpr, int dest, int jumpIfNull)
 							 &regFree1);
 				sqlVdbeAddOp3(v, OP_IfNot, r1, dest,
 						  jumpIfNull != 0);
-				VdbeCoverage(v);
-				testcase(regFree1 == 0);
-				testcase(jumpIfNull == 0);
 			}
 			break;
 		}
@@ -5109,7 +4847,8 @@ sqlExprCompare(Expr * pA, Expr * pB, int iTab)
 			return 2;
 		if (ALWAYS((combinedFlags & EP_Reduced) == 0)
 		    && pA->op != TK_STRING) {
-			if (pA->iColumn != pB->iColumn)
+			if (pA->iColumn != pB->iColumn ||
+			    pA->var_base != pB->var_base)
 				return 2;
 			if (pA->iTable != pB->iTable
 			    && (pA->iTable != iTab || NEVER(pB->iTable >= 0)))
@@ -5189,7 +4928,6 @@ sqlExprImpliesExpr(Expr * pE1, Expr * pE2, int iTab)
 	}
 	if (pE2->op == TK_NOTNULL && pE1->op != TK_ISNULL) {
 		Expr *pX = sqlExprSkipCollate(pE1->pLeft);
-		testcase(pX != pE1->pLeft);
 		if (sqlExprCompare(pX, pE2->pLeft, iTab) == 0)
 			return 1;
 	}
@@ -5265,13 +5003,11 @@ sqlFunctionUsesThisSrc(Expr * pExpr, SrcList * pSrcList)
  * the new element.  Return a negative number if malloc fails.
  */
 static int
-addAggInfoColumn(sql * db, AggInfo * pInfo)
+addAggInfoColumn(struct AggInfo *pInfo)
 {
 	int i;
-	pInfo->aCol = sqlArrayAllocate(db,
-					   pInfo->aCol,
-					   sizeof(pInfo->aCol[0]),
-					   &pInfo->nColumn, &i);
+	pInfo->aCol = sqlArrayAllocate(pInfo->aCol, sizeof(pInfo->aCol[0]),
+				       &pInfo->nColumn, &i);
 	return i;
 }
 
@@ -5280,13 +5016,11 @@ addAggInfoColumn(sql * db, AggInfo * pInfo)
  * the new element.  Return a negative number if malloc fails.
  */
 static int
-addAggInfoFunc(sql * db, AggInfo * pInfo)
+addAggInfoFunc(struct AggInfo *pInfo)
 {
 	int i;
-	pInfo->aFunc = sqlArrayAllocate(db,
-					    pInfo->aFunc,
-					    sizeof(pInfo->aFunc[0]),
-					    &pInfo->nFunc, &i);
+	pInfo->aFunc = sqlArrayAllocate(pInfo->aFunc, sizeof(pInfo->aFunc[0]),
+					&pInfo->nFunc, &i);
 	return i;
 }
 
@@ -5307,8 +5041,6 @@ analyzeAggregate(Walker * pWalker, Expr * pExpr)
 	switch (pExpr->op) {
 	case TK_AGG_COLUMN:
 	case TK_COLUMN_REF:{
-			testcase(pExpr->op == TK_AGG_COLUMN);
-			testcase(pExpr->op == TK_COLUMN_REF);
 			/* Check to see if the column is in one of the tables in the FROM
 			 * clause of the aggregate query
 			 */
@@ -5341,8 +5073,7 @@ analyzeAggregate(Walker * pWalker, Expr * pExpr)
 						if ((k >= pAggInfo->nColumn)
 						    && (k =
 							addAggInfoColumn
-							(pParse->db,
-							 pAggInfo)) >= 0) {
+							(pAggInfo)) >= 0) {
 							pCol =
 							    &pAggInfo->aCol[k];
 							pCol->space_def =
@@ -5440,13 +5171,23 @@ analyzeAggregate(Walker * pWalker, Expr * pExpr)
 				if (i >= pAggInfo->nFunc) {
 					/* pExpr is original.  Make a new entry in pAggInfo->aFunc[]
 					 */
-					i = addAggInfoFunc(pParse->db,
-							   pAggInfo);
+					i = addAggInfoFunc(pAggInfo);
 					if (i >= 0) {
 						assert(!ExprHasProperty
 						       (pExpr, EP_xIsSelect));
 						pItem = &pAggInfo->aFunc[i];
 						pItem->pExpr = pExpr;
+						int n = pExpr->x.pList == NULL ?
+							0 : pExpr->x.pList->nExpr;
+						/*
+						 * Allocate n MEMs for arguments
+						 * and one more MEM for
+						 * accumulator. This makes it
+						 * easier to pass these n + 1
+						 * MEMs to the user-defined
+						 * aggregate function.
+						 */
+						pParse->nMem += n;
 						pItem->iMem = ++pParse->nMem;
 						assert(!ExprHasProperty
 						       (pExpr, EP_IntValue));
@@ -5457,12 +5198,6 @@ analyzeAggregate(Walker * pWalker, Expr * pExpr)
 								true;
 							return WRC_Abort;
 						}
-						assert(pItem->func->def->
-						       language ==
-						       FUNC_LANGUAGE_SQL_BUILTIN &&
-						       pItem->func->def->
-						       aggregate ==
-						       FUNC_AGGREGATE_GROUP);
 						if (pExpr->flags & EP_Distinct) {
 							pItem->iDistinct =
 								pParse->nTab++;
@@ -5619,3 +5354,44 @@ sqlClearTempRegCache(Parse * pParse)
 	pParse->nRangeReg = 0;
 }
 
+uint32_t
+sql_fieldno_by_expr(const struct space *space, const struct Expr *expr)
+{
+	assert(expr->op == TK_ID);
+	uint32_t res = sql_space_fieldno(space, expr->u.zToken);
+	if (res != UINT32_MAX || (expr->flags & EP_Lookup2) == 0)
+		return res;
+	char *old_name_str = sql_legacy_name_new0(expr->u.zToken);
+	res = sql_space_fieldno(space, old_name_str);
+	sql_xfree(old_name_str);
+	return res;
+
+}
+
+uint32_t
+sql_fieldno_by_item(const struct space *space, const struct ExprList_item *item)
+{
+	uint32_t res = sql_space_fieldno(space, item->zName);
+	if (res != UINT32_MAX || item->legacy_name == NULL)
+		return res;
+	return sql_space_fieldno(space, item->legacy_name);
+}
+
+uint32_t
+sql_coll_id_by_expr(const struct Expr *expr)
+{
+	assert(expr->op == TK_COLLATE);
+	const char *name = expr->u.zToken;
+	struct coll_id *coll_id = coll_by_name(name, strlen(name));
+	if (coll_id != NULL)
+		return coll_id->id;
+	if ((expr->flags & EP_Lookup2) == 0)
+		return UINT32_MAX;
+
+	char *old_name_str = sql_legacy_name_new0(expr->u.zToken);
+	coll_id = coll_by_name(old_name_str, strlen(old_name_str));
+	sql_xfree(old_name_str);
+	if (coll_id != NULL)
+		return coll_id->id;
+	return UINT32_MAX;
+}
